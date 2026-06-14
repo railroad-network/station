@@ -92,7 +92,8 @@ obligations on communities that adopt, fork, or self-host the software.
 
 ## References
 
-- Design overview, Section 10.9 "The Technology Stack" (`docs/design/`)
+- Design overview, Section 10.9 "The Technology Stack"
+  (`docs/design/Railroad-Network-Overview.md`)
 - Design overview, Section 12 "Development Roadmap" — Phase 0 exit criteria
   (external cryptographic audit before real users)
 - Repository Strategy document — "Phase 0 — One repo", "What does NOT get its

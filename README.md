@@ -27,6 +27,12 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## Design documents
+
+The full design overview — vision, governance, economics, oracle, identity,
+federation, and technical architecture — lives in
+[`docs/design/`](docs/design/README.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the current contribution policy and
