@@ -1,0 +1,13 @@
+[package]
+name = "rrn-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rrn"
+path = "src/main.rs"
+
+[dependencies]

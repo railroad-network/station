@@ -1,3 +1,16 @@
 .claude
 
 CLAUDE.md
+
+# Rust
+/target/
+**/target/
+
+# macOS
+.DS_Store
+
+# Editor swap files
+*.swp
+
+# Local environment
+.env

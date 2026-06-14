@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rrn-crypto",
+    "crates/rrn-storage",
+    "crates/rrn-identity",
+    "crates/rrn-ledger",
+    "crates/rrn-protocol",
+    "crates/rrn-station",
+    "crates/rrn-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/railroad-network/station"
+authors = ["Railroad Network contributors"]
+
+[workspace.dependencies]
+# Shared dependencies are added here as tasks require them.
