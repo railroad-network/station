@@ -1,0 +1,31 @@
+# Configuration for `cargo deny check` (advisories, licenses, bans, sources).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Deny dependencies pulled in by a yanked crate version.
+yanked = "deny"
+
+[licenses]
+# cargo-deny denies any license not on this list (and therefore the entire
+# GPL family — GPL, LGPL, AGPL, etc. — is denied by omission).
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn (don't fail) on multiple versions of the same crate in the dependency
+# graph; revisit if it gets noisy.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

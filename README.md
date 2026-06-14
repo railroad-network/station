@@ -1,5 +1,7 @@
 # Railroad Network — station
 
+[![CI](https://github.com/railroad-network/station/actions/workflows/ci.yml/badge.svg)](https://github.com/railroad-network/station/actions/workflows/ci.yml)
+
 **Railroad Network** is a federated platform for self-organizing communities: a
 mutual-credit economy denominated in a single unit (the "Common"),
 decentralized identity with social vouching and Shamir-based social recovery,
