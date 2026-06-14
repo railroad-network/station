@@ -1,0 +1,44 @@
+# Architecture Decision Records
+
+An Architecture Decision Record (ADR) captures a single significant design
+decision, the context that motivated it, and the alternatives that were
+considered and rejected. ADRs answer the question a future contributor (or
+auditor) will inevitably ask: "why did we do it this way?"
+
+## When to write one
+
+Write an ADR whenever a decision is **locked** — meaning the project commits
+to it and treats deviation as requiring a new decision, not a quiet drift.
+Examples: choice of a core language or library, a cryptographic primitive, a
+wire format, a storage engine, a licensing model, or a security boundary.
+
+Small implementation details that are easy to change later (variable names,
+internal module layout, etc.) do not need an ADR.
+
+## Format
+
+ADRs follow the [MADR](https://adr.github.io/madr/) (Markdown Architecture
+Decision Records) convention, using the structure in
+[`template.md`](template.md):
+
+- **Status** — proposed, accepted, rejected, deprecated, or superseded
+- **Context** — the forces and constraints that motivate the decision
+- **Decision** — what was decided
+- **Consequences** — what becomes easier or harder as a result
+- **Alternatives Considered** — what else was evaluated, and why it lost
+
+## Numbering and lifecycle
+
+- Files are named `NNNN-kebab-case-title.md`, numbered sequentially starting
+  at `0001`.
+- **ADRs are append-only.** If a decision changes, write a new ADR that
+  supersedes the old one (and mark the old one's Status accordingly) — don't
+  edit history.
+- Keep each ADR to a single decision; don't bundle unrelated choices.
+
+## Index
+
+- [0001 — Rust workspace and dual license](0001-rust-workspace-and-dual-license.md)
+
+See also [`docs/threat-model.md`](../threat-model.md) for the project's living
+threat model, which references decisions recorded here.
