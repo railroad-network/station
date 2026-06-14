@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-commit checks: formatting and lints. Installed via
+# `git config core.hooksPath .githooks` (see scripts/install-hooks.sh).
+set -e
+
+echo "pre-commit: cargo fmt --check"
+if ! cargo fmt --check; then
+    echo
+    echo "error: formatting check failed. Run 'cargo fmt' and try again." >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo
+    echo "error: clippy check failed. Fix the warnings above and try again." >&2
+    exit 1
+fi

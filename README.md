@@ -29,6 +29,9 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+Run `./scripts/install-hooks.sh` after cloning to enable the local pre-commit
+checks (formatting and lints).
+
 ## Design documents
 
 The full design overview — vision, governance, economics, oracle, identity,
