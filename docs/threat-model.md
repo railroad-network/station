@@ -181,14 +181,98 @@ of content hashes.
 
 ### `rrn-storage`
 
-*Populated in M0.2 — Storage and CRDTs.*
+Local persistence (SQLite, `db`/`migrations`), the three CRDTs (`crdt`), and the
+hash-chained append-only signed log (`log`). The log is the **source of truth**;
+CRDT state is derived by replaying it and is never authoritative on its own.
 
-- TODO: Spoofing
-- TODO: Tampering
-- TODO: Repudiation
-- TODO: Information disclosure
-- TODO: Denial of service
-- TODO: Elevation of privilege
+**Assets:** the integrity and ordering of the append-only log; the deterministic
+convergence of CRDT merges; the on-disk schema as a stable contract; durability
+of committed writes.
+
+> Populated through M0.2 (SQLite schema, the three CRDTs, and the hash-chained
+> log). Replay-derived state and any further residual risks are revisited as the
+> ledger (M0.5) builds on this layer.
+
+#### Spoofing
+
+- *Threat:* a forged record (attestation, transaction, log entry) is written as
+  though it came from a legitimate identity.
+- *Mitigation:* authenticity is not the database's job — every record destined
+  for the log is a `rrn-crypto::SignedPayload`, and `AppendLog::append` verifies
+  the signature before writing (T0.2.6). The raw SQLite tables enforce structure
+  (foreign key `attestations.signer → identities.pubkey`), not authenticity.
+- *Residual risk:* a row inserted directly via SQL bypasses signature checks;
+  that is the Tampering threat below, caught on read by chain verification, not
+  prevented at write time.
+
+#### Tampering — database file and log chain
+
+- *Threat (database file):* an attacker with filesystem access edits, inserts,
+  or deletes rows directly — altering a balance, rewriting an attestation,
+  excising a transaction.
+- *Mitigation:* the append-only log chains each entry to the Blake3
+  `content_hash` of the previous one (`prev_hash`), so any in-place edit,
+  reorder, or deletion breaks the chain and is detected by
+  `AppendLog::verify_chain` (T0.2.6). CRDT state is rebuilt from the log
+  (T0.2.7), so a tampered derived row (e.g. `balances`) is overwritten by replay
+  — the log wins. Append operations are wrapped in a single SQLite transaction
+  so an entry is never half-written.
+- *Threat (schema drift):* the on-disk schema silently diverges from the code's
+  expectations — a hand-edited table, a skipped or reordered migration, a partly
+  applied migration.
+- *Mitigation:* migrations are immutable and versioned, applied once each inside
+  a transaction and recorded in `_migrations` with a Blake3 checksum of the SQL
+  text; re-running is a no-op. A golden-schema test (`tests/schema.golden.sql`)
+  fails CI on any unintended change to table or index definitions. Tables are
+  declared `STRICT` so column types are enforced rather than coerced.
+- *Residual risk:* the hash chain proves *integrity and order within one log*,
+  not *uniqueness* — two replicas can still fork (conflicting valid chains).
+  Fork detection across replicas is out of scope for Phase 0 (Phase 1+
+  `rrn-protocol`). An attacker who truncates the log to a prior valid prefix
+  produces a still-consistent shorter chain; detecting rollback needs external
+  anchoring (later).
+
+#### Repudiation
+
+- *Threat:* a participant denies an action recorded in storage.
+- *Mitigation:* log entries carry the signer's `SignedPayload`; the chained,
+  append-only structure preserves a tamper-evident signed history. Non-
+  repudiation rests on the `rrn-crypto` key-secrecy assumption.
+
+#### Information disclosure
+
+- *Threat:* the SQLite file is read by anyone with filesystem access, exposing
+  balances, transaction graphs, and social-vouch relationships (a privacy-
+  sensitive social graph), or a seized device discloses all of it.
+- *Mitigation:* at-rest encryption of secret key material is `rrn-identity`'s
+  responsibility (argon2id + XChaCha20-Poly1305); this crate stores no secret
+  keys. Whole-database encryption for the social-graph metadata is noted as
+  future work (physical-seizure mitigation, design overview §10.8).
+- *Residual risk:* in Phase 0 the database is plaintext on disk; the metadata it
+  contains is exposed to a local attacker or seized media. Accepted for now per
+  the device-trust assumption.
+
+#### Denial of service
+
+- *Threat:* adversarial input or pathological state — a corrupt/oversized BLOB,
+  an enormous log forcing full-scan `verify_chain`/replay, unbounded CRDT growth
+  (OR-Set tombstones).
+- *Mitigation:* all storage operations return `Result` and do not panic on
+  malformed rows; `verify_chain` and replay are O(N) but Phase 0 logs are small,
+  with snapshotting deferred (T0.2.7 supports replay `from_seq` as the
+  foundation). OR-Set tombstone garbage collection is a known, documented
+  deferral.
+- *Residual risk:* no size limits on log/CRDT growth yet; a local writer can bloat
+  the database. Bounded only by disk in Phase 0.
+
+#### Elevation of privilege
+
+- *Threat:* using storage to grant authority not legitimately held (e.g. forging
+  a balance or membership to gain standing).
+- *Mitigation:* storage has no notion of authority; balances and memberships are
+  CRDTs derived from signed log entries, so privilege follows verified
+  signatures, not direct row writes (which replay overwrites). Authorization
+  rules live in `rrn-ledger`/`rrn-identity`.
 
 ### `rrn-identity`
 

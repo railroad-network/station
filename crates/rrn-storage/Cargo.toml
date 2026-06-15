@@ -5,5 +5,26 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Local storage for Railroad Network: SQLite persistence, CRDTs, and the append-only signed log."
 
 [dependencies]
+# Embedded SQLite. `bundled` compiles the SQLite C amalgamation in-tree — no
+# system libsqlite3 dependency, reproducible across platforms. Spec pinned 0.31;
+# 0.40 is the current stable (the Connection/PRAGMA API used here is unchanged).
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Crypto layer: SignedPayload, Hash, PublicKey — the log builds on these.
+# Path + version (not path alone) so the internal dep isn't a `*` wildcard,
+# which `cargo deny` rejects for publishable crates.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+# Canonical CBOR for serializing CRDT state to local BLOBs (kv table). Same
+# encoder the crypto layer uses (ADR-0002); here it is local persistence, not
+# signing, but determinism is still desirable.
+dcbor = "0.25"
+# OsRng for OR-Set's 128-bit unique tags. Version matched to rrn-crypto.
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
