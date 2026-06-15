@@ -276,14 +276,118 @@ of committed writes.
 
 ### `rrn-identity`
 
-*Populated in M0.3 — Identity Layer and M0.4 — Shamir Secret Sharing.*
+Turns raw keys into identities: bech32m addresses (`address`), the
+passphrase-encrypted wallet (`wallet`), the generic signed `Attestation`
+(`attestation`), and the first concrete attestation — the `vouch`. Social
+recovery (`recovery`, ADR-0004) is the highest-stakes part of this crate and is
+populated separately in M0.4.
 
-- TODO: Spoofing
-- TODO: Tampering
-- TODO: Repudiation
-- TODO: Information disclosure
-- TODO: Denial of service
-- TODO: Elevation of privilege
+**Assets:** the wallet's secret key at rest (the whole identity — lose it or
+leak it and the identity is forged or gone); the secret key in memory while
+unlocked; the binding between a public key and its human-readable address; the
+authenticity of vouches (a forged vouch is a fake social relationship).
+
+> Populated through M0.3 (addresses, wallet encryption, attestation, vouch).
+> Shamir social recovery threats are added in M0.4; the social-graph /
+> Sybil-resistance analysis of vouching is a Phase 1+ concern (vouch *content*
+> trust, as opposed to vouch *authenticity*, is out of scope here).
+
+#### Spoofing — forged identity or forged vouch
+
+- *Threat:* an attacker presents a vouch (or other attestation) as though it
+  came from a victim's identity, or claims an address that is not theirs.
+- *Mitigation:* every attestation is an `rrn-crypto::SignedPayload` signed over
+  its canonical CBOR; `create_vouch` signs with the voucher's keypair and
+  `SignedPayload::verify` checks it against the signer's public key. An address
+  *is* a public key, so claiming an address you don't hold means signing without
+  the matching secret key — reducible to the `rrn-crypto` forgery assumption.
+- *Residual risk:* authenticity is not authority. A *validly signed* vouch from a
+  real-but-malicious identity, or a Sybil cluster of mutually-vouching keys, is
+  cryptographically sound; defending against that is reputation/Sybil analysis
+  deferred to Phase 1+, not a signature problem.
+
+#### Tampering — altered wallet, altered address, altered vouch
+
+- *Threat (wallet at rest):* an attacker with filesystem access edits the
+  `.rrnwallet` file to corrupt or substitute key material.
+- *Mitigation:* the wallet ciphertext is sealed with XChaCha20-Poly1305; any
+  edit to the ciphertext, nonce, or KDF params fails the Poly1305 tag and
+  `decrypt` returns `WalletError::Decrypt` rather than yielding a tampered key
+  (unit-tested: flipping a ciphertext byte fails). The address is *not* stored in
+  the wallet — it is re-derived from the decrypted secret key — so a tampered
+  address can never disagree with the key it claims to represent.
+- *Threat (address typo / wrong network):* a mistyped or cross-network address is
+  accepted as a different valid key, sending value to the wrong identity.
+- *Mitigation:* bech32m carries a checksum, so a single-character typo is
+  rejected at parse time; the HRP must be `rrn` (a `bc1…` address is rejected);
+  only a 32-byte payload that decodes to a canonical curve point is accepted; and
+  decoding strictly requires the bech32m checksum variant (ADR-0003). Tested with
+  bad-checksum, wrong-HRP, wrong-length, and non-m-variant cases.
+- *Threat (attestation tampering):* modify a stored vouch and have it still
+  verify.
+- *Mitigation:* the signature covers the canonical CBOR of the attestation; the
+  append-only log stores the exact signed bytes, and altering them fails
+  verification (tested: flipping a stored body byte breaks `payload.verify()`).
+
+#### Repudiation
+
+- *Threat:* a voucher denies having issued a vouch.
+- *Mitigation:* a vouch is a non-repudiable Ed25519 signature, persisted in the
+  hash-chained append-only log (`rrn-storage`); the signed history is
+  tamper-evident. Rests on the `rrn-crypto` key-secrecy assumption.
+
+#### Information disclosure — secret-key leakage
+
+- *Threat:* the wallet's secret key leaks — via a weak passphrase brute-forced
+  offline, theft of the wallet file, a world-readable file, memory dumps, or
+  debug output.
+- *Mitigations:*
+  - *Passphrase / offline brute force:* the file-encryption key is derived with
+    **argon2id** (m_cost 64 MiB, t_cost 3, p_cost 4), making each guess
+    expensive; parameters are stored per-wallet and tunable upward via the
+    versioned format. A weak passphrase is still the user's risk — passphrase
+    *strength enforcement* is a deferred UI concern, noted as residual risk.
+  - *File theft / at rest:* the secret key is never on disk in the clear; only
+    the argon2id+XChaCha20-Poly1305 ciphertext is. A random 32-byte salt and
+    24-byte nonce are generated per save.
+  - *File permissions:* the wallet is written `0o600` (owner-only) on Unix, via
+    an atomic write-to-temp-then-rename so a crash never leaves a truncated or
+    world-readable file at the real path.
+  - *Memory / debug:* `WalletContents` is `Zeroize + ZeroizeOnDrop` (the secret
+    key is wiped on drop); the derived AEAD key and the decrypted plaintext
+    buffer are explicitly zeroized after use; `WalletContents`' `Debug` redacts
+    the secret key, and `SecretKey` itself is non-serde and redacted (per
+    `rrn-crypto`).
+- *Residual risk:* the key is necessarily plaintext in RAM while the wallet is
+  unlocked; a compromised OS or memory scraper (out of scope per Trust
+  Assumptions) can read it. `zeroize` narrows but does not close that window. A
+  weak user passphrase undermines the KDF regardless of cost parameters.
+
+#### Denial of service — malicious wallet or address input
+
+- *Threat:* adversarial bytes fed to the wallet decoder or address parser cause a
+  panic or unbounded work — a corrupt `.rrnwallet`, a hostile bech32 string, a
+  malformed attestation CBOR.
+- *Mitigation:* all parsers return `Result` and never panic on malformed input
+  (corrupt wallet → `WalletError::Corrupt`/`Decrypt`; bad address → an
+  `AddressParseError` variant). Canonical CBOR decode is bounded by input length.
+  argon2id memory cost is bounded by the stored parameters; the version is
+  checked before key derivation, so an unsupported-version file is rejected
+  cheaply rather than triggering an expensive KDF.
+- *Residual risk:* the stored KDF parameters are attacker-influenceable in a
+  hostile wallet file — a forged file could specify a very large `m_cost` to
+  force a big allocation on `decrypt`. Phase 0 accepts this (you only decrypt
+  your own wallet); a future hardening is to clamp accepted parameter ranges.
+
+#### Elevation of privilege
+
+- *Threat:* using identity primitives to gain standing not legitimately held.
+- *Mitigation:* this crate grants no authority on its own — it produces and
+  verifies signatures and stores attestations. Authority derived from vouches
+  (reputation, membership) lives in `rrn-ledger` and later governance layers;
+  `reputation_stake_centi` is recorded but deliberately *not* enforced in Phase 0
+  (no reputation system yet). Privilege therefore follows verified signatures,
+  not anything mintable here.
 
 ### `rrn-ledger`
 

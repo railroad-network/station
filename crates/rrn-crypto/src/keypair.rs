@@ -38,6 +38,28 @@ impl SecretKey {
     fn signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.0)
     }
+
+    /// Constructs a secret key from its raw 32-byte Ed25519 seed.
+    ///
+    /// This is the deliberate, explicit path for *restoring* a persisted
+    /// secret key — `SecretKey` has no serde impl precisely so that secrets are
+    /// never serialized by accident, so this byte constructor is the only way
+    /// back in. Its sole intended caller is the identity wallet, which encrypts
+    /// the seed at rest (argon2id + XChaCha20-Poly1305); keeping the byte API
+    /// here, rather than a `serde` derive, keeps every persistence site
+    /// greppable and inside the audit boundary.
+    pub fn from_bytes(seed: [u8; 32]) -> Self {
+        Self(seed)
+    }
+
+    /// Returns a copy of the raw 32-byte Ed25519 seed.
+    ///
+    /// The returned array **is** the private key: treat it as secret material
+    /// and zeroize the copy once done. Used only by the wallet to encrypt the
+    /// seed at rest; nothing else should pull the bytes out in the clear.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
 }
 
 /// An Ed25519 public (verifying) key — 32 compressed bytes, validated as a
@@ -242,6 +264,18 @@ mod tests {
                 "base64 key bytes leaked: {surface}"
             );
         }
+    }
+
+    #[test]
+    fn secret_key_byte_roundtrip_preserves_identity() {
+        // The wallet's persistence path: pull the seed out, put it back, and
+        // the reconstructed keypair must be the same identity (same public key)
+        // and produce the same signatures.
+        let kp = Keypair::generate();
+        let restored = Keypair::from_secret(SecretKey::from_bytes(kp.secret_key().to_bytes()));
+        assert_eq!(kp.public_key(), restored.public_key());
+        let sig = restored.sign(b"persisted");
+        assert!(kp.public_key().verify(b"persisted", &sig).is_ok());
     }
 
     #[test]

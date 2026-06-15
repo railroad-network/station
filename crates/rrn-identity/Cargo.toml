@@ -5,5 +5,36 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Identity layer for Railroad Network: wallets, addresses, vouching, social recovery."
 
 [dependencies]
+# Crypto primitives (keys, signatures, canonical CBOR, SignedPayload) and the
+# append-only log. Path + version so the internal dep isn't a `*` wildcard,
+# which `cargo deny` rejects for publishable crates.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+# Human-readable addresses with a checksum. Spec pinned 0.11; 0.12 is current
+# stable. The 0.12 API takes/returns raw bytes (`encode::<Bech32m>(hrp, &[u8])`
+# / `decode -> (Hrp, Vec<u8>)`) and handles the 8↔5-bit base32 conversion
+# internally, so there is no manual `u5`/`ToBase32` step. See ADR-0003.
+bech32 = "0.12"
+# Passphrase KDF for the wallet (argon2id). Low-level `hash_password_into`
+# derives raw key bytes; we do not use the PHC string form.
+argon2 = "0.5"
+# Authenticated symmetric encryption of the wallet at rest. XChaCha20-Poly1305's
+# 24-byte nonce is large enough to pick at random safely. `getrandom` exposes
+# `AeadCore::generate_nonce` / `OsRng`.
+chacha20poly1305 = "0.10"
+# OsRng for the wallet's random salt and nonce. Version matched to the rest of
+# the workspace (rrn-crypto / rrn-storage).
+rand_core = { version = "0.6", features = ["getrandom"] }
+# CBOR for the wallet file format and for the canonical bytes of attestations.
+dcbor = "0.25"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+# A real temp directory for wallet save/load tests.
+tempfile = "3"
