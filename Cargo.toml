@@ -9,6 +9,9 @@ members = [
     "crates/rrn-station",
     "crates/rrn-cli",
 ]
+# The cargo-fuzz crate is its own (nightly-only) workspace; keep it out of the
+# stable workspace build. See fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,12 @@
+# cargo-fuzz requires a nightly toolchain (it relies on nightly-only sanitizer
+# coverage flags). This file scopes nightly to the `fuzz/` directory so the rest
+# of the workspace keeps building on the stable toolchain pinned at the repo
+# root.
+#
+# Intentionally unpinned (`nightly` rather than a `nightly-YYYY-MM-DD` date):
+# any recent nightly builds these targets, and a pinned date in a file we cannot
+# revalidate here would silently rot when that nightly is GC'd from static.rust-
+# lang.org. The dedicated, coverage-guided fuzzing infrastructure (Phase 5) is
+# the right place to pin an exact nightly for reproducibility.
+[toolchain]
+channel = "nightly"

@@ -39,6 +39,7 @@ Decision Records) convention, using the structure in
 ## Index
 
 - [0001 — Rust workspace and dual license](0001-rust-workspace-and-dual-license.md)
+- [0002 — Canonical serialization via deterministic CBOR (`dcbor`)](0002-canonical-serialization-dcbor.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.

@@ -64,3 +64,22 @@ jobs:
           cache-bin: true
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          cache-bin: true
+      - run: cargo install cargo-fuzz --locked
+      # Compile all three targets, then run each as a 60s smoke check (not full
+      # fuzzing — that runs on dedicated infra in Phase 5). `-runs` caps the
+      # work if 60s would otherwise be exceeded between iterations.
+      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz run verify_signature    -- -max_total_time=60
+      - run: cargo +nightly fuzz run canonical_roundtrip -- -max_total_time=60
+      - run: cargo +nightly fuzz run hash_chain          -- -max_total_time=60

@@ -6,6 +6,13 @@ CLAUDE.md
 /target/
 **/target/
 
+# cargo-fuzz: generated corpus and crash artifacts (keep Cargo.toml + targets)
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+# A standalone Cargo.lock is generated for the detached fuzz workspace.
+/fuzz/Cargo.lock
+
 # macOS
 .DS_Store
 

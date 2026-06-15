@@ -7,6 +7,14 @@ all-features = true
 [advisories]
 # Deny dependencies pulled in by a yanked crate version.
 yanked = "deny"
+ignore = [
+    # `paste` is unmaintained/archived (RUSTSEC-2024-0436 is an "unmaintained"
+    # notice, not a vulnerability). It is a build-time proc-macro pulled in
+    # transitively by `dcbor` (our canonical-CBOR dependency — see ADR-0002),
+    # generates no runtime code path we ship, and has no known CVE. Revisit if
+    # dcbor drops it or moves to a maintained fork (e.g. `pastey`).
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # cargo-deny denies any license not on this list (and therefore the entire
@@ -14,9 +22,11 @@ yanked = "deny"
 allow = [
     "Apache-2.0",
     "MIT",
+    "BSD-2-Clause",         # arrayref (via blake3)
+    "BSD-2-Clause-Patent",  # dcbor (canonical CBOR, ADR-0002)
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
+    "Unicode-3.0",          # unicode-ident (via proc-macro2)
 ]
 confidence-threshold = 0.8
 

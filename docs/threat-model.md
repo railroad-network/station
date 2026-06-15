@@ -78,14 +78,106 @@ being rigidly bound by it. Populated as each crate's milestone lands.
 
 ### `rrn-crypto`
 
-*Populated in M0.1 — Crypto Primitives.*
+The audit boundary. Provides Ed25519 signing (`keypair`), Blake3 hashing
+(`hash`), canonical deterministic CBOR (`serialize`), and the
+`SignedPayload<T>` wrapper (`signed`). Everything downstream trusts these
+primitives, so the threats here are the highest-stakes in the system.
 
-- TODO: Spoofing
-- TODO: Tampering
-- TODO: Repudiation
-- TODO: Information disclosure
-- TODO: Denial of service
-- TODO: Elevation of privilege
+**Assets:** Ed25519 secret keys; the integrity of the sign→verify relation;
+the byte-for-byte determinism of canonical encoding; the collision resistance
+of content hashes.
+
+#### Spoofing — forging a signature / impersonating a signer
+
+- *Threat:* an attacker produces a `SignedPayload` that verifies under a
+  victim's public key without holding the secret key.
+- *Mitigations:* Ed25519 over `ed25519-dalek` v2 (a reviewed implementation);
+  forging requires breaking the discrete-log assumption, which the threat
+  model takes as hard. The signed bytes are the *canonical CBOR of the
+  payload* (`signed.rs`), never an attacker-malleable wire envelope, so there
+  is no encoding wiggle room to exploit.
+- *Residual risk:* compromise of the secret key itself (see Information
+  disclosure) defeats this entirely — the cryptography assumes the key is
+  secret.
+
+#### Tampering — altering a signed value, or signature malleability
+
+- *Threat (payload tampering):* modify `payload` after signing and have it
+  still verify.
+- *Mitigation:* `verify()` re-serializes the payload to canonical bytes and
+  checks the signature against those bytes; any change to the payload changes
+  the bytes and fails verification. Property-tested (flip-a-bit in message
+  fails verify).
+- *Threat (signature malleability):* Ed25519 admits non-canonical `S`
+  components and small-order public keys that some verifiers accept, letting a
+  third party mint a *different* valid signature for the same message
+  (transaction-malleability style).
+- *Mitigation:* verification uses `verify_strict`, which rejects non-canonical
+  `S` and small-order keys. Property-tested (flip-a-bit in signature fails
+  verify).
+- *Residual risk:* this crate guarantees a unique encoding *only* for types
+  routed through canonical CBOR; a downstream type that signs ad-hoc bytes
+  bypasses the guarantee. Enforced by convention (sign via `SignedPayload`),
+  not the type system.
+
+#### Repudiation
+
+- *Threat:* a signer denies having signed a value.
+- *Mitigation:* a valid Ed25519 signature is non-repudiable evidence under the
+  key-secrecy assumption; the append-only log (`rrn-storage`) preserves signed
+  history. Largely an `rrn-ledger`/`rrn-storage` concern; `rrn-crypto` only
+  supplies the primitive.
+
+#### Information disclosure — secret-key leakage
+
+- *Threat:* secret key material leaks via memory, logs, debug output, or
+  accidental serialization.
+- *Mitigations:* `SecretKey` holds only the 32-byte seed and is
+  `Zeroize + ZeroizeOnDrop` (wiped on drop); its `Debug` prints
+  `SecretKey([REDACTED])` and `Keypair`'s `Debug` shows only the public key —
+  both unit-tested to never emit key bytes. `SecretKey` deliberately does not
+  implement `serde::Serialize`/`Deserialize`, so it cannot be serialized by
+  accident. At-rest encryption of persisted keys is `rrn-identity`'s job
+  (argon2id + XChaCha20-Poly1305), out of scope here.
+- *Residual risk:* secrets are necessarily in plaintext in RAM while in use; a
+  compromised OS / memory scraper (out of scope per Trust Assumptions) can
+  read them. `zeroize` narrows but does not eliminate the window.
+
+#### Denial of service — malicious inputs at parsing boundaries
+
+- *Threat:* adversarial bytes fed to `PublicKey::from_bytes`,
+  `Signature::from_bytes`, `verify`, or canonical decode cause a panic or
+  unbounded work.
+- *Mitigations:* all parsers return `Result` and never panic on malformed
+  input (off-curve keys → `InvalidEncoding`); a `cargo-fuzz` target
+  (`verify_signature`) asserts no panic on arbitrary `(pubkey, sig, message)`.
+  Ed25519 verify is fixed-cost in the input size.
+- *Residual risk:* CBOR decode work is bounded by input length; very large
+  inputs are a caller/transport concern (message size limits live in
+  `rrn-protocol`, Phase 1+).
+
+#### Elevation of privilege
+
+- Not directly applicable at this layer: `rrn-crypto` has no notion of roles
+  or authority. Authorization is built on top of verified signatures in
+  `rrn-identity`/`rrn-ledger`. The relevant obligation here is *correctness*:
+  a `verify` that wrongly returns `Ok` would let any forged value escalate.
+
+#### Weak randomness
+
+- *Threat:* predictable key generation undermines every guarantee above.
+- *Mitigation:* `Keypair::generate` draws from the OS CSPRNG (`OsRng`, backed
+  by `getrandom`); no userspace PRNG seeds key material. Per Trust
+  Assumptions, the OS CSPRNG is trusted to provide sufficient entropy.
+
+#### Side channels
+
+- *Mitigation:* `ed25519-dalek` performs constant-time scalar arithmetic and
+  constant-time signature verification internally; we do not hand-roll
+  comparisons of secret-dependent values.
+- *Residual risk:* full side-channel resistance (cache/timing/EM) on arbitrary
+  hardware is not claimed; physical-access attackers are bounded by the
+  device-trust assumption.
 
 ### `rrn-storage`
 

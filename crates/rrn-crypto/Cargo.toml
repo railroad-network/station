@@ -5,5 +5,33 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Cryptographic primitives for Railroad Network: Ed25519, Blake3, canonical dCBOR."
 
 [dependencies]
+# Signing. default-features = false then re-enable explicitly (see ADR-0001
+# audit posture). `zeroize` wipes the inner SigningKey; `rand_core` provides
+# `generate`.
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "std",
+    "zeroize",
+    "rand_core",
+] }
+blake3 = "1"
+# Deterministic CBOR (RFC 8949 §4.2.1) — canonical by construction. See
+# ADR-0002 for why this (native traits) rather than a serde-based encoder.
+dcbor = "0.25"
+# `getrandom` feature exposes `rand_core::OsRng`, used by `Keypair::generate`.
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+zeroize = { version = "1", features = ["derive"] }
+# String encodings for the serde wire forms: base64 for keys/signatures, hex
+# for hashes.
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1"
+rand = "0.8"
+# Concrete format for exercising the serde (base64/hex) wire impls in tests.
+serde_json = "1"

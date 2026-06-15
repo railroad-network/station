@@ -1,0 +1,44 @@
+# cargo-fuzz crate for rrn-crypto. Detached from the main workspace (the empty
+# `[workspace]` table below) so it is built only under a nightly toolchain via
+# `cargo +nightly fuzz`, never by `cargo build --workspace` on stable. The main
+# workspace also lists `fuzz` under `exclude` for the same reason.
+[package]
+name = "rrn-crypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dcbor = "0.25"
+rrn-crypto = { path = "../crates/rrn-crypto" }
+
+[profile.release]
+debug = 1
+
+# Keep fuzz targets out of the main workspace's dependency/version resolution.
+[workspace]
+
+[[bin]]
+name = "verify_signature"
+path = "fuzz_targets/verify_signature.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_roundtrip"
+path = "fuzz_targets/canonical_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hash_chain"
+path = "fuzz_targets/hash_chain.rs"
+test = false
+doc = false
+bench = false
