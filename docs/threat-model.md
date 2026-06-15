@@ -389,6 +389,108 @@ authenticity of vouches (a forged vouch is a fake social relationship).
   (no reputation system yet). Privilege therefore follows verified signatures,
   not anything mintable here.
 
+### `rrn-identity::recovery` (Shamir social recovery)
+
+Splits the wallet's Ed25519 secret key into `N` shards via an **own**
+implementation of Shamir's Secret Sharing over GF(256) (`gf256`, `shamir`, per
+ADR-0004), seals each shard to a holder's identity key (`encryption`), and
+reconstructs the key from any `K` decrypted shards (`flow`). This is the
+highest-stakes code in the crate: it handles the secret key in the clear during
+split and reconstruction, and the shards it produces are, in aggregate, the key
+itself.
+
+**Assets:** the secret key while it is split / reconstructed in memory; the
+`K`-of-`N` confidentiality property (any `K-1` shards must reveal *nothing*); the
+confidentiality of each shard in transit and at rest with its holder; the
+correctness of the field arithmetic and interpolation (a bug silently corrupts
+or leaks the key).
+
+> Populated through T0.4.7 (GF(256) arithmetic, the split/reconstruct, shard
+> encryption, and the recovery package/flow).
+
+#### Tampering / spoofing — the recovery package and flow
+
+- *Threat:* an attacker edits a stored `.rrnrecovery` package — swapping in their
+  own shards, lowering the threshold, or substituting the recorded address — so a
+  later reconstruction yields a key they control.
+- *Mitigation:* the shards are individually sealed (above), so they cannot be
+  read or forged without the holders' keys. On reconstruction,
+  `reconstruct_wallet` re-derives the address from the recovered key and rejects
+  it unless it matches the package's `original_address`
+  (`RecoveryError::AddressMismatch`) — wrong, insufficient, or substituted shards
+  reconstruct to a *different* key and are caught (unit-tested). The package is
+  canonical CBOR, so it decodes deterministically.
+- *Residual risk:* the package metadata (threshold, original address, creation
+  time) is intentionally plaintext — a reader learns *that* an identity has a
+  recovery package and its parameters, but not the key. An attacker who tampers
+  with `original_address` itself only causes recovery to fail (denial of service
+  against the owner's own backup), not key disclosure. Whole-package
+  confidentiality is out of scope by design: secrecy rests on the per-shard
+  encryption and the threshold.
+
+#### Information disclosure — the `K-1` confidentiality property
+
+- *Threat:* a holder (or a thief) with fewer than `K` shards learns something
+  about the secret key.
+- *Mitigation:* Shamir is information-theoretically secure — a degree-`K-1`
+  polynomial is undetermined by any `K-1` points, so `K-1` shards are
+  consistent with *every* possible secret and reveal nothing (the secret byte at
+  index `0` is the polynomial's constant term, and `0` is forbidden as a share
+  index so it is never handed out). The random coefficients come from a
+  caller-supplied `CryptoRng`, and are zeroized after the shards are evaluated.
+- *Residual risk:* the property holds only if the coefficients are truly random;
+  a weak RNG breaks it (the caller is trusted to pass a real `CryptoRng`).
+  Holder *collusion* up to `K` is by design out of scope — that is the recovery
+  trust model, not an attack.
+
+#### Information disclosure / Tampering — shards in distribution and at rest
+
+- *Threat (interception):* an attacker intercepts a shard while it travels to its
+  holder, or reads it from a holder's storage. With `K` intercepted shards the
+  secret key is reconstructable; even one shard erodes the `K`-of-`N` margin.
+- *Mitigation:* a shard is never distributed raw — it is sealed
+  (`encryption::encrypt_shard`) to the holder's identity key via X25519 ECDH +
+  `blake3::derive_key` + XChaCha20-Poly1305 with a fresh ephemeral keypair and
+  random 24-byte nonce per shard. Only the holder's secret key can derive the
+  AEAD key, so an interceptor without it learns nothing; fresh ephemerals mean
+  shards sealed to the same holder share no key material.
+- *Threat (tampering / wrong shard):* an attacker alters a sealed shard, or a
+  holder returns a corrupted one, so reconstruction silently yields a wrong key
+  (raw Shamir has no integrity check).
+- *Mitigation:* XChaCha20-Poly1305 is authenticated and the KDF input binds the
+  full transcript (`shared ‖ ephemeral_pub ‖ holder_pub`); any change to the
+  ciphertext, nonce, or ephemeral key fails the Poly1305 tag and
+  `decrypt_shard` returns an error rather than a wrong shard (unit-tested:
+  flipped ciphertext byte and flipped ephemeral key both fail). The AEAD is thus
+  the integrity check the bare Shamir layer lacks.
+- *Residual risk:* a **compromised holder** (their identity secret key stolen, or
+  the holder themselves malicious) can decrypt their own shard — that is inherent
+  to entrusting them a shard, and is bounded by the `K`-of-`N` threshold (an
+  attacker needs `K` compromised/colluding holders). Choosing trustworthy holders
+  and a sound `K` is the user's responsibility; refresh/revocation
+  (`flow::refresh`) lets a user re-split to a new holder set if a relationship
+  sours. Reuse of the long-term Ed25519 identity key for ECDH is an accepted
+  simplification (holders are identified by one key); the ephemeral-static
+  construction still gives per-shard key separation.
+
+#### Side channels — GF(256) table-lookup cache timing
+
+- *Threat:* field multiplication indexes the `LOG`/`EXP` tables by secret bytes
+  (secret values, polynomial coefficients, shard data). The cache line touched
+  depends on the secret, so an attacker able to observe this process's cache
+  (e.g. a co-resident process measuring cache timing) can learn information about
+  the operands.
+- *Mitigation:* the *algorithmic* control flow is constant-time — `mul` has no
+  data-dependent branch (the zero-operand case is selected branchlessly via
+  `subtle`); `inv`/`div` branch only on the *public* shard indices, never on a
+  secret. What remains is the data-dependent table *index*.
+- *Residual risk (accepted):* full cache-timing resistance is not claimed.
+  Recovery is a rare, interactive, local operation: it runs on the user's own
+  device, against the user's own shards, with no co-resident remote attacker in
+  the Phase 0 deployment model (consistent with the device-trust assumption
+  above). Constant-time table-free multiplication is noted as a possible future
+  hardening if the deployment model ever admits a co-resident attacker.
+
 ### `rrn-ledger`
 
 *Populated in M0.5 — Transaction Engine.*

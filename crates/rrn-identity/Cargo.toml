@@ -33,8 +33,39 @@ dcbor = "0.25"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 zeroize = { version = "1", features = ["derive"] }
+# Constant-time primitives for GF(256) arithmetic: branchless handling of the
+# zero operand in field multiplication, so no field op branches on a secret
+# value (see recovery/gf256.rs and ADR-0004).
+subtle = "2"
+# Social recovery (M0.4) seals each Shamir shard to its holder with a sealed-box
+# scheme: X25519 ECDH over keys converted from the holder's Ed25519 identity,
+# then XChaCha20-Poly1305. `ed25519-dalek` provides the Edwards→Montgomery
+# conversion (`VerifyingKey::to_montgomery`, `SigningKey::to_scalar_bytes`);
+# `x25519-dalek` performs the Diffie-Hellman. Key derivation reuses blake3
+# (already pulled via rrn-crypto) in its native `derive_key` KDF mode.
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "std",
+    "zeroize",
+] }
+x25519-dalek = { version = "2", default-features = false, features = [
+    "static_secrets",
+    "zeroize",
+] }
+blake3 = "1"
 
 [dev-dependencies]
 proptest = "1"
 # A real temp directory for wallet save/load tests.
 tempfile = "3"
+# A seedable CryptoRng for deterministic split tests (same seed → same shards).
+# Pinned to the 0.3 line so it implements the `rand_core` 0.6 `RngCore`/
+# `CryptoRng` traits the recovery API is generic over; the 0.10 line tracks
+# `rand_core` 0.9 and would not satisfy those bounds.
+rand_chacha = "0.3"
+# Parsing the committed cross-implementation Shamir reference vectors (T0.4.5).
+serde_json = "1"
+hex = "0.4"
+# Narrating the end-to-end social-recovery scenario test so its output reads as
+# a story (T0.4.9). The workspace's chosen logging stack.
+tracing = "0.1"
+tracing-subscriber = "0.3"

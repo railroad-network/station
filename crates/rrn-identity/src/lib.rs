@@ -12,6 +12,9 @@
 //!   credentials, and transaction confirmations are all specializations of.
 //! - [`vouch`] — the first concrete attestation: a signed statement that a key
 //!   belongs to a real, known individual.
+//! - [`recovery`] — Shamir-based social recovery: split the wallet's secret key
+//!   into shards, seal each to a holder, and reconstruct from a threshold. Own
+//!   Shamir implementation over GF(256) per ADR-0004.
 //!
 //! # Where it sits in the stack
 //!
@@ -25,5 +28,6 @@
 
 pub mod address;
 pub mod attestation;
+pub mod recovery;
 pub mod vouch;
 pub mod wallet;
