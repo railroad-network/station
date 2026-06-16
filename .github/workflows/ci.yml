@@ -76,10 +76,34 @@ jobs:
           workspaces: fuzz
           cache-bin: true
       - run: cargo install cargo-fuzz --locked
-      # Compile all three targets, then run each as a 60s smoke check (not full
-      # fuzzing — that runs on dedicated infra in Phase 5). `-runs` caps the
-      # work if 60s would otherwise be exceeded between iterations.
+      # Compile all targets, then run each as a 60s smoke check (not full
+      # fuzzing — the ≥1h-per-target pass is the gated audit-prep workflow).
+      # `-max_total_time` caps the work; a target that panics fails the job.
       - run: cargo +nightly fuzz build
       - run: cargo +nightly fuzz run verify_signature    -- -max_total_time=60
       - run: cargo +nightly fuzz run canonical_roundtrip -- -max_total_time=60
       - run: cargo +nightly fuzz run hash_chain          -- -max_total_time=60
+      - run: cargo +nightly fuzz run log_replay          -- -max_total_time=60
+      - run: cargo +nightly fuzz run state_machine       -- -max_total_time=60
+      - run: cargo +nightly fuzz run shamir_reconstruct  -- -max_total_time=60
+      - run: cargo +nightly fuzz run wallet_decrypt      -- -max_total_time=60
+      - run: cargo +nightly fuzz run address_parse       -- -max_total_time=60
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+      - run: cargo install cargo-tarpaulin --locked
+      # Tarpaulin is run on Linux for the official numbers (it is unreliable on
+      # macOS). HTML + LCOV are uploaded as a build artifact rather than
+      # committed — coverage reports are large and noisy in git (T0.7.2).
+      - run: cargo tarpaulin --workspace --out Html --out Lcov --output-dir target/coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/coverage/

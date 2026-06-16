@@ -1,11 +1,22 @@
 # Threat Model
 
-This is a **living document**. It grows incrementally as each crate is built:
-every crate's task spec includes a "threat model entry" acceptance item, which
-is where that crate's section gets filled in. Sections below are scaffolded
-now with `TODO:` placeholders so the structure is in place from the start.
+This is a **living document**. It grew incrementally as each crate was built:
+every crate's task spec included a "threat model entry" acceptance item, which
+is where that crate's section was filled in. As of M0.7 (audit prep) it has had
+a comprehensive end-to-end pass: every Phase 0 crate has a populated section,
+the cross-cutting threats are analyzed, and the residual risks and known
+limitations are stated explicitly.
 
-Auditors should read this document first.
+**Auditors should read this document first.** Every mitigation claim is meant to
+be traceable to specific code; where a claim names a behavior (`verify_strict`,
+`append_raw` re-chaining, idempotent settlement), the corresponding code lives
+in the named crate/module and is covered by a unit or property test. If you find
+a claim here that the code does not support, that discrepancy is itself a
+finding — report it.
+
+The one deliberately-empty section is `rrn-protocol`, whose federation surface
+is a Phase 0 stub; its threats are Phase 1+ work and are marked as such rather
+than guessed at.
 
 ## Scope
 
@@ -42,32 +53,32 @@ Deferred to Phase 1 and beyond:
 
 ## Trust Assumptions
 
-- TODO: The local operating system, filesystem, and kernel are trusted — we
+- The local operating system, filesystem, and kernel are trusted — we
   do not defend against a compromised OS on the user's own device.
-- TODO: The Rust compiler/toolchain and the cryptographic crates we depend on
+- The Rust compiler/toolchain and the cryptographic crates we depend on
   (`ed25519-dalek`, `blake3`, `chacha20poly1305`, `argon2`) are trusted to
   correctly implement their published algorithms. Supply-chain risk on the
   dependency tree is mitigated by `cargo audit` and `cargo deny` (T0.0.3).
-- TODO: The OS-provided CSPRNG (via `getrandom`) provides sufficient entropy
+- The OS-provided CSPRNG (via `getrandom`) provides sufficient entropy
   for key generation and nonces.
-- TODO: Our own Shamir's Secret Sharing implementation (`rrn-identity`, per
+- Our own Shamir's Secret Sharing implementation (`rrn-identity`, per
   ADR-0004) is *not* covered by the "trusted dependency" assumption above —
   it is in-scope for audit precisely because it is hand-rolled.
 
 ## Attacker Capabilities
 
-- TODO: Can observe and record all network traffic between nodes (passive
+- Can observe and record all network traffic between nodes (passive
   eavesdropper on an untrusted network).
-- TODO: Can run arbitrary code on hardware they control, including a modified
+- Can run arbitrary code on hardware they control, including a modified
   `station`/`rrn` binary, and can hold one or more valid identities (bounded
   by social vouching — see design overview Section 6, Identity Layer).
-- TODO: Can replay, reorder, delay, or drop previously observed protocol
+- Can replay, reorder, delay, or drop previously observed protocol
   messages.
-- TODO: Can submit malformed, oversized, or adversarially-crafted CBOR
+- Can submit malformed, oversized, or adversarially-crafted CBOR
   payloads to any parsing boundary.
-- TODO: Cannot break Ed25519, Blake3, or XChaCha20-Poly1305 (assumed
+- Cannot break Ed25519, Blake3, or XChaCha20-Poly1305 (assumed
   cryptographically hard); cannot forge a signature without the private key.
-- TODO: May physically seize a node's storage media (see design overview
+- May physically seize a node's storage media (see design overview
   Section 10.8, "Physical node seizure").
 
 ## Per-Component Threats
@@ -593,15 +604,16 @@ transition; the derivability of all state from the log.
 
 ### `rrn-protocol`
 
-*Phase 0 contains stubs only; populated as the federation protocol is built
-(Phase 1+).*
-
-- TODO: Spoofing
-- TODO: Tampering
-- TODO: Repudiation
-- TODO: Information disclosure
-- TODO: Denial of service
-- TODO: Elevation of privilege
+**Intentionally unpopulated in Phase 0.** This crate contains only stubs — there
+is no wire format, no cross-community sync, no treaty or gossip *protocol* to
+analyze yet (the Phase 0 two-station demo's minimal gossip lives in
+`rrn-station`, and its threats are covered in that section). The federation
+attack surface — eclipse attacks, ledger forks across communities, Sybil
+federation, treaty abuse, transport authentication and encryption — is real but
+belongs to the design it will implement, and is **out of scope for the Phase 0
+audit** (see [Scope](#scope) and [Known limitations](#known-limitations)). A
+full STRIDE section per protocol message is added as the protocol is built in
+Phase 1+, so it is not pre-filled with speculation here.
 
 ### `rrn-station` / `rrn-cli`
 
@@ -712,21 +724,187 @@ daemon (one local user, one writer).
 - *Residual risk:* replay/double-spend protection lives in `rrn-ledger` (see its
   Elevation-of-privilege entry); the station layer adds no new ledger authority.
 
-## Mitigations
+## Cross-cutting threats
 
-TODO: For each threat above, record the corresponding mitigation here as it
-is implemented. Anticipated mitigations carried over from the design overview
-(Section 10.8, "Security Architecture") include:
+Some threats are not owned by a single crate — they emerge from how the layers
+compose. These are the ones an auditor should reason about end-to-end.
 
-- DONE (M0.5): Replay attack → monotonically increasing per-identity nonce plus
-  a ±5-minute timestamp window, enforced in `rrn-ledger`'s engine (T0.5.6), with
-  idempotent, exactly-once settlement (T0.5.5/T0.5.7). See the `rrn-ledger`
-  Elevation of privilege entry above.
-- TODO: Physical node seizure → data at rest encrypted with keys held by
-  community members (`rrn-identity` wallet encryption, argon2id + XChaCha20-
-  Poly1305)
-- TODO: Eclipse attack, ledger fork, Sybil federation → deferred to Phase 1+
-  (`rrn-protocol`), out of scope for Phase 0 per above
+### Replay across crates
+
+Every signed value (`rrn-crypto::SignedPayload`) is, on its own, a bearer token:
+holding the bytes lets you re-present them. Replay protection is therefore not a
+property of any one signature but of the *log + ledger* enforcing single use:
+
+- A proposal is **content-addressed** (its `TransactionId` is the Blake3 hash of
+  its canonical bytes), so a verbatim replay collides with the existing id and
+  is rejected (`Error::DuplicateProposal`).
+- Each sender carries a **monotonic, gap-free nonce**; a replayed or out-of-order
+  proposal fails `Error::BadNonce`.
+- A proposal is valid only inside `proposed_at ≤ now ≤ expires_at` (±5 min skew,
+  `CLOCK_SKEW_TOLERANCE_SECS`), so a stale capture cannot be replayed forever.
+- Settlement is **idempotent**: `Settler::settle` checks the derived state is not
+  already `Settled` *before* any balance write, and balances are derived from
+  settlement records keyed by `proposal_id`, so a duplicated settlement entry
+  (including one re-delivered over gossip) cannot double-apply.
+- Replicated entries arrive via `AppendLog::append_raw`, which **dedupes by
+  Blake3 content hash** before writing, so a replayed log entry is dropped.
+
+*Residual:* the nonce sequence is per-sender on a *single* replica. A sender
+acting on two stations, or cross-replica nonce coordination generally, is a
+Phase 1+ federation problem (no global ordering in Phase 0).
+
+### Log fork / rollback
+
+The append-only log proves *integrity and order within one log*, not
+*uniqueness across replicas*. Within a replica, `verify_chain` detects any edit,
+reorder, deletion, or splice (each entry chains to the Blake3 `content_hash` of
+the previous), and `append_raw` re-chains replicated entries onto the **local**
+tail rather than importing a peer's `prev_hash` — a peer cannot inject a break
+into our chain. What is *not* defended:
+
+- **Forking** — two replicas extending into conflicting-but-individually-valid
+  chains. The Phase 0 gossip stub logs a warning and skips conflicting entries;
+  real fork *resolution* is Phase 1+ (`rrn-protocol`).
+- **Rollback / truncation** — truncating the log to an earlier valid prefix
+  yields a shorter but still-consistent chain. Detecting this needs external
+  anchoring (e.g. cross-replica checkpoints), also Phase 1+.
+
+### Key-compromise impact analysis
+
+What an attacker gains by stealing each kind of secret key, since the whole
+system reduces to "a valid signature ⇒ authentic" under the key-secrecy
+assumption:
+
+- **A user's identity key** (the wallet secret): full impersonation — propose
+  payments as them, confirm payments to them, issue vouches as them. Bounded
+  only by the ledger rules (nonce/window), not prevented. This is *the* asset;
+  it is protected at rest by argon2id + XChaCha20-Poly1305 and in memory by
+  `zeroize`. Social recovery (`recovery`) is the mitigation for *loss*, not for
+  *theft* — a thief with the live key needs no recovery.
+- **The station key**: authority to author settlement/cancellation records
+  (ADR-0005) and to sign gossip handshakes. A compromised station can settle
+  eligible confirmed transactions and serve hostile-but-valid entries to peers;
+  it **cannot** forge a sender's proposal or a receiver's confirmation (those
+  need the parties' keys). The single Phase 0 station is trusted to decide
+  *when* to settle.
+- **A recovery shard holder's key**: lets that holder decrypt *their own* shard.
+  Inherent to entrusting them a shard, and bounded by the `K`-of-`N` threshold —
+  an attacker needs `K` compromised/colluding holders to reconstruct the key;
+  any `K-1` reveal nothing (Shamir is information-theoretically secure).
+
+Compromise of any key is **non-recoverable by cryptography alone** — there is no
+revocation list in Phase 0. Re-keying means creating a new identity (and, for
+recovery, `flow::refresh` to re-split to a new holder set).
+
+## Trust boundaries
+
+The arrows are the boundaries an auditor should focus on: every place untrusted
+or lower-trust data crosses into a higher-trust context. In Phase 0 the *only*
+network boundary is the gossip stub; the CLI↔daemon boundary is local.
+
+```
+                        ┌──────────────────────────────────────────────┐
+                        │  User's device (TRUSTED per device-trust       │
+                        │  assumption: OS, kernel, RAM, disk)            │
+                        │                                                │
+   passphrase (no echo) │   ┌────────────┐   Unix socket 0o600          │
+   ───────────────────► │   │  rrn (CLI) │◄───────────────┐             │
+                        │   └────────────┘   (line-JSON)   │             │
+                        │                                  ▼             │
+                        │                          ┌───────────────┐     │
+                        │   ┌──────────────┐       │ station daemon│     │
+   .rrnwallet (disk) ──►│   │ wallet       │──key─► │ (holds key in │     │
+   argon2id+AEAD at rest│   │ decrypt      │       │  RAM, decrypted│     │
+                        │   └──────────────┘       │  for lifetime) │     │
+                        │                          └───────┬───────┘     │
+                        │   ┌──────────────────────────────▼─────────┐   │
+                        │   │ rrn-ledger  (engine, settlement)        │   │
+                        │   │  └─ verifies SignedPayload at boundary  │   │
+                        │   ├─────────────────────────────────────────┤   │
+                        │   │ rrn-storage (append-only log = truth;   │   │
+                        │   │  append/append_raw RE-VERIFY signatures │   │
+                        │   │  and hash-chain before writing)         │   │
+                        │   │  CRDT/balance state ← replay(log)       │   │
+                        │   ├─────────────────────────────────────────┤   │
+                        │   │ rrn-crypto  (AUDIT BOUNDARY: sign/verify,│   │
+                        │   │  canonical CBOR, hash; no rrn-* deps)    │   │
+                        │   └─────────────────────────────────────────┘   │
+                        │            ▲   SQLite file (plaintext on disk)   │
+                        └────────────┼───────────────────────────────────┘
+                                     │
+              gossip (TCP) ──────────┘  ◄── UNTRUSTED NETWORK
+              peer entries: NOT trusted by source; every entry
+              re-verified (signature + content hash) and re-chained
+              onto the local tail by append_raw before it is stored.
+              No transport auth/encryption in Phase 0 (Phase 1+).
+```
+
+The load-bearing invariant: **untrusted bytes never become trusted state
+without passing through `rrn-crypto` verification** — at the ledger boundary
+*and* again at the log write (`append`/`append_raw`). State is always *derived
+from* the verified log, never written authoritatively around it.
+
+## Known limitations
+
+Things Phase 0 explicitly does **not** mitigate, and why. Stating these plainly
+is deliberate — the audit covers what is built, and these are the documented
+edges of that scope.
+
+- **No Sybil resistance.** Vouch *authenticity* is enforced cryptographically;
+  vouch *trust* is not. A single-community Phase 0 deployment is assumed; a
+  Sybil cluster of mutually-vouching keys is cryptographically valid. Reputation
+  / Sybil analysis is Phase 1+.
+- **No federation security.** Eclipse attacks, cross-replica ledger forks,
+  rollback detection, and treaty abuse are out of scope (see
+  [Log fork / rollback](#log-fork--rollback) and `rrn-protocol`).
+- **No at-rest encryption of the database.** Only the wallet secret key is
+  encrypted. Balances, the transaction graph, memos, and the social-vouch graph
+  are plaintext on disk — exposed to a local attacker or seized media. Whole-DB
+  encryption is future work (design §10.8).
+- **No memory hardening beyond `zeroize`.** Keys are necessarily plaintext in
+  RAM while in use; no `mlock`, no swap guard, no core-dump suppression. A
+  same-user code-execution attacker or physical memory access defeats secrecy
+  (per the device-trust assumption). `RRN_PASSPHRASE`, if used, is visible in
+  the process environment.
+- **No credit limits / no debt bound.** A sender can settle into arbitrary debt
+  in Phase 0.
+- **No rate limiting or resource caps** on the IPC socket or the gossip port,
+  and no message-size cap; the gossip stub pulls a peer's whole log each round.
+  O(N) full-log replay has no snapshotting yet. All Phase 1/2.
+- **Unclamped wallet KDF parameters.** A hostile `.rrnwallet` can specify a very
+  large argon2 `m_cost`, forcing a large allocation on `decrypt` (accepted: you
+  only decrypt your own wallet; clamping is a noted future hardening). This is
+  the documented caveat the `wallet_decrypt` fuzz target may surface.
+- **GF(256) table-lookup timing in Shamir.** Field multiplication indexes
+  `LOG`/`EXP` tables by secret bytes; full cache-timing resistance is not
+  claimed. Recovery is a rare, local, interactive operation with no co-resident
+  remote attacker in the Phase 0 model. Constant-time table-free multiplication
+  is a noted future hardening.
+- **No key revocation.** Compromise of any key is non-recoverable by
+  cryptography alone in Phase 0 (see [Key-compromise impact
+  analysis](#key-compromise-impact-analysis)).
+- **No formal verification.** Correctness rests on unit tests, `proptest` for
+  algebraic properties (CRDT laws, sign/verify, canonicalization), cross-crate
+  integration tests, and the fuzz harnesses — not on machine-checked proofs.
+
+## Mitigations summary
+
+The mitigations are documented inline per component and per cross-cutting threat
+above; this is the index. Anticipated mitigations from the design overview
+(Section 10.8, "Security Architecture") map to Phase 0 as follows:
+
+- **Replay attack** → per-sender monotonic nonce + ±5-minute timestamp window +
+  content-addressed ids in `rrn-ledger` (T0.5.6), idempotent exactly-once
+  settlement (T0.5.5/T0.5.7), content-hash dedupe on replication
+  (`append_raw`). See [Replay across crates](#replay-across-crates).
+- **Tampering / forgery** → `verify_strict` over canonical CBOR via
+  `SignedPayload`, re-verified at the log write; hash-chained log detected by
+  `verify_chain`; state derived from the log, never written around it.
+- **Physical node seizure** → wallet key encrypted at rest (argon2id +
+  XChaCha20-Poly1305, `0o600`, atomic write). Whole-database encryption is **not
+  yet** done (see [Known limitations](#known-limitations)).
+- **Eclipse attack, ledger fork, Sybil federation** → deferred to Phase 1+
+  (`rrn-protocol`), out of scope for the Phase 0 audit per [Scope](#scope).
 
 ## References
 

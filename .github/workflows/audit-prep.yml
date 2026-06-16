@@ -1,0 +1,58 @@
+name: audit-prep
+
+# Gated, manually-triggered deep fuzzing pass for audit preparation (T0.7.3).
+# Unlike the 60s-per-target smoke check in ci.yml (which gates every PR), this
+# runs each target for >=1 hour. It is NOT on push/PR — run it before handing a
+# tagged commit to the auditor, and triage any uploaded crash before submission.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "Seconds to run each fuzz target (>=3600 for the audit pass)"
+        required: false
+        default: "3600"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Each target runs in its own job so they fuzz in parallel and none hits the
+    # 6h per-job ceiling. Generous timeout = run duration + build/install slack.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - verify_signature
+          - canonical_roundtrip
+          - hash_chain
+          - log_replay
+          - state_machine
+          - shamir_reconstruct
+          - wallet_decrypt
+          - address_parse
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          cache-bin: true
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build ${{ matrix.target }}
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- -max_total_time=${{ github.event.inputs.duration_secs }}
+      # Upload any crash inputs even when the run failed, so they can be
+      # reproduced and minimized locally (see fuzz/README.md "Triaging a crash").
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
