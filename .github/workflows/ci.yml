@@ -95,6 +95,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: true
@@ -102,7 +104,13 @@ jobs:
       # Tarpaulin is run on Linux for the official numbers (it is unreliable on
       # macOS). HTML + LCOV are uploaded as a build artifact rather than
       # committed — coverage reports are large and noisy in git (T0.7.2).
-      - run: cargo tarpaulin --workspace --out Html --out Lcov --output-dir target/coverage
+      #
+      # --engine llvm: the default ptrace engine times out ("Timed out waiting
+      # for test response") on the multi-threaded tokio e2e tests (gossip/IPC
+      # daemons in two_station_e2e, ipc, backup_recover, cli_e2e). LLVM
+      # source-based coverage doesn't trace syscalls, so it handles async +
+      # networking reliably. --timeout covers the cross-station convergence waits.
+      - run: cargo tarpaulin --workspace --engine llvm --timeout 300 --out Html --out Lcov --output-dir target/coverage
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-report
