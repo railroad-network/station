@@ -32,6 +32,29 @@ cargo test --workspace
 Run `./scripts/install-hooks.sh` after cloning to enable the local pre-commit
 checks (formatting and lints).
 
+## Trying it out
+
+Run `./scripts/demo-phase-0.sh` to see Phase 0 in action. The script builds the
+release binaries, brings up two independent `station` daemons on localhost
+(Alice and Bob), and drives a full mutual-credit exchange through the `rrn`
+CLI: Alice vouches for Bob, pays him 3 Commons, Bob confirms, the settlement
+window elapses, and both stations independently converge on the same balances
+(Alice −3.00, Bob +3.00 Commons) and the same hash-chained log. It cleans up
+after itself and is safe to re-run.
+
+Under the hood the demo uses the two binaries directly:
+
+```sh
+station init --data-dir <dir>   # generate an identity + initialize storage
+station run  --data-dir <dir>   # run the daemon (serves the rrn CLI over a Unix socket)
+
+rrn whoami                      # your address
+rrn pay <addr> 3.00 --memo …    # propose a payment
+rrn confirm <tx_id>             # the receiver confirms
+rrn balance [<addr>]            # balances, derived from the log
+rrn history                     # the local append-only log, decoded
+```
+
 ## Design documents
 
 The full design overview — vision, governance, economics, oracle, identity,

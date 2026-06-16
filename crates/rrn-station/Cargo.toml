@@ -5,9 +5,39 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "The Railroad Network station daemon: holds the wallet and log, runs settlement, gossips with peers, and serves the rrn CLI over a Unix socket."
+
+[lib]
+name = "rrn_station"
+path = "src/lib.rs"
 
 [[bin]]
 name = "station"
 path = "src/main.rs"
 
 [dependencies]
+# All lower library crates, path + version (not a `*` wildcard, which
+# cargo-deny rejects).
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
+
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+toml = "1"
+uuid = { version = "1", features = ["v4"] }
+# Hidden passphrase entry (not echoed); used by `station init` / `run`.
+rpassword = "7"
+# Canonical CBOR — for decoding log payloads into history/balances and for the
+# secret-key bytes the recovery RPC moves around.
+dcbor = "0.25"
+
+[dev-dependencies]
+tempfile = "3"

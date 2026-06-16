@@ -5,9 +5,24 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "The Railroad Network rrn CLI: a thin client that drives a running station daemon over its Unix socket."
 
 [[bin]]
 name = "rrn"
 path = "src/main.rs"
 
 [dependencies]
+# The CLI shares the wire types and Unix-socket client with the daemon rather
+# than redefining them, so the two cannot drift (see T0.6.3's "shared types"
+# note). It pulls in only the `rpc` / `rpc_client` surface.
+rrn-station = { path = "../rrn-station", version = "0.1" }
+
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

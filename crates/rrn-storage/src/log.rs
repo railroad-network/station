@@ -159,6 +159,75 @@ impl<'a> AppendLog<'a> {
         })
     }
 
+    /// Appends a pre-signed [`StoredPayload`] received from a peer, verbatim.
+    ///
+    /// Replication (the gossip layer, M0.6) hands over the exact bytes another
+    /// replica signed, not a typed `T` — so this path takes a [`StoredPayload`]
+    /// and stores its `bytes` unchanged, rather than re-encoding through
+    /// `Into<CBOR>` (which would only round-trip for types we can name). The
+    /// signature is verified before anything is written.
+    ///
+    /// A payload's [`content_hash`](LogEntry::content_hash) is the Blake3 of its
+    /// `bytes` alone (independent of chain position), so the *same* payload has
+    /// the same `content_hash` on every replica. This method is therefore
+    /// idempotent across replicas: an entry whose `content_hash` is already in
+    /// the log is skipped and `Ok(None)` is returned; a genuinely new entry is
+    /// appended (chained to *this* replica's current tail) and returned as
+    /// `Ok(Some(entry))`. Two replicas thus converge on the same *set* of
+    /// payloads even though their hash chains link them in receipt order.
+    pub fn append_raw(&mut self, payload: StoredPayload) -> Result<Option<LogEntry>> {
+        payload.verify().map_err(|_| Error::InvalidSignature)?;
+
+        let content_hash = Hash::of(&payload.bytes);
+        if self.contains(&content_hash)? {
+            return Ok(None);
+        }
+        let prev_hash = match self.tail()? {
+            Some(prev) => prev.content_hash,
+            None => zero_hash(),
+        };
+        let created_at = now_secs();
+
+        let conn = self.db.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO log_entries (prev_hash, content_hash, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                prev_hash.to_bytes().as_slice(),
+                content_hash.to_bytes().as_slice(),
+                payload.encode(),
+                created_at,
+            ],
+        )?;
+        let seq = tx.last_insert_rowid() as u64;
+        tx.commit()?;
+
+        tracing::trace!(seq, %content_hash, "appended replicated log entry");
+        Ok(Some(LogEntry {
+            seq,
+            prev_hash,
+            content_hash,
+            payload,
+            created_at,
+        }))
+    }
+
+    /// Whether an entry with this `content_hash` is already in the log. Used by
+    /// [`append_raw`](Self::append_raw) to deduplicate replicated entries.
+    pub fn contains(&self, content_hash: &Hash) -> Result<bool> {
+        let found: Option<i64> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM log_entries WHERE content_hash = ?1 LIMIT 1",
+                [content_hash.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Fetches the entry at `seq`, if present.
     pub fn get(&self, seq: u64) -> Result<Option<LogEntry>> {
         let raw = self
@@ -439,6 +508,56 @@ mod tests {
         let err = log.append(signed).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature), "{err:?}");
         // Nothing was written.
+        assert!(log.tail().unwrap().is_none());
+    }
+
+    #[test]
+    fn append_raw_replicates_dedupes_and_rechains() {
+        // Source replica writes two entries.
+        let src_db = fresh_log_db();
+        let kp = Keypair::generate();
+        let (s1, s2) = {
+            let mut src = AppendLog::new(&src_db);
+            (
+                append_note(&mut src, &kp, 11).payload,
+                append_note(&mut src, &kp, 22).payload,
+            )
+        };
+
+        // A second replica that already holds an unrelated entry at seq 1.
+        let dst_db = fresh_log_db();
+        let mut dst = AppendLog::new(&dst_db);
+        append_note(&mut dst, &kp, 99);
+
+        // Replicate the source payloads verbatim. They land at seq 2, 3 and are
+        // re-chained to *this* replica's tail, not the source's.
+        let e2 = dst.append_raw(s1.clone()).unwrap().expect("newly appended");
+        let e3 = dst.append_raw(s2.clone()).unwrap().expect("newly appended");
+        assert_eq!((e2.seq, e3.seq), (2, 3));
+        assert_eq!(e3.prev_hash, e2.content_hash);
+        assert_eq!(dst.verify_chain().unwrap(), 3);
+
+        // Re-replicating an already-held payload is a no-op (dedup by content).
+        assert!(dst.append_raw(s1).unwrap().is_none());
+        assert!(dst.append_raw(s2).unwrap().is_none());
+        assert_eq!(dst.tail().unwrap().unwrap().seq, 3);
+    }
+
+    #[test]
+    fn append_raw_rejects_invalid_signature_without_writing() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+
+        // A payload whose signature does not match its bytes.
+        let good = SignedPayload::sign(Note(7), &kp);
+        let tampered = StoredPayload {
+            bytes: to_canonical_bytes(Note(8)),
+            signer: good.signer,
+            signature: good.signature,
+        };
+        let err = log.append_raw(tampered).unwrap_err();
+        assert!(matches!(err, Error::InvalidSignature), "{err:?}");
         assert!(log.tail().unwrap().is_none());
     }
 }

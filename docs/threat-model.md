@@ -605,14 +605,112 @@ transition; the derivability of all state from the log.
 
 ### `rrn-station` / `rrn-cli`
 
-*Populated in M0.6 — CLI and Two-Station Demo.*
+The daemon that holds an open database and decrypted wallet, runs the settlement
+sweep on a timer, gossips log entries with peers, and serves the `rrn` CLI; plus
+the CLI itself. This layer adds three new boundaries the lower crates did not
+have: a **local IPC socket** (CLI ↔ daemon), a **peer TCP surface** (the gossip
+stub), and a **long-lived process holding key material in memory**.
 
-- TODO: Spoofing
-- TODO: Tampering
-- TODO: Repudiation
-- TODO: Information disclosure
-- TODO: Denial of service
-- TODO: Elevation of privilege
+**Assets:** the in-memory station secret key (held decrypted for the daemon's
+lifetime); the integrity of the local log under entries pulled from peers; the
+confidentiality and integrity of the CLI↔daemon channel; the availability of the
+daemon (one local user, one writer).
+
+> Populated in M0.6. The CLI and the gossip layer speak the same line-delimited
+> JSON envelope ([`rpc`]) over two different transports. The gossip stub is
+> deliberately minimal (T0.6.6) and is replaced wholesale in Phase 2; several
+> residual risks below are explicitly its problem to solve.
+
+#### Spoofing — impersonating the CLI user, or a peer
+
+- *Threat:* a different local user connects to the daemon's Unix socket and
+  issues commands as the station; or a machine on the network impersonates a
+  configured peer and feeds the station log entries.
+- *Mitigation:* the Unix socket is the authorization boundary — it is created
+  with owner-only (`0o600`) permissions, so only the user who launched the
+  daemon can call it; there is no in-band CLI auth, by design. Peer entries are
+  *not* trusted on the basis of their source: every entry pulled over gossip is
+  re-verified with `AppendLog::append_raw`, which checks `signer.verify(bytes,
+  signature)` before storing — an entry whose signature does not match its bytes
+  is dropped (and never aborts the batch).
+- *Residual risk:* a valid signature only proves *authorship*, not *authority*.
+  A peer can serve a correctly-signed entry that is semantically hostile (a
+  station-signed settlement crediting itself); Phase 0's two-station demo runs
+  between trusting parties, and authority/fork resolution is Phase 1+. The peer
+  TCP port has no transport authentication or encryption at all.
+
+#### Tampering — the IPC channel, and peer-supplied entries
+
+- *Threat:* a request or response on the wire is altered; a peer reorders or
+  forks its log so replication corrupts the local chain.
+- *Mitigation:* the JSON envelope is operational plumbing, not a signed payload —
+  the *authenticated* content is the `StoredPayload` inside, whose signature and
+  Blake3 content hash are checked on append. Replicated entries are appended via
+  `append_raw`, which re-chains them onto the *local* tail (it does not import a
+  peer's `prev_hash`), dedupes by content hash, and leaves `verify_chain`
+  intact; a peer cannot splice a break into our chain. Balances are *derived*
+  from settlement records keyed by `proposal_id`, so a replayed or duplicated
+  settlement record cannot double-apply.
+- *Residual risk:* fork detection across replicas is out of scope (the gossip
+  stub logs a warning and skips conflicting entries). The local DB and socket
+  are plaintext on disk per the device-trust assumption.
+
+#### Repudiation
+
+- *Threat:* the station denies having authored a settlement or vouch it wrote.
+- *Mitigation:* every log entry the station writes — proposals, confirmations,
+  vouches, and station-signed settlement/cancellation records — is signed by the
+  station key and hash-chained, so authorship is attributable and tamper-evident
+  (inherited from `rrn-ledger`/`rrn-storage`). The daemon's `tracing` logs record
+  operations but are not themselves authenticated.
+- *Residual risk:* as everywhere, non-repudiation rests on key secrecy; a holder
+  of the station key acts as the station.
+
+#### Information disclosure — the long-lived in-memory key
+
+- *Threat:* the station secret key, decrypted once at `station run` and held for
+  the process lifetime, leaks via a core dump, swap, `/proc`, or a memory-scraping
+  attacker on the host.
+- *Mitigation:* the passphrase is read without echo (`rpassword`) or from
+  `RRN_PASSPHRASE` for non-interactive use; the wallet is argon2id +
+  XChaCha20-Poly1305 at rest (`rrn-identity`). The socket's `0o600` mode keeps
+  other local users out of the IPC channel. The wire protocol never carries the
+  secret key (recovery moves *sealed* shards; reconstruction happens from
+  holder-decrypted shards supplied as files).
+- *Residual risk:* a daemon necessarily holds the key decrypted in RAM while
+  running; per the device-trust assumption an attacker with code execution as the
+  same user, or with physical memory access, can recover it. `RRN_PASSPHRASE`, if
+  used, is visible in the process environment. Phase 0 does not lock memory or
+  guard against swap.
+
+#### Denial of service — malformed input, peer flooding, the single writer
+
+- *Threat:* a malformed CLI line or peer message crashes the daemon; a peer
+  floods the gossip port; the single-writer core is starved.
+- *Mitigation:* a malformed request line is answered with an `INVALID_REQUEST`
+  error and the connection kept open — one bad line never takes down the daemon
+  (covered by the `ipc` integration test). Each connection is handled on its own
+  task but funnels through the single-threaded core, so there is no data race;
+  the core processes commands serially. Peer reads are bounded by line framing,
+  and a peer that errors only fails *that* gossip round.
+- *Residual risk:* there is no rate-limiting, connection cap, or message-size
+  cap on either the socket or the peer port (Phase 0 logs are small and the
+  demo is local/trusted); the gossip stub pulls a peer's whole log each round,
+  which does not scale. Both are explicitly Phase 2's to fix.
+
+#### Elevation of privilege
+
+- *Threat:* a CLI client performs an action it should not, or a peer's data
+  causes the daemon to take a privileged action.
+- *Mitigation:* the CLI has no privileges the socket owner does not already have
+  (it *is* the owner); there is no privilege separation to escalate across in
+  Phase 0. Peer input can only ever result in appending validly-signed entries
+  the derivation layer already constrains (nonce ordering, signer/receiver
+  checks, exactly-once settlement) — it cannot invoke arbitrary daemon
+  operations, because the gossip surface exposes only `peer_handshake`,
+  `log_tail`, and `log_range`.
+- *Residual risk:* replay/double-spend protection lives in `rrn-ledger` (see its
+  Elevation-of-privilege entry); the station layer adds no new ledger authority.
 
 ## Mitigations
 
