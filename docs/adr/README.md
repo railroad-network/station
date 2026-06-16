@@ -42,6 +42,7 @@ Decision Records) convention, using the structure in
 - [0002 — Canonical serialization via deterministic CBOR (`dcbor`)](0002-canonical-serialization-dcbor.md)
 - [0003 — Human-readable address format: bech32m with HRP `rrn`](0003-bech32-address-format.md)
 - [0004 — Own Shamir's Secret Sharing implementation over GF(256)](0004-own-shamir-implementation.md)
+- [0005 — The station signs settlement and cancellation records](0005-station-signed-settlement.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.

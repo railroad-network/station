@@ -926,6 +926,17 @@ dependencies = [
 [[package]]
 name = "rrn-ledger"
 version = "0.1.0"
+dependencies = [
+ "dcbor",
+ "proptest",
+ "rrn-crypto",
+ "rrn-identity",
+ "rrn-storage",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "rrn-protocol"

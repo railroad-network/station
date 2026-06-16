@@ -5,5 +5,22 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Ledger and transaction engine for Railroad Network: the mutual-credit transaction lifecycle, settlement, and balances."
 
 [dependencies]
+# Lower layers, path + version (not a `*` wildcard, which cargo-deny rejects).
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# Canonical CBOR for the signed transaction records (ADR-0002). The spec's
+# dependency list omitted this, but every signed payload needs the native
+# `Into<CBOR>` / `TryFrom<CBOR>` mapping, same as the other crates.
+dcbor = "0.25"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+# Narrates the lifecycle/idempotency integration tests under `--nocapture`.
+tracing-subscriber = "0.3"

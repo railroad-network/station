@@ -30,7 +30,12 @@ use crate::serialize::to_canonical_bytes;
 
 /// A payload bundled with the public key of its signer and a signature over
 /// the payload's canonical CBOR bytes.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+///
+/// `PartialEq`/`Eq` compare the payload, signer, and signature structurally;
+/// two envelopes are equal iff all three match. Downstream state machines that
+/// embed signed envelopes in an `Eq` enum (e.g. `rrn-ledger`'s
+/// `TransactionState`) rely on this.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SignedPayload<T> {
     /// The signed value.
     pub payload: T,

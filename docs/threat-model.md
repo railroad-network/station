@@ -493,14 +493,103 @@ or leaks the key).
 
 ### `rrn-ledger`
 
-*Populated in M0.5 — Transaction Engine.*
+The mutual-credit transaction engine: the signed [`transaction`] records, the
+`Proposed → Confirmed → Settled`/`Cancelled` state machine, the settlement
+window, and the balance changes that close it. It is the most security-sensitive
+layer in Phase 0 — it is the code that moves Commons.
 
-- TODO: Spoofing
-- TODO: Tampering
-- TODO: Repudiation
-- TODO: Information disclosure
-- TODO: Denial of service
-- TODO: Elevation of privilege
+**Assets:** the integrity of each balance (no value created or destroyed except
+by a settled, doubly-signed transaction); the *exactly-once* application of a
+settlement; the per-sender nonce sequence; the authenticity of every lifecycle
+transition; the derivability of all state from the log.
+
+> Populated in M0.5. The engine derives all transaction state by replaying the
+> append-only log; the materialized `balances` table is a cache. Settlement and
+> cancellation entries are signed by the local station — see
+> [ADR-0005](adr/0005-station-signed-settlement.md).
+
+#### Spoofing — forging a proposal, confirmation, or settlement
+
+- *Threat:* an attacker submits a proposal that debits someone else, confirms a
+  transaction addressed to a different receiver, or fabricates a settlement.
+- *Mitigation:* every record is a `rrn-crypto::SignedPayload`, verified at the
+  engine boundary *and* re-verified by `AppendLog::append`. A proposal is
+  rejected unless its signer is the named `sender` (`Error::SenderMismatch`); a
+  confirmation unless its signer is, and it names, the proposal's `receiver`
+  (`Error::ConfirmerMismatch`). Settlement and cancellation are signed by the
+  station key (ADR-0005), so even those terminal transitions are attributable,
+  not anonymous log writes.
+- *Residual risk:* anyone holding a party's secret key acts as that party — non-
+  repudiation rests on the `rrn-crypto` key-secrecy assumption. The single
+  Phase 0 station is trusted to decide *when* to settle (it cannot forge a
+  proposal or confirmation); multi-station settlement authority is Phase 1+.
+
+#### Tampering — altering an amount, a balance, or the lifecycle
+
+- *Threat:* a stored proposal's amount or receiver is edited; a balance row is
+  rewritten; a transaction is advanced to `Settled` without a confirmation.
+- *Mitigation:* a `TransactionId` is the Blake3 hash of the proposal's canonical
+  bytes (content-addressed), and the proposal is signed — altering any field
+  breaks both the id and the signature. State is *derived from the log*, not
+  from a mutable status column, and the log is hash-chained
+  (`verify_chain`), so an edited or reordered entry is detected. A `Settled`
+  state is only ever derived from a `Confirmed` state plus a station settlement
+  record; the balance table is a cache that replay can rebuild (the log wins).
+- *Residual risk:* a direct SQL edit of the `balances` cache is not detected
+  until the next replay rebuilds it; like `rrn-storage`, integrity is enforced
+  on read (replay) rather than prevented at write. Phase 0 logs are plaintext on
+  disk per the device-trust assumption.
+
+#### Repudiation
+
+- *Threat:* a sender denies proposing, or a receiver denies confirming, a
+  transaction that moved their balance.
+- *Mitigation:* the settled transaction's `proposal` and `confirmation` are both
+  retained in the log as signed payloads; the chained, append-only structure
+  preserves a tamper-evident, attributable history of who agreed to what and
+  when. `settled_at` and the station signature record who settled it.
+
+#### Information disclosure
+
+- *Threat:* the transaction graph (who paid whom, how much, with what memo) is a
+  privacy-sensitive social/economic graph; reading the database exposes it.
+- *Mitigation:* this crate stores no secret keys. Amounts and memos live in the
+  log and `transactions`/`balances` tables in plaintext; whole-database
+  encryption is deferred (noted under `rrn-storage`).
+- *Residual risk:* in Phase 0 the ledger is plaintext on disk and exposed to a
+  local attacker or seized media. Accepted per the device-trust assumption.
+
+#### Denial of service
+
+- *Threat:* adversarial input or pathological state — a flood of proposals to
+  grow the log, malformed records, or a `now` that forces large sweeps; deriving
+  state by full log replay is O(N) per operation.
+- *Mitigation:* all engine/settler operations return `Result` and never panic on
+  malformed records (unrecognized log payloads are ignored during replay).
+  Replay is O(N) but Phase 0 logs are small; the materialized `balances` cache
+  already avoids re-summing on every read, and a `transactions` snapshot/index
+  is the natural optimization when logs grow (reserved, not yet needed).
+- *Residual risk:* unbounded log growth and the O(N) replay cost are real at
+  scale; snapshotting and rate-limiting are post-Phase-0 work.
+
+#### Elevation of privilege — replay and double-spend
+
+- *Threat:* a signed proposal is a bearer token; replaying it could apply the
+  same debit twice (a double-spend), or a settlement could be applied twice.
+- *Mitigation:* **replay protection** (T0.5.6) — each sender has a monotonic
+  nonce with no gaps and no duplicates (`Error::BadNonce`), and a proposal whose
+  content-addressed id is already in the log is rejected
+  (`Error::DuplicateProposal`). A proposal is only valid inside its time window
+  `proposed_at <= now <= expires_at`, with **±5 minutes** (`CLOCK_SKEW_TOLERANCE_SECS`)
+  of drift tolerance, so a stale capture cannot be replayed indefinitely.
+  Settlement is **idempotent**: `Settler::settle` checks the derived state is
+  not already `Settled` *before* any balance write, so settling twice can never
+  double-apply (T0.5.5, T0.5.7).
+- *Residual risk:* the nonce is per-sender on a single replica; cross-replica
+  nonce coordination (a sender acting on two stations) is a Phase 1+ federation
+  problem. Credit limits are not enforced — a sender can settle into arbitrary
+  debt in Phase 0 (Phase 1). The ±5 minute drift window is a deliberate
+  usability/security trade-off recorded here.
 
 ### `rrn-protocol`
 
@@ -531,8 +620,10 @@ TODO: For each threat above, record the corresponding mitigation here as it
 is implemented. Anticipated mitigations carried over from the design overview
 (Section 10.8, "Security Architecture") include:
 
-- TODO: Replay attack → monotonically increasing per-identity nonce plus
-  timestamp, enforced in `rrn-ledger` (T0.5.6)
+- DONE (M0.5): Replay attack → monotonically increasing per-identity nonce plus
+  a ±5-minute timestamp window, enforced in `rrn-ledger`'s engine (T0.5.6), with
+  idempotent, exactly-once settlement (T0.5.5/T0.5.7). See the `rrn-ledger`
+  Elevation of privilege entry above.
 - TODO: Physical node seizure → data at rest encrypted with keys held by
   community members (`rrn-identity` wallet encryption, argon2id + XChaCha20-
   Poly1305)
