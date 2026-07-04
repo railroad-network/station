@@ -1113,6 +1113,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrn-governance"
+version = "0.1.0"
+dependencies = [
+ "rrn-crypto",
+ "rrn-identity",
+ "rrn-storage",
+]
+
+[[package]]
 name = "rrn-identity"
 version = "0.1.0"
 dependencies = [
@@ -1155,8 +1164,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrn-marketplace"
+version = "0.1.0"
+dependencies = [
+ "rrn-crypto",
+ "rrn-identity",
+ "rrn-ledger",
+ "rrn-storage",
+]
+
+[[package]]
 name = "rrn-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "rrn-reputation"
+version = "0.1.0"
+dependencies = [
+ "rrn-crypto",
+ "rrn-identity",
+ "rrn-ledger",
+ "rrn-storage",
+]
 
 [[package]]
 name = "rrn-station"

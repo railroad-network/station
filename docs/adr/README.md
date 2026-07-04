@@ -43,6 +43,8 @@ Decision Records) convention, using the structure in
 - [0003 — Human-readable address format: bech32m with HRP `rrn`](0003-bech32-address-format.md)
 - [0004 — Own Shamir's Secret Sharing implementation over GF(256)](0004-own-shamir-implementation.md)
 - [0005 — The station signs settlement and cancellation records](0005-station-signed-settlement.md)
+- [0006 — The mobile client holds the keys; the station is a local backend](0006-m1-client-architecture.md)
+- [0007 — uniffi-rs generates the mobile bindings to our Rust crypto](0007-rust-mobile-ffi-uniffi.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.

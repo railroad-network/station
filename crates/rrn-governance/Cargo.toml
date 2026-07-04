@@ -1,0 +1,16 @@
+[package]
+name = "rrn-governance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Governance for Railroad Network: proposals, one-member-one-vote balloting, and tallying."
+
+[dependencies]
+# Ballots are signed and canonically encoded so a tally is verifiable.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+# Proposals and votes are recorded in the append-only log.
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+# One member, one vote: eligibility and vote weight are identity properties.
+rrn-identity = { path = "../rrn-identity", version = "0.1" }

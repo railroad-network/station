@@ -1,0 +1,18 @@
+[package]
+name = "rrn-reputation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reputation for Railroad Network: transaction- and attestation-derived scores with time decay."
+
+[dependencies]
+# Signed attestations and canonical CBOR underlie every reputation input.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+# Reputation state is materialized from, and cached in, local storage.
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+# Reputation is a property of an identity and is built from its attestations.
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# Scores derive from confirmed/settled transaction history on the ledger.
+rrn-ledger = { path = "../rrn-ledger", version = "0.1" }

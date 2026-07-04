@@ -1,0 +1,18 @@
+[package]
+name = "rrn-marketplace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Marketplace for Railroad Network: goods/services listings, inquiries, and search."
+
+[dependencies]
+# Signed listings and canonical CBOR for their content-addressed ids.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+# Persistence and the append-only log listings/inquiries are recorded in.
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+# Listers and inquirers are identities; listing authorship is an attestation.
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# A completed sale settles as a mutual-credit transaction on the ledger.
+rrn-ledger = { path = "../rrn-ledger", version = "0.1" }

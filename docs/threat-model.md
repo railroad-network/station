@@ -7,6 +7,16 @@ a comprehensive end-to-end pass: every Phase 0 crate has a populated section,
 the cross-cutting threats are analyzed, and the residual risks and known
 limitations are stated explicitly.
 
+**Phase 1 (from M1.0) is now being layered on top.** The sections it adds — the
+mobile client and its transport to the station, and the marketplace, reputation,
+and governance crates — describe threats against code that is largely still
+*scaffolding*. To keep the auditor's "every mitigation claim is traceable to
+code" contract intact, these sections mark their defenses as **Planned
+mitigation** and name the task that will implement them, rather than claiming a
+protection that does not yet exist. As each Phase 1 crate lands, its
+implementation task promotes the relevant entries from *planned* to *shipped*
+(with the concrete function/module, exactly as the Phase 0 sections do).
+
 **Auditors should read this document first.** Every mitigation claim is meant to
 be traceable to specific code; where a claim names a behavior (`verify_strict`,
 `append_raw` re-chaining, idempotent settlement), the corresponding code lives
@@ -35,6 +45,20 @@ Phase 0 (this repo, through milestone M0.7) covers:
 - The daemon/CLI boundary and local IPC for the two-station demo
   (`rrn-station`, `rrn-cli`)
 
+Phase 1 (from M1.0) extends the scope with:
+
+- The **mobile client** as the authoritative key-holder (per
+  [ADR-0006](adr/0006-m1-client-architecture.md)) — device-level protection of
+  the member's keypair, and the on-device Rust crypto shipped via uniffi-rs
+  ([ADR-0007](adr/0007-rust-mobile-ffi-uniffi.md))
+- The **mobile↔station transport** — per-request authentication by the mobile's
+  signature, and the one-time pairing bond
+- **Marketplace** — signed goods/services listings, inquiries, and search
+  (`rrn-marketplace`)
+- **Reputation** — transaction- and attestation-derived scores with time decay
+  (`rrn-reputation`)
+- **Governance** — proposals and one-member-one-vote balloting (`rrn-governance`)
+
 ## Out of Scope
 
 Deferred to Phase 1 and beyond:
@@ -45,11 +69,12 @@ Deferred to Phase 1 and beyond:
   cross-community validation / governance approval (Tier 4); see design
   overview Section 4.3, "The Tiered Oracle Model". Phase 0 only needs Tier
   1/2 (bilateral confirmation + settlement window + reputation stake)
-- **Marketplace** — goods/services listings and matching
-- **Governance** — voting, charters, dispute tribunals beyond automated
-  Tier 1/2 escalation
+- **Governance beyond direct balloting** — charters and dispute tribunals;
+  Phase 1's `rrn-governance` covers proposals and one-member-one-vote voting,
+  not tribunal adjudication or oracle escalation above Tier 2
 - **Radio (LoRa) and mesh transport-specific threats** — Phase 0 runs over
-  local network/loopback only
+  local network/loopback only; Phase 1's mobile↔station transport section
+  covers the *local-network* case, not radio/mesh links
 
 ## Trust Assumptions
 
@@ -723,6 +748,227 @@ daemon (one local user, one writer).
   `log_tail`, and `log_range`.
 - *Residual risk:* replay/double-spend protection lives in `rrn-ledger` (see its
   Elevation-of-privilege entry); the station layer adds no new ledger authority.
+
+### `rrn-marketplace`
+
+Discovery and intent on top of the ledger: signed listings, inquiries against
+them, and search over open listings. It adds no new money path — a completed
+sale settles as an ordinary `rrn-ledger` transaction — so its threats are about
+*fraud, gaming, and spam* on the discovery layer rather than about credit
+integrity (which the ledger already owns).
+
+**Assets:** the authorship and content integrity of a listing; the binding
+between a listing and the transaction that fulfils it; fair discovery (open
+listings actually surface); a buyer's protection against a lister who takes
+credit and never delivers.
+
+> Phase 1 scaffold (M1.0). The crate is a skeleton; the mitigations below are
+> **planned**, named by the task that will ship them, not yet implemented.
+
+#### Listing fraud — the lister never delivers
+
+- *Threat:* a member posts a listing, the buyer transacts, and the good or
+  service never arrives.
+- *Planned mitigation (M1 marketplace task, building on `rrn-ledger`):* a sale
+  is not final on posting — it settles through the ledger's bilateral
+  confirmation + settlement window (the Tier 1/2 oracle), so credit is not
+  released until the buyer confirms delivery, and a non-delivery leaves the
+  transaction unconfirmed/disputed and dents the lister's reputation
+  (`rrn-reputation`).
+- *Residual risk:* a scam conducted entirely off-ledger (payment arranged
+  outside the system) is out of scope; the first victim of a new defrauder is
+  unprotected — reputation only punishes *after* the fact.
+
+#### Reputation gaming via fake transactions
+
+- *Threat:* colluding identities run wash sales against each other's listings to
+  manufacture positive transaction history and inflate standing.
+- *Planned mitigation (M1 marketplace + `rrn-reputation`):* reputation inputs are
+  weighted by the counterparties' position in the social vouching graph
+  (`rrn-identity`) and by counterparty diversity, and decay over time, so a tight
+  ring of self-dealing accounts yields little durable score. Sybil creation is
+  bounded by the cost of getting vouched in.
+- *Residual risk:* collusion among genuinely-vouched real members is hard to
+  distinguish from honest trade; quantitative detection is deferred to Phase 2.
+
+#### Listing spam
+
+- *Threat:* an identity floods the marketplace with junk listings to bury real
+  ones or degrade discovery.
+- *Planned mitigation (M1 marketplace task):* listings are signed, so they are
+  attributable and rate-limitable per identity; identity creation is Sybil-
+  bounded by vouching; search ranking demotes low-reputation and unvouched
+  listers.
+- *Residual risk:* no rate limit exists yet (planned, not shipped); a vouched
+  member can still post up to whatever limit is chosen.
+
+### `rrn-reputation`
+
+A member's standing, *derived* from signed evidence (settled transactions,
+attestations) rather than asserted. Because a score is a computation over the
+log, the threats are attempts to poison the evidence set or to manufacture
+standing, not to tamper with a stored number (which hash-chaining already
+prevents).
+
+**Assets:** the re-derivability of a score from signed, content-addressed
+evidence; the honesty of the evidence set; resistance to manufactured or
+inherited standing.
+
+> Phase 1 scaffold (M1.0). Mitigations below are **planned**.
+
+#### Reputation laundering / whitewashing
+
+- *Threat:* a member with bad standing abandons the identity and starts fresh,
+  or attempts to carry standing to a clean identity, to escape a bad history.
+- *Planned mitigation (M1 reputation task):* reputation is **non-transferable** —
+  it is bound to the identity keypair, not a token that can be moved, and a fresh
+  identity starts from zero and must be vouched in (a social cost).
+- *Residual risk:* identity churn is only as expensive as vouching makes it;
+  whitewashing by starting over is *mitigated, not eliminated*, and is a known
+  limitation carried from the identity layer.
+
+#### Attestation farming
+
+- *Threat:* colluding identities issue each other positive attestations to
+  inflate scores.
+- *Planned mitigation (M1 reputation task):* attestations are weighted by the
+  attester's own standing and vouch-graph position, reciprocal/clustered
+  attestations are discounted, and all inputs decay with time.
+- *Residual risk:* sophisticated collusion inside a real vouch cluster is hard to
+  detect; a full quantitative model is deferred to Phase 2.
+
+#### Time-decay gaming
+
+- *Threat:* a member times their behavior to exploit the decay curve — front-load
+  good conduct, then coast on a slowly-decaying score.
+- *Planned mitigation (M1 reputation task):* continuous (not stepped) decay so
+  there is no cliff or window to game, with recent evidence dominating the score.
+- *Residual risk:* the decay parameters are a policy tradeoff; gaming the exact
+  curve is bounded but nonzero.
+
+### `rrn-governance`
+
+Binding collective decisions: signed proposals, one-member-one-vote balloting,
+and a verifiable tally. The defining control — vote weight is a property of a
+vouched identity, not of stake or reputation — is what most of these threats
+push against.
+
+**Assets:** the one-member-one-vote invariant; the integrity of a tally
+(re-derivable from signed ballots); the availability of the proposal channel.
+
+> Phase 1 scaffold (M1.0). Mitigations below are **planned**.
+
+#### Proposal flooding
+
+- *Threat:* an identity submits a flood of proposals to bury real ones or force
+  the community into constant voting (a governance DoS).
+- *Planned mitigation (M1 governance task):* proposals are signed and
+  rate-limitable per identity, and a proposal must clear a sponsorship/second
+  threshold before it reaches a ballot; identity is Sybil-bounded by vouching.
+- *Residual risk:* rate limiting is not yet implemented; a coordinated group of
+  real members can still consume community attention.
+
+#### Vote buying
+
+- *Threat:* an actor pays members (in Commons or off-system) to vote a chosen
+  way.
+- *Planned mitigation (M1 governance task):* one-member-one-vote caps the value
+  of any single vote, which lowers the return on buying it; social accountability
+  around signed votes raises the cost.
+- *Residual risk:* off-system bribery and coercion are fundamentally hard to
+  prevent technically; deferred to community norms and to keeping each vote
+  low-value. Ballot-secrecy tradeoffs (which would reduce buyability) are a
+  Phase 2 design question.
+
+#### Ballot stuffing (Sybil voting)
+
+- *Threat:* one person casts multiple votes by controlling multiple identities.
+- *Planned mitigation (M1 governance task):* one-member-one-vote is enforced at
+  eligibility — only vouched identities may vote (`rrn-identity`) — and duplicate
+  ballots from the same identity on the same proposal are rejected at tally.
+- *Residual risk:* Sybil resistance is only as strong as the vouching graph; a
+  compromised or careless voucher chain admits fake members who each get a vote.
+
+## Mobile client (Phase 1)
+
+The mobile client is new in Phase 1 and, per
+[ADR-0006](adr/0006-m1-client-architecture.md), is the **authoritative
+key-holder** — the member's Ed25519 secret key lives on the device, not on the
+station. That moves the highest-stakes asset in the system into the member's
+pocket and onto a consumer OS, which is a materially different environment from
+the station's. Two surfaces matter: the device itself, and the link from the
+device to the station.
+
+> Phase 1 scaffold (M1.0). No mobile code exists yet; every mitigation below is
+> **planned**, named by the task (M1.1 crypto/FFI, M1.2 auth/UI, M1.3 transport,
+> M1.3.3 pairing) that will ship it.
+
+### Device attack surface
+
+**Assets:** the member's Ed25519 secret key at rest on the device; the wallet
+passphrase; the integrity of the app doing the signing.
+
+- **Device theft.** *Threat:* the phone is stolen and the thief tries to extract
+  or use the key. *Planned mitigation (M1.1/M1.2):* the key is held in the OS
+  secure store (iOS Keychain / Android Keystore), gated behind the device
+  biometric/passcode, and the wallet is encrypted at rest (argon2id +
+  XChaCha20-Poly1305, the same scheme `rrn-identity` uses on the station); a lost
+  device is recovered via Shamir social recovery ([ADR-0004](adr/0004-own-shamir-implementation.md)).
+  *Residual risk:* a thief with an *unlocked* device, or who coerces the member,
+  acts as the member.
+- **Malware on the phone.** *Threat:* a malicious app or compromised OS reads the
+  key or invokes signing. *Planned mitigation:* secure-store access control ties
+  key use to our app plus a biometric prompt. *Residual risk:* per the project's
+  device-trust assumption (carried from Phase 0), a compromised OS is *outside*
+  the trust boundary — app-level controls cannot defend against it.
+- **OS-level key extraction.** *Threat:* the secret key is lifted out of secure
+  storage. *Planned mitigation (M1.1):* prefer hardware-backed, non-exportable
+  keys (Secure Enclave / StrongBox) where possible. *Residual risk / open design
+  question:* our Rust crypto (via uniffi, [ADR-0007](adr/0007-rust-mobile-ffi-uniffi.md))
+  must *use* the signing key, so it may not be able to live as a non-exportable
+  hardware key. M1.1 must resolve this — likely a hardware-backed wrapping key
+  that protects an exportable signing key — and the residual extraction risk
+  depends on that resolution. Flagged, not yet settled.
+- **Shoulder surfing during passphrase entry.** *Threat:* an observer reads the
+  passphrase as it is typed. *Planned mitigation (M1.2):* secure (non-echoing)
+  text entry, with biometric unlock as the default so the passphrase is seldom
+  typed at all. *Residual risk:* direct physical observation is reduced, not
+  eliminated.
+- **Biometric spoofing.** *Threat:* a fake fingerprint or face defeats the
+  unlock. *Planned mitigation (M1.2):* rely on the platform's biometric liveness
+  (Face ID / Touch ID / BiometricPrompt); the biometric only *gates access* to
+  the key store, it is not itself the key. *Residual risk:* the platform
+  biometric's strength is the ceiling — a defeated biometric equals device
+  access.
+
+### Mobile–station transport
+
+**Assets:** the authenticity of each mobile→station request; the integrity of
+ledger data replicated across the link; the pairing bond between a specific
+mobile and a specific station.
+
+- **MITM on the local network.** *Threat:* an attacker on the same LAN intercepts
+  or alters traffic between mobile and station. *Planned mitigation (M1.3):* per
+  ADR-0006, every request is authenticated by the mobile's signature over the
+  payload, so tampering is detected regardless of the channel, and the channel is
+  encrypted with keys established at pairing. *Residual risk:* traffic-analysis
+  metadata, and any exposure before pairing completes.
+- **Replay.** *Threat:* a captured signed request is replayed to repeat its
+  effect. *Planned mitigation (M1.3):* the same replay defenses as the ledger —
+  per-sender monotonic nonce, content-addressed ids, and a bounded time window
+  (inherited from `rrn-ledger`). *Residual risk:* replay within the accepted time
+  window, bounded by its width.
+- **Station impersonation.** *Threat:* a rogue host poses as the member's paired
+  station. *Planned mitigation (M1.3.3):* pairing binds the station's public key
+  and every subsequent exchange verifies the station against it. *Residual risk:*
+  see TOFU below — the bind is only as trustworthy as the moment it was made.
+- **Pairing-time TOFU.** *Threat:* pairing is trust-on-first-use, so an attacker
+  present at the *first* contact can interpose and become the "trusted" station.
+  *Planned mitigation (M1.3.3):* out-of-band confirmation at pairing — a QR code
+  shown by the station and scanned by the mobile, or a short authentication
+  string both sides compare — to authenticate that first contact. *Residual
+  risk:* if users skip the out-of-band step, TOFU is only as safe as the pairing
+  environment; this is documented as a user-facing risk for M1.3.3.
 
 ## Cross-cutting threats
 
