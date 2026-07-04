@@ -3,6 +3,11 @@
 
 *A blueprint for self-organizing communities with federated governance, mutual credit economics, decentralized identity, and resilient peer-to-peer trade — inspired by Harriet Tubman's Underground Railroad.*
 
+> **Status note (2026-07-04).** Parts of this overview predate the implementation and the
+> Architecture Decision Records. Where this document and an ADR in [`docs/adr/`](../adr/)
+> conflict, **the ADR is authoritative**. Locked implementation decisions (libraries,
+> formats, units) are summarized in the repository's `CLAUDE.md`.
+
 ---
 
 ## Table of Contents
@@ -64,7 +69,7 @@ Everything in the architecture flows from these non-negotiable constraints:
 
 - **Offline-first** — the system works with zero connectivity; connectivity adds capability but is never required
 - **Local-first** — community data lives on community hardware, not in a cloud owned by any third party
-- **Byzantine fault tolerant** — assumes some nodes are malicious or compromised and designs around that reality
+- **Byzantine-aware** — assumes some nodes are malicious or compromised and designs around that reality: misbehavior is made detectable and attributable through signed, hash-chained records rather than assumed away (see 10.4 for the precise consensus trust model)
 - **Incrementally deployable** — a single community can run the full system in isolation; federation adds value but is not required to bootstrap
 - **Low-resource capable** — runs on a Raspberry Pi 4; does not require data center infrastructure
 - **Useful at every phase** — each roadmap phase delivers standalone value; the project does not require full completion to be useful
@@ -73,7 +78,7 @@ Everything in the architecture flows from these non-negotiable constraints:
 
 Railroad Network encodes lessons from governance and trade systems that operated without central authority for centuries:
 
-- **Iroquois Confederacy** — Federated sovereign nations with shared meta-governance and a written constitution predating the US Constitution
+- **Iroquois Confederacy** — Federated sovereign nations with shared meta-governance under a constitution — the Great Law of Peace, preserved orally and in wampum — predating the US Constitution
 - **Hanseatic League** — Federated trade network spanning 200 cities across northern Europe for 400 years, with shared commercial law, mutual dispute resolution, and collective sanctions — all without a central government
 - **Medieval guild systems** — Cross-community professional standards, credentialing, and reputation networks that maintained quality and trust across trade routes
 - **Somali xeer** — Customary law that functions without a state, enforced through clan reputation and mutual obligation
@@ -123,7 +128,7 @@ Different decisions warrant different voting mechanisms. A single mechanism for 
 | **Sortition panels** | Random selection from qualified members, like jury duty. Eliminates campaigning, reduces factional capture. Best for reviewing administrative decisions and constitutional interpretation. |
 | **Delegated councils** | Elected or appointed small groups with authority over specific domains. Medical council governs health standards. Each council has defined scope and term limits. |
 | **Consent-based** | Proposal passes unless actively blocked by a threshold of objectors. Dramatically reduces friction for non-controversial matters. |
-| **Quadratic voting** | Members allocate voice credits across issues. Diminishing returns on any single issue lets intensity of preference matter. Minority positions with deep convictions can make themselves heard. |
+| **Quadratic voting** | Members allocate a budget of voice points across issues ("points", not "credits" — unrelated to Commons). Diminishing returns on any single issue lets intensity of preference matter. Minority positions with deep convictions can make themselves heard. |
 
 ### 2.4 Proposal Lifecycle
 
@@ -186,7 +191,9 @@ The economic foundation of Railroad Network is a universal mutual credit system 
 
 ### 3.1 How Mutual Credit Works
 
-No tokens are pre-minted. The ledger tracks balances only. Every member starts at zero. When you provide value, your balance goes positive. When you receive value, your balance goes negative. **The sum of all balances in the network always equals zero.**
+No tokens are pre-minted. The ledger tracks balances only. Every member starts at zero. When you provide value, your balance goes positive. When you receive value, your balance goes negative. **Every ledger entry is balanced, so the sum of all balances in the network — member accounts plus each community's commons-pool account — always equals zero.**
+
+Mechanisms that create or retire credit outside of trade — base issuance, contribution minting, demurrage, jubilees (see 3.3 and 3.5–3.6) — are booked against the community's **commons pool**, an ordinary ledger account, so the invariant holds everywhere.
 
 ```
 Example transaction:
@@ -196,11 +203,13 @@ Example transaction:
     James's balance:  0 → -3 Commons
     Network total:    still 0
 
-  Sarah buys grain from Valley Farm:
+  Sarah buys 8 Commons of grain from Valley Farm:
     Sarah's balance: +3 → -5 Commons
     Farm's balance:   0 → +8 Commons
     Network total:    still 0
 ```
+
+Amounts are recorded as signed integer **centicommons** (1 Common = 100 centicommons) in the ledger and in every signed payload — never floating point. Whole-Common amounts in this document are readable shorthand for their centicommon values.
 
 ### 3.2 Why One Universal Credit Unit
 
@@ -221,10 +230,10 @@ The 'centralization' is in the accounting unit, not in governance of it. All nod
 Credits are created by the act of trade. When you provide a service, your balance goes up; the receiver's goes down. No one mints anything. This is the most collapse-resilient option: no prior coordination required, no central issuer that can fail, scales naturally with economic activity.
 
 #### 3.3.2 Basic Activity Issuance (Optional)
-Communities can optionally enable a small base issuance (e.g., 10 Commons per active member per week) to bootstrap participation for new members. Issuance rate governed at the federation level to prevent inflation.
+Communities can optionally enable a small base issuance (e.g., 10 Commons per active member per week) to bootstrap participation for new members. Issuance rate governed at the federation level to prevent inflation. Issuance is booked as a debit against the community's commons-pool account, preserving the zero-sum invariant.
 
 #### 3.3.3 Contribution-Based Minting (Advanced)
-Some transaction categories — environmental stewardship, community infrastructure work — can trigger net credit creation when verified work occurs. Requires a robust oracle. Phase 3+ feature. Minting rate set through federation governance.
+Some transaction categories — environmental stewardship, community infrastructure work — can trigger net credit creation when verified work occurs. Requires a robust oracle. Phase 3+ feature. Minting rate set through federation governance. Like base issuance, minted credits are debited from the commons pool.
 
 ### 3.4 Free Market Pricing and Price Discovery
 
@@ -239,7 +248,7 @@ Some transaction categories — environmental stewardship, community infrastruct
 
 A healthy mutual credit economy needs credits moving, not hoarding:
 
-- **Demurrage** — Credits decay slightly over time if not spent (community-configurable, e.g., -1% per month). Based on Silvio Gesell's concept, tested successfully in the 1932 Wörgl Experiment. Forces circulation.
+- **Demurrage** — Credits decay slightly over time if not spent (community-configurable, e.g., -1% per month). Based on Silvio Gesell's concept, tested successfully in the 1932 Wörgl Experiment. Forces circulation. Decayed credits are credited back to the commons pool, not destroyed.
 - **Credit ceilings** — Members cannot accumulate more than X Commons. Forces high earners to spend or donate to the commons pool.
 - **Contribution requirements** — Members provide a minimum labor or service to the community regardless of credit balance, creating a social contract baseline.
 
@@ -249,8 +258,8 @@ In post-collapse scenarios, certain skills become extraordinarily valuable. A pu
 
 - **Universal basic services** — Certain services provided at zero cost, funded by a community tax on positive balances
 - **Tiered access** — Basic version of any service is cheap or free; premium version is market-priced
-- **Jubilee cycles** — Periodic partial balance resets, inspired by the biblical Jubilee; prevents permanent underclass formation
-- **Debt forgiveness governance** — Community votes to forgive specific debts in specific circumstances
+- **Jubilee cycles** — Periodic partial balance resets, inspired by the biblical Jubilee; prevents permanent underclass formation; resets are booked against the commons pool
+- **Debt forgiveness governance** — Community votes to forgive specific debts in specific circumstances, with the forgiven amount absorbed by the commons pool
 
 ---
 
@@ -286,7 +295,7 @@ For higher-value transactions, N community members above a reputation threshold 
 Require artifact evidence before credits move. Medical consultations produce anonymized treatment records. Construction work produces geotagged before/after photos. Agricultural deliveries produce signed receipts. The platform becomes a tamper-evident evidence repository. Optional enhancement in low-device scenarios.
 
 #### 4.2.5 Delayed Settlement with Dispute Window
-Credits do not move instantly. A 48-72 hour settlement delay allows anyone in the community to raise a dispute. After the window closes with no dispute, credits move automatically. Leverages the community's social fabric — people in small communities notice when someone games the system.
+Credits do not move instantly. A settlement delay (community-configurable, default 48 hours) allows anyone in the community to raise a dispute. After the window closes with no dispute, credits move automatically. Leverages the community's social fabric — people in small communities notice when someone games the system.
 
 #### 4.2.6 Cross-Community Oracle Validation
 For high-value inter-community transactions, a third community acts as neutral validator. They earn a small Commons fee. This creates a market for trusted third-party validation — communities build reputations as reliable arbiters.
@@ -298,10 +307,12 @@ At the federation level, the system watches aggregate patterns. Fraud leaves sig
 
 | Tier | Transaction Range | Requirements | Oracle Mechanism |
 |---|---|---|---|
-| **Tier 1** | 0–5 Commons | Bilateral confirmation | Delayed settlement window only. Low friction, some fraud acceptable at micro scale. |
-| **Tier 2** | 5–50 Commons | Bilateral + reputation stake | 48hr dispute window. Community social fabric is the oracle. Attestors stake reputation. |
-| **Tier 3** | 50–500 Commons | Tier 2 + physical artifacts + 3 community witnesses | Fraud becomes expensive and socially visible. Evidence is cryptographically timestamped. |
-| **Tier 4** | 500+ Commons | Tier 3 + cross-community validation + governance approval | Essentially a notarized contract. Neutral third community validates. Full audit trail. |
+| **Tier 1** | under 5 Commons | Bilateral confirmation | Delayed settlement window only. Low friction, some fraud acceptable at micro scale. |
+| **Tier 2** | 5 to under 50 Commons | Bilateral + reputation stake | Settlement window doubles as dispute window (default 48h). Community social fabric is the oracle. Attestors stake reputation. |
+| **Tier 3** | 50 to under 500 Commons | Tier 2 + physical artifacts + 3 community witnesses | Fraud becomes expensive and socially visible. Evidence is cryptographically timestamped. |
+| **Tier 4** | 500 Commons and up | Tier 3 + cross-community validation + governance approval | Essentially a notarized contract. Neutral third community validates. Full audit trail. |
+
+Boundaries are half-open and evaluated in integer centicommons (500 / 5,000 / 50,000). Transaction value sets the tier **floor** — a listing or either party may opt a transaction *up* to a higher tier (e.g., a 3-Common medical consultation listed at Tier 2), never down.
 
 ### 4.4 The Philosophical Foundation
 
@@ -394,15 +405,17 @@ When you join a community, existing members vouch for you by cryptographically s
 
 ```json
 {
-  "voucher_key": "0x4a7b...",
-  "vouched_key": "0x9f2c...",
+  "voucher": "rrn1q4a7l2v...",
+  "vouched": "rrn1x9f2cw8...",
   "community": "blue_ridge_collective",
   "statement": "I attest this key belongs to a real, unique individual known to this community.",
   "reputation_stake": 0.5,
-  "timestamp": "2031-04-15T09:23:00Z",
-  "signature": "0x8b3f..."
+  "timestamp": 1934961780,
+  "signature": "8b3f..."
 }
 ```
+
+*(Example payloads in this document are shown as JSON for readability. The wire format is canonical CBOR (`dcbor`), identities are bech32m `rrn1...` addresses, and times are Unix seconds as signed 64-bit integers.)*
 
 #### Layer 3 — Verified Claims
 On top of community identity, members attach verifiable claims: medical licenses, labor hour records, citizenship attestations, skill certifications. These are held in the member's identity wallet and presented selectively when needed. The receiver verifies the signature — no central registry required. Self-sovereign identity: you hold your own credentials.
@@ -436,7 +449,7 @@ Social recovery using Shamir's Secret Sharing is the selected key management app
 
 **Shard management rules:**
 - Distribute to different households and roles — do not put 3 of 5 shards in one family
-- **Shard refresh** — if your relationship with a shard holder deteriorates, revoke their shard and reissue to someone else without changing your underlying identity
+- **Shard refresh** — if your relationship with a shard holder deteriorates, re-split the key with a fresh random polynomial and distribute new shards; old and new shards cannot be combined. Caveat: plain Shamir has no true revocation — any K holders of the *old* shard set can still reconstruct the key together. If K or more old shards may be compromised or colluding, rotate the underlying key itself
 - In collapse context, key recovery may be a physical gathering — a designed social ritual, not just a technical process
 
 ### 6.6 The Duplicate Identity Problem
@@ -496,16 +509,18 @@ For inter-community disputes or cases where a member alleges their own community
 Every dispute filing requires staking reputation:
 
 ```
-Disputed value    Reputation stake required
-0-5 Commons       0.1 points
-5-50 Commons      0.5 points
-50-500 Commons    2.0 points
-500+ Commons      5.0 points
+Disputed value             Reputation stake required
+under 5 Commons            0.1 points
+5 to under 50 Commons      0.5 points
+50 to under 500 Commons    1.5 points
+500 Commons and up         3.0 points
 
 On win:  stake returned + portion of loser's stake
 On loss: stake forfeited + additional reputation hit
 Fraud finding: heavier penalty than honest disagreement
 ```
+
+Stakes are absolute points on the 0–5 scale, so filing a large dispute requires substantial standing — deliberate friction against frivolous high-value claims — but the top stake is capped well below the maximum score so that established members, not only perfect ones, can file.
 
 ### 7.5 The Pattern Attack Defense
 
@@ -546,7 +561,7 @@ Federation is deliberately not automatic. It should be a conscious community dec
 ```json
 {
   "community_id": "blue_ridge_collective",
-  "founded": "2031-04-12",
+  "founded": 1934668800,
   "population": 340,
   "location_type": "rural_mountain",
   "governance_model": "liquid_democracy",
@@ -564,9 +579,9 @@ Federation is deliberately not automatic. It should be a conscious community dec
     "credit_limit_per_partner": 500,
     "min_reputation_for_trade": 3.5
   },
-  "charter_hash": "0x9f2c...",
-  "governance_key": "0x4a7b...",
-  "last_updated": "2031-09-03"
+  "charter_hash": "9f2c...",
+  "governance_key": "rrn1g0vk3y...",
+  "last_updated": 1947110400
 }
 ```
 
@@ -642,7 +657,7 @@ The marketplace is where the abstract economy becomes concrete and daily. Three 
 
 ```json
 {
-  "listing_id": "0x8f3a...",
+  "listing_id": "8f3a...",
   "provider": "dr_sarah",
   "community": "blue_ridge_collective",
   "type": "service",
@@ -686,7 +701,7 @@ Recurring services are a distinct primitive from one-off transactions:
   "terms": {
     "frequency": "daily",
     "duration_weeks": 12,
-    "commons_per_period": 8,
+    "commons_per_week": 8,
     "payment_schedule": "weekly"
   },
   "performance_metrics": {
@@ -695,7 +710,7 @@ Recurring services are a distinct primitive from one-off transactions:
   },
   "termination": {
     "notice_period_days": 7,
-    "early_termination_penalty": 20
+    "early_termination_penalty_commons": 20
   }
 }
 ```
@@ -737,7 +752,7 @@ In a collapse scenario, anticipating scarcity before it becomes a crisis is the 
 2. **Inquiry / Negotiation** — Buyer sends inquiry; price negotiation if listing is negotiable; terms confirmed
 3. **Transaction initiation** — Both parties cryptographically agree to terms; transaction recorded as pending; if escrow required, credits locked
 4. **Fulfillment** — Goods delivered or service performed; evidence submitted per oracle tier
-5. **Confirmation window** — Bilateral confirmation plus 48-72 hour community dispute window
+5. **Confirmation window** — Bilateral confirmation plus the community dispute window (the settlement window, default 48 hours)
 6. **Settlement** — Credits move; transaction recorded as complete; reputation scores updated
 7. **Review** — Optional rating and attestation feeds into provider's reputation
 
@@ -770,7 +785,7 @@ SYNC LAYER
   Conflict Resolution · Delta Sync
 
 CONSENSUS LAYER
-  Local BFT Consensus · Ledger
+  Local Raft Consensus · Ledger
   Transaction Ordering · Finality
 
 TRANSPORT LAYER
@@ -805,8 +820,10 @@ IDENTITY LAYER
 #### Within a Community — Raft Consensus
 Raft provides consistent ledger ordering, automatic leader failover, and clear finality. A community runs 3-7 nodes on devices owned by trusted community members. Running a node is a form of community contribution earning a small credit stipend.
 
+**Trust model:** Raft tolerates crashed nodes, not Byzantine ones — the operator set is semi-trusted, which matches the deployment reality (nodes run by known community members). Tampering or equivocation by an operator is not *prevented* by consensus; it is made **detectable and attributable** by the signature-gated, hash-chained append-only log, and handled through governance and reputation. This is a deliberate trade: honest-but-crashy is the common failure mode inside a community, and social accountability is the defense against the rare malicious operator.
+
 #### Between Communities — Eventual Consistency
-Each community's ledger is authoritative for its own transactions. Inter-community transactions use a two-phase commit protocol:
+Each community's ledger is authoritative for its own transactions. Inter-community transactions use a two-phase commit handshake with log-based reconciliation:
 
 ```
 Phase 1 — Prepare:
@@ -816,14 +833,20 @@ Phase 1 — Prepare:
 
 Phase 2 — Commit:
   Both communities confirm readiness
-  Transaction commits atomically on both ledgers
+  Each ledger records a signed commit entry; the
+  transaction is final once both entries exist
 
 Failure handling:
   If either community goes offline mid-transaction,
-  pending transaction auto-cancels after N hours.
-  Automatic rollback on both sides.
-  No credits lost, no inventory committed.
+  the pending transaction expires after N hours.
+  A partner that committed before the outage learns
+  the true outcome on reconnect: commit and expiry
+  records are exchanged during log sync, and a
+  deterministic rule (a commit signed before the
+  expiry deadline wins) reconciles both ledgers.
 ```
+
+A two-phase handshake cannot guarantee atomic commit across an unreliable network — one side can commit while the other times out. The design goal is therefore *detectable, convergent* outcomes via the signed logs, not impossible atomicity: divergence is temporary and self-healing, never silent.
 
 ### 10.5 Sync Layer — CRDTs
 
@@ -851,34 +874,39 @@ State propagates via **gossip protocol** — each node periodically selects rand
 
 Each protocol is a defined message format plus a state machine. Any node implementing the protocols can participate regardless of hardware or OS. The protocols are the permanent layer — everything above them can be replaced.
 
-### 10.7 Node Hardware Tiers
+### 10.7 Node Hardware Classes
 
-| Tier | Description |
+*("Class" rather than "tier" — oracle tiers in Section 4.3 are unrelated.)*
+
+| Class | Description |
 |---|---|
-| **Tier 1 — Full node** | Raspberry Pi 4, 4GB RAM, 128GB storage. Runs full ledger, all protocols, local API server. Solar-powered. Community's primary node. ~$80 hardware cost. |
-| **Tier 2 — Light node** | Smartphone or low-power laptop. Holds personal wallet and identity. Connects to full node via local WiFi or Bluetooth. |
-| **Tier 3 — Minimal node** | Basic phone with SMS capability. Interacts via structured SMS commands to a community hub. Functional for core credit transactions and governance votes. |
-| **Tier 4 — Paper fallback** | Printed QR codes representing signed transaction records. Physically carried between communities by conductors. Scanned and ingested on reconnect. |
+| **Class 1 — Full node** | Raspberry Pi 4, 4GB RAM, 128GB storage. Runs full ledger, all protocols, local API server. Solar-powered. Community's primary node. ~$80 hardware cost. |
+| **Class 2 — Light node** | Smartphone or low-power laptop. Holds personal wallet and identity. Connects to full node via local WiFi or Bluetooth. |
+| **Class 3 — Minimal node** | Basic phone with SMS capability. Interacts via structured SMS commands to a community hub. Functional for core credit transactions and governance votes. |
+| **Class 4 — Paper fallback** | Printed QR codes representing signed transaction records. Physically carried between communities by conductors. Scanned and ingested on reconnect. |
 
 ### 10.8 Security Architecture
 
 | Attack Vector | Mitigation |
 |---|---|
 | **Eclipse attack** | Maintain peer lists from multiple independent sources, prefer geographically diverse peers, detect isolation via heartbeat failures |
-| **Ledger fork** | Raft consensus requires quorum, transactions have cryptographic ordering, fork detection is automatic |
+| **Ledger fork** | Raft quorum prevents accidental forks; a malicious leader can still equivocate, so every entry is signed and hash-chained — equivocation is automatically detectable, attributable to its signer, and punishable through governance |
 | **Sybil federation** | Community reputation scores are slow to build; new communities have limited governance weight during probation |
 | **Replay attack** | Every transaction includes a monotonically increasing nonce per identity plus a timestamp; nodes reject previously-seen nonces |
-| **Physical node seizure** | Data at rest encrypted with keys held by community members, not stored on the node; seizing the hardware yields an encrypted brick |
+| **Physical node seizure** | Data at rest encrypted with keys held by community members, not stored on the node; seizing a powered-off node yields an encrypted brick. Residual risk: a node seized while running has keys in memory — the mitigations there are physical custody and rapid re-bootstrap, not encryption |
 
 ### 10.9 The Technology Stack
 
 | Component | Technology & Rationale |
 |---|---|
-| **Primary language** | Rust — performance, memory safety, works on low-power ARM, strong crypto library ecosystem, no GC pauses |
-| **Local database** | SQLite + custom CRDT layer — embedded, no server required, works offline, tiny footprint |
-| **Cryptography** | libsodium — Ed25519 keys, ChaCha20 encryption, well-audited, fast on ARM |
-| **Consensus** | Custom Raft (evaluate `openraft` first) — small codebase, well-understood, adaptable to low-bandwidth |
-| **Mobile client** | React Native — cross-platform iOS/Android, offline-capable, large developer ecosystem |
+| **Primary language** | Rust — performance, memory safety, works on low-power ARM, strong crypto library ecosystem, no GC pauses (ADR-0001) |
+| **Local database** | SQLite via `rusqlite` (bundled, WAL mode, foreign keys ON) + custom CRDT layer — embedded, no server required, works offline, tiny footprint |
+| **Cryptography** | `ed25519-dalek` v2 (signatures), `blake3` (hashing), XChaCha20-Poly1305 via `chacha20poly1305` (symmetric), `argon2` (key derivation) — audited pure-Rust crates, fast on ARM |
+| **Canonical serialization** | `dcbor` — Deterministic CBOR (RFC 8949 §4.2.1); signatures always cover the canonical CBOR bytes of the payload (ADR-0002) |
+| **Addresses** | bech32m with HRP `rrn` — addresses read `rrn1...` (ADR-0003) |
+| **Shamir secret sharing** | Own implementation over GF(256), Rijndael polynomial, in `rrn-identity` — existing crates evaluated and rejected (ADR-0004) |
+| **Consensus** | Custom Raft (evaluate `openraft` first) — small codebase, well-understood, adaptable to low-bandwidth. Phase 2+; a single-station community needs no consensus protocol |
+| **Mobile client** | React Native + TypeScript UI over the Rust core (`rrn-crypto`, `rrn-identity`) compiled for iOS/Android, bindings generated by `uniffi-rs` (ADR-0006, ADR-0007) |
 | **SMS interface** | Simple AT command parser — runs on any device with serial port access to a radio modem |
 | **ZK proofs** | arkworks-rs — Rust ZK library for duplicate identity detection |
 | **Radio transport** | LoRa via standard SX127x chipsets — widely available, low cost, 5-15km range |
@@ -1290,7 +1318,7 @@ The posture: **author who uses their own work, not operator who happens to have 
 | **Raft** | A distributed consensus algorithm for maintaining consistent ledger state within a community's node set |
 | **Reputation staking** | Cryptographically linking your reputation score to an attestation, putting it at risk if the attestation proves false |
 | **Shamir's Secret Sharing** | A cryptographic scheme for splitting a secret into N shares, where any K shares can reconstruct the original |
-| **Station** | A Railroad Network community — a node in the federated network |
+| **Station** | Two meanings, kept deliberately distinct: (1) the `station` daemon — the node software a community runs ("update your station to v0.4"); (2) per the Underground Railroad analogy, a community itself. Prefer "community" for the social/federation entity and "station" for the running software |
 | **Treaty** | A formal federation agreement between two communities, signed by both governance keys and recorded on both ledgers |
 | **ZK Proof** | Zero-knowledge proof; allows proving a statement is true without revealing the underlying information |
 
