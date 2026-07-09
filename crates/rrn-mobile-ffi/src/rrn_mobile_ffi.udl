@@ -4,8 +4,9 @@
 // attack surface and a small maintenance surface.
 //
 // M1.1 T1.1.1 scope: the four rrn-crypto primitives (Keypair, PublicKey,
-// Signature, Hash). Address parsing (T1.1.3), the wallet file format (T1.1.5),
-// and SignedPayload / dcbor (T1.1.7) extend this contract in their own tasks.
+// Signature, Hash). Address parsing (T1.1.3) reused those types. The wallet
+// file format (T1.1.5) adds WalletContents + EncryptedWallet below;
+// SignedPayload / dcbor (T1.1.7) extends this contract in its own task.
 //
 // Deliberately NOT exposed: SecretKey. The secret seed never crosses the FFI
 // boundary in the clear — mobile holds it inside an opaque Keypair and never
@@ -71,4 +72,69 @@ interface Hash {
     bytes to_bytes();
 
     string to_hex();
+};
+
+// ---------------------------------------------------------------------------
+// Wallet file format (T1.1.5). A `.rrnwallet` is the canonical-CBOR encoding of
+// an EncryptedWallet: the identity's secret sealed with XChaCha20-Poly1305
+// under an argon2id key derived from the user's passphrase. Mobile goes through
+// rrn-identity for this — it never reimplements the format — so a wallet
+// created on mobile opens on the station and vice versa.
+
+// Flat error surface for the fallible wallet operations. Deliberately coarse:
+// `Decrypt` covers both a wrong passphrase and tampered ciphertext (the two are
+// not distinguished, on purpose), and the crate-local detail stays in Rust.
+[Error]
+enum WalletError {
+    "Decrypt",
+    "UnsupportedVersion",
+    "Corrupt",
+    "Kdf",
+};
+
+// The decrypted, in-memory contents of a wallet: one identity plus metadata.
+// Opaque — the secret seed never crosses the FFI boundary. Signing capability
+// is reached through keypair(), which keeps the secret inside Rust (the
+// no-export-secret rule from ADR-0006).
+interface WalletContents {
+    // Generates a brand-new identity: a fresh keypair, empty metadata, and
+    // created_at set to the current Unix time.
+    [Name=create_new]
+    constructor();
+
+    PublicKey public_key();
+
+    // The bech32m `rrn1…` address of this identity.
+    string address();
+
+    // Unix seconds when the identity was created.
+    i64 created_at();
+
+    // Arbitrary, non-secret user metadata (labels, display name, …).
+    record<string, string> metadata();
+
+    // The keypair for this identity, for signing. The secret stays in Rust.
+    Keypair keypair();
+};
+
+// A wallet sealed for storage. Its `to_bytes` is the `.rrnwallet` file content;
+// mobile persists those bytes in the OS keychain/keystore (double protection:
+// passphrase encryption plus Keychain/Keystore at-rest).
+interface EncryptedWallet {
+    // Seals `contents` under `passphrase` with a fresh random salt and nonce.
+    [Name=encrypt, Throws=WalletError]
+    constructor(WalletContents contents, string passphrase);
+
+    // Parses the canonical-CBOR `.rrnwallet` bytes. `Corrupt` if the bytes are
+    // not valid canonical CBOR or do not match the wallet layout.
+    [Name=from_bytes, Throws=WalletError]
+    constructor(bytes data);
+
+    // Opens the wallet, returning its decrypted contents. A wrong passphrase or
+    // tampered ciphertext yields `Decrypt` — never garbage plaintext.
+    [Throws=WalletError]
+    WalletContents decrypt(string passphrase);
+
+    // The canonical-CBOR `.rrnwallet` bytes.
+    bytes to_bytes();
 };

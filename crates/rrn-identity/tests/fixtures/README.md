@@ -31,6 +31,36 @@ cp crates/rrn-identity/tests/fixtures/cross_platform_address.json \
 The `committed_fixture_is_in_sync` test fails if the committed JSON drifts from
 what the generator produces, so a stale fixture cannot pass CI unnoticed.
 
+## `cross_platform_wallet.json` — mobile/station wallet-file parity (T1.1.5)
+
+Locks the `.rrnwallet` file format (M0.3.3: canonical-CBOR envelope, argon2id +
+XChaCha20-Poly1305) so a wallet created on one platform opens on the other.
+`rrn_identity::wallet` *is* the source of truth; mobile reaches the same code
+through the uniffi FFI (`rrn-mobile-ffi`).
+
+Generated and verified by
+[`tests/cross_platform_wallet.rs`](../cross_platform_wallet.rs); the mobile repo
+commits a copy at `__tests__/fixtures/cross_platform_wallet.json` and its
+`Wallet.test.ts` reads it. Contents: 8 wallets, each a deterministic
+(blake3-derived) identity — seed, address, `created_at`, metadata — sealed into
+an `encrypted` `.rrnwallet` blob under a recorded passphrase, plus a
+`wrong_passphrase` for the rejection check.
+
+**Unlike the address/signing fixtures, this one is _not_ bit-reproducible**:
+wallet encryption uses a fresh random salt + nonce per encrypt, so regenerating
+produces different-but-valid ciphertext (like the SLIP-0039 vectors below). The
+tests therefore lock the invariant, not the bytes — each committed blob must
+decrypt, under its passphrase, to its recorded identity; wrong passphrases and
+tampered bytes must be rejected.
+
+Regenerate (ciphertext changes each run; identities stay fixed):
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-identity --test cross_platform_wallet
+cp crates/rrn-identity/tests/fixtures/cross_platform_wallet.json \
+   ../mobile/__tests__/fixtures/cross_platform_wallet.json
+```
+
 ---
 
 # Shamir reference vectors

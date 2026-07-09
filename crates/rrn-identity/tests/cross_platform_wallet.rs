@@ -1,0 +1,211 @@
+//! Cross-platform wallet-file vectors: the contract that a `.rrnwallet` created
+//! on one platform opens on the other (T1.1.5).
+//!
+//! `rrn_identity::wallet` is the single source of truth for the wallet file
+//! format (M0.3.3): canonical-CBOR envelope, argon2id + XChaCha20-Poly1305.
+//! Mobile reaches the *same* code through the uniffi FFI (`rrn-mobile-ffi`)
+//! rather than reimplementing it, so a wallet created on mobile decrypts on the
+//! station and vice versa.
+//!
+//! Unlike the address and signing fixtures, wallet encryption is **randomized**
+//! (fresh salt + nonce per encrypt), so the committed `encrypted` bytes are not
+//! bit-reproducible — regenerating produces different-but-valid ciphertext (as
+//! with the SLIP-0039 reference vectors). The *identities* are deterministic
+//! (blake3-derived seeds), so what this test locks is the invariant that
+//! matters: the committed bytes decrypt, under the recorded passphrase, to the
+//! recorded identity — and that wrong passphrases and tampered bytes are
+//! rejected. The mobile side reads the same committed JSON; see
+//! `mobile/__tests__/Wallet.test.ts`.
+//!
+//! Regenerate with:
+//!   RRN_REGEN=1 cargo test -p rrn-identity --test cross_platform_wallet
+//! then copy `tests/fixtures/cross_platform_wallet.json` into the mobile repo at
+//! `__tests__/fixtures/cross_platform_wallet.json`.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::{Keypair, SecretKey};
+use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_identity::address::Address;
+use rrn_identity::wallet::{EncryptedWallet, WalletContents, WalletError};
+use serde::{Deserialize, Serialize};
+
+/// How many wallets to generate. Kept small on purpose: each encrypt/decrypt
+/// runs argon2id at 64 MiB, so a hundred would make the suite slow for no extra
+/// coverage — the format is the same for every wallet.
+const WALLET_COUNT: u32 = 8;
+
+/// One wallet vector: the identity (deterministic) plus the sealed bytes
+/// (randomized). `encrypted` is the hex of the canonical-CBOR `.rrnwallet` file.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletVector {
+    seed: String,
+    passphrase: String,
+    created_at: i64,
+    metadata: BTreeMap<String, String>,
+    address: String,
+    pubkey: String,
+    encrypted: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Fixture {
+    #[serde(rename = "_comment")]
+    comment: String,
+    /// A passphrase guaranteed to differ from every vector's — for the
+    /// wrong-passphrase rejection check.
+    wrong_passphrase: String,
+    wallets: Vec<WalletVector>,
+}
+
+/// Deterministic 32-byte value from a domain-separated label and index.
+fn derive(label: &str, i: u32) -> [u8; 32] {
+    let mut input = label.as_bytes().to_vec();
+    input.extend_from_slice(&i.to_le_bytes());
+    Hash::of(&input).to_bytes()
+}
+
+fn metadata_for(i: u32) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    m.insert("label".to_string(), format!("wallet-{i}"));
+    m.insert("device".to_string(), "phone".to_string());
+    m
+}
+
+/// Builds a deterministic identity for index `i` — same seed, address, and
+/// metadata on every run, so the *expected* half of each vector is stable.
+fn contents_for(i: u32) -> WalletContents {
+    let seed = derive("rrn-cross-platform-wallet-fixture:v1:seed:", i);
+    let keypair = Keypair::from_secret(SecretKey::from_bytes(seed));
+    let address = Address::from_public_key(keypair.public_key());
+    // All WalletContents fields are public, so the fixture can pin a chosen
+    // identity rather than the random one `create_new` would produce.
+    WalletContents {
+        secret_key: keypair.secret_key().clone(),
+        address,
+        created_at: 1_700_000_000 + i64::from(i),
+        metadata: metadata_for(i),
+    }
+}
+
+fn passphrase_for(i: u32) -> String {
+    // Include a non-ASCII character to exercise the argon2id byte handling.
+    format!("wallet-pass-{i}-🚂")
+}
+
+fn build_fixture() -> Fixture {
+    let wallets = (0..WALLET_COUNT)
+        .map(|i| {
+            let contents = contents_for(i);
+            let passphrase = passphrase_for(i);
+            let sealed =
+                EncryptedWallet::encrypt(&contents, &passphrase).expect("encrypt must succeed");
+            WalletVector {
+                seed: hex::encode(contents.secret_key.to_bytes()),
+                passphrase,
+                created_at: contents.created_at,
+                metadata: contents.metadata.clone(),
+                address: contents.address.to_string(),
+                pubkey: hex::encode(
+                    Keypair::from_secret(contents.secret_key.clone())
+                        .public_key()
+                        .to_bytes(),
+                ),
+                encrypted: hex::encode(to_canonical_bytes(sealed)),
+            }
+        })
+        .collect();
+
+    Fixture {
+        comment: "Cross-platform wallet-file vectors for T1.1.5. Generated by \
+            rrn-identity/tests/cross_platform_wallet.rs (rrn_identity::wallet is \
+            the source of truth, M0.3.3). Mobile reaches the same .rrnwallet \
+            format via rrn-mobile-ffi and must decrypt each `encrypted` blob \
+            under its passphrase to the recorded identity. Identities are \
+            blake3-derived (deterministic); the `encrypted` bytes are randomized \
+            per encrypt (argon2id + XChaCha20-Poly1305), so regeneration yields \
+            different-but-valid ciphertext. Regenerate with RRN_REGEN=1."
+            .to_string(),
+        wrong_passphrase: "definitely-not-any-vector-passphrase".to_string(),
+        wallets,
+    }
+}
+
+fn fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross_platform_wallet.json")
+}
+
+fn load_committed() -> Fixture {
+    let text = std::fs::read_to_string(fixture_path())
+        .expect("committed fixture missing — run with RRN_REGEN=1 to create it");
+    serde_json::from_str(&text).expect("committed fixture is not valid JSON")
+}
+
+fn serialize(fixture: &Fixture) -> String {
+    serde_json::to_string_pretty(fixture).unwrap() + "\n"
+}
+
+fn encrypted_wallet(hex_bytes: &str) -> Result<EncryptedWallet, String> {
+    from_canonical_bytes(&hex::decode(hex_bytes).expect("valid hex")).map_err(|e| e.to_string())
+}
+
+#[test]
+fn regenerate_fixture_when_requested() {
+    if std::env::var("RRN_REGEN").is_ok() {
+        std::fs::create_dir_all(fixture_path().parent().unwrap()).unwrap();
+        std::fs::write(fixture_path(), serialize(&build_fixture())).unwrap();
+    }
+    // The committed fixture must always be present and parse.
+    let fixture = load_committed();
+    assert_eq!(fixture.wallets.len(), WALLET_COUNT as usize);
+    assert!(!fixture.wrong_passphrase.is_empty());
+}
+
+#[test]
+fn committed_wallets_decrypt_to_expected_identity() {
+    let fixture = load_committed();
+    for w in &fixture.wallets {
+        let sealed = encrypted_wallet(&w.encrypted).expect("committed wallet must parse");
+        let opened = sealed
+            .decrypt(&w.passphrase)
+            .expect("committed wallet must decrypt");
+        assert_eq!(hex::encode(opened.secret_key.to_bytes()), w.seed);
+        assert_eq!(opened.address.to_string(), w.address);
+        assert_eq!(
+            hex::encode(
+                Keypair::from_secret(opened.secret_key.clone())
+                    .public_key()
+                    .to_bytes()
+            ),
+            w.pubkey
+        );
+        assert_eq!(opened.created_at, w.created_at);
+        assert_eq!(opened.metadata, w.metadata);
+    }
+}
+
+#[test]
+fn wrong_passphrase_is_rejected() {
+    let fixture = load_committed();
+    let w = &fixture.wallets[0];
+    let sealed = encrypted_wallet(&w.encrypted).unwrap();
+    let err = sealed.decrypt(&fixture.wrong_passphrase).unwrap_err();
+    assert!(matches!(err, WalletError::Decrypt), "{err:?}");
+}
+
+#[test]
+fn tampered_bytes_are_rejected() {
+    let fixture = load_committed();
+    let w = &fixture.wallets[0];
+    let mut bytes = hex::decode(&w.encrypted).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x01;
+    // Either the CBOR no longer parses, or it parses but the AEAD tag fails —
+    // either way, no identity comes out.
+    let opened = match from_canonical_bytes::<EncryptedWallet>(&bytes) {
+        Ok(sealed) => sealed.decrypt(&w.passphrase).is_ok(),
+        Err(_) => false,
+    };
+    assert!(!opened, "tampered wallet bytes must not yield an identity");
+}

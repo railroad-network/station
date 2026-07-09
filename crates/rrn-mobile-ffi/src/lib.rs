@@ -22,6 +22,7 @@
 
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rrn_crypto::hash::Hash as CoreHash;
@@ -29,6 +30,10 @@ use rrn_crypto::keypair::{
     Keypair as CoreKeypair, ParseError, PublicKey as CorePublicKey, Signature as CoreSignature,
 };
 use rrn_identity::address::{Address, AddressParseError};
+use rrn_identity::wallet::{
+    EncryptedWallet as CoreEncryptedWallet, WalletContents as CoreWalletContents,
+    WalletError as CoreWalletError,
+};
 
 /// Error surfaced across the FFI boundary for fallible constructors.
 ///
@@ -195,6 +200,126 @@ impl Hash {
     }
 }
 
+/// Error surfaced across the FFI boundary for the fallible wallet operations.
+///
+/// Coarse by design: `Decrypt` covers both a wrong passphrase and a tampered
+/// ciphertext — the two are not distinguished, matching the crate's own
+/// posture — and the file-I/O variants of the underlying error do not occur on
+/// this byte-oriented API (mobile does its own storage via the OS keychain).
+#[derive(Debug, thiserror::Error)]
+pub enum WalletError {
+    /// Wrong passphrase, or the ciphertext / AEAD tag was altered.
+    #[error("wrong passphrase or corrupt wallet")]
+    Decrypt,
+    /// The file's declared format version is not supported by this build.
+    #[error("unsupported wallet version")]
+    UnsupportedVersion,
+    /// The bytes are not valid canonical CBOR, or do not match the wallet layout.
+    #[error("corrupt wallet file")]
+    Corrupt,
+    /// Argon2id key derivation failed.
+    #[error("key derivation failed")]
+    Kdf,
+}
+
+impl From<CoreWalletError> for WalletError {
+    fn from(e: CoreWalletError) -> Self {
+        match e {
+            CoreWalletError::Decrypt => WalletError::Decrypt,
+            CoreWalletError::UnsupportedVersion(_) => WalletError::UnsupportedVersion,
+            CoreWalletError::Corrupt(_) => WalletError::Corrupt,
+            CoreWalletError::Kdf(_) => WalletError::Kdf,
+            // The byte API never reads or writes files, so these cannot arise;
+            // fold them into Corrupt rather than widen the FFI enum.
+            CoreWalletError::NotFound(_) | CoreWalletError::Io(_) => WalletError::Corrupt,
+        }
+    }
+}
+
+/// FFI handle to a decrypted wallet's contents. The secret seed stays in Rust —
+/// mobile reaches signing through [`WalletContents::keypair`], never raw bytes.
+pub struct WalletContents {
+    inner: CoreWalletContents,
+}
+
+impl WalletContents {
+    /// Generates a brand-new identity (fresh keypair, empty metadata, `created_at`
+    /// = now).
+    pub fn create_new() -> Self {
+        Self {
+            inner: CoreWalletContents::create_new(),
+        }
+    }
+
+    /// This identity's public key.
+    pub fn public_key(&self) -> Arc<PublicKey> {
+        Arc::new(PublicKey {
+            inner: *self.inner.address.public_key(),
+        })
+    }
+
+    /// The bech32m `rrn1…` address of this identity.
+    pub fn address(&self) -> String {
+        self.inner.address.to_string()
+    }
+
+    /// Unix seconds when the identity was created.
+    pub fn created_at(&self) -> i64 {
+        self.inner.created_at
+    }
+
+    /// A copy of the identity's non-secret metadata.
+    pub fn metadata(&self) -> HashMap<String, String> {
+        self.inner
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// The keypair for this identity, for signing. The secret seed never leaves
+    /// Rust — this reconstructs a `Keypair` handle around the in-memory secret.
+    pub fn keypair(&self) -> Arc<Keypair> {
+        Arc::new(Keypair {
+            inner: CoreKeypair::from_secret(self.inner.secret_key.clone()),
+        })
+    }
+}
+
+/// FFI handle to a sealed wallet. `to_bytes` is the `.rrnwallet` file content.
+pub struct EncryptedWallet {
+    inner: CoreEncryptedWallet,
+}
+
+impl EncryptedWallet {
+    /// Seals `contents` under `passphrase` (argon2id + XChaCha20-Poly1305, fresh
+    /// random salt and nonce).
+    pub fn encrypt(contents: Arc<WalletContents>, passphrase: String) -> Result<Self, WalletError> {
+        Ok(Self {
+            inner: CoreEncryptedWallet::encrypt(&contents.inner, &passphrase)?,
+        })
+    }
+
+    /// Parses the canonical-CBOR `.rrnwallet` bytes.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, WalletError> {
+        let inner: CoreEncryptedWallet =
+            rrn_crypto::serialize::from_canonical_bytes(&data).map_err(|_| WalletError::Corrupt)?;
+        Ok(Self { inner })
+    }
+
+    /// Opens the wallet, returning its decrypted contents.
+    pub fn decrypt(&self, passphrase: String) -> Result<Arc<WalletContents>, WalletError> {
+        Ok(Arc::new(WalletContents {
+            inner: self.inner.decrypt(&passphrase)?,
+        }))
+    }
+
+    /// The canonical-CBOR `.rrnwallet` bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        rrn_crypto::serialize::to_canonical_bytes(self.inner.clone())
+    }
+}
+
 uniffi::include_scaffolding!("rrn_mobile_ffi");
 
 #[cfg(test)]
@@ -276,5 +401,66 @@ mod tests {
         assert_eq!(a.to_hex(), b.to_hex());
         assert_eq!(a.to_bytes().len(), 32);
         assert_eq!(a.to_hex().len(), 64);
+    }
+
+    const PASS: &str = "correct horse battery staple";
+
+    #[test]
+    fn wallet_encrypt_decrypt_roundtrips_through_ffi_shapes() {
+        let contents = Arc::new(WalletContents::create_new());
+        let address = contents.address();
+        let pubkey = contents.public_key().to_bytes();
+
+        let sealed = EncryptedWallet::encrypt(contents, PASS.to_string()).expect("encrypt");
+        let bytes = sealed.to_bytes();
+
+        // Reparse the bytes (the `.rrnwallet` file) and decrypt to the same id.
+        let reparsed = EncryptedWallet::from_bytes(bytes).expect("from_bytes");
+        let opened = reparsed.decrypt(PASS.to_string()).expect("decrypt");
+        assert_eq!(opened.address(), address);
+        assert_eq!(opened.public_key().to_bytes(), pubkey);
+    }
+
+    #[test]
+    fn wallet_wrong_passphrase_is_decrypt_error() {
+        let sealed =
+            EncryptedWallet::encrypt(Arc::new(WalletContents::create_new()), PASS.to_string())
+                .unwrap();
+        assert!(matches!(
+            sealed.decrypt("wrong passphrase".to_string()),
+            Err(WalletError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn wallet_tampered_bytes_are_rejected() {
+        let sealed =
+            EncryptedWallet::encrypt(Arc::new(WalletContents::create_new()), PASS.to_string())
+                .unwrap();
+        let mut bytes = sealed.to_bytes();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        // Either the CBOR no longer parses, or it parses but the AEAD tag fails.
+        let opened = EncryptedWallet::from_bytes(bytes).and_then(|w| w.decrypt(PASS.to_string()));
+        assert!(opened.is_err());
+    }
+
+    #[test]
+    fn wallet_garbage_bytes_are_corrupt_error() {
+        assert!(matches!(
+            EncryptedWallet::from_bytes(vec![0xff, 0x00, 0x13]),
+            Err(WalletError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn wallet_keypair_signs_and_the_public_key_verifies() {
+        let contents = WalletContents::create_new();
+        let kp = contents.keypair();
+        let pk = contents.public_key();
+        let msg = b"spend from this identity".to_vec();
+        let sig = kp.sign(msg.clone());
+        assert!(pk.verify(msg, sig));
+        // The keypair's own public key matches the wallet's.
+        assert_eq!(kp.public_key().to_bytes(), pk.to_bytes());
     }
 }
