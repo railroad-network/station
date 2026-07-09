@@ -899,9 +899,11 @@ pocket and onto a consumer OS, which is a materially different environment from
 the station's. Two surfaces matter: the device itself, and the link from the
 device to the station.
 
-> Phase 1 scaffold (M1.0). No mobile code exists yet; every mitigation below is
-> **planned**, named by the task (M1.1 crypto/FFI, M1.2 auth/UI, M1.3 transport,
-> M1.3.3 pairing) that will ship it.
+> Phase 1, M1.1 in progress. The crypto/FFI layer has begun landing — the
+> `SecureStore` component below is **implemented** (T1.1.2), and its subsection
+> reflects shipped behaviour. The remaining mitigations are still **planned**,
+> named by the task (M1.1 crypto/FFI, M1.2 auth/UI, M1.3 transport, M1.3.3
+> pairing) that will ship them.
 
 ### Device attack surface
 
@@ -940,6 +942,59 @@ passphrase; the integrity of the app doing the signing.
   the key store, it is not itself the key. *Residual risk:* the platform
   biometric's strength is the ceiling — a defeated biometric equals device
   access.
+
+### `mobile/src/crypto/SecureStore`
+
+*Implemented in M1.1 (T1.1.2).* The one API through which the mobile app writes
+sensitive bytes — foremost the wallet secret — to OS-backed storage. A single TS
+interface (`save`/`load`/`delete`/`has`) over `react-native-keychain`, with
+per-platform hardening. This subsection makes concrete the "secure store"
+mitigation referenced above under *Device theft* and *OS-level key extraction*.
+
+**Assets:** the bytes held under each key namespace (`WALLET_SECRET`,
+`STATION_PAIRING_TOKEN`, `RECOVERY_SHARDS`); the access-control policy that gates
+their retrieval.
+
+- **OS-level protections in force.** *iOS:* items are stored with
+  `WHEN_UNLOCKED_THIS_DEVICE_ONLY` (readable only while the device is unlocked;
+  never synced to iCloud or migrated to another device) and access-controlled by
+  `BIOMETRY_ANY` (Face ID / Touch ID). *Android:* the Keystore entry prefers
+  `SECURE_HARDWARE` (TEE / StrongBox), falling back to `SECURE_SOFTWARE` only
+  where no secure hardware exists, stored as a biometric-gated AES-GCM key
+  (`WHEN_UNLOCKED`). *Residual risk:* on the software-fallback path the key
+  material is protected by the OS keystore but not by dedicated hardware; the
+  fallback is silent, so a device without secure hardware is not distinguished at
+  the API from one with it.
+- **Layered with passphrase encryption.** *Threat:* an attacker who extracts the
+  stored bytes (see *OS-level key extraction* above) obtains the secret. *Mitigation:*
+  double protection — the wallet secret is passphrase-encrypted (argon2id +
+  XChaCha20-Poly1305, the `.rrnwallet` format, T1.1.5) *before* it is written
+  here, so Keychain/Keystore extraction yields ciphertext, not the key.
+  SecureStore's job is OS-level isolation and biometric gating; confidentiality
+  of the secret does not rest on it alone. *Residual risk:* a weak user passphrase
+  narrows the argon2id margin.
+- **Biometric bypass.** *Threat:* an attacker defeats the biometric gate (spoofed
+  face/fingerprint, or coercion of the member) and calls `load`. *Mitigation:* the
+  OS renders and enforces the biometric prompt — the app never draws its own auth
+  UI (which would be a phishing vector) — so platform liveness detection is the
+  control. `has` deliberately does **not** decrypt, so existence checks never
+  surface a prompt or the value. *Residual risk:* the platform biometric's
+  strength is the ceiling; a defeated biometric on an unlocked device equals
+  access. Biometric only gates access, it is not the key.
+- **Jailbreak / root.** *Threat:* on a jailbroken (iOS) or rooted (Android)
+  device, the keychain/keystore protections and app sandbox can be subverted, and
+  stored items read directly. *Mitigation:* per the project's device-trust
+  assumption (carried from Phase 0), a compromised OS is *outside* the trust
+  boundary — the passphrase layer above is the only defense that still holds, and
+  it holds only as ciphertext-at-rest, not against a keylogger capturing the
+  passphrase on the same compromised OS. *Residual risk:* accepted and
+  documented; app-level controls cannot defend a rooted device. Runtime
+  jailbreak/root *detection* is out of scope for M1.1 (deferred to hardening).
+- **Data lifetime.** Modern iOS/Android wipe keychain/keystore entries on app
+  uninstall, so secrets do not survive removal of the app; and device-only
+  accessibility keeps them off backups/other devices. *Residual risk:* none
+  beyond the above; noted so the property is not silently relied upon without
+  being stated.
 
 ### Mobile–station transport
 
