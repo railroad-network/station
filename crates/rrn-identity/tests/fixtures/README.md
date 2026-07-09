@@ -1,5 +1,10 @@
 # Test fixtures
 
+> Note: the signing parity fixture lives in the **`rrn-crypto`** crate
+> (`crates/rrn-crypto/tests/fixtures/cross_platform_sign.json`), since signing is
+> `rrn_crypto::keypair`, not identity. See T1.1.4 and
+> [`crates/rrn-crypto/tests/cross_platform_sign.rs`](../../../rrn-crypto/tests/cross_platform_sign.rs).
+
 ## `cross_platform_address.json` — mobile/station address parity (T1.1.3)
 
 Locks the `rrn1…` address for a set of public keys so the **mobile** client and
