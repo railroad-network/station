@@ -1,3 +1,33 @@
+# Test fixtures
+
+## `cross_platform_address.json` — mobile/station address parity (T1.1.3)
+
+Locks the `rrn1…` address for a set of public keys so the **mobile** client and
+the **station** agree byte-for-byte. Unlike the Shamir vectors below, there is
+no external oracle here: `rrn_identity::address` (bech32m, ADR-0003) *is* the
+source of truth, and mobile reaches the same code through the uniffi FFI
+(`rrn-mobile-ffi`) rather than reimplementing bech32.
+
+Generated and round-trip-verified by
+[`tests/cross_platform_address.rs`](../cross_platform_address.rs); the mobile
+repo commits a copy at `__tests__/fixtures/cross_platform_address.json` and its
+`address.test.ts` reads it. Contents: 100 deterministic vectors (blake3-derived
+seeds → keypairs → addresses), 2 locked known-answer vectors (all-zero and
+all-ones seed), and 7 malformed strings the parser must reject.
+
+Regenerate (reproducible bit-for-bit — no RNG):
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-identity --test cross_platform_address
+cp crates/rrn-identity/tests/fixtures/cross_platform_address.json \
+   ../mobile/__tests__/fixtures/cross_platform_address.json
+```
+
+The `committed_fixture_is_in_sync` test fails if the committed JSON drifts from
+what the generator produces, so a stale fixture cannot pass CI unnoticed.
+
+---
+
 # Shamir reference vectors
 
 `shamir_vectors.json` cross-validates our own Shamir's Secret Sharing

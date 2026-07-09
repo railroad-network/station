@@ -11,7 +11,11 @@
 // boundary in the clear — mobile holds it inside an opaque Keypair and never
 // extracts raw bytes (the no-export-secret rule from ADR-0006).
 
-namespace rrn_mobile_ffi {};
+namespace rrn_mobile_ffi {
+    // Whether `address` is a well-formed `rrn1…` address (correct bech32m
+    // checksum, HRP, length, and a valid curve point). Never throws.
+    boolean is_valid_address(string address);
+};
 
 // Flat error surfaced to Swift/Kotlin/TS for every fallible constructor. The
 // variants mirror the crate-local parse errors without leaking their internals.
@@ -38,6 +42,10 @@ interface Keypair {
 interface PublicKey {
     [Name=from_bytes, Throws=CryptoError]
     constructor(bytes data);
+
+    // Parses a bech32m `rrn1…` address back into the public key it encodes.
+    [Name=from_address, Throws=CryptoError]
+    constructor(string address);
 
     bytes to_bytes();
 

@@ -28,7 +28,7 @@ use rrn_crypto::hash::Hash as CoreHash;
 use rrn_crypto::keypair::{
     Keypair as CoreKeypair, ParseError, PublicKey as CorePublicKey, Signature as CoreSignature,
 };
-use rrn_identity::address::Address;
+use rrn_identity::address::{Address, AddressParseError};
 
 /// Error surfaced across the FFI boundary for fallible constructors.
 ///
@@ -60,6 +60,20 @@ impl From<ParseError> for CryptoError {
             ParseError::InvalidEncoding => CryptoError::InvalidEncoding,
         }
     }
+}
+
+impl From<AddressParseError> for CryptoError {
+    fn from(_: AddressParseError) -> Self {
+        // The mobile UI does not branch on which way an address was malformed
+        // (bad checksum vs wrong HRP vs bad length vs bad key) — it only needs
+        // "this is not a valid address". The precise reason stays in Rust.
+        CryptoError::InvalidAddress
+    }
+}
+
+/// Whether `address` is a well-formed `rrn1…` address. Never throws.
+pub fn is_valid_address(address: String) -> bool {
+    address.parse::<Address>().is_ok()
 }
 
 /// FFI handle to an Ed25519 keypair. The secret seed never leaves Rust.
@@ -105,6 +119,14 @@ impl PublicKey {
             .map_err(|_| CryptoError::WrongLength)?;
         Ok(Self {
             inner: CorePublicKey::from_bytes(arr)?,
+        })
+    }
+
+    /// Parses a bech32m `rrn1…` address back into the public key it encodes.
+    pub fn from_address(address: String) -> Result<Self, CryptoError> {
+        let addr: Address = address.parse()?;
+        Ok(Self {
+            inner: *addr.public_key(),
         })
     }
 
@@ -219,6 +241,32 @@ mod tests {
     fn public_key_renders_bech32_address() {
         let addr = Keypair::generate().public_key().to_address();
         assert!(addr.starts_with("rrn1"), "unexpected address: {addr}");
+    }
+
+    #[test]
+    fn address_roundtrips_to_identical_public_key() {
+        let pk = Keypair::generate().public_key();
+        let addr = pk.to_address();
+        let reparsed = PublicKey::from_address(addr).expect("valid address");
+        assert_eq!(reparsed.to_bytes(), pk.to_bytes());
+    }
+
+    #[test]
+    fn is_valid_address_accepts_real_and_rejects_garbage() {
+        let addr = Keypair::generate().public_key().to_address();
+        assert!(is_valid_address(addr.clone()));
+        assert!(!is_valid_address("not-an-address".to_string()));
+        // A tampered checksum (flip the last character) must be rejected, and
+        // from_address must surface InvalidAddress rather than panic.
+        let mut chars: Vec<char> = addr.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == 'q' { 'p' } else { 'q' };
+        let tampered: String = chars.into_iter().collect();
+        assert!(!is_valid_address(tampered.clone()));
+        assert!(matches!(
+            PublicKey::from_address(tampered),
+            Err(CryptoError::InvalidAddress)
+        ));
     }
 
     #[test]

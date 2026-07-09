@@ -1,0 +1,222 @@
+//! Cross-platform address vectors: the contract that mobile and station agree
+//! on the `rrn1…` address for any given public key, byte-for-byte (T1.1.3).
+//!
+//! The station's `rrn_identity::address` is the single source of truth for the
+//! bech32m encoding (ADR-0003); mobile reaches the *same* code through the
+//! uniffi FFI (`rrn-mobile-ffi`) rather than reimplementing bech32. This test
+//! generates a committed fixture — random-but-deterministic keypairs, plus
+//! locked known-answer vectors and a set of malformed strings — and verifies
+//! the round-trip (pubkey → address → pubkey) here in Rust. The mobile side
+//! reads the same committed JSON and must parse every address back to the
+//! identical public-key bytes; see `mobile/__tests__/address.test.ts`.
+//!
+//! The fixture is regenerable but committed, so mobile CI needs no Rust
+//! toolchain. Regenerate with:
+//!   RRN_REGEN=1 cargo test -p rrn-identity --test cross_platform_address
+//! then copy `tests/fixtures/cross_platform_address.json` into the mobile repo
+//! at `__tests__/fixtures/cross_platform_address.json`.
+
+use std::path::PathBuf;
+
+use bech32::{Bech32, Bech32m, Hrp};
+use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::{Keypair, PublicKey, SecretKey};
+use rrn_identity::address::{Address, HRP};
+use serde::{Deserialize, Serialize};
+
+/// One (public key, address) pair. `seed` is the Ed25519 seed the keypair was
+/// derived from — recorded so the fixture is fully reproducible from scratch.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Vector {
+    seed: String,
+    pubkey: String,
+    address: String,
+}
+
+/// A string that must NOT parse as an address, with why it is invalid.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Invalid {
+    value: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Fixture {
+    #[serde(rename = "_comment")]
+    comment: String,
+    hrp: String,
+    /// 100 random-but-deterministic vectors.
+    vectors: Vec<Vector>,
+    /// Locked known-answer vectors — if any of these change, the address format
+    /// changed, which needs an ADR, not a fixture edit.
+    known_answer: Vec<Vector>,
+    /// Strings the parser must reject.
+    invalid_addresses: Vec<Invalid>,
+}
+
+/// Derives a guaranteed-valid keypair from a 32-byte seed.
+fn keypair_from_seed(seed: [u8; 32]) -> Keypair {
+    Keypair::from_secret(SecretKey::from_bytes(seed))
+}
+
+fn vector_for_seed(seed: [u8; 32]) -> Vector {
+    let pk: PublicKey = keypair_from_seed(seed).public_key();
+    Vector {
+        seed: hex::encode(seed),
+        pubkey: hex::encode(pk.to_bytes()),
+        address: Address::from_public_key(pk).to_string(),
+    }
+}
+
+/// Deterministic seed #i: `blake3("…fixture:v1" || i)`. No RNG, so every run —
+/// on any machine — produces byte-identical seeds (and thus addresses).
+fn deterministic_seed(i: u32) -> [u8; 32] {
+    let mut input = b"rrn-cross-platform-address-fixture:v1:".to_vec();
+    input.extend_from_slice(&i.to_le_bytes());
+    Hash::of(&input).to_bytes()
+}
+
+fn build_fixture() -> Fixture {
+    let vectors: Vec<Vector> = (0..100)
+        .map(|i| vector_for_seed(deterministic_seed(i)))
+        .collect();
+
+    // KATs: the all-zero and all-ones *seeds* (both derive to valid curve
+    // points). The all-zero-seed address is also locked in the address.rs unit
+    // tests — the two must agree.
+    let known_answer = vec![vector_for_seed([0u8; 32]), vector_for_seed([0xFFu8; 32])];
+
+    // A valid address whose last character we flip to break the checksum.
+    let valid = &vectors[0].address;
+    let tampered = {
+        let mut chars: Vec<char> = valid.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == 'q' { 'p' } else { 'q' };
+        chars.into_iter().collect::<String>()
+    };
+    let payload = keypair_from_seed(deterministic_seed(0))
+        .public_key()
+        .to_bytes();
+    let wrong_hrp = bech32::encode::<Bech32m>(Hrp::parse("bc").unwrap(), &payload).unwrap();
+    let non_m_variant = bech32::encode::<Bech32>(Hrp::parse(HRP).unwrap(), &payload).unwrap();
+    let wrong_length =
+        bech32::encode::<Bech32m>(Hrp::parse(HRP).unwrap(), &[1u8, 2, 3, 4]).unwrap();
+
+    let invalid = |value: String, reason: &str| Invalid {
+        value,
+        reason: reason.to_string(),
+    };
+    let invalid_addresses = vec![
+        invalid(tampered, "tampered bech32m checksum"),
+        invalid(wrong_hrp, "valid bech32m under the wrong HRP (bc)"),
+        invalid(non_m_variant, "bech32 (non-m) checksum variant"),
+        invalid(wrong_length, "correct HRP but 4-byte payload"),
+        invalid(String::new(), "empty string"),
+        invalid("not-an-address".to_string(), "not bech32 at all"),
+        invalid("rrn1".to_string(), "HRP and separator with no payload"),
+    ];
+
+    Fixture {
+        comment: "Cross-platform address vectors for T1.1.3. Generated by \
+            rrn-identity/tests/cross_platform_address.rs (rrn_identity::address is \
+            the source of truth, ADR-0003). Mobile reaches the same code via \
+            rrn-mobile-ffi and must parse each address to identical pubkey bytes. \
+            Seeds are blake3-derived and deterministic; regenerate with RRN_REGEN=1."
+            .to_string(),
+        hrp: HRP.to_string(),
+        vectors,
+        known_answer,
+        invalid_addresses,
+    }
+}
+
+fn fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross_platform_address.json")
+}
+
+fn load_committed() -> Fixture {
+    let text = std::fs::read_to_string(fixture_path())
+        .expect("committed fixture missing — run with RRN_REGEN=1 to create it");
+    serde_json::from_str(&text).expect("committed fixture is not valid JSON")
+}
+
+/// Serialized form: pretty JSON with a trailing newline. Deterministic given
+/// deterministic inputs, so re-running produces byte-identical output.
+fn serialize(fixture: &Fixture) -> String {
+    serde_json::to_string_pretty(fixture).unwrap() + "\n"
+}
+
+#[test]
+fn committed_fixture_is_in_sync() {
+    let generated = serialize(&build_fixture());
+    if std::env::var("RRN_REGEN").is_ok() {
+        std::fs::create_dir_all(fixture_path().parent().unwrap()).unwrap();
+        std::fs::write(fixture_path(), &generated).unwrap();
+        return;
+    }
+    let committed = std::fs::read_to_string(fixture_path()).unwrap_or_default();
+    assert_eq!(
+        committed, generated,
+        "fixture drift — regenerate with RRN_REGEN=1 cargo test -p rrn-identity \
+         --test cross_platform_address, then copy the JSON into the mobile repo"
+    );
+}
+
+#[test]
+fn regeneration_is_stable() {
+    // The whole cross-platform contract rests on this being reproducible.
+    assert_eq!(serialize(&build_fixture()), serialize(&build_fixture()));
+}
+
+#[test]
+fn addresses_roundtrip_to_identical_public_keys() {
+    let fixture = load_committed();
+    assert_eq!(fixture.vectors.len(), 100);
+    for v in fixture.vectors.iter().chain(fixture.known_answer.iter()) {
+        // address → public key, byte-for-byte equal to the recorded pubkey.
+        let parsed: Address = v.address.parse().expect("fixture address must parse");
+        assert_eq!(
+            hex::encode(parsed.public_key().to_bytes()),
+            v.pubkey,
+            "{}",
+            v.address
+        );
+        // public key → address, byte-for-byte equal to the recorded address.
+        let pk = PublicKey::from_bytes(
+            hex::decode(&v.pubkey)
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(Address::from_public_key(pk).to_string(), v.address);
+    }
+}
+
+#[test]
+fn known_answer_addresses_locked() {
+    let fixture = load_committed();
+    let zero = &fixture.known_answer[0];
+    assert_eq!(zero.seed, "0".repeat(64));
+    // Must match the vector locked in address.rs's own unit tests.
+    assert_eq!(
+        zero.address,
+        "rrn18d4z00xwk6jz6c4r4rgz5mcdwdjny9thrh3y8f36cpy2rz6emg5scr4w0n"
+    );
+    assert_eq!(fixture.known_answer[1].seed, "ff".repeat(32));
+}
+
+#[test]
+fn invalid_addresses_are_rejected() {
+    let fixture = load_committed();
+    assert!(!fixture.invalid_addresses.is_empty());
+    for bad in &fixture.invalid_addresses {
+        assert!(
+            bad.value.parse::<Address>().is_err(),
+            "expected rejection ({}): {:?}",
+            bad.reason,
+            bad.value
+        );
+    }
+}
