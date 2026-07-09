@@ -1,0 +1,39 @@
+[package]
+name = "rrn-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "uniffi binding surface for the mobile client: a curated FFI over rrn-crypto and rrn-identity."
+# Mobile-only binding shim. Not published to a registry — it is compiled into
+# the iOS xcframework / Android AAR consumed by the mobile app, not depended on
+# by any other rrn-* crate. See ADR-0007.
+publish = false
+
+# `cdylib`/`staticlib` are what the mobile toolchains link against; `lib` is
+# needed so the in-crate `uniffi-bindgen` binary can reach the scaffolding.
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "rrn_mobile_ffi"
+
+# In-crate binding generator, per the uniffi convention. Run as:
+#   cargo run -p rrn-mobile-ffi --bin uniffi-bindgen -- generate ...
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# The audit-boundary crates stay pure Rust; this crate is the only place uniffi
+# and its generated `unsafe` FFI scaffolding live. Path + version so the
+# internal dep isn't a `*` wildcard.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# Pinned to 0.31 to stay paired with `uniffi-bindgen-react-native` 0.31.x, the
+# React Native wrapper the mobile app consumes (ADR-0007). Do NOT bump
+# independently of that wrapper. `cli` exposes the in-crate uniffi-bindgen.
+uniffi = { version = "0.31", features = ["cli"] }
+thiserror = "1"
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }

@@ -12,6 +12,8 @@ members = [
     "crates/rrn-marketplace",
     "crates/rrn-reputation",
     "crates/rrn-governance",
+    # Phase 1 (M1.1) mobile FFI binding surface over rrn-crypto / rrn-identity.
+    "crates/rrn-mobile-ffi",
 ]
 # The cargo-fuzz crate is its own (nightly-only) workspace; keep it out of the
 # stable workspace build. See fuzz/README.md.

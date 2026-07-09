@@ -1,0 +1,66 @@
+// The mobile FFI contract (ADR-0007). This UDL is the single source of truth
+// for the Swift, Kotlin, and React Native bindings — keep it NARROW: only the
+// operations the mobile app actually performs. A small surface is a small
+// attack surface and a small maintenance surface.
+//
+// M1.1 T1.1.1 scope: the four rrn-crypto primitives (Keypair, PublicKey,
+// Signature, Hash). Address parsing (T1.1.3), the wallet file format (T1.1.5),
+// and SignedPayload / dcbor (T1.1.7) extend this contract in their own tasks.
+//
+// Deliberately NOT exposed: SecretKey. The secret seed never crosses the FFI
+// boundary in the clear — mobile holds it inside an opaque Keypair and never
+// extracts raw bytes (the no-export-secret rule from ADR-0006).
+
+namespace rrn_mobile_ffi {};
+
+// Flat error surfaced to Swift/Kotlin/TS for every fallible constructor. The
+// variants mirror the crate-local parse errors without leaking their internals.
+[Error]
+enum CryptoError {
+    "WrongLength",
+    "InvalidEncoding",
+    "InvalidSignature",
+    "InvalidAddress",
+};
+
+// An Ed25519 keypair. Opaque: the secret seed stays on the Rust side.
+interface Keypair {
+    // Generates a fresh keypair from the OS CSPRNG.
+    [Name=generate]
+    constructor();
+
+    PublicKey public_key();
+
+    Signature sign(bytes message);
+};
+
+// An Ed25519 public key (32 compressed bytes, validated as a curve point).
+interface PublicKey {
+    [Name=from_bytes, Throws=CryptoError]
+    constructor(bytes data);
+
+    bytes to_bytes();
+
+    // The bech32m `rrn1…` address for this key (via rrn-identity).
+    string to_address();
+
+    boolean verify(bytes message, Signature signature);
+};
+
+// An Ed25519 signature (64 bytes: R ‖ S).
+interface Signature {
+    [Name=from_bytes, Throws=CryptoError]
+    constructor(bytes data);
+
+    bytes to_bytes();
+};
+
+// A Blake3 content hash (32 bytes).
+interface Hash {
+    [Name=of]
+    constructor(bytes data);
+
+    bytes to_bytes();
+
+    string to_hex();
+};

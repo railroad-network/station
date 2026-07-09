@@ -1,0 +1,4 @@
+# Build artifacts produced by build-ios.sh — regenerated, never committed.
+# The published artifact is versioned by CI, not tracked in-tree (ADR-0007).
+/generated/
+/build/
