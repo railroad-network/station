@@ -34,6 +34,18 @@ rrn-identity = { path = "../rrn-identity", version = "0.1" }
 # independently of that wrapper. `cli` exposes the in-crate uniffi-bindgen.
 uniffi = { version = "0.31", features = ["cli"] }
 thiserror = "1"
+# canonical_bytes (T1.1.7): parse the mobile tagged-JSON payload model and
+# re-emit it as canonical dCBOR. dcbor is pinned to the same 0.25 line as
+# rrn-crypto so the CBOR type is identical across the crate boundary; serde_json
+# parses the transport JSON; hex decodes byte-string nodes. These live here, at
+# the FFI boundary, so the audited rrn-crypto core keeps no JSON-parsing surface.
+dcbor = "0.25"
+serde_json = "1"
+hex = "0.4"
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }
+
+[dev-dependencies]
+# Deserializing the committed cross-platform canonical fixture.
+serde = { version = "1", features = ["derive"] }

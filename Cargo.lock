@@ -1290,11 +1290,14 @@ name = "rrn-ledger"
 version = "0.1.0"
 dependencies = [
  "dcbor",
+ "hex",
  "proptest",
  "rrn-crypto",
  "rrn-identity",
+ "rrn-mobile-ffi",
  "rrn-storage",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
@@ -1314,8 +1317,12 @@ dependencies = [
 name = "rrn-mobile-ffi"
 version = "0.1.0"
 dependencies = [
+ "dcbor",
+ "hex",
  "rrn-crypto",
  "rrn-identity",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uniffi",
 ]

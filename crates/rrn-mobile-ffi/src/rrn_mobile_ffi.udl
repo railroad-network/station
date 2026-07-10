@@ -16,6 +16,28 @@ namespace rrn_mobile_ffi {
     // Whether `address` is a well-formed `rrn1…` address (correct bech32m
     // checksum, HRP, length, and a valid curve point). Never throws.
     boolean is_valid_address(string address);
+
+    // Serializes a signed-payload value to canonical (deterministic) dCBOR bytes
+    // (T1.1.7, ADR-0002). `payload_json` is the mobile tagged-value model: each
+    // node is a single-key object — {"text":…}, {"int":"<decimal>"},
+    // {"bytes":"<hex>"}, {"bool":…}, {"null":null}, {"array":[…]}, or
+    // {"map":[["key",node],…]}. The returned bytes are byte-identical to what
+    // rrn_crypto::serialize::to_canonical_bytes produces for the equivalent Rust
+    // value, so a signature over them verifies on the station and vice versa.
+    // Floats are forbidden (PayloadError::FloatForbidden); there is no float tag.
+    [Throws=PayloadError]
+    bytes canonical_bytes(string payload_json);
+};
+
+// Flat error surface for canonical_bytes. Mirrors the tagged-value failure modes
+// without leaking parser internals.
+[Error]
+enum PayloadError {
+    "InvalidJson",
+    "MalformedNode",
+    "FloatForbidden",
+    "InvalidInt",
+    "InvalidBytes",
 };
 
 // Flat error surfaced to Swift/Kotlin/TS for every fallible constructor. The

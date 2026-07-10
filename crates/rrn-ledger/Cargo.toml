@@ -24,3 +24,10 @@ tracing = "0.1"
 proptest = "1"
 # Narrates the lifecycle/idempotency integration tests under `--nocapture`.
 tracing-subscriber = "0.3"
+# Cross-platform SignedPayload<TransactionProposal> fixture (T1.1.7): drives the
+# real mobile `canonical_bytes` FFI so the test proves the mobile tagged-JSON
+# path produces byte-identical canonical CBOR to the typed encoder. Dev-only —
+# rrn-mobile-ffi is never a runtime dependency of the ledger.
+rrn-mobile-ffi = { path = "../rrn-mobile-ffi", version = "0.1" }
+serde_json = "1"
+hex = "0.4"

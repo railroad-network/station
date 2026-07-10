@@ -22,6 +22,9 @@
 
 #![warn(missing_docs)]
 
+mod payload;
+pub use payload::{canonical_bytes, PayloadError};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
