@@ -30,6 +30,11 @@ allow = [
     "Zlib",                 # sqlite-wasm-rs — wasm-only transitive dep of rusqlite,
                             # never compiled in our native builds; permissive,
                             # GPL-compatible, OSI-approved.
+    "MPL-2.0",              # uniffi + uniffi_* (ADR-0007, mobile FFI bindings).
+                            # File-level (weak) copyleft: obligations attach only
+                            # to modifications of the MPL-licensed files
+                            # themselves, not to code that links against them —
+                            # compatible with our Apache-2.0/MIT dual license.
 ]
 confidence-threshold = 0.8
 
