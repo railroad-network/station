@@ -61,6 +61,43 @@ cp crates/rrn-identity/tests/fixtures/cross_platform_wallet.json \
    ../mobile/__tests__/fixtures/cross_platform_wallet.json
 ```
 
+## `ffi_invariants.json` — consolidated FFI invariants (T1.1.6)
+
+Rolls the mobile/station invariants that T1.1.3–T1.1.5 locked separately into
+**one** fixture both sides run against, and adds the one invariant no prior
+fixture covered: **Blake3 hash determinism**. Each section reaches the same Rust
+core mobile reaches via `rrn-mobile-ffi` — `rrn_crypto` for hashing/signing,
+`rrn_identity` for addresses/wallets — so there is one implementation of each
+primitive, not two. (This test lives in `rrn-identity` rather than `rrn-crypto`,
+where the T1.1.6 spec text places it, because the consolidated invariants span
+both crates and `rrn-identity` is the one that can reach both.)
+
+Generated and verified by [`tests/ffi_invariants.rs`](../ffi_invariants.rs); the
+mobile repo commits a copy at `__tests__/fixtures/ffi_invariants.json` and its
+`ffi_invariants.test.ts` reads it. Contents: 100 address round-trip vectors, 100
+signing vectors + tamper triples, 100 hashing vectors + 2 known-answer hashes
+(incl. the empty-input Blake3 constant), and 8 wallet round-trip vectors + a
+`wrong_passphrase`.
+
+**Mixed reproducibility**: the address/signing/hashing sections are
+blake3-derived and bit-reproducible (a `deterministic_sections_match_generator`
+test fails on drift); the wallet `encrypted` bytes are randomized per encrypt
+(argon2id + XChaCha20-Poly1305), so those regenerate to different-but-valid
+ciphertext and are checked by invariant, not by bytes.
+
+> Generic dcbor canonical-bytes determinism is **not** here — its `canonical_bytes`
+> FFI surface is a T1.1.7 deliverable, and the only dcbor bytes crossing the
+> boundary today (randomized wallet blobs) cannot back a byte-determinism check.
+> That invariant lands in T1.1.7.
+
+Regenerate (deterministic sections bit-for-bit; wallet ciphertext changes):
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-identity --test ffi_invariants
+cp crates/rrn-identity/tests/fixtures/ffi_invariants.json \
+   ../mobile/__tests__/fixtures/ffi_invariants.json
+```
+
 ---
 
 # Shamir reference vectors
