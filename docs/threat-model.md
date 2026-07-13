@@ -1081,6 +1081,86 @@ station agree byte-for-byte on addresses, signatures, and wallet files.
   pending the RN-wrapper build (ADR-0007 accepted risk); until then the wrappers
   are exercised against Rust-generated fixtures, not the live native module.
 
+### `mobile` social-recovery UI surface (M1.2)
+
+*Implemented in M1.2 (T1.2.3).* The wallet UI for Shamir social recovery
+([ADR-0004](adr/0004-own-shamir-implementation.md)): the owner splits their key
+across a circle of holders and hands each a sealed shard (`ChooseHolders` →
+`RecoverySplit` → `DistributeShards`), and a holder receives a shard sent to them
+(`HeldShards`). The split, sealing, and shard parsing are the Rust engine's,
+reached through the crypto FFI surface above (`RecoveryPackage`,
+`parse_shard_payload`); the shards themselves cross device-to-device as QR codes.
+This subsection covers the UI/transport of that ceremony — the FFI's guarantees
+and `SecureStore`'s at-rest protections are the two subsections above.
+
+**Assets:** the owner's key while split into shards; the confidentiality of each
+sealed shard in transit and while held on a holder's device; the recovery
+config (holder addresses + local nicknames) persisted on the owner's device.
+
+- **Shard interception during distribution.** *Threat:* an attacker photographs
+  or otherwise captures a shard QR as it is shown holder-to-holder. *Mitigation:*
+  each shard is **sealed to its holder's public key** (per-holder ephemeral-key
+  encryption in `rrn-identity::recovery`), so a captured QR yields ciphertext an
+  interceptor cannot open without that holder's secret; and any single shard is
+  **below the reconstruction threshold** `K`, so it reveals nothing about the key
+  even if opened. Distribution is designed as an in-person, one-at-a-time hand-off
+  (`DistributeShards` shows one holder's QR at a time). *Residual risk:* an
+  attacker who both compromises a specific holder's key *and* intercepts that
+  holder's shard gains one share — still short of `K`; collecting `K` such pairs
+  is the threshold assumption itself.
+- **Holder app / device compromise.** *Threat:* an attacker with access to a
+  holder's device reads the shards it is holding for others
+  (`SecureStoreKeys.RECOVERY_SHARDS`). *Mitigation:* held shards are stored as the
+  **sealed ciphertext** exactly as received — decryptable only with the holder's
+  wallet secret, which is itself passphrase-encrypted and behind the OS
+  biometric/passcode (`SecureStore`) — and each is one share below threshold. For
+  that reason the held-shard store carries **no biometric gate of its own**
+  (`requireBiometric: false`): gating already-sealed, sub-threshold material would
+  prompt the holder on every read without adding a defense the payload encryption
+  does not already provide. *Residual risk:* a fully compromised OS is outside the
+  trust boundary (carried device-trust assumption); even so, the attacker holds
+  sealed shares below threshold, not the friend's key.
+- **Wallet handle is re-acquired, not carried, for recovery.** *Threat:* keeping
+  the decrypted wallet or the passphrase alive after onboarding — so it is around
+  when recovery setup runs — widens the window a JS/native compromise could scrape
+  it. *Mitigation:* onboarding seals the wallet and immediately drops both the
+  passphrase and the in-memory handle; recovery setup **re-unlocks** at its own
+  gate (`RecoveryUnlock`, biometric-first with passphrase fallback), the single
+  path for both the post-onboarding and the Settings entry points. The handle
+  lives only for the duration of the flow and is cleared on completion.
+  *Residual risk:* the passphrase's transient lifetime in the JS heap during
+  unlock — the same accepted risk noted under the crypto FFI surface.
+- **Passphrase kept out of navigation state.** *Threat:* React Navigation
+  serializes route params into persisted navigation state, so a passphrase (or
+  wallet handle) passed as a param could be written to disk. *Mitigation:* the
+  transient recovery secrets are held in an in-memory React context
+  (`RecoveryContext`), never in route params; only a non-secret `origin` string
+  is routed. *Residual risk:* none beyond the in-heap-lifetime risk above.
+- **Malicious or malformed shard fed to a holder.** *Threat:* a holder is tricked
+  into scanning a crafted QR (a plain address, an unrelated code, or corrupt
+  bytes) that mis-parses into a bad stored entry. *Mitigation:* `HeldShards`
+  accepts a QR only if it carries the `rrnrecovery:` scheme *and* the Rust
+  `parse_shard_payload` accepts its bytes; anything else is rejected with an
+  explanation and nothing is stored. Parsing reads only non-secret routing
+  metadata and never decrypts the shard. *Residual risk:* a holder can still be
+  socially engineered into storing a validly-formed shard from an impersonator —
+  harmless to the holder (they only hold it), and surfaced to the owner as a
+  wrong/missing holder at reconstruction time.
+- **Self-attested delivery.** *Threat:* the owner believes recovery is in place
+  when it is not. *Mitigation:* delivery is explicitly self-attested — the owner
+  taps "Scanned" per holder — and finishing is blocked until at least `K` are
+  marked delivered, so the config cannot claim a working circle below threshold.
+  *Residual risk:* an owner who mis-attests (marks a holder who did not actually
+  receive the shard) records a circle that will not reconstruct; this is a
+  usability/honesty limit of an offline hand-off, not a confidentiality break.
+- **Recovery config is non-secret.** The persisted config
+  (`SecureStoreKeys.RECOVERY_CONFIG`) holds holder addresses, local nicknames,
+  the threshold, and per-holder delivery flags — **no shard material** — so it is
+  stored without a biometric gate (like the held-shard store) and, if extracted,
+  discloses only the social graph of the circle, not the key. *Residual risk:*
+  that social-graph metadata (who holds for whom) is itself mildly sensitive and
+  is accepted as local-only, device-protected data.
+
 ### Mobile–station transport
 
 **Assets:** the authenticity of each mobile→station request; the integrity of
