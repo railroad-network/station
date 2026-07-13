@@ -27,6 +27,15 @@ namespace rrn_mobile_ffi {
     // Floats are forbidden (PayloadError::FloatForbidden); there is no float tag.
     [Throws=PayloadError]
     bytes canonical_bytes(string payload_json);
+
+    // Reads the non-secret metadata off a distributable recovery shard payload
+    // (the bytes from RecoveryPackage.shard_payload), for a holder's receive
+    // flow (T1.2.3). Does not decrypt the shard — only surfaces the routing
+    // metadata so the holder app can confirm the shard is addressed to it and
+    // file the payload under `original_address`. `Corrupt` if the bytes are not
+    // canonical CBOR or do not match the payload shape.
+    [Throws=RecoveryError]
+    ShardInfo parse_shard_payload(bytes payload);
 };
 
 // Flat error surface for canonical_bytes. Mirrors the tagged-value failure modes
@@ -159,4 +168,66 @@ interface EncryptedWallet {
 
     // The canonical-CBOR `.rrnwallet` bytes.
     bytes to_bytes();
+};
+
+// ---------------------------------------------------------------------------
+// Social recovery (T1.2.3). Split the wallet secret into N shards sealed to N
+// holders, any K of which reconstruct — see rrn-identity's `recovery` module.
+// This FFI exposes only the setup + holder-receive half of the ritual: build a
+// package, read out one sealed shard payload per holder to distribute, and (on
+// the holder side) read a scanned payload's routing metadata. Reconstruction is
+// not on this surface. The wallet secret never crosses the boundary.
+
+// Flat error surface for recovery. Coarse by design; the crate-local detail
+// stays in Rust. `Internal` covers underlying-crate variants that cannot arise
+// on this surface (it never reconstructs, re-derives an address, or does I/O).
+[Error]
+enum RecoveryError {
+    "TooManyHolders",
+    "InvalidParameters",
+    "InvalidHolderAddress",
+    "ShardIndexOutOfRange",
+    "Encryption",
+    "Corrupt",
+    "Internal",
+};
+
+// Non-secret metadata read off a distributable shard payload by the holder's
+// app (via `parse_shard_payload`). `holder_address` is the identity this shard
+// is sealed to — the receiver can check it matches their own ("is this for
+// me?"); `original_address` is the identity being recovered (the storage key).
+dictionary ShardInfo {
+    string original_address;
+    string holder_address;
+    u8 threshold;
+    u8 total;
+};
+
+// A social-recovery package: N shards of the wallet secret, each sealed to a
+// holder, any K of which reconstruct. Opaque — the secret material stays in
+// Rust; only the per-holder sealed shard payloads leave, one at a time.
+interface RecoveryPackage {
+    // Splits `wallet`'s secret into one sealed shard per entry in
+    // `holder_addresses`, requiring `threshold` (K) of the holders
+    // (N = holder_addresses.len()) to reconstruct. Each holder address is a
+    // bech32m `rrn1…` string; K must satisfy 2 <= K <= N <= 16.
+    [Name=create, Throws=RecoveryError]
+    constructor(WalletContents wallet, sequence<string> holder_addresses, u8 threshold);
+
+    // K — decrypted shards required to reconstruct.
+    u8 threshold();
+
+    // N — total shards / holders.
+    u8 total();
+
+    // The number of sealed shards (equals `total`); valid indices for
+    // `shard_payload` are `0..shard_count`.
+    u32 shard_count();
+
+    // The self-contained, distributable payload for the shard at `index`:
+    // canonical CBOR of {original_address, threshold, total, sealed shard}. The
+    // holder scans this (e.g. as a QR) and stores it. Only that holder's secret
+    // key can open the sealed shard, so it is safe over an untrusted channel.
+    [Throws=RecoveryError]
+    bytes shard_payload(u32 index);
 };

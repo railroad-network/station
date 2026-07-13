@@ -25,6 +25,9 @@
 mod payload;
 pub use payload::{canonical_bytes, PayloadError};
 
+mod recovery;
+pub use recovery::{parse_shard_payload, RecoveryError, RecoveryPackage, ShardInfo};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
