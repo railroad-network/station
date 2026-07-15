@@ -1,3 +1,16 @@
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
+# Cross-compilation targets for the mobile FFI (ADR-0007). Only rrn-mobile-ffi
+# is built for them — every other crate here is host-only — but they are declared
+# at the workspace level because that is where rustup reads them from. Declaring
+# them makes rustup install them for the channel pinned above; a bare
+# `rustup target add` run from the mobile repo instead lands on the *default*
+# toolchain, and the build then fails with "can't find crate for `core`", which
+# points at the wrong problem entirely.
+#
+# arm64 is real devices and the local emulator; x86_64 is CI's emulator, which
+# runs on an Intel Ubuntu runner. Apple targets are deliberately absent: mobile
+# CI installs those itself, and declaring them here would make every station job
+# fetch an Apple stdlib it never uses.
+targets = ["aarch64-linux-android", "x86_64-linux-android"]
