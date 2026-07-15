@@ -26,7 +26,7 @@ use rrn_storage::migrations;
 use crate::clock::Clock;
 use crate::config::StationConfig;
 use crate::core::{Core, CoreHandle};
-use crate::{gossip, server};
+use crate::{gossip, mdns, server};
 
 /// Wallet file name within the data dir.
 pub const WALLET_FILE: &str = "wallet.rrnwallet";
@@ -140,6 +140,34 @@ impl Station {
             core.clone(),
             shutdown_rx.clone(),
         )));
+
+        // Local-network advertisement, so a mobile can find this station
+        // without being told an IP address (T1.3.2).
+        //
+        // Best-effort by design: a station that cannot advertise — no
+        // multicast-capable interface, a locked-down network, another daemon
+        // holding the mDNS port — is still perfectly usable by a mobile that is
+        // pointed at it by hand, which is why the mobile keeps a manual-add
+        // path. So a failure here warns and carries on rather than refusing to
+        // bring the station up.
+        if config.mobile.advertise {
+            let name = config
+                .mobile
+                .name
+                .clone()
+                .unwrap_or_else(|| mdns::station_name(&address));
+            match mdns::advertise(&config.mobile.listen, &name, &address) {
+                Ok(ad) => {
+                    tracing::info!(
+                        name = %name,
+                        listen = %config.mobile.listen,
+                        "Advertising on the local network"
+                    );
+                    tasks.push(tokio::spawn(mdns::serve(ad, shutdown_rx.clone())));
+                }
+                Err(e) => tracing::warn!(error = %e, "not advertising on the local network"),
+            }
+        }
 
         // Settlement sweep timer.
         tasks.push(tokio::spawn(sweep_timer(

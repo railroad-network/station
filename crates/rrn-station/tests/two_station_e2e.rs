@@ -23,12 +23,19 @@ const START: i64 = 1_000_000;
 const WINDOW: u64 = 5; // short settlement window for the test
 
 /// Writes a `config.toml` with the given listen port, peer port, and fast loops.
+///
+/// mDNS is off: `[mobile] advertise` defaults to `true`, and a test has no
+/// business publishing services onto whatever network the developer or the CI
+/// runner happens to be on. This test is about the peer/gossip surface, which
+/// is unrelated.
 fn write_config(dir: &Path, listen_port: u16, peer_port: u16) {
     let text = format!(
         "[peers]\n\
          list = [\"127.0.0.1:{peer_port}\"]\n\n\
          [network]\n\
          listen = \"127.0.0.1:{listen_port}\"\n\n\
+         [mobile]\n\
+         advertise = false\n\n\
          [settlement]\n\
          window_seconds = {WINDOW}\n\n\
          [timers]\n\

@@ -1,12 +1,16 @@
 //! On-disk station configuration: `<data_dir>/config.toml`.
 //!
-//! Phase 0 peer discovery is a static list — no mDNS, no DHT. The file names the
+//! *Peer* discovery is a static list — no mDNS, no DHT. The file names the
 //! peers this station gossips with and the TCP address it listens on for
 //! incoming peer connections (distinct from the Unix socket, which is local-only
-//! CLI IPC). Two optional sections, [`SettlementSection`] and [`TimersSection`],
-//! let the demo shorten the settlement window and speed up the sweep/gossip
-//! loops; both default to production-ish values when omitted, so the minimal
-//! file in the [module example](#example) is valid on its own.
+//! CLI IPC). Three optional sections — [`MobileConfig`], [`SettlementSection`],
+//! and [`TimersSection`] — cover the mobile-facing surface and let the demo
+//! shorten the settlement window and speed up the sweep/gossip loops; all
+//! default to production-ish values when omitted, so the minimal file in the
+//! [module example](#example) is valid on its own.
+//!
+//! Note that *mobile* discovery is mDNS ([`crate::mdns`], T1.3.2) — that is a
+//! separate surface from peer gossip, and the two are not to be confused.
 //!
 //! # Example
 //!
@@ -33,6 +37,10 @@ pub struct StationConfig {
     pub peers: PeersConfig,
     /// Inbound peer-network binding.
     pub network: NetworkConfig,
+    /// The mobile-facing surface (optional; defaults to advertising on all
+    /// interfaces).
+    #[serde(default)]
+    pub mobile: MobileConfig,
     /// Settlement tuning (optional; defaults to the 48h production window).
     #[serde(default)]
     pub settlement: SettlementSection,
@@ -54,6 +62,48 @@ pub struct PeersConfig {
 pub struct NetworkConfig {
     /// `host:port` this station binds for inbound gossip.
     pub listen: String,
+}
+
+/// `[mobile]` — how paired mobile clients reach this station.
+///
+/// Distinct from [`NetworkConfig`], which is the *peer* gossip surface: a phone
+/// and a peer station speak different protocols on different ports.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MobileConfig {
+    /// `host:port` the mobile↔station listener binds. Unlike the peer listener
+    /// this must be reachable from the LAN, so it defaults to all interfaces
+    /// rather than loopback.
+    ///
+    /// T1.3.2 only *advertises* this port over mDNS; T1.3.4 binds it.
+    #[serde(default = "default_mobile_listen")]
+    pub listen: String,
+    /// Overrides the name advertised over mDNS. When omitted — the normal case
+    /// — the name is derived deterministically from the station's own address
+    /// (see [`crate::mdns::station_name`]), so it is stable across restarts and
+    /// distinct between stations without anything being persisted here.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Whether to advertise on the local network at all. Set `false` to run
+    /// dark: mobiles must then be pointed at this station by hand.
+    #[serde(default = "default_advertise")]
+    pub advertise: bool,
+}
+
+fn default_mobile_listen() -> String {
+    "0.0.0.0:7500".to_string()
+}
+fn default_advertise() -> bool {
+    true
+}
+
+impl Default for MobileConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_mobile_listen(),
+            name: None,
+            advertise: default_advertise(),
+        }
+    }
 }
 
 /// `[settlement]` — the dispute/settlement window.
@@ -171,6 +221,7 @@ impl StationConfig {
             network: NetworkConfig {
                 listen: format!("127.0.0.1:{}", random_port()),
             },
+            mobile: MobileConfig::default(),
             settlement: SettlementSection::default(),
             timers: TimersSection::default(),
         }
@@ -213,6 +264,31 @@ mod tests {
         assert_eq!(cfg.settlement.window_seconds, DEFAULT_WINDOW_SECONDS);
         assert_eq!(cfg.timers.sweep_interval_secs, 30);
         assert_eq!(cfg.timers.gossip_interval_secs, 5);
+        // A config written before [mobile] existed still parses, and advertises
+        // on all interfaces with a derived name.
+        assert_eq!(cfg.mobile.listen, "0.0.0.0:7500");
+        assert!(cfg.mobile.advertise);
+        assert_eq!(cfg.mobile.name, None);
+    }
+
+    #[test]
+    fn mobile_section_overrides_defaults() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [mobile]
+            listen = "192.168.1.9:9000"
+            name = "Railroad Station — Blue Ridge"
+            advertise = false
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.mobile.listen, "192.168.1.9:9000");
+        assert_eq!(
+            cfg.mobile.name.as_deref(),
+            Some("Railroad Station — Blue Ridge")
+        );
+        assert!(!cfg.mobile.advertise);
     }
 
     #[test]

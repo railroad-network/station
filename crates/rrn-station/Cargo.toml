@@ -38,6 +38,11 @@ rpassword = "7"
 # Canonical CBOR — for decoding log payloads into history/balances and for the
 # secret-key bytes the recovery RPC moves around.
 dcbor = "0.25"
+# mDNS/DNS-SD advertisement so a mobile can find this station on the local
+# network without typing an IP (T1.3.2). Pure Rust with no async-runtime
+# dependency of its own — it runs its own thread — so it does not constrain the
+# tokio version here. Discovery is not a security boundary (see mdns.rs).
+mdns-sd = "0.20"
 
 [dev-dependencies]
 tempfile = "3"
