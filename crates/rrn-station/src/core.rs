@@ -12,6 +12,7 @@
 //! receiving commands over a [`std::sync::mpsc`] channel and replying over Tokio
 //! oneshots — which can be fulfilled from any thread.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -38,6 +39,8 @@ use rrn_crypto::keypair::{PublicKey, Signature};
 use crate::clock::Clock;
 use crate::gossip::WireEntry;
 use crate::ledger_view;
+use crate::paired::{self, PairedMobiles};
+use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
 use crate::{history, rpc};
 
 /// Community identifier stamped on Phase 0 vouches (a placeholder until real
@@ -93,6 +96,15 @@ pub enum Command {
         entries: Vec<WireEntry>,
         /// How many were newly appended (not already held).
         reply: oneshot::Sender<usize>,
+    },
+    /// A mobile's pairing request (T1.3.3), from the mobile HTTP surface. The
+    /// core verifies it, records it as pending for the operator to confirm, and
+    /// replies with the station's signed response.
+    PairRequest {
+        /// The request as it arrived on the wire.
+        request: PairRequest,
+        /// The station's signed response, or why it was rejected.
+        reply: oneshot::Sender<Result<PairResponse, PairError>>,
     },
     /// Stop the core loop (graceful shutdown).
     Shutdown,
@@ -177,6 +189,20 @@ impl CoreHandle {
         rx.await.unwrap_or(0)
     }
 
+    /// Submits a mobile's pairing request; returns the station's signed response
+    /// or the rejection reason. [`PairError::Unavailable`] means the core is gone.
+    pub async fn pair_request(&self, request: PairRequest) -> Result<PairResponse, PairError> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::PairRequest { request, reply })
+            .is_err()
+        {
+            return Err(PairError::Unavailable);
+        }
+        rx.await.unwrap_or(Err(PairError::Unavailable))
+    }
+
     /// Asks the core to shut down.
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -190,21 +216,32 @@ pub struct Core {
     wallet: WalletContents,
     settlement: SettlementConfig,
     clock: Clock,
+    /// Mobiles that have completed pairing — the authorization list for the
+    /// mobile HTTP surface (T1.3.3). Persisted across restarts.
+    paired: PairedMobiles,
+    /// Pairing requests accepted but not yet confirmed by the operator, keyed by
+    /// mobile address. In-memory only: an unconfirmed request has no standing to
+    /// survive a restart, and each entry expires after [`pairing::PENDING_TTL_SECS`].
+    pending: BTreeMap<String, PendingPair>,
 }
 
 impl Core {
-    /// Builds a core over an opened `db` and decrypted `wallet`.
+    /// Builds a core over an opened `db`, decrypted `wallet`, and the persisted
+    /// paired-mobile list.
     pub fn new(
         db: Database,
         wallet: WalletContents,
         settlement: SettlementConfig,
         clock: Clock,
+        paired: PairedMobiles,
     ) -> Self {
         Core {
             db,
             wallet,
             settlement,
             clock,
+            paired,
+            pending: BTreeMap::new(),
         }
     }
 
@@ -247,6 +284,9 @@ impl Core {
                 Command::AppendEntries { entries, reply } => {
                     let _ = reply.send(self.do_append_entries(entries));
                 }
+                Command::PairRequest { request, reply } => {
+                    let _ = reply.send(self.do_pair_request(request));
+                }
                 Command::Shutdown => {
                     tracing::info!("core shutting down");
                     break;
@@ -267,6 +307,12 @@ impl Core {
             "vouch" => self.m_vouch(req),
             "backup_export" => self.m_backup_export(req),
             "recover_import" => self.m_recover_import(req),
+            // Operator-facing pairing management (T1.3.3), invoked by the
+            // `station` binary over this same Unix socket.
+            "pair_list_pending" => self.m_pair_list_pending(),
+            "pair_confirm" => self.m_pair_confirm(req),
+            "list_mobiles" => self.m_list_mobiles(),
+            "unpair" => self.m_unpair(req),
             other => Err(rpc::RpcError {
                 code: rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
@@ -472,6 +518,133 @@ impl Core {
     fn station_keypair(&self) -> Keypair {
         Keypair::from_secret(self.wallet.secret_key.clone())
     }
+
+    // --- pairing (T1.3.3) ---------------------------------------------------
+
+    /// Verifies a mobile's pairing request, records it as pending for the
+    /// operator to confirm, and returns the station's signed response.
+    ///
+    /// Accepting a request does **not** pair the mobile: it proves the mobile
+    /// holds its key and lets both sides display the same confirmation code. The
+    /// mobile is added to [`paired`](Self::paired) only when the operator runs
+    /// `station pair-mobile` after comparing that code in person (T1.3.3).
+    fn do_pair_request(&mut self, request: PairRequest) -> Result<PairResponse, PairError> {
+        let verified = request.verify()?;
+
+        let now = self.clock.now();
+        if (now - verified.requested_at).abs() > pairing::REQUESTED_AT_SKEW_SECS {
+            return Err(PairError::StaleTimestamp);
+        }
+
+        let station = self.station_keypair();
+        let station_pubkey = station.public_key();
+        let sas = paired::confirmation_code(&station_pubkey, &verified.mobile_pubkey);
+
+        // Drop anything that has aged out before recording this one, so a stream
+        // of abandoned attempts cannot grow the map without bound.
+        self.prune_pending(now);
+        let address = verified.mobile_address.to_string();
+        self.pending.insert(
+            address.clone(),
+            PendingPair {
+                mobile_address: address,
+                sas,
+                received_at: now,
+            },
+        );
+
+        // Sign a response bound to this request's token, proving the station's
+        // identity and preventing a captured response from being reused.
+        let msg = pairing::response_signed_bytes(&station_pubkey, &verified.token);
+        let signature = station.sign(&msg);
+        Ok(PairResponse {
+            station_address: self.wallet.address.to_string(),
+            signature: hex(&signature.to_bytes()),
+        })
+    }
+
+    /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
+    fn prune_pending(&mut self, now: i64) {
+        self.pending
+            .retain(|_, p| now - p.received_at <= pairing::PENDING_TTL_SECS);
+    }
+
+    /// `pair_list_pending` — the accepted-but-unconfirmed requests, each with the
+    /// confirmation code the operator reads aloud to compare with the mobile.
+    fn m_pair_list_pending(&mut self) -> Result<serde_json::Value, rpc::RpcError> {
+        let now = self.clock.now();
+        self.prune_pending(now);
+        let pending: Vec<_> = self
+            .pending
+            .values()
+            .map(|p| {
+                serde_json::json!({
+                    "address": p.mobile_address,
+                    "sas": p.sas,
+                    "age_secs": now - p.received_at,
+                })
+            })
+            .collect();
+        ok(&serde_json::json!({ "pending": pending }))
+    }
+
+    /// `pair_confirm` — the operator has compared the code in person and vouches
+    /// for the pair. Moves the mobile from pending to the persisted paired list.
+    fn m_pair_confirm(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            address: String,
+        }
+        let params: Params = parse_params(req)?;
+
+        let now = self.clock.now();
+        self.prune_pending(now);
+        let pending = self.pending.remove(&params.address).ok_or_else(|| {
+            invalid_params(format!(
+                "no pending pairing request from {} (it may have expired)",
+                params.address
+            ))
+        })?;
+
+        self.paired.add(pending.mobile_address.clone(), now);
+        self.paired.save().map_err(internal)?;
+        ok(&serde_json::json!({
+            "address": pending.mobile_address,
+            "paired_at": now,
+        }))
+    }
+
+    /// `list_mobiles` — the mobiles currently paired with this station.
+    fn m_list_mobiles(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let mobiles: Vec<_> = self
+            .paired
+            .list()
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "address": m.address,
+                    "paired_at": m.paired_at,
+                })
+            })
+            .collect();
+        ok(&serde_json::json!({ "mobiles": mobiles }))
+    }
+
+    /// `unpair` — revoke a mobile's pairing. Its next request will be rejected
+    /// (T1.3.4). Reports whether the address was actually paired.
+    fn m_unpair(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            address: String,
+        }
+        let params: Params = parse_params(req)?;
+
+        let removed = self.paired.remove(&params.address);
+        if removed {
+            self.paired.save().map_err(internal)?;
+        }
+        ok(&serde_json::json!({ "removed": removed }))
+    }
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -603,6 +776,7 @@ mod tests {
             WalletContents::create_new(),
             SettlementConfig::default(),
             Clock::manual(1_000),
+            PairedMobiles::default(),
         )
     }
 

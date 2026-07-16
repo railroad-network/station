@@ -35,7 +35,8 @@ fn write_config(dir: &Path, listen_port: u16, peer_port: u16) {
          [network]\n\
          listen = \"127.0.0.1:{listen_port}\"\n\n\
          [mobile]\n\
-         advertise = false\n\n\
+         advertise = false\n\
+         listen = \"127.0.0.1:0\"\n\n\
          [settlement]\n\
          window_seconds = {WINDOW}\n\n\
          [timers]\n\

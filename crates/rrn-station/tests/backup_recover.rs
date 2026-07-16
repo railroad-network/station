@@ -22,6 +22,7 @@ const PASSPHRASE: &str = "recovery-test";
 fn write_config(dir: &Path, port: u16) {
     let text = format!(
         "[peers]\nlist = []\n\n[network]\nlisten = \"127.0.0.1:{port}\"\n\n\
+         [mobile]\nadvertise = false\nlisten = \"127.0.0.1:0\"\n\n\
          [timers]\nsweep_interval_secs = 60\ngossip_interval_secs = 60\n"
     );
     std::fs::write(dir.join("config.toml"), text).unwrap();

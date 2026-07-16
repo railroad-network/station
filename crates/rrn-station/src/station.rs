@@ -26,7 +26,7 @@ use rrn_storage::migrations;
 use crate::clock::Clock;
 use crate::config::StationConfig;
 use crate::core::{Core, CoreHandle};
-use crate::{gossip, mdns, server};
+use crate::{gossip, mdns, mobile_server, paired, server};
 
 /// Wallet file name within the data dir.
 pub const WALLET_FILE: &str = "wallet.rrnwallet";
@@ -106,7 +106,8 @@ impl Station {
         let settlement = SettlementConfig {
             window_seconds: config.settlement.window_seconds,
         };
-        let core = Core::new(db, wallet, settlement, params.clock.clone()).spawn();
+        let paired = paired::PairedMobiles::load(&data_dir).context("load paired mobiles")?;
+        let core = Core::new(db, wallet, settlement, params.clock.clone(), paired).spawn();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -140,6 +141,29 @@ impl Station {
             core.clone(),
             shutdown_rx.clone(),
         )));
+
+        // Mobile-facing HTTP surface (ADR-0008 / T1.3.3+), on the port mDNS
+        // advertises. Best-effort, matching the advertisement below: if the port
+        // cannot be bound — most often another station already holds it on this
+        // host — the station still serves peers and the CLI, and the warning
+        // explains why mobiles cannot reach it. A dark station (advertise =
+        // false) still serves here: `advertise` governs discoverability, not
+        // reachability, since a hand-added mobile must still connect.
+        match TcpListener::bind(&config.mobile.listen).await {
+            Ok(mobile_listener) => {
+                tracing::info!(listen = %config.mobile.listen, "Listening for mobiles");
+                tasks.push(tokio::spawn(mobile_server::serve(
+                    mobile_listener,
+                    core.clone(),
+                    shutdown_rx.clone(),
+                )));
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                listen = %config.mobile.listen,
+                "mobile HTTP listener not bound; mobiles cannot reach this station"
+            ),
+        }
 
         // Local-network advertisement, so a mobile can find this station
         // without being told an IP address (T1.3.2).

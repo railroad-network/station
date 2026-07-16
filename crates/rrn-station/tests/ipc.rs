@@ -19,11 +19,13 @@ const PASSPHRASE: &str = "ipc-test";
 /// Writes a config with a unique listen port, no peers, and no mDNS.
 ///
 /// `[mobile] advertise` defaults to `true`; a test should not publish services
-/// onto the developer's or CI runner's network.
+/// onto the developer's or CI runner's network. `[mobile] listen` is pinned to a
+/// loopback ephemeral port so opening the station does not bind the default
+/// `0.0.0.0:7500` (which prompts the macOS firewall and collides across tests).
 fn write_config(dir: &Path, port: u16) {
     let text = format!(
         "[peers]\nlist = []\n\n[network]\nlisten = \"127.0.0.1:{port}\"\n\n\
-         [mobile]\nadvertise = false\n\n\
+         [mobile]\nadvertise = false\nlisten = \"127.0.0.1:0\"\n\n\
          [timers]\nsweep_interval_secs = 60\ngossip_interval_secs = 60\n"
     );
     std::fs::write(dir.join("config.toml"), text).unwrap();

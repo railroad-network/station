@@ -24,6 +24,11 @@ rrn-identity = { path = "../rrn-identity", version = "0.1" }
 rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
 
 tokio = { version = "1", features = ["full"] }
+# The mobile-facing HTTP surface (ADR-0008 / T1.3.3+): plain HTTP over local
+# TCP as a dumb carrier — the security boundary is the application-layer sealed
+# envelope, not the transport. axum is tokio-native, so it runs on the existing
+# runtime, and its long-poll support is what T1.3.5 will build push on.
+axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
