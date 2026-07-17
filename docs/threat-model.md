@@ -1163,32 +1163,89 @@ config (holder addresses + local nicknames) persisted on the owner's device.
 
 ### Mobile–station transport
 
-**Assets:** the authenticity of each mobile→station request; the integrity of
-ledger data replicated across the link; the pairing bond between a specific
-mobile and a specific station.
+**Assets:** the authenticity of each mobile→station request; the confidentiality
+of request/response contents on the wire; the integrity of ledger data
+replicated across the link; the pairing bond between a specific mobile and a
+specific station.
+
+The transport is **plain HTTP over local TCP** ([ADR-0008](adr/0008-mobile-station-transport.md));
+the security boundary is the **application-layer sealed-and-signed envelope**,
+not the channel. A request is a canonical-dCBOR envelope
+(`method`/`params`/`signer`/`recipient`/`nonce`/`timestamp`) signed by the
+mobile's Ed25519 identity key, framed with that signature, then **sealed** to the
+station's public key (anonymous X25519→blake3→XChaCha20-Poly1305 box, the same
+`rrn-identity::sealed` construction recovery uses). The station opens it, and the
+mitigations below are what the shipped `rpc_envelope` / `core::do_rpc_request`
+pipeline enforces (T1.3.4).
 
 - **MITM on the local network.** *Threat:* an attacker on the same LAN intercepts
-  or alters traffic between mobile and station. *Planned mitigation (M1.3):* per
-  ADR-0006, every request is authenticated by the mobile's signature over the
-  payload, so tampering is detected regardless of the channel, and the channel is
-  encrypted with keys established at pairing. *Residual risk:* traffic-analysis
-  metadata, and any exposure before pairing completes.
-- **Replay.** *Threat:* a captured signed request is replayed to repeat its
-  effect. *Planned mitigation (M1.3):* the same replay defenses as the ledger —
-  per-sender monotonic nonce, content-addressed ids, and a bounded time window
-  (inherited from `rrn-ledger`). *Residual risk:* replay within the accepted time
-  window, bounded by its width.
+  or alters traffic between mobile and station. *Mitigation (shipped, T1.3.4):*
+  every request carries the mobile's signature over the exact payload bytes, so
+  any tampering fails verification regardless of the channel; and the payload is
+  sealed to the station's key, so a snooper reads only ciphertext. TLS is
+  deliberately *not* used — the envelope already provides both properties and
+  survives store-and-forward carriers TLS cannot (ADR-0008). *Residual risk:*
+  traffic-analysis metadata (below), and any exposure before pairing completes.
+- **Replay.** *Threat:* a captured sealed request is replayed to repeat its
+  effect. *Mitigation (shipped, T1.3.4):* **two independent nonces** apply. The
+  channel enforces a **per-mobile monotonic transport nonce**, persisted in
+  `paired_mobiles.json` (`PairedMobiles::accept_nonce`) and checked before
+  dispatch, plus a ±5-minute timestamp-skew bound (`TIMESTAMP_SKEW_SECS`) — a
+  request must be strictly newer and fresh. Independently, any *transaction* it
+  carries is still subject to the ledger's own content-addressing and per-sender
+  gap-free nonce (see [Replay across crates](#replay-across-crates)). The nonce
+  high-water mark is persisted **before** dispatch, so a replay cannot slip in
+  even if the method then fails. *Residual risk:* replay within the ±5-minute
+  window is bounded by its width; a request whose transport nonce was burned but
+  never reached the ledger is simply refused on retry (the mobile skips to the
+  next nonce).
 - **Station impersonation.** *Threat:* a rogue host poses as the member's paired
-  station. *Planned mitigation (M1.3.3):* pairing binds the station's public key
-  and every subsequent exchange verifies the station against it. *Residual risk:*
-  see TOFU below — the bind is only as trustworthy as the moment it was made.
+  station. *Mitigation (shipped, T1.3.3/T1.3.4):* the request is sealed to the
+  paired station's public key, so only the real station can open it; the
+  `recipient` key is **bound inside the mobile's signature**, so a station cannot
+  peel a signed request out of its envelope and re-seal it to a third party; and
+  the station signs its reply, which the mobile verifies against the paired key.
+  *Residual risk:* see TOFU below — the bind is only as trustworthy as the moment
+  pairing was made.
+- **Signer impersonation / unpaired access.** *Threat:* a device that is not the
+  member — an unpaired key, or one paired mobile trying to act as another —
+  submits requests. *Mitigation (shipped, T1.3.4):* the station authorizes on the
+  `signer` recovered from the verified signature: it must be in
+  `paired_mobiles`, and because `signer` is inside the signed bytes a mobile
+  cannot claim another's identity. Write methods additionally bind the *submitter*
+  to the authenticated signer (a mobile cannot relay a proposal/confirmation
+  signed by someone else), and the ledger re-verifies the record's own signature.
+  Unpaired or badly-signed requests get a 401-equivalent with no sealed body.
+  *Residual risk:* none beyond key compromise (below).
+- **Paired-mobile compromise.** *Threat:* an attacker obtains a member's unlocked
+  device or identity key and acts as that member until noticed. *Mitigation
+  (shipped):* the mobile holds the key sealed at rest (passphrase + keychain) and
+  the app gates on a lock screen that drops the unlocked wallet when backgrounded
+  (T1.3.4), narrowing the window; either side can revoke the bond at any time
+  (operator `station unpair <address>`, or the mobile from Settings), after which
+  the next request is rejected as unpaired. *Residual risk:* actions taken with a
+  live key before revocation stand — this is the inherent limit of a bearer key,
+  the same as any self-custody wallet.
+- **Envelope confidentiality / traffic analysis.** *Threat:* an observer learns
+  content or metadata from the link. *Mitigation (shipped, T1.3.4):* the sealed
+  box keeps request and response *contents* confidential to the two endpoints on
+  plain HTTP. *Residual risk (accepted):* the seal has **no forward secrecy** —
+  it uses the station's long-term key, so a future compromise of that secret
+  would open previously-recorded traffic; ADR-0008 scopes per-request FS out for
+  Phase 1, with Noise_KK as the named upgrade path (a superseding ADR, since
+  pairing already establishes both static keys). Metadata — that a given mobile
+  talked to a given station, when, and roughly how much — is **not** hidden and
+  is out of scope.
 - **Pairing-time TOFU.** *Threat:* pairing is trust-on-first-use, so an attacker
   present at the *first* contact can interpose and become the "trusted" station.
-  *Planned mitigation (M1.3.3):* out-of-band confirmation at pairing — a QR code
-  shown by the station and scanned by the mobile, or a short authentication
-  string both sides compare — to authenticate that first contact. *Residual
-  risk:* if users skip the out-of-band step, TOFU is only as safe as the pairing
-  environment; this is documented as a user-facing risk for M1.3.3.
+  *Mitigation (shipped, T1.3.3):* an out-of-band **short authentication string** —
+  an 8-hex code derived from *both* static public keys (`blake3(tag ‖ station_pk
+  ‖ mobile_pk)`), displayed by the station operator (`station pair-mobile`) and on
+  the mobile, which a human compares in person. A man-in-the-middle would have to
+  present its own key, which changes the code, so the comparison catches it. (The
+  spec's QR-scanned-by-CLI was rejected — a headless Pi cannot scan, and one QR
+  cannot carry both keys.) *Residual risk:* if users skip the comparison, TOFU is
+  only as safe as the pairing environment; this remains a user-facing risk.
 
 ## Cross-cutting threats
 
