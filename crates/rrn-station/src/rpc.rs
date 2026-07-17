@@ -232,3 +232,57 @@ pub struct WhoamiResult {
     /// The station's own `rrn1…` address.
     pub address: String,
 }
+
+/// `transactions` params — the mobile-facing, member-relative view of the
+/// ledger (T1.3.4). Unlike `history` (operator summary strings), this returns
+/// structured rows the wallet UI renders directly.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TransactionsParams {
+    /// The member `rrn1…` address whose transactions to return, and the vantage
+    /// point for `direction`/`amount_centi` (in vs out relative to them).
+    pub address: String,
+    /// Max number of (most-recent-first) rows to return; `None` = all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+/// One transaction, correlated from its log events and expressed relative to the
+/// querying member (T1.3.4). The station does the stitching; the wallet renders.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionRow {
+    /// The content-addressed transaction id, hex-encoded.
+    pub id: String,
+    /// The other party's `rrn1…` address (the member is one side; this is the
+    /// other). Display names are resolved locally on the mobile, not here.
+    pub counterparty_address: String,
+    /// `"in"` when the member receives, `"out"` when the member sends.
+    pub direction: String,
+    /// Amount in centicommons, **signed relative to the member**: positive when
+    /// money comes in, negative when it goes out.
+    pub amount_centi: i64,
+    /// Optional memo carried on the proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// Lifecycle: `pending` | `confirmed` | `settled` | `cancelled`.
+    pub state: String,
+    /// Unix seconds the proposal was made (the row's sort key).
+    pub timestamp: i64,
+    /// Unix seconds an unconfirmed proposal auto-cancels; present while pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// Unix seconds the receiver confirmed; present once confirmed/settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<i64>,
+    /// Unix seconds the transaction settled; present once settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<i64>,
+    /// The sender's per-sender ledger nonce for this transaction.
+    pub nonce: u64,
+}
+
+/// `transactions` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransactionsResult {
+    /// The member's transactions, most recent first.
+    pub transactions: Vec<TransactionRow>,
+}

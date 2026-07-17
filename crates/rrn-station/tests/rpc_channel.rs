@@ -18,16 +18,19 @@ use tokio::net::{TcpStream, UnixStream};
 use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
 use rrn_identity::address::Address;
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
+use rrn_ledger::transaction::{
+    SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionProposal,
+};
 use rrn_station::core::hex;
 use rrn_station::pairing::{request_signed_bytes, PairRequest};
 use rrn_station::rpc_envelope::{
-    frame_signed_request, request_payload_bytes, RequestEnvelope, ResponseEnvelope,
-    ENVELOPE_VERSION,
+    frame_signed_record, frame_signed_request, request_payload_bytes, RequestEnvelope,
+    ResponseEnvelope, ENVELOPE_VERSION,
 };
 use rrn_station::station::{Station, StationParams};
 use rrn_station::Clock;
 
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::to_canonical_bytes;
 
 const PASSPHRASE: &str = "rpc-channel-test";
 const MOBILE_PORT: u16 = 7530;
@@ -168,7 +171,59 @@ fn open_reply(mobile: &Keypair, station_pk: &PublicKey, sealed_reply: &[u8]) -> 
     station_pk
         .verify(payload, &Signature::from_bytes(sig).unwrap())
         .expect("station reply signature verifies");
-    from_canonical_bytes(payload).unwrap()
+    // The response is JSON (the mobile carries no dCBOR decoder); the request was
+    // canonical dCBOR. See rpc_envelope for why they differ.
+    serde_json::from_slice(payload).unwrap()
+}
+
+/// Builds the `submit_proposal` params: a sender-signed proposal, framed as a
+/// signed record and hex-encoded — exactly what the mobile produces.
+fn proposal_params(
+    sender: &Keypair,
+    receiver: &Address,
+    amount: i64,
+    nonce: u64,
+    now: i64,
+) -> String {
+    let proposal = TransactionProposal::new(
+        Address::from_public_key(sender.public_key()),
+        *receiver,
+        amount,
+        Some("groceries".into()),
+        nonce,
+        now,
+        now + 3600,
+    );
+    let signed = SignedProposal::sign(proposal.clone(), sender);
+    let frame = frame_signed_record(
+        &to_canonical_bytes(proposal),
+        &sender.public_key(),
+        &signed.signature,
+    );
+    format!("{{\"signed_proposal\":\"{}\"}}", hex(&frame))
+}
+
+/// Builds the `submit_confirmation` params: a receiver-signed confirmation of
+/// `tx_id_hex`, framed and hex-encoded.
+fn confirmation_params(receiver: &Keypair, tx_id_hex: &str, now: i64) -> String {
+    use rrn_crypto::hash::Hash;
+    use rrn_ledger::transaction::TransactionId;
+    let id_bytes: [u8; 32] = rrn_station::core::unhex(tx_id_hex)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let confirmation = TransactionConfirmation {
+        proposal_id: TransactionId(Hash::from_bytes(id_bytes)),
+        confirmer: Address::from_public_key(receiver.public_key()),
+        confirmed_at: now,
+    };
+    let signed = SignedConfirmation::sign(confirmation.clone(), receiver);
+    let frame = frame_signed_record(
+        &to_canonical_bytes(confirmation),
+        &receiver.public_key(),
+        &signed.signature,
+    );
+    format!("{{\"signed_confirmation\":\"{}\"}}", hex(&frame))
 }
 
 async fn open_station(dir: &Path) -> Station {
@@ -303,10 +358,117 @@ async fn authenticated_channel_happy_path_and_rejections() {
     assert_eq!(status, 200, "authenticated, but the method is gated");
     let reply = open_reply(&mobile, &station_pk, &body);
     assert!(reply.result.is_none());
-    assert_eq!(reply.error.unwrap().0, -32601, "method not found");
+    assert_eq!(reply.error.unwrap().code, -32601, "method not found");
 
     // The reply really used the current envelope version.
     assert_eq!(ENVELOPE_VERSION, 1);
+
+    // --- write path: the mobile submits its own signed proposal ---
+    // A receiver mobile, also paired so it can later confirm over the channel.
+    let receiver = Keypair::generate();
+    pair_mobile(&socket, &receiver).await;
+    let receiver_addr = Address::from_public_key(receiver.public_key());
+    let now = now_secs();
+
+    // The sender (`mobile`) proposes 500 to the receiver. Its *ledger* nonce is 0
+    // (first proposal); its *transport* nonce continues at 6 — the two are
+    // independent.
+    let params = proposal_params(&mobile, &receiver_addr, 500, 0, now);
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "submit_proposal",
+        &params,
+        6,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "proposal submitted");
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(reply.error.is_none(), "propose error: {:?}", reply.error);
+    let proposed: serde_json::Value =
+        serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert_eq!(proposed["state"], "Proposed");
+    let tx_id = proposed["tx_id"].as_str().unwrap().to_string();
+
+    // The sender sees it in their transaction view: out, negative, pending.
+    let params = format!("{{\"address\":\"{mobile_addr}\"}}");
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "transactions",
+        &params,
+        7,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    let view: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    let row = &view["transactions"][0];
+    assert_eq!(row["id"], tx_id);
+    assert_eq!(row["direction"], "out");
+    assert_eq!(row["amount_centi"], -500);
+    assert_eq!(row["state"], "pending");
+    assert_eq!(row["counterparty_address"], receiver_addr.to_string());
+
+    // The receiver confirms it (their own signed confirmation, transport nonce 1).
+    let params = confirmation_params(&receiver, &tx_id, now);
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "submit_confirmation",
+        &params,
+        1,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "confirmation submitted");
+    let reply = open_reply(&receiver, &station_pk, &body);
+    assert!(reply.error.is_none(), "confirm error: {:?}", reply.error);
+
+    // The receiver's view now shows it: in, positive, confirmed.
+    let params = format!("{{\"address\":\"{}\"}}", receiver_addr);
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "transactions",
+        &params,
+        2,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&receiver, &station_pk, &body);
+    let view: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    let row = &view["transactions"][0];
+    assert_eq!(row["direction"], "in");
+    assert_eq!(row["amount_centi"], 500);
+    assert_eq!(row["state"], "confirmed");
+
+    // A mobile cannot submit a proposal signed by someone else (submitter binding).
+    let stranger = Keypair::generate();
+    let params = proposal_params(&stranger, &receiver_addr, 100, 0, now);
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "submit_proposal",
+        &params,
+        8,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "authenticated");
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        reply.error.is_some(),
+        "a relayed foreign proposal is refused"
+    );
 
     station.shutdown().await;
 }

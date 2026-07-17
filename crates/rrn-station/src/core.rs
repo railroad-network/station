@@ -44,14 +44,8 @@ use crate::ledger_view;
 use crate::paired::{self, PairedMobiles};
 use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
 use crate::rpc_envelope::{self, ChannelError, RequestEnvelope, ResponseEnvelope};
+use crate::transaction_view;
 use crate::{history, rpc};
-
-/// Methods a paired mobile may invoke over the authenticated channel (T1.3.4).
-/// The operator-only methods (`pair_confirm`, `unpair`, `list_mobiles`,
-/// `pair_list_pending`) and the local-only recovery methods are deliberately
-/// absent — a mobile reaches only its own read surface. The write methods
-/// (`propose`, `confirm`) join this list with the mobile-signed submit path.
-const MOBILE_METHODS: &[&str] = &["whoami", "balance", "history"];
 
 /// Community identifier stamped on Phase 0 vouches (a placeholder until real
 /// community ids arrive in Phase 1).
@@ -337,6 +331,7 @@ impl Core {
             "propose" => self.m_propose(req),
             "confirm" => self.m_confirm(req),
             "history" => self.m_history(req),
+            "transactions" => self.m_transactions(req),
             "vouch" => self.m_vouch(req),
             "backup_export" => self.m_backup_export(req),
             "recover_import" => self.m_recover_import(req),
@@ -428,6 +423,18 @@ impl Core {
         let params: rpc::HistoryParams = parse_params(req)?;
         let entries = history::history(&self.db, params.limit, params.offset).map_err(internal)?;
         ok(&rpc::HistoryResult { entries })
+    }
+
+    /// `transactions` — the member-relative, structured transaction view the
+    /// mobile wallet renders (T1.3.4). Correlates the log's events into one row
+    /// per transaction from the querying member's vantage point.
+    fn m_transactions(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::TransactionsParams = parse_params(req)?;
+        let member = parse_addr(&params.address)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+        let transactions = transaction_view::member_transactions(&snapshot, &member, params.limit);
+        ok(&rpc::TransactionsResult { transactions })
     }
 
     fn m_vouch(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -645,53 +652,103 @@ impl Core {
         let response = self.dispatch_channel_call(&envelope);
 
         // 5. Sign the reply as the station and seal it back to the mobile.
-        let reply_frame = rpc_envelope::frame_signed_response(response, &station);
+        let reply_frame = rpc_envelope::frame_signed_response(&response, &station);
         let sealed_reply = sealed::seal(&mobile_pubkey, &reply_frame, TRANSPORT_CONTEXT)
             .map_err(|_| ChannelError::Sealed)?;
         Ok(sealed_reply.to_bytes())
     }
 
-    /// Routes an authenticated envelope to the existing method dispatch, gated to
-    /// the [`MOBILE_METHODS`] surface, and wraps the outcome as a response
-    /// envelope (a method-level failure becomes a sealed error, not a rejection).
+    /// Routes an authenticated envelope to the mobile-permitted method surface
+    /// and wraps the outcome as a response envelope (a method-level failure
+    /// becomes a sealed error, not a transport rejection).
     fn dispatch_channel_call(&mut self, envelope: &RequestEnvelope) -> ResponseEnvelope {
-        if !MOBILE_METHODS.contains(&envelope.method.as_str()) {
-            return ResponseEnvelope {
-                nonce: envelope.nonce,
-                result: None,
-                error: Some((
-                    rpc::METHOD_NOT_FOUND,
-                    format!("method not available to mobiles: {}", envelope.method),
-                )),
-            };
+        match self.route_channel_method(envelope) {
+            Ok(result) => ResponseEnvelope::ok(envelope.nonce, result.to_string()),
+            Err((code, message)) => ResponseEnvelope::err(envelope.nonce, code, message),
         }
-        let params: serde_json::Value = match serde_json::from_str(&envelope.params) {
-            Ok(v) => v,
-            Err(e) => {
-                return ResponseEnvelope {
-                    nonce: envelope.nonce,
-                    result: None,
-                    error: Some((rpc::INVALID_PARAMS, format!("params not valid JSON: {e}"))),
-                }
+    }
+
+    /// The mobile method allowlist, as an explicit match. Read methods route
+    /// through the shared dispatch; the write methods (`submit_proposal` /
+    /// `submit_confirmation`) need the *authenticated* signer — a mobile submits
+    /// only records it itself signed as sender/receiver — so they are handled
+    /// here rather than via the signer-less [`Self::handle_call`]. Everything
+    /// else (operator, recovery, station-as-sender `propose`/`confirm`) is
+    /// unreachable.
+    fn route_channel_method(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        match envelope.method.as_str() {
+            "submit_proposal" => self.channel_submit_proposal(envelope),
+            "submit_confirmation" => self.channel_submit_confirmation(envelope),
+            "whoami" | "balance" | "transactions" => {
+                let params = serde_json::from_str(&envelope.params)
+                    .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+                let req = rpc::Request {
+                    id: envelope.nonce.to_string(),
+                    method: envelope.method.clone(),
+                    params,
+                };
+                self.handle_call(&req).map_err(|e| (e.code, e.message))
             }
-        };
-        let req = rpc::Request {
-            id: envelope.nonce.to_string(),
-            method: envelope.method.clone(),
-            params,
-        };
-        match self.handle_call(&req) {
-            Ok(result) => ResponseEnvelope {
-                nonce: envelope.nonce,
-                result: Some(result.to_string()),
-                error: None,
-            },
-            Err(e) => ResponseEnvelope {
-                nonce: envelope.nonce,
-                result: None,
-                error: Some((e.code, e.message)),
-            },
+            other => Err((
+                rpc::METHOD_NOT_FOUND,
+                format!("method not available to mobiles: {other}"),
+            )),
         }
+    }
+
+    /// `submit_proposal` — accept a mobile-signed [`SignedProposal`] and append
+    /// it. The member is the sender and signs it on the phone (ADR-0006); the
+    /// station only validates and records. `params` carries the canonical dCBOR
+    /// of the signed proposal, hex-encoded.
+    fn channel_submit_proposal(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_proposal")?;
+        let signed: SignedProposal = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed proposal".into()))?;
+        // A mobile submits only its own transactions: the sender must be the
+        // authenticated signer. (The engine independently checks the embedded
+        // signature is by the sender; this binds it to *this* paired mobile.)
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "proposal sender is not the authenticated mobile".into(),
+            ));
+        }
+        let now = self.clock.now();
+        let tx_id = signed.payload.id;
+        let mut engine = Engine::new(&self.db, self.station_keypair());
+        engine
+            .submit_proposal(signed, now)
+            .map_err(ledger_err_pair)?;
+        Ok(serde_json::json!({ "tx_id": hex(&tx_id.to_bytes()), "state": "Proposed" }))
+    }
+
+    /// `submit_confirmation` — accept a mobile-signed [`SignedConfirmation`] of a
+    /// proposal the mobile is the receiver of.
+    fn channel_submit_confirmation(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_confirmation")?;
+        let signed: SignedConfirmation = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed confirmation".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "confirmer is not the authenticated mobile".into(),
+            ));
+        }
+        let now = self.clock.now();
+        let mut engine = Engine::new(&self.db, self.station_keypair());
+        engine
+            .submit_confirmation(signed, now)
+            .map_err(ledger_err_pair)?;
+        Ok(serde_json::json!({ "state": "Confirmed" }))
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
@@ -842,6 +899,27 @@ fn ledger_err(e: rrn_ledger::Error) -> rpc::RpcError {
         Storage(_) | Invalid(_) => internal(e),
         _ => invalid_params(e.to_string()),
     }
+}
+
+/// The channel's `(code, message)` form of a ledger error — the same mapping as
+/// [`ledger_err`], for the write-path handlers that build a response envelope.
+fn ledger_err_pair(e: rrn_ledger::Error) -> (i32, String) {
+    let r = ledger_err(e);
+    (r.code, r.message)
+}
+
+/// Pulls a hex-string field out of a JSON `params` object and decodes it to
+/// bytes, for the write-path handlers that carry a canonical-dCBOR record.
+fn hex_param(params: &str, field: &str) -> Result<Vec<u8>, (i32, String)> {
+    let value: serde_json::Value = serde_json::from_str(params)
+        .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+    let hex_str = value.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+        (
+            rpc::INVALID_PARAMS,
+            format!("missing string field: {field}"),
+        )
+    })?;
+    unhex(hex_str).ok_or_else(|| (rpc::INVALID_PARAMS, format!("{field} is not hex")))
 }
 
 /// Lowercase hex of a byte slice.

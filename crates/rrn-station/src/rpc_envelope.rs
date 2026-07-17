@@ -35,6 +35,7 @@ use dcbor::prelude::*;
 
 use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::signed::SignedPayload;
 
 /// The envelope format version, bumped if the wire shape ever changes. Bound
 /// inside the signed bytes so a downgrade cannot be forged.
@@ -159,70 +160,58 @@ fn extract_pubkey(map: &dcbor::Map, key: &str) -> Result<PublicKey, dcbor::Error
     PublicKey::from_bytes(bytes).map_err(|_| dcbor::Error::WrongType)
 }
 
-/// The station's reply, sealed back to the mobile. Carries the request `nonce`
-/// so the mobile can tie a reply to the request it sent, and exactly one of a
-/// `result` JSON string or an `(code, message)` error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A method-level error inside a [`ResponseEnvelope`]: a JSON-RPC-style code and
+/// a human-readable message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResponseError {
+    /// One of the `-326xx` codes ([`crate::rpc`]).
+    pub code: i32,
+    /// Diagnostic text; not meant to be machine-matched.
+    pub message: String,
+}
+
+/// The station's reply, sealed back to the mobile.
+///
+/// Serialized as **JSON**, not canonical dCBOR: the response is a single-producer
+/// (station), single-consumer (mobile) message, and the mobile verifies the
+/// station's signature over the exact bytes it received rather than
+/// re-serializing — so canonical determinism buys nothing here, and JSON spares
+/// the mobile a dCBOR *decoder* it would otherwise need (it only carries the
+/// dCBOR *encoder*, via `canonicalBytes`). The request, which the mobile signs
+/// and the station must decode, stays canonical dCBOR.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResponseEnvelope {
-    /// Echo of the request nonce this answers.
+    /// The envelope version, mirrored from the request side.
+    pub v: u64,
+    /// Echo of the request nonce this answers, so the mobile can correlate it.
     pub nonce: u64,
-    /// The method result as a JSON string on success.
+    /// The method result as a JSON string on success; absent on failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    /// `(code, message)` on failure; mutually exclusive with `result`.
-    pub error: Option<(i32, String)>,
+    /// The method error on failure; absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
 }
 
-impl From<ResponseEnvelope> for CBOR {
-    fn from(e: ResponseEnvelope) -> Self {
-        let mut m = Map::new();
-        m.insert("v", ENVELOPE_VERSION);
-        m.insert("nonce", e.nonce);
-        match e.result {
-            Some(result) => m.insert("result", result),
-            None => m.insert("result", CBOR::null()),
+impl ResponseEnvelope {
+    /// A success reply carrying `result` (a JSON string) for `nonce`.
+    pub fn ok(nonce: u64, result: String) -> Self {
+        ResponseEnvelope {
+            v: ENVELOPE_VERSION,
+            nonce,
+            result: Some(result),
+            error: None,
         }
-        match e.error {
-            Some((code, message)) => {
-                let mut em = Map::new();
-                em.insert("code", code);
-                em.insert("message", message);
-                m.insert("error", em);
-            }
-            None => m.insert("error", CBOR::null()),
-        }
-        m.into()
     }
-}
 
-impl TryFrom<CBOR> for ResponseEnvelope {
-    type Error = dcbor::Error;
-
-    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
-        let map = match cbor.into_case() {
-            CBORCase::Map(map) => map,
-            _ => return Err(dcbor::Error::WrongType),
-        };
-        if map.extract::<&str, u64>("v")? != ENVELOPE_VERSION {
-            return Err(dcbor::Error::WrongType);
+    /// An error reply for `nonce`.
+    pub fn err(nonce: u64, code: i32, message: String) -> Self {
+        ResponseEnvelope {
+            v: ENVELOPE_VERSION,
+            nonce,
+            result: None,
+            error: Some(ResponseError { code, message }),
         }
-        let error = match map.get::<&str, CBOR>("error") {
-            Some(cbor) if !cbor.is_null() => {
-                let em = match cbor.into_case() {
-                    CBORCase::Map(em) => em,
-                    _ => return Err(dcbor::Error::WrongType),
-                };
-                Some((
-                    em.extract::<&str, i32>("code")?,
-                    em.extract::<&str, String>("message")?,
-                ))
-            }
-            _ => None,
-        };
-        Ok(ResponseEnvelope {
-            nonce: map.extract::<&str, u64>("nonce")?,
-            result: map.get::<&str, String>("result"),
-            error,
-        })
     }
 }
 
@@ -271,13 +260,66 @@ pub fn parse_signed_request(frame: &[u8]) -> Result<RequestEnvelope, ChannelErro
     Ok(envelope)
 }
 
-/// Signs and frames a response the same way: `payload_len ‖ payload ‖ signature`,
-/// where the station signs the canonical response bytes. The caller seals the
-/// result to the mobile's key.
-pub fn frame_signed_response(response: ResponseEnvelope, station: &Keypair) -> Vec<u8> {
-    let payload = to_canonical_bytes(response);
+/// Signs and frames a response: `payload_len ‖ payload ‖ signature`, where the
+/// payload is the response's **JSON** bytes and the station signs them. The
+/// caller seals the result to the mobile's key. JSON serialization is
+/// infallible for this type (only integers and strings), so this cannot fail.
+pub fn frame_signed_response(response: &ResponseEnvelope, station: &Keypair) -> Vec<u8> {
+    let payload = serde_json::to_vec(response).expect("ResponseEnvelope serializes");
     let signature = station.sign(&payload);
     frame_signed_request(&payload, &signature)
+}
+
+/// Length of a public key in the signed-record framing.
+const PK_LEN: usize = 32;
+
+/// Frames a mobile-submitted **signed record** (the write path, T1.3.4):
+/// `payload_len(u32 BE) ‖ payload(canonical dCBOR) ‖ signer(32) ‖ signature(64)`.
+///
+/// This is how the mobile hands the station a whole [`SignedPayload`] — a signed
+/// proposal or confirmation — over the channel. `SignedPayload` is a serde
+/// envelope, not a dCBOR value, so it needs an explicit framing; the mobile
+/// builds it from its canonical payload bytes, its public key, and its
+/// signature, all of which it already has.
+pub fn frame_signed_record(payload: &[u8], signer: &PublicKey, signature: &Signature) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LEN_PREFIX + payload.len() + PK_LEN + SIG_LEN);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&signer.to_bytes());
+    out.extend_from_slice(&signature.to_bytes());
+    out
+}
+
+/// Reconstructs a `SignedPayload<T>` from [`frame_signed_record`] framing. The
+/// signature is **not** checked here — the ledger engine re-verifies it against
+/// the re-canonicalized payload; this only re-assembles the envelope, rejecting
+/// malformed framing, a non-canonical payload, or bad key/signature bytes.
+pub fn parse_signed_record<T>(bytes: &[u8]) -> Result<SignedPayload<T>, ChannelError>
+where
+    T: TryFrom<CBOR>,
+    <T as TryFrom<CBOR>>::Error: core::fmt::Display,
+{
+    if bytes.len() < LEN_PREFIX + PK_LEN + SIG_LEN {
+        return Err(ChannelError::Malformed);
+    }
+    let payload_len = u32::from_be_bytes(bytes[..LEN_PREFIX].try_into().unwrap()) as usize;
+    let payload_end = LEN_PREFIX
+        .checked_add(payload_len)
+        .ok_or(ChannelError::Malformed)?;
+    if bytes.len() != payload_end + PK_LEN + SIG_LEN {
+        return Err(ChannelError::Malformed);
+    }
+    let payload: T = from_canonical_bytes(&bytes[LEN_PREFIX..payload_end])
+        .map_err(|_| ChannelError::Malformed)?;
+    let signer_bytes: [u8; PK_LEN] = bytes[payload_end..payload_end + PK_LEN].try_into().unwrap();
+    let sig_bytes: [u8; SIG_LEN] = bytes[payload_end + PK_LEN..].try_into().unwrap();
+    let signer = PublicKey::from_bytes(signer_bytes).map_err(|_| ChannelError::BadSignature)?;
+    let signature = Signature::from_bytes(sig_bytes).map_err(|_| ChannelError::BadSignature)?;
+    Ok(SignedPayload {
+        payload,
+        signer,
+        signature,
+    })
 }
 
 #[cfg(test)]
@@ -367,15 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn response_frame_is_station_signed_and_verifies() {
+    fn response_frame_is_station_signed_and_json_parses() {
         let station = Keypair::generate();
-        let resp = ResponseEnvelope {
-            nonce: 7,
-            result: Some("{\"balance_centi\":2400}".into()),
-            error: None,
-        };
-        let frame = frame_signed_response(resp.clone(), &station);
-        // A mobile parses the reply exactly like the station parses a request.
+        let resp = ResponseEnvelope::ok(7, "{\"balance_centi\":2400}".into());
+        let frame = frame_signed_response(&resp, &station);
+        // The mobile splits the frame like the station splits a request, verifies
+        // the station's signature over the received bytes, then JSON-parses them.
         let payload_len = u32::from_be_bytes(frame[..LEN_PREFIX].try_into().unwrap()) as usize;
         let payload = &frame[LEN_PREFIX..LEN_PREFIX + payload_len];
         let sig: [u8; SIG_LEN] = frame[LEN_PREFIX + payload_len..].try_into().unwrap();
@@ -383,8 +422,10 @@ mod tests {
             .public_key()
             .verify(payload, &Signature::from_bytes(sig).unwrap())
             .is_ok());
-        let decoded: ResponseEnvelope = from_canonical_bytes(payload).unwrap();
+        let decoded: ResponseEnvelope = serde_json::from_slice(payload).unwrap();
+        assert_eq!(decoded.v, ENVELOPE_VERSION);
         assert_eq!(decoded.nonce, 7);
         assert_eq!(decoded.result.as_deref(), Some("{\"balance_centi\":2400}"));
+        assert!(decoded.error.is_none());
     }
 }
