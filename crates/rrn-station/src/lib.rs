@@ -43,6 +43,7 @@ pub mod paired;
 pub mod pairing;
 pub mod rpc;
 pub mod rpc_client;
+pub mod rpc_envelope;
 pub mod server;
 pub mod station;
 

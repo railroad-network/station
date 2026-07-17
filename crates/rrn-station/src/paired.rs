@@ -31,6 +31,13 @@ pub struct PairedMobile {
     pub address: String,
     /// Station-clock Unix seconds when this pairing was confirmed.
     pub paired_at: i64,
+    /// The highest request nonce seen from this mobile on the authenticated
+    /// channel (T1.3.4). Monotonic per mobile: a request must carry a strictly
+    /// greater nonce or it is rejected as a replay. Starts at 0 (so the first
+    /// request is nonce 1) and resets on a fresh pairing. `#[serde(default)]` so
+    /// a `paired_mobiles.json` written before this field parses as 0.
+    #[serde(default)]
+    pub last_nonce: u64,
 }
 
 /// The station's set of paired mobiles, backed by a JSON file.
@@ -97,8 +104,27 @@ impl PairedMobiles {
             PairedMobile {
                 address,
                 paired_at: now,
+                // A fresh pairing resets the nonce window; the mobile likewise
+                // restarts its request counter after (re)pairing.
+                last_nonce: 0,
             },
         );
+    }
+
+    /// Accepts request nonce `nonce` from `address` if it is strictly greater
+    /// than the highest previously seen — the monotonic replay check for the
+    /// authenticated channel (T1.3.4). On success updates the stored high-water
+    /// mark and returns `true`; returns `false` for an unpaired address or a
+    /// stale/replayed nonce. Does **not** persist — call [`save`](Self::save)
+    /// after a successful accept so the bump survives a restart.
+    pub fn accept_nonce(&mut self, address: &str, nonce: u64) -> bool {
+        match self.mobiles.get_mut(address) {
+            Some(m) if nonce > m.last_nonce => {
+                m.last_nonce = nonce;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Removes a mobile by address. Returns whether it was present. Does not
@@ -193,6 +219,45 @@ mod tests {
 
         let reloaded = PairedMobiles::load(dir.path()).unwrap();
         assert!(!reloaded.contains("rrn1alice"));
+    }
+
+    #[test]
+    fn nonce_must_strictly_increase_and_persists() {
+        let dir = tmp_dir();
+        let mut paired = PairedMobiles::load(dir.path()).unwrap();
+        paired.add("rrn1alice".to_string(), 1_000);
+
+        // First request (nonce 1) accepted; the same or lower rejected.
+        assert!(paired.accept_nonce("rrn1alice", 1));
+        assert!(!paired.accept_nonce("rrn1alice", 1), "replay of same nonce");
+        assert!(!paired.accept_nonce("rrn1alice", 0), "lower nonce");
+        // A jump forward is fine (the mobile may skip nonces).
+        assert!(paired.accept_nonce("rrn1alice", 5));
+        assert!(
+            !paired.accept_nonce("rrn1alice", 4),
+            "below high-water mark"
+        );
+        // Unpaired address never accepts.
+        assert!(!paired.accept_nonce("rrn1bob", 1));
+
+        paired.save().unwrap();
+        let reloaded = PairedMobiles::load(dir.path()).unwrap();
+        // The high-water mark survived the restart, so old nonces stay rejected.
+        assert!(!reloaded.list()[0].last_nonce.eq(&0));
+        let mut reloaded = reloaded;
+        assert!(!reloaded.accept_nonce("rrn1alice", 5));
+        assert!(reloaded.accept_nonce("rrn1alice", 6));
+    }
+
+    #[test]
+    fn repairing_resets_the_nonce_window() {
+        let dir = tmp_dir();
+        let mut paired = PairedMobiles::load(dir.path()).unwrap();
+        paired.add("rrn1alice".to_string(), 1_000);
+        assert!(paired.accept_nonce("rrn1alice", 9));
+        // Re-pairing the same address starts the window over.
+        paired.add("rrn1alice".to_string(), 2_000);
+        assert!(paired.accept_nonce("rrn1alice", 1));
     }
 
     #[test]

@@ -36,12 +36,22 @@ use rrn_storage::log::{AppendLog, StoredPayload};
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{PublicKey, Signature};
 
+use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
+
 use crate::clock::Clock;
 use crate::gossip::WireEntry;
 use crate::ledger_view;
 use crate::paired::{self, PairedMobiles};
 use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
+use crate::rpc_envelope::{self, ChannelError, RequestEnvelope, ResponseEnvelope};
 use crate::{history, rpc};
+
+/// Methods a paired mobile may invoke over the authenticated channel (T1.3.4).
+/// The operator-only methods (`pair_confirm`, `unpair`, `list_mobiles`,
+/// `pair_list_pending`) and the local-only recovery methods are deliberately
+/// absent — a mobile reaches only its own read surface. The write methods
+/// (`propose`, `confirm`) join this list with the mobile-signed submit path.
+const MOBILE_METHODS: &[&str] = &["whoami", "balance", "history"];
 
 /// Community identifier stamped on Phase 0 vouches (a placeholder until real
 /// community ids arrive in Phase 1).
@@ -105,6 +115,15 @@ pub enum Command {
         request: PairRequest,
         /// The station's signed response, or why it was rejected.
         reply: oneshot::Sender<Result<PairResponse, PairError>>,
+    },
+    /// A paired mobile's authenticated request (T1.3.4), from the mobile HTTP
+    /// surface. The bytes are the sealed envelope; the reply is the sealed
+    /// response bytes, or the rejection reason for the edge to turn into a status.
+    RpcRequest {
+        /// The sealed request envelope as it arrived on the wire.
+        sealed: Vec<u8>,
+        /// The sealed response bytes, or why the request was rejected.
+        reply: oneshot::Sender<Result<Vec<u8>, ChannelError>>,
     },
     /// Stop the core loop (graceful shutdown).
     Shutdown,
@@ -203,6 +222,17 @@ impl CoreHandle {
         rx.await.unwrap_or(Err(PairError::Unavailable))
     }
 
+    /// Submits a paired mobile's sealed request (T1.3.4); returns the sealed
+    /// response bytes, or the rejection reason. [`ChannelError::Unavailable`]
+    /// means the core is gone.
+    pub async fn rpc_request(&self, sealed: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::RpcRequest { sealed, reply }).is_err() {
+            return Err(ChannelError::Unavailable);
+        }
+        rx.await.unwrap_or(Err(ChannelError::Unavailable))
+    }
+
     /// Asks the core to shut down.
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -286,6 +316,9 @@ impl Core {
                 }
                 Command::PairRequest { request, reply } => {
                     let _ = reply.send(self.do_pair_request(request));
+                }
+                Command::RpcRequest { sealed, reply } => {
+                    let _ = reply.send(self.do_rpc_request(sealed));
                 }
                 Command::Shutdown => {
                     tracing::info!("core shutting down");
@@ -561,6 +594,104 @@ impl Core {
             station_address: self.wallet.address.to_string(),
             signature: hex(&signature.to_bytes()),
         })
+    }
+
+    // --- authenticated request channel (T1.3.4) -----------------------------
+
+    /// Opens, authenticates, and dispatches a paired mobile's sealed request,
+    /// returning the sealed response bytes.
+    ///
+    /// The order is deliberate: cheap, stateless checks (open, signature, format)
+    /// run before the stateful ones (recipient, paired, skew, nonce), and the
+    /// nonce is consumed **before** dispatch so a request cannot be replayed even
+    /// if the method itself fails. Auth failures return a [`ChannelError`] with
+    /// no sealed body — the edge turns them into a 4xx; an authenticated request
+    /// whose *method* fails still gets a sealed error response.
+    fn do_rpc_request(&mut self, sealed_bytes: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
+        // 1. Open the seal with the station's secret key.
+        let sealed = SealedBox::from_bytes(&sealed_bytes).map_err(|_| ChannelError::Sealed)?;
+        let frame = sealed::open(&sealed, &self.wallet.secret_key, TRANSPORT_CONTEXT)
+            .map_err(|_| ChannelError::Sealed)?;
+
+        // 2. Parse the frame and verify the signature over the exact payload.
+        let envelope = rpc_envelope::parse_signed_request(&frame)?;
+
+        // 3. Stateful authorization.
+        let station = self.station_keypair();
+        if envelope.recipient.to_bytes() != station.public_key().to_bytes() {
+            return Err(ChannelError::WrongRecipient);
+        }
+        let signer = Address::from_public_key(envelope.signer).to_string();
+        if !self.paired.contains(&signer) {
+            return Err(ChannelError::NotPaired);
+        }
+        let now = self.clock.now();
+        if (now - envelope.timestamp).abs() > rpc_envelope::TIMESTAMP_SKEW_SECS {
+            return Err(ChannelError::StaleTimestamp);
+        }
+        if !self.paired.accept_nonce(&signer, envelope.nonce) {
+            return Err(ChannelError::Replay);
+        }
+        // Persist the nonce high-water mark so the replay bound survives a
+        // restart. If this fails, do not consume the request against a nonce we
+        // could not record — surface it as unavailable so the mobile retries.
+        if let Err(e) = self.paired.save() {
+            tracing::error!(error = %e, "failed to persist mobile request nonce");
+            return Err(ChannelError::Unavailable);
+        }
+
+        // 4. Dispatch through the mobile-permitted method surface.
+        let mobile_pubkey = envelope.signer;
+        let response = self.dispatch_channel_call(&envelope);
+
+        // 5. Sign the reply as the station and seal it back to the mobile.
+        let reply_frame = rpc_envelope::frame_signed_response(response, &station);
+        let sealed_reply = sealed::seal(&mobile_pubkey, &reply_frame, TRANSPORT_CONTEXT)
+            .map_err(|_| ChannelError::Sealed)?;
+        Ok(sealed_reply.to_bytes())
+    }
+
+    /// Routes an authenticated envelope to the existing method dispatch, gated to
+    /// the [`MOBILE_METHODS`] surface, and wraps the outcome as a response
+    /// envelope (a method-level failure becomes a sealed error, not a rejection).
+    fn dispatch_channel_call(&mut self, envelope: &RequestEnvelope) -> ResponseEnvelope {
+        if !MOBILE_METHODS.contains(&envelope.method.as_str()) {
+            return ResponseEnvelope {
+                nonce: envelope.nonce,
+                result: None,
+                error: Some((
+                    rpc::METHOD_NOT_FOUND,
+                    format!("method not available to mobiles: {}", envelope.method),
+                )),
+            };
+        }
+        let params: serde_json::Value = match serde_json::from_str(&envelope.params) {
+            Ok(v) => v,
+            Err(e) => {
+                return ResponseEnvelope {
+                    nonce: envelope.nonce,
+                    result: None,
+                    error: Some((rpc::INVALID_PARAMS, format!("params not valid JSON: {e}"))),
+                }
+            }
+        };
+        let req = rpc::Request {
+            id: envelope.nonce.to_string(),
+            method: envelope.method.clone(),
+            params,
+        };
+        match self.handle_call(&req) {
+            Ok(result) => ResponseEnvelope {
+                nonce: envelope.nonce,
+                result: Some(result.to_string()),
+                error: None,
+            },
+            Err(e) => ResponseEnvelope {
+                nonce: envelope.nonce,
+                result: None,
+                error: Some((e.code, e.message)),
+            },
+        }
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
