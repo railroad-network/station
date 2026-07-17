@@ -29,5 +29,6 @@
 pub mod address;
 pub mod attestation;
 pub mod recovery;
+pub mod sealed;
 pub mod vouch;
 pub mod wallet;

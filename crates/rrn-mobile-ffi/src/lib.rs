@@ -62,6 +62,20 @@ pub enum CryptoError {
     /// An address string was not a valid `rrn1…` address.
     #[error("invalid address")]
     InvalidAddress,
+    /// A sealed box could not be opened: the wrong recipient key, the wrong
+    /// context, truncated framing, or tampering (not distinguished).
+    #[error("sealed box could not be opened")]
+    SealFailed,
+}
+
+impl From<rrn_identity::sealed::SealError> for CryptoError {
+    fn from(e: rrn_identity::sealed::SealError) -> Self {
+        use rrn_identity::sealed::SealError;
+        match e {
+            SealError::MalformedRecipientKey => CryptoError::InvalidEncoding,
+            SealError::Truncated | SealError::Decrypt => CryptoError::SealFailed,
+        }
+    }
 }
 
 impl From<ParseError> for CryptoError {
@@ -113,6 +127,21 @@ impl Keypair {
             inner: self.inner.sign(&message),
         })
     }
+
+    /// Opens a sealed box that was sealed to this keypair's public key with
+    /// [`PublicKey::seal`] (ADR-0008 transport envelope). `sealed_box` is the
+    /// opaque `eph ‖ nonce ‖ ct` framing. Returns [`CryptoError::SealFailed`]
+    /// for the wrong key, wrong context, truncated framing, or tampering — never
+    /// yields wrong plaintext. The secret seed stays inside Rust throughout.
+    pub fn open(&self, sealed_box: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        let sb = rrn_identity::sealed::SealedBox::from_bytes(&sealed_box)?;
+        let plaintext = rrn_identity::sealed::open(
+            &sb,
+            self.inner.secret_key(),
+            rrn_identity::sealed::TRANSPORT_CONTEXT,
+        )?;
+        Ok(plaintext)
+    }
 }
 
 /// FFI handle to an Ed25519 public key.
@@ -155,6 +184,21 @@ impl PublicKey {
     /// signature, wrong key, or malformed key all return `false`.
     pub fn verify(&self, message: Vec<u8>, signature: Arc<Signature>) -> bool {
         self.inner.verify(&message, &signature.inner).is_ok()
+    }
+
+    /// Seals `plaintext` so only the holder of this key's secret can open it
+    /// (ADR-0008 transport envelope). Returns the opaque `eph ‖ nonce ‖ ct`
+    /// framing; the mobile treats it as bytes and never parses it. Uses the
+    /// shared [`TRANSPORT_CONTEXT`](rrn_identity::sealed::TRANSPORT_CONTEXT), so
+    /// only [`Keypair::open`] on the matching secret — anywhere, station or
+    /// mobile — can recover the plaintext.
+    pub fn seal(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        let sealed = rrn_identity::sealed::seal(
+            &self.inner,
+            &plaintext,
+            rrn_identity::sealed::TRANSPORT_CONTEXT,
+        )?;
+        Ok(sealed.to_bytes())
     }
 }
 
@@ -352,6 +396,40 @@ mod tests {
         let pk = kp.public_key();
         let sig = kp.sign(b"original".to_vec());
         assert!(!pk.verify(b"tampered".to_vec(), sig));
+    }
+
+    #[test]
+    fn seal_open_roundtrips_through_ffi_shapes() {
+        // The mobile seals to the station's public key; the station (or, here,
+        // the same keypair) opens with its secret. Exercises the opaque byte
+        // framing the transport passes over HTTP.
+        let recipient = Keypair::generate();
+        let plaintext = b"balance request envelope".to_vec();
+        let sealed = recipient
+            .public_key()
+            .seal(plaintext.clone())
+            .expect("seal to a valid key");
+        let opened = recipient
+            .open(sealed)
+            .expect("open with the matching secret");
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn open_with_wrong_key_fails_cleanly() {
+        let recipient = Keypair::generate();
+        let wrong = Keypair::generate();
+        let sealed = recipient.public_key().seal(b"secret".to_vec()).unwrap();
+        assert!(matches!(wrong.open(sealed), Err(CryptoError::SealFailed)));
+    }
+
+    #[test]
+    fn open_truncated_box_fails_cleanly() {
+        let kp = Keypair::generate();
+        assert!(matches!(
+            kp.open(vec![0u8; 8]),
+            Err(CryptoError::SealFailed)
+        ));
     }
 
     #[test]

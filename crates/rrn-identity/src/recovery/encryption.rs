@@ -51,17 +51,13 @@
 //! the original holder first decrypting it; re-issuing to new holders is a fresh
 //! split (see [`super::flow`] refresh).
 
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use dcbor::prelude::*;
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand_core::{OsRng, RngCore};
-use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use rrn_crypto::keypair::{PublicKey, SecretKey};
 
 use crate::address::Address;
+use crate::sealed::{self, SealError, SealedBox};
 
 use super::shamir::{RawShard, ShardIndex};
 
@@ -109,74 +105,40 @@ pub enum ShardCryptoError {
     CorruptPlaintext,
 }
 
-/// The holder's X25519 public key, converted from their Ed25519 identity key.
-fn holder_x25519_public(pk: &PublicKey) -> Result<XPublicKey, ShardCryptoError> {
-    let vk = VerifyingKey::from_bytes(&pk.to_bytes())
-        .map_err(|_| ShardCryptoError::MalformedHolderKey)?;
-    Ok(XPublicKey::from(vk.to_montgomery().to_bytes()))
-}
-
-/// The holder's X25519 secret (and matching public) derived from their Ed25519
-/// secret seed. The public is recomputed here so the KDF transcript matches what
-/// [`encrypt_shard`] bound, and so it reflects the *actual* decrypting key.
-fn holder_x25519_secret(sk: &SecretKey) -> (StaticSecret, XPublicKey) {
-    let mut seed = sk.to_bytes();
-    let signing = SigningKey::from_bytes(&seed);
-    seed.zeroize();
-    let static_secret = StaticSecret::from(signing.to_scalar_bytes());
-    let public = XPublicKey::from(signing.verifying_key().to_montgomery().to_bytes());
-    (static_secret, public)
-}
-
-/// Derives the 32-byte AEAD key, binding the whole ECDH transcript.
-fn derive_key(shared: &[u8; 32], ephemeral_pub: &[u8; 32], holder_pub: &[u8; 32]) -> [u8; 32] {
-    let mut material = [0u8; 96];
-    material[..32].copy_from_slice(shared);
-    material[32..64].copy_from_slice(ephemeral_pub);
-    material[64..].copy_from_slice(holder_pub);
-    let key = blake3::derive_key(KDF_CONTEXT, &material);
-    material.zeroize();
-    key
+/// Maps a general [`SealError`] onto this module's shard-specific error. A
+/// malformed holder key stays distinct; every crypto failure collapses to
+/// [`ShardCryptoError::Decrypt`] (the same not-distinguished behavior as before).
+fn from_seal_error(e: SealError) -> ShardCryptoError {
+    match e {
+        SealError::MalformedRecipientKey => ShardCryptoError::MalformedHolderKey,
+        SealError::Truncated | SealError::Decrypt => ShardCryptoError::Decrypt,
+    }
 }
 
 /// Seals `shard` so only the holder of `holder_pubkey`'s secret key can open it.
+///
+/// Delegates the sealing to [`crate::sealed`] under [`KDF_CONTEXT`], so recovery
+/// and the mobile↔station transport share one construction; the context string
+/// is what keeps a shard box and a transport box from ever opening as each other.
 pub fn encrypt_shard(
     shard: &RawShard,
     holder_pubkey: &PublicKey,
 ) -> Result<EncryptedShard, ShardCryptoError> {
-    let holder_x_pub = holder_x25519_public(holder_pubkey)?;
-
-    // Fresh ephemeral keypair; ECDH against the holder's X25519 public key.
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_pub = XPublicKey::from(&ephemeral_secret);
-    let shared = ephemeral_secret.diffie_hellman(&holder_x_pub);
-
-    let mut key = derive_key(
-        shared.as_bytes(),
-        ephemeral_pub.as_bytes(),
-        holder_x_pub.as_bytes(),
-    );
-
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
-
     // Plaintext: index ‖ data. The index is not secret, but sealing it under the
     // AEAD binds it so a holder cannot be handed a shard with a swapped index.
     let mut plaintext = [0u8; PLAINTEXT_LEN];
     plaintext[0] = shard.index.0;
     plaintext[1..].copy_from_slice(&shard.data);
 
-    let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("32-byte key is valid");
-    let result = cipher.encrypt(XNonce::from_slice(&nonce), plaintext.as_slice());
-    key.zeroize();
+    let sealed = sealed::seal(holder_pubkey, &plaintext, KDF_CONTEXT).map_err(from_seal_error);
     plaintext.zeroize();
-    let ciphertext = result.map_err(|_| ShardCryptoError::Decrypt)?;
+    let sealed = sealed?;
 
     Ok(EncryptedShard {
         holder: Address::from_public_key(*holder_pubkey),
-        ephemeral_pubkey: *ephemeral_pub.as_bytes(),
-        nonce,
-        ciphertext,
+        ephemeral_pubkey: sealed.ephemeral_pubkey,
+        nonce: sealed.nonce,
+        ciphertext: sealed.ciphertext,
     })
 }
 
@@ -188,23 +150,13 @@ pub fn decrypt_shard(
     encrypted: &EncryptedShard,
     holder_secret: &SecretKey,
 ) -> Result<RawShard, ShardCryptoError> {
-    let (static_secret, holder_x_pub) = holder_x25519_secret(holder_secret);
-    let ephemeral_pub = XPublicKey::from(encrypted.ephemeral_pubkey);
-    let shared = static_secret.diffie_hellman(&ephemeral_pub);
-
-    let mut key = derive_key(
-        shared.as_bytes(),
-        &encrypted.ephemeral_pubkey,
-        holder_x_pub.as_bytes(),
-    );
-
-    let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("32-byte key is valid");
-    let result = cipher.decrypt(
-        XNonce::from_slice(&encrypted.nonce),
-        encrypted.ciphertext.as_slice(),
-    );
-    key.zeroize();
-    let mut plaintext = result.map_err(|_| ShardCryptoError::Decrypt)?;
+    let sealed = SealedBox {
+        ephemeral_pubkey: encrypted.ephemeral_pubkey,
+        nonce: encrypted.nonce,
+        ciphertext: encrypted.ciphertext.clone(),
+    };
+    let mut plaintext =
+        sealed::open(&sealed, holder_secret, KDF_CONTEXT).map_err(from_seal_error)?;
 
     if plaintext.len() != PLAINTEXT_LEN {
         plaintext.zeroize();

@@ -57,6 +57,7 @@ enum CryptoError {
     "InvalidEncoding",
     "InvalidSignature",
     "InvalidAddress",
+    "SealFailed",
 };
 
 // An Ed25519 keypair. Opaque: the secret seed stays on the Rust side.
@@ -68,6 +69,13 @@ interface Keypair {
     PublicKey public_key();
 
     Signature sign(bytes message);
+
+    // Opens a sealed box addressed to this keypair's public key (ADR-0008
+    // transport envelope). `sealed_box` is the opaque framing PublicKey.seal
+    // produced; the secret seed never crosses the FFI boundary. SealFailed on a
+    // wrong key, wrong context, truncated framing, or tampering.
+    [Throws=CryptoError]
+    bytes open(bytes sealed_box);
 };
 
 // An Ed25519 public key (32 compressed bytes, validated as a curve point).
@@ -85,6 +93,14 @@ interface PublicKey {
     string to_address();
 
     boolean verify(bytes message, Signature signature);
+
+    // Seals `plaintext` so only the holder of this key's secret can open it
+    // (ADR-0008 transport envelope), returning the opaque `eph ‖ nonce ‖ ct`
+    // framing. Used by the mobile to seal a request to its paired station; the
+    // station opens it with the matching secret. Uses the shared transport KDF
+    // context, distinct from the recovery-shard one.
+    [Throws=CryptoError]
+    bytes seal(bytes plaintext);
 };
 
 // An Ed25519 signature (64 bytes: R ‖ S).
