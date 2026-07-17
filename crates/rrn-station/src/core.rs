@@ -332,6 +332,7 @@ impl Core {
             "confirm" => self.m_confirm(req),
             "history" => self.m_history(req),
             "transactions" => self.m_transactions(req),
+            "next_nonce" => self.m_next_nonce(req),
             "vouch" => self.m_vouch(req),
             "backup_export" => self.m_backup_export(req),
             "recover_import" => self.m_recover_import(req),
@@ -435,6 +436,21 @@ impl Core {
             .map_err(internal)?;
         let transactions = transaction_view::member_transactions(&snapshot, &member, params.limit);
         ok(&rpc::TransactionsResult { transactions })
+    }
+
+    /// `next_nonce` — the nonce a member's next proposal must carry (T1.3.4). The
+    /// mobile reads this before it signs a proposal, since the nonce is signed
+    /// and the ledger requires it to be exactly the next in sequence.
+    fn m_next_nonce(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::NextNonceParams = parse_params(req)?;
+        let who = match params.address {
+            Some(s) => parse_addr(&s)?,
+            None => self.wallet.address,
+        };
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+        let nonce = snapshot.next_nonce(&who.public_key().to_bytes());
+        ok(&rpc::NextNonceResult { nonce })
     }
 
     fn m_vouch(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -682,7 +698,7 @@ impl Core {
         match envelope.method.as_str() {
             "submit_proposal" => self.channel_submit_proposal(envelope),
             "submit_confirmation" => self.channel_submit_confirmation(envelope),
-            "whoami" | "balance" | "transactions" => {
+            "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
                 let req = rpc::Request {

@@ -370,17 +370,37 @@ async fn authenticated_channel_happy_path_and_rejections() {
     let receiver_addr = Address::from_public_key(receiver.public_key());
     let now = now_secs();
 
-    // The sender (`mobile`) proposes 500 to the receiver. Its *ledger* nonce is 0
-    // (first proposal); its *transport* nonce continues at 6 — the two are
-    // independent.
-    let params = proposal_params(&mobile, &receiver_addr, 500, 0, now);
+    // Query-first: the sender asks for its authoritative next ledger nonce before
+    // signing. A member that has never proposed gets 0.
+    let params = format!("{{\"address\":\"{mobile_addr}\"}}");
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "next_nonce",
+        &params,
+        6,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    let ledger_nonce = serde_json::from_str::<serde_json::Value>(reply.result.as_deref().unwrap())
+        .unwrap()["nonce"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(ledger_nonce, 0, "first proposal is nonce 0");
+
+    // The sender proposes 500 to the receiver with that ledger nonce. Its
+    // *transport* nonce continues at 7 — the two are independent.
+    let params = proposal_params(&mobile, &receiver_addr, 500, ledger_nonce, now);
     let req = sealed_request(
         &mobile,
         &station_pk,
         &station_pk,
         "submit_proposal",
         &params,
-        6,
+        7,
         now,
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
@@ -400,7 +420,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         &station_pk,
         "transactions",
         &params,
-        7,
+        8,
         now,
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
@@ -459,7 +479,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         &station_pk,
         "submit_proposal",
         &params,
-        8,
+        9,
         now,
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;

@@ -286,3 +286,24 @@ pub struct TransactionsResult {
     /// The member's transactions, most recent first.
     pub transactions: Vec<TransactionRow>,
 }
+
+/// `next_nonce` params — the member whose next proposal nonce to return.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NextNonceParams {
+    /// The member `rrn1…` address. Absent/empty means the station's own identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+/// `next_nonce` result — the nonce a member's next proposal must carry (T1.3.4).
+///
+/// The ledger requires each sender's proposals to be strictly sequential, and
+/// the nonce is part of the *signed* proposal, so the mobile must learn its
+/// authoritative next value from the station before it signs (it cannot be
+/// assigned after signing). This exposes the `next_nonce` the ledger already
+/// derives from the log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NextNonceResult {
+    /// The next expected per-sender nonce (0 if the member has never proposed).
+    pub nonce: u64,
+}
