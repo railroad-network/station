@@ -1266,6 +1266,26 @@ pipeline enforces (T1.3.4).
   the paired-member set (an unpaired key cannot authenticate to open one at all).
   A per-mobile single-flight/connection cap is the named hardening if this
   matters at scale.
+- **Background-sync signing credential (mobile, T1.3.6).** *Threat:* draining
+  `/subscribe` while the app is backgrounded or killed needs the mobile's signing
+  key, but the normal model keeps the key only in memory after a passphrase
+  unlock and drops it on background — a headless task has no unlocked wallet.
+  Making the key usable in the background is inherently a weakening of that
+  posture. *Mitigation (shipped, T1.3.6):* the capability is **opt-in and
+  default-off**; nothing is provisioned unless the user turns on Background sync.
+  When they do, the wallet is re-encrypted under a fresh random secret and the
+  blob + secret are stored at **device-unlock accessibility** (`WHEN_UNLOCKED_
+  THIS_DEVICE_ONLY`, no biometric ACL) — the same at-rest class as the transport
+  nonce and event cursor. The secret never leaves Rust in raw form (this is a
+  standard `.rrnwallet` envelope under a machine-generated passphrase), the pair
+  is device-bound and non-exportable, and it is cleared when the user turns
+  background sync off or factory-resets. *Residual risk (accepted, opt-in):* the
+  stored pair is a **full-power** signing wallet (there is no read-only subkey),
+  so the app process — or malware running as it on an unlocked device — could use
+  it to sign, not just read. The named hardening is a **station-issued,
+  read-scoped background token** minted at pairing, which would let the phone
+  fetch events without carrying a transacting key; that is a future cross-repo
+  change, out of scope for Phase 1.
 
 ## Cross-cutting threats
 
