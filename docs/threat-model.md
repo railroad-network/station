@@ -1246,6 +1246,26 @@ pipeline enforces (T1.3.4).
   spec's QR-scanned-by-CLI was rejected — a headless Pi cannot scan, and one QR
   cannot carry both keys.) *Residual risk:* if users skip the comparison, TOFU is
   only as safe as the pairing environment; this remains a user-facing risk.
+- **Push updates over the long-poll (`/subscribe`).** *Threat:* the push channel
+  could leak a member's events to an eavesdropper, deliver a forged event, or be
+  used to exhaust the station. *Mitigation (shipped, T1.3.5):* `/subscribe` reuses
+  the **same sealed, signed envelope** as `/rpc` — authenticated by the mobile's
+  key, sealed to the station, replay-bound by the same per-request transport
+  nonce, skew-checked, and gated on the paired list — so all of the MITM, replay,
+  impersonation, and confidentiality properties above apply unchanged. Each event
+  is derived from an already-signed, engine-verified log entry and delivered
+  inside the station-signed sealed reply; the station relays only what it
+  cryptographically accepted on ingest (the mobile carries no dCBOR decoder, so it
+  does not independently re-verify the embedded originator signature — a
+  documented consequence of ADR-0008, not a gap). Directional relevance means a
+  member only ever receives events it is a party to (a proposal to it, its own
+  proposal confirmed, a settlement or cancellation it is in), so the channel
+  cannot be used to enumerate other members' activity. *Residual risk (accepted
+  for Phase 1):* a paired mobile can hold a connection (and a task) open for the
+  ~30s hold, so a compromised paired device could tie up connections; the bound is
+  the paired-member set (an unpaired key cannot authenticate to open one at all).
+  A per-mobile single-flight/connection cap is the named hardening if this
+  matters at scale.
 
 ## Cross-cutting threats
 

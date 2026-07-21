@@ -87,6 +87,11 @@ pub struct MobileConfig {
     /// dark: mobiles must then be pointed at this station by hand.
     #[serde(default = "default_advertise")]
     pub advertise: bool,
+    /// How long a `/subscribe` long-poll is held open before returning an empty
+    /// heartbeat (T1.3.5). The default matches the task's 30s; tests set it small
+    /// so the timeout path is fast.
+    #[serde(default = "default_subscribe_hold_secs")]
+    pub subscribe_hold_secs: u64,
 }
 
 fn default_mobile_listen() -> String {
@@ -95,6 +100,9 @@ fn default_mobile_listen() -> String {
 fn default_advertise() -> bool {
     true
 }
+fn default_subscribe_hold_secs() -> u64 {
+    30
+}
 
 impl Default for MobileConfig {
     fn default() -> Self {
@@ -102,6 +110,7 @@ impl Default for MobileConfig {
             listen: default_mobile_listen(),
             name: None,
             advertise: default_advertise(),
+            subscribe_hold_secs: default_subscribe_hold_secs(),
         }
     }
 }

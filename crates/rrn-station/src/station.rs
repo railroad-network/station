@@ -155,6 +155,7 @@ impl Station {
                 tasks.push(tokio::spawn(mobile_server::serve(
                     mobile_listener,
                     core.clone(),
+                    std::time::Duration::from_secs(config.mobile.subscribe_hold_secs),
                     shutdown_rx.clone(),
                 )));
             }

@@ -7,8 +7,15 @@
 //! ourselves — see ADR-0008. Every handler forwards to the single-threaded
 //! [`Core`](crate::core), so there is no shared-state race here either.
 //!
-//! Today it exposes `POST /pair` (T1.3.3) and `POST /rpc`, the authenticated
-//! request channel (T1.3.4). Long-poll updates (T1.3.5) add their route here.
+//! Routes: `POST /pair` (T1.3.3), `POST /rpc` — the authenticated request channel
+//! (T1.3.4) — and `POST /subscribe`, the long-poll for push-style updates
+//! (T1.3.5). The subscribe handler is the one place a request is *held open*: it
+//! authenticates through the core, then either returns pending events immediately
+//! or parks on the core's log-tail signal (up to `subscribe_hold`) and returns
+//! the moment a relevant event is appended. The wait lives here, never in the
+//! core loop.
+
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -18,21 +25,38 @@ use axum::{Json, Router};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::core::CoreHandle;
+use crate::core::{CoreHandle, SubscribeOutcome};
 use crate::pairing::{PairError, PairRequest, PairResponse};
 use crate::rpc_envelope::ChannelError;
 
-/// Builds the router over a core handle.
-fn app(core: CoreHandle) -> Router {
+/// Router state: the core handle plus how long a `/subscribe` is held open.
+#[derive(Clone)]
+struct AppState {
+    core: CoreHandle,
+    subscribe_hold: Duration,
+}
+
+/// Builds the router over a core handle and the subscribe hold duration.
+fn app(core: CoreHandle, subscribe_hold: Duration) -> Router {
     Router::new()
         .route("/pair", post(pair))
         .route("/rpc", post(rpc))
-        .with_state(core)
+        .route("/subscribe", post(subscribe))
+        .with_state(AppState {
+            core,
+            subscribe_hold,
+        })
 }
 
 /// Serves the mobile HTTP surface on `listener` until `shutdown` flips to true.
-pub async fn serve(listener: TcpListener, core: CoreHandle, mut shutdown: watch::Receiver<bool>) {
-    let result = axum::serve(listener, app(core))
+/// `subscribe_hold` is how long a long-poll waits before an empty heartbeat.
+pub async fn serve(
+    listener: TcpListener,
+    core: CoreHandle,
+    subscribe_hold: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let result = axum::serve(listener, app(core, subscribe_hold))
         .with_graceful_shutdown(async move {
             // Resolves when the station begins shutting down; ignore a dropped
             // sender (the station is going away regardless).
@@ -49,10 +73,10 @@ pub async fn serve(listener: TcpListener, core: CoreHandle, mut shutdown: watch:
 /// A rejected request maps to `400 Bad Request` with a short reason (the mobile
 /// shows it to the user); a core that is shutting down maps to `503`.
 async fn pair(
-    State(core): State<CoreHandle>,
+    State(state): State<AppState>,
     Json(request): Json<PairRequest>,
 ) -> Result<Json<PairResponse>, (StatusCode, String)> {
-    match core.pair_request(request).await {
+    match state.core.pair_request(request).await {
         Ok(response) => Ok(Json(response)),
         Err(PairError::Unavailable) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -69,10 +93,73 @@ async fn pair(
 /// inside the seal (ADR-0008). An authentication failure maps to `401` (the
 /// mobile is not, or not provably, a paired member); a malformed or
 /// wrong-recipient envelope to `400`; a shutting-down core to `503`.
-async fn rpc(State(core): State<CoreHandle>, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
-    match core.rpc_request(body.to_vec()).await {
+async fn rpc(State(state): State<AppState>, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
+    match state.core.rpc_request(body.to_vec()).await {
         Ok(sealed_reply) => Ok(sealed_reply),
         Err(e) => Err((channel_status(e), e.as_str().to_string())),
+    }
+}
+
+/// `POST /subscribe` — a paired mobile's long-poll for push updates (T1.3.5).
+///
+/// Same sealed envelope as `/rpc` (method `subscribe`, params carry the
+/// `last_seen_event_id` cursor). The handler authenticates through the core, then
+/// either returns pending events immediately or parks on the log-tail signal
+/// until an event is appended or `subscribe_hold` elapses (an empty heartbeat).
+/// The response is the same sealed reply shape, carrying `{last_seen_event_id,
+/// events}` as its result.
+async fn subscribe(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let core = &state.core;
+    match core.subscribe(body.to_vec()).await {
+        Err(e) => Err((channel_status(e), e.as_str().to_string())),
+        Ok(SubscribeOutcome::Ready(sealed)) => Ok(sealed),
+        Ok(SubscribeOutcome::Waiting {
+            member,
+            member_pk,
+            last_seen,
+            nonce,
+        }) => {
+            let mut tail = core.log_tail_watch();
+            let hold = tokio::time::sleep(state.subscribe_hold);
+            tokio::pin!(hold);
+            loop {
+                tokio::select! {
+                    _ = &mut hold => {
+                        // Timeout: return a sealed empty heartbeat advancing the
+                        // cursor. `None` here would only be a seal failure.
+                        return match core
+                            .poll_events(member, member_pk, last_seen, nonce, true)
+                            .await
+                        {
+                            Some(sealed) => Ok(sealed),
+                            None => Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "could not seal subscribe reply".to_string(),
+                            )),
+                        };
+                    }
+                    changed = tail.changed() => {
+                        if changed.is_err() {
+                            // The core dropped the tail sender — shutting down.
+                            return Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "station unavailable".to_string(),
+                            ));
+                        }
+                        if let Some(sealed) = core
+                            .poll_events(member, member_pk, last_seen, nonce, false)
+                            .await
+                        {
+                            return Ok(sealed);
+                        }
+                        // Tail advanced but nothing for this member — keep waiting.
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -39,7 +39,7 @@ const PEER_PORT: u16 = 7531;
 fn write_config(dir: &Path) {
     let text = format!(
         "[peers]\nlist = []\n\n[network]\nlisten = \"127.0.0.1:{PEER_PORT}\"\n\n\
-         [mobile]\nadvertise = false\nlisten = \"127.0.0.1:{MOBILE_PORT}\"\n\n\
+         [mobile]\nadvertise = false\nlisten = \"127.0.0.1:{MOBILE_PORT}\"\nsubscribe_hold_secs = 2\n\n\
          [timers]\nsweep_interval_secs = 60\ngossip_interval_secs = 60\n"
     );
     std::fs::write(dir.join("config.toml"), text).unwrap();
@@ -224,6 +224,23 @@ fn confirmation_params(receiver: &Keypair, tx_id_hex: &str, now: i64) -> String 
         &signed.signature,
     );
     format!("{{\"signed_confirmation\":\"{}\"}}", hex(&frame))
+}
+
+/// The `events` array from a subscribe reply.
+fn events_of(reply: &ResponseEnvelope) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    v["events"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `last_seen_event_id` cursor from a subscribe reply.
+fn cursor_of(reply: &ResponseEnvelope) -> u64 {
+    let v: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    v["last_seen_event_id"].as_u64().unwrap()
+}
+
+/// Whether any event in a subscribe reply has the given `kind`.
+fn has_kind(reply: &ResponseEnvelope, kind: &str) -> bool {
+    events_of(reply).iter().any(|e| e["kind"] == kind)
 }
 
 async fn open_station(dir: &Path) -> Station {
@@ -488,6 +505,131 @@ async fn authenticated_channel_happy_path_and_rejections() {
     assert!(
         reply.error.is_some(),
         "a relayed foreign proposal is refused"
+    );
+
+    // --- T1.3.5: push events over /subscribe -------------------------------
+    // The log now holds a proposal (seq 1) and its confirmation (seq 2).
+
+    // (a) The sender subscribes from the start: it is told its proposal was
+    //     confirmed — but never notified of its own proposal.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        "{\"last_seen_event_id\":0}",
+        10,
+        now_secs(),
+    );
+    let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "subscribe with pending events returns at once");
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        has_kind(&reply, "confirmation_received"),
+        "sender told of confirm"
+    );
+    assert!(
+        !has_kind(&reply, "proposal_received"),
+        "sender not told of own proposal"
+    );
+    let sender_cursor = cursor_of(&reply);
+
+    // (b) The receiver subscribes from the start: it is told a proposal arrived.
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        "{\"last_seen_event_id\":0}",
+        3,
+        now_secs(),
+    );
+    let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&receiver, &station_pk, &body);
+    assert!(
+        has_kind(&reply, "proposal_received"),
+        "receiver told of proposal"
+    );
+
+    // (c) Long-poll wakes on a fresh append: the sender parks at the current
+    //     tail, the receiver then proposes *to* it, and the parked call returns.
+    let parked_req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        &format!("{{\"last_seen_event_id\":{sender_cursor}}}"),
+        11,
+        now_secs(),
+    );
+    let parked = tokio::spawn(async move {
+        http_post("/subscribe", "application/octet-stream", &parked_req).await
+    });
+    // Give the subscribe time to authenticate and park before the append.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let now = now_secs();
+    let params = format!("{{\"address\":\"{}\"}}", receiver_addr);
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "next_nonce",
+        &params,
+        4,
+        now,
+    );
+    let (_, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    let reply = open_reply(&receiver, &station_pk, &body);
+    let r_nonce = serde_json::from_str::<serde_json::Value>(reply.result.as_deref().unwrap())
+        .unwrap()["nonce"]
+        .as_u64()
+        .unwrap();
+    let mobile_pubaddr = Address::from_public_key(mobile.public_key());
+    let params = proposal_params(&receiver, &mobile_pubaddr, 250, r_nonce, now);
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "submit_proposal",
+        &params,
+        5,
+        now,
+    );
+    let (status, _) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "wake proposal submitted");
+
+    let (status, body) = tokio::time::timeout(Duration::from_secs(10), parked)
+        .await
+        .expect("parked subscribe returns")
+        .unwrap();
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        has_kind(&reply, "proposal_received"),
+        "parked subscribe woke on the new proposal"
+    );
+    let sender_cursor2 = cursor_of(&reply);
+
+    // (d) With nothing new appended, the long-poll returns an empty heartbeat
+    //     after the (short, test-configured) hold, advancing the cursor.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        &format!("{{\"last_seen_event_id\":{sender_cursor2}}}"),
+        12,
+        now_secs(),
+    );
+    let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(events_of(&reply).is_empty(), "heartbeat carries no events");
+    assert!(
+        cursor_of(&reply) >= sender_cursor2,
+        "heartbeat advances the cursor"
     );
 
     station.shutdown().await;

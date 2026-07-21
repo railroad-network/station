@@ -34,6 +34,7 @@
 pub mod clock;
 pub mod config;
 pub mod core;
+pub mod events;
 pub mod gossip;
 pub mod history;
 pub mod ledger_view;

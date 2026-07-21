@@ -35,8 +35,9 @@ pub fn member_transactions(
 }
 
 /// Maps one correlated state to a row for `member`, or `None` if the member is
-/// not a party to it (or it is the never-constructed dispute stub).
-fn row_for(state: &TransactionState, member: &Address) -> Option<TransactionRow> {
+/// not a party to it (or it is the never-constructed dispute stub). Shared with
+/// [`crate::events`], which builds the same member-relative row for a push event.
+pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<TransactionRow> {
     let proposal = match state {
         TransactionState::Proposed { proposal }
         | TransactionState::Confirmed { proposal, .. }

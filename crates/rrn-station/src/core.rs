@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
 use rrn_identity::address::Address;
@@ -39,6 +39,7 @@ use rrn_crypto::keypair::{PublicKey, Signature};
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
 
 use crate::clock::Clock;
+use crate::events::{self, Event};
 use crate::gossip::WireEntry;
 use crate::ledger_view;
 use crate::paired::{self, PairedMobiles};
@@ -119,14 +120,61 @@ pub enum Command {
         /// The sealed response bytes, or why the request was rejected.
         reply: oneshot::Sender<Result<Vec<u8>, ChannelError>>,
     },
+    /// A paired mobile's `/subscribe` request (T1.3.5): authenticate, then return
+    /// pending events sealed, or the context to long-poll on.
+    Subscribe {
+        /// The sealed subscribe envelope as it arrived on the wire.
+        sealed: Vec<u8>,
+        /// Pending events (sealed), or the long-poll context, or a rejection.
+        reply: oneshot::Sender<Result<SubscribeOutcome, ChannelError>>,
+    },
+    /// Re-poll events for an already-authenticated long-polling subscriber
+    /// (T1.3.5). `force` returns a sealed empty heartbeat when still empty.
+    CollectEvents {
+        /// The subscriber's address.
+        member: Address,
+        /// The subscriber's public key (to seal the reply to).
+        member_pk: PublicKey,
+        /// The cursor the subscriber is polling from.
+        last_seen: u64,
+        /// The subscribe request's nonce, echoed in the sealed reply.
+        nonce: u64,
+        /// Return a sealed empty batch even with no events (the timeout path).
+        force: bool,
+        /// The sealed response, or `None` when there is still nothing.
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// Stop the core loop (graceful shutdown).
     Shutdown,
+}
+
+/// The outcome of an authenticated `/subscribe` request (T1.3.5): either events
+/// were already pending (sealed, return immediately) or the edge should park on
+/// the log-tail signal and re-poll with the carried context — no re-auth.
+pub enum SubscribeOutcome {
+    /// A sealed response carrying at least one event.
+    Ready(Vec<u8>),
+    /// No events yet; long-poll using this (already-authenticated) context.
+    Waiting {
+        /// The subscriber's address.
+        member: Address,
+        /// The subscriber's public key (to seal the reply to).
+        member_pk: PublicKey,
+        /// The cursor to poll from.
+        last_seen: u64,
+        /// The request nonce to echo in the eventual reply.
+        nonce: u64,
+    },
 }
 
 /// A cloneable handle the async tasks use to talk to the core.
 #[derive(Clone)]
 pub struct CoreHandle {
     tx: mpsc::Sender<Command>,
+    /// Fires whenever the log tail advances — the wake signal a `/subscribe`
+    /// long-poll parks on (T1.3.5). Carries the current tail seq, but callers
+    /// only use it as an edge trigger to re-poll for events.
+    log_tail: watch::Receiver<u64>,
 }
 
 impl CoreHandle {
@@ -227,6 +275,52 @@ impl CoreHandle {
         rx.await.unwrap_or(Err(ChannelError::Unavailable))
     }
 
+    /// Authenticates a paired mobile's `/subscribe` request (T1.3.5); returns
+    /// pending events (sealed) or the long-poll context. [`ChannelError::Unavailable`]
+    /// means the core is gone.
+    pub async fn subscribe(&self, sealed: Vec<u8>) -> Result<SubscribeOutcome, ChannelError> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::Subscribe { sealed, reply }).is_err() {
+            return Err(ChannelError::Unavailable);
+        }
+        rx.await.unwrap_or(Err(ChannelError::Unavailable))
+    }
+
+    /// Re-polls events for a parked subscriber. `Some` is a sealed response to
+    /// return (events, or an empty heartbeat when `force`); `None` means there is
+    /// still nothing and the caller should keep waiting.
+    pub async fn poll_events(
+        &self,
+        member: Address,
+        member_pk: PublicKey,
+        last_seen: u64,
+        nonce: u64,
+        force: bool,
+    ) -> Option<Vec<u8>> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::CollectEvents {
+                member,
+                member_pk,
+                last_seen,
+                nonce,
+                force,
+                reply,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.unwrap_or(None)
+    }
+
+    /// A receiver that fires whenever the log tail advances — the wake signal a
+    /// `/subscribe` long-poll parks on (T1.3.5).
+    pub fn log_tail_watch(&self) -> watch::Receiver<u64> {
+        self.log_tail.clone()
+    }
+
     /// Asks the core to shut down.
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -247,6 +341,9 @@ pub struct Core {
     /// mobile address. In-memory only: an unconfirmed request has no standing to
     /// survive a restart, and each entry expires after [`pairing::PENDING_TTL_SECS`].
     pending: BTreeMap<String, PendingPair>,
+    /// Publishes the log tail after every append so a parked `/subscribe`
+    /// long-poll wakes and re-polls for events (T1.3.5).
+    tail_tx: watch::Sender<u64>,
 }
 
 impl Core {
@@ -259,6 +356,7 @@ impl Core {
         clock: Clock,
         paired: PairedMobiles,
     ) -> Self {
+        let (tail_tx, _) = watch::channel(0u64);
         Core {
             db,
             wallet,
@@ -266,17 +364,19 @@ impl Core {
             clock,
             paired,
             pending: BTreeMap::new(),
+            tail_tx,
         }
     }
 
     /// Spawns the core on a dedicated thread and returns a handle to it.
     pub fn spawn(self) -> CoreHandle {
         let (tx, rx) = mpsc::channel::<Command>();
+        let log_tail = self.tail_tx.subscribe();
         std::thread::Builder::new()
             .name("rrn-core".into())
             .spawn(move || self.run(rx))
             .expect("spawn core thread");
-        CoreHandle { tx }
+        CoreHandle { tx, log_tail }
     }
 
     /// The blocking command loop. Returns when a [`Command::Shutdown`] arrives or
@@ -314,12 +414,44 @@ impl Core {
                 Command::RpcRequest { sealed, reply } => {
                     let _ = reply.send(self.do_rpc_request(sealed));
                 }
+                Command::Subscribe { sealed, reply } => {
+                    let _ = reply.send(self.do_subscribe(sealed));
+                }
+                Command::CollectEvents {
+                    member,
+                    member_pk,
+                    last_seen,
+                    nonce,
+                    force,
+                    reply,
+                } => {
+                    let _ = reply
+                        .send(self.do_collect_events(member, member_pk, last_seen, nonce, force));
+                }
                 Command::Shutdown => {
                     tracing::info!("core shutting down");
                     break;
                 }
             }
+            // After any command that may have appended to the log (a mobile or
+            // operator write, a settlement sweep, a gossip apply), wake parked
+            // long-polls if the tail advanced. A no-op for read-only commands.
+            self.publish_tail();
         }
+    }
+
+    /// Publishes the current log tail to `/subscribe` waiters, but only when it
+    /// actually advanced — so a read-only command does not spuriously wake them.
+    fn publish_tail(&self) {
+        let tail = self.tail_seq();
+        self.tail_tx.send_if_modified(|current| {
+            if *current == tail {
+                false
+            } else {
+                *current = tail;
+                true
+            }
+        });
     }
 
     // --- public RPC dispatch ------------------------------------------------
@@ -631,8 +763,31 @@ impl Core {
     /// no sealed body — the edge turns them into a 4xx; an authenticated request
     /// whose *method* fails still gets a sealed error response.
     fn do_rpc_request(&mut self, sealed_bytes: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
+        // Authenticate (open, verify, authorize, consume the nonce), then
+        // dispatch through the mobile-permitted method surface and seal the reply
+        // back to the mobile. A method-level failure still gets a sealed error
+        // response; only auth failures return no sealed body (a 4xx at the edge).
+        let envelope = self.authenticate_envelope(&sealed_bytes)?;
+        let mobile_pubkey = envelope.signer;
+        let response = self.dispatch_channel_call(&envelope);
+        let station = self.station_keypair();
+        let reply_frame = rpc_envelope::frame_signed_response(&response, &station);
+        let sealed_reply = sealed::seal(&mobile_pubkey, &reply_frame, TRANSPORT_CONTEXT)
+            .map_err(|_| ChannelError::Sealed)?;
+        Ok(sealed_reply.to_bytes())
+    }
+
+    /// Opens, verifies, and authorizes a sealed request envelope — the auth
+    /// preamble shared by `/rpc` and `/subscribe` (T1.3.4/T1.3.5). On success the
+    /// request's transport nonce is consumed and persisted, so a replay is
+    /// rejected even if the caller never dispatches. Auth failures return a
+    /// [`ChannelError`] the edge turns into a 4xx.
+    fn authenticate_envelope(
+        &mut self,
+        sealed_bytes: &[u8],
+    ) -> Result<RequestEnvelope, ChannelError> {
         // 1. Open the seal with the station's secret key.
-        let sealed = SealedBox::from_bytes(&sealed_bytes).map_err(|_| ChannelError::Sealed)?;
+        let sealed = SealedBox::from_bytes(sealed_bytes).map_err(|_| ChannelError::Sealed)?;
         let frame = sealed::open(&sealed, &self.wallet.secret_key, TRANSPORT_CONTEXT)
             .map_err(|_| ChannelError::Sealed)?;
 
@@ -662,16 +817,80 @@ impl Core {
             tracing::error!(error = %e, "failed to persist mobile request nonce");
             return Err(ChannelError::Unavailable);
         }
+        Ok(envelope)
+    }
 
-        // 4. Dispatch through the mobile-permitted method surface.
-        let mobile_pubkey = envelope.signer;
-        let response = self.dispatch_channel_call(&envelope);
+    /// Authenticates a `/subscribe` request and either returns pending events
+    /// (sealed, ready) or the context to long-poll on (T1.3.5). The 30s wait
+    /// itself lives in the async edge, not here — the core must not block.
+    fn do_subscribe(&mut self, sealed_bytes: Vec<u8>) -> Result<SubscribeOutcome, ChannelError> {
+        let envelope = self.authenticate_envelope(&sealed_bytes)?;
+        if envelope.method != "subscribe" {
+            return Err(ChannelError::Malformed);
+        }
+        let last_seen = parse_subscribe_cursor(&envelope.params);
+        let member = Address::from_public_key(envelope.signer);
+        let member_pk = envelope.signer;
+        let nonce = envelope.nonce;
+        let tail = self.tail_seq();
+        let events = events::events_since(&self.db, &member, last_seen, tail);
+        if events.is_empty() {
+            Ok(SubscribeOutcome::Waiting {
+                member,
+                member_pk,
+                last_seen,
+                nonce,
+            })
+        } else {
+            let sealed = self
+                .seal_subscribe_reply(&member_pk, nonce, tail, events)
+                .ok_or(ChannelError::Sealed)?;
+            Ok(SubscribeOutcome::Ready(sealed))
+        }
+    }
 
-        // 5. Sign the reply as the station and seal it back to the mobile.
+    /// Re-polls for a parked subscriber (already authenticated by [`Self::do_subscribe`]).
+    /// Returns `Some(sealed)` when there are events, or when `force` (the timeout
+    /// heartbeat — a sealed empty batch advancing the cursor to the tail); `None`
+    /// when there is still nothing and the caller should keep waiting.
+    fn do_collect_events(
+        &self,
+        member: Address,
+        member_pk: PublicKey,
+        last_seen: u64,
+        nonce: u64,
+        force: bool,
+    ) -> Option<Vec<u8>> {
+        let tail = self.tail_seq();
+        let events = events::events_since(&self.db, &member, last_seen, tail);
+        if events.is_empty() && !force {
+            return None;
+        }
+        self.seal_subscribe_reply(&member_pk, nonce, tail, events)
+    }
+
+    /// Builds the subscribe response (`{last_seen_event_id, events}` as the
+    /// `ResponseEnvelope.result` JSON), signs it as the station, and seals it to
+    /// the member — mirroring the `/rpc` reply path.
+    fn seal_subscribe_reply(
+        &self,
+        member_pk: &PublicKey,
+        nonce: u64,
+        tail: u64,
+        events: Vec<Event>,
+    ) -> Option<Vec<u8>> {
+        let result =
+            serde_json::json!({ "last_seen_event_id": tail, "events": events }).to_string();
+        let response = ResponseEnvelope::ok(nonce, result);
+        let station = self.station_keypair();
         let reply_frame = rpc_envelope::frame_signed_response(&response, &station);
-        let sealed_reply = sealed::seal(&mobile_pubkey, &reply_frame, TRANSPORT_CONTEXT)
-            .map_err(|_| ChannelError::Sealed)?;
-        Ok(sealed_reply.to_bytes())
+        match sealed::seal(member_pk, &reply_frame, TRANSPORT_CONTEXT) {
+            Ok(s) => Some(s.to_bytes()),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to seal subscribe reply");
+                None
+            }
+        }
     }
 
     /// Routes an authenticated envelope to the mobile-permitted method surface
@@ -865,6 +1084,16 @@ fn parse_params<T: serde::de::DeserializeOwned>(req: &rpc::Request) -> Result<T,
 fn parse_addr(s: &str) -> Result<Address, rpc::RpcError> {
     s.parse::<Address>()
         .map_err(|e| invalid_params(format!("invalid address {s:?}: {e}")))
+}
+
+/// Reads `last_seen_event_id` from a subscribe request's JSON `params`. A missing
+/// or malformed cursor means "from the start" (0) — the station simply returns
+/// everything the member has not acked, so a fresh subscriber sees its backlog.
+fn parse_subscribe_cursor(params: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(params)
+        .ok()
+        .and_then(|v| v.get("last_seen_event_id").and_then(|n| n.as_u64()))
+        .unwrap_or(0)
 }
 
 fn parse_tx_id(s: &str) -> Result<TransactionId, rpc::RpcError> {
