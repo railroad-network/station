@@ -1579,6 +1579,7 @@ dependencies = [
  "rrn-crypto",
  "rrn-identity",
  "rrn-ledger",
+ "rrn-mobile-ffi",
  "rrn-storage",
  "serde",
  "serde_json",

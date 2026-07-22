@@ -17,7 +17,9 @@ use tokio::net::{TcpStream, UnixStream};
 
 use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
 use rrn_identity::address::Address;
+use rrn_identity::attestation::Attestation;
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
+use rrn_identity::vouch::{VouchBody, VouchKind};
 use rrn_ledger::transaction::{
     SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionProposal,
 };
@@ -224,6 +226,29 @@ fn confirmation_params(receiver: &Keypair, tx_id_hex: &str, now: i64) -> String 
         &signed.signature,
     );
     format!("{{\"signed_confirmation\":\"{}\"}}", hex(&frame))
+}
+
+/// Builds the `submit_vouch` params: a voucher-signed vouch attestation for
+/// `subject`, framed as a signed record and hex-encoded — what the mobile makes.
+fn vouch_params(voucher: &Keypair, subject: &Address, now: i64) -> String {
+    let attestation = Attestation {
+        kind: VouchKind,
+        body: VouchBody {
+            community: "rrn-phase0".to_string(),
+            statement: "I know this person personally".to_string(),
+            reputation_stake_centi: 50,
+        },
+        subject: *subject,
+        issued_at: now,
+        expires_at: None,
+    };
+    let signed = attestation.clone().sign(voucher);
+    let frame = frame_signed_record(
+        &to_canonical_bytes(attestation),
+        &voucher.public_key(),
+        &signed.signature,
+    );
+    format!("{{\"signed_vouch\":\"{}\"}}", hex(&frame))
 }
 
 /// The `events` array from a subscribe reply.
@@ -631,6 +656,43 @@ async fn authenticated_channel_happy_path_and_rejections() {
         cursor_of(&reply) >= sender_cursor2,
         "heartbeat advances the cursor"
     );
+
+    // --- T1.4.3: a paired mobile submits a vouch it signed -----------------
+    let params = vouch_params(&mobile, &receiver_addr, now);
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "submit_vouch",
+        &params,
+        20,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "vouch submitted");
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(reply.error.is_none(), "vouch error: {:?}", reply.error);
+    let vouched: serde_json::Value =
+        serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    let vouch_id = vouched["vouch_id"].as_str().expect("vouch_id string");
+    assert_eq!(vouch_id.len(), 64, "vouch_id is a 32-byte hex hash");
+
+    // A mobile cannot submit a vouch signed by someone else (submitter binding).
+    let stranger = Keypair::generate();
+    let params = vouch_params(&stranger, &receiver_addr, now);
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "submit_vouch",
+        &params,
+        21,
+        now,
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200, "authenticated");
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(reply.error.is_some(), "a relayed foreign vouch is refused");
 
     station.shutdown().await;
 }

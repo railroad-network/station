@@ -231,6 +231,11 @@ pub struct RecoverImportResult {
 pub struct WhoamiResult {
     /// The station's own `rrn1…` address.
     pub address: String,
+    /// The community identifier a member stamps into a vouch (Phase 0:
+    /// `"rrn-phase0"`; real community identity arrives in Phase 1). The mobile
+    /// reads this rather than hardcoding the string so it cannot drift.
+    #[serde(default)]
+    pub community: String,
 }
 
 /// `transactions` params — the mobile-facing, member-relative view of the

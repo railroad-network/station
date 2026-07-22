@@ -22,7 +22,7 @@ use rrn_crypto::keypair::Keypair;
 use rrn_identity::address::Address;
 use rrn_identity::recovery::flow::{reconstruct_wallet, RecoveryPackage};
 use rrn_identity::recovery::shamir::{RawShard, ShardIndex};
-use rrn_identity::vouch::{append_vouch, create_vouch};
+use rrn_identity::vouch::{append_vouch, create_vouch, SignedVouch};
 use rrn_identity::wallet::WalletContents;
 use rrn_ledger::engine::Engine;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
@@ -484,6 +484,7 @@ impl Core {
     fn m_whoami(&self) -> Result<serde_json::Value, rpc::RpcError> {
         ok(&rpc::WhoamiResult {
             address: self.wallet.address.to_string(),
+            community: VOUCH_COMMUNITY.to_string(),
         })
     }
 
@@ -917,6 +918,7 @@ impl Core {
         match envelope.method.as_str() {
             "submit_proposal" => self.channel_submit_proposal(envelope),
             "submit_confirmation" => self.channel_submit_confirmation(envelope),
+            "submit_vouch" => self.channel_submit_vouch(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -984,6 +986,40 @@ impl Core {
             .submit_confirmation(signed, now)
             .map_err(ledger_err_pair)?;
         Ok(serde_json::json!({ "state": "Confirmed" }))
+    }
+
+    /// `submit_vouch` — accept a mobile-signed [`SignedVouch`] and append it. The
+    /// voucher is the signer and signs it on the phone (ADR-0006); the station
+    /// only validates and records. `params` carries the canonical dCBOR of the
+    /// signed vouch, hex-encoded (as `submit_proposal` does for a proposal).
+    fn channel_submit_vouch(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_vouch")?;
+        let signed: SignedVouch = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed vouch".into()))?;
+        // A mobile submits only vouches it signed: the voucher must be the
+        // authenticated signer bound to this paired mobile.
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "voucher is not the authenticated mobile".into(),
+            ));
+        }
+        // Verify the signature over the canonical payload before persisting.
+        // Unlike a proposal there is no ledger engine to re-check it, so verify
+        // it explicitly here.
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "vouch signature does not verify".into(),
+            )
+        })?;
+        let vouch_id = hex(&signed.payload_hash().to_bytes());
+        let mut log = AppendLog::new(&self.db);
+        append_vouch(&mut log, signed).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({ "vouch_id": vouch_id }))
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].

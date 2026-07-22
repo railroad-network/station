@@ -51,3 +51,8 @@ mdns-sd = "0.20"
 
 [dev-dependencies]
 tempfile = "3"
+# Only for the cross-platform vouch fixture generator (tests/cross_platform_vouch.rs):
+# it asserts the mobile tagged-JSON path through `canonical_bytes` yields the same
+# bytes as the typed encoder before committing the vector. No dependency cycle —
+# rrn-mobile-ffi does not depend on rrn-station.
+rrn-mobile-ffi = { path = "../rrn-mobile-ffi", version = "0.1" }
