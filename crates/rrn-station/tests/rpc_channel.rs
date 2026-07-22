@@ -694,5 +694,52 @@ async fn authenticated_channel_happy_path_and_rejections() {
     let reply = open_reply(&mobile, &station_pk, &body);
     assert!(reply.error.is_some(), "a relayed foreign vouch is refused");
 
+    // --- T1.4.1: the vouch reaches its subject over /subscribe -------------
+    // The subject (the receiver) subscribes from the start and finds a
+    // vouch_received event carrying the vouch row — same content address the
+    // submit returned, the voucher's address, and no transaction payload.
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        "{\"last_seen_event_id\":0}",
+        6,
+        now_secs(),
+    );
+    let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&receiver, &station_pk, &body);
+    assert!(has_kind(&reply, "vouch_received"), "subject told of vouch");
+    let vouch_event = events_of(&reply)
+        .into_iter()
+        .find(|e| e["kind"] == "vouch_received")
+        .unwrap();
+    assert_eq!(vouch_event["vouch"]["vouch_id"], vouch_id);
+    assert_eq!(vouch_event["vouch"]["voucher_address"], mobile_addr);
+    assert_eq!(vouch_event["vouch"]["stake_centi"], 50);
+    assert!(
+        vouch_event.get("transaction").is_none(),
+        "a vouch event carries no transaction row"
+    );
+
+    // The voucher is never notified of their own vouch.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        &format!("{{\"last_seen_event_id\":{sender_cursor2}}}"),
+        22,
+        now_secs(),
+    );
+    let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        !has_kind(&reply, "vouch_received"),
+        "voucher not told of own vouch"
+    );
+
     station.shutdown().await;
 }

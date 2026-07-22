@@ -18,8 +18,12 @@
 //! display payload is the same member-relative [`TransactionRow`] the wallet
 //! already renders (reusing [`transaction_view::row_for`]).
 
+use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
+use rrn_identity::attestation::Attestation;
+use rrn_identity::vouch::{VouchBody, VouchKind};
 use rrn_ledger::settlement::SettlementRecord;
 use rrn_ledger::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::{TransactionConfirmation, TransactionId, TransactionProposal};
@@ -45,7 +49,7 @@ pub enum EventKind {
     /// A proposal this member is party to was cancelled/expired (delivered to
     /// the counterparty of whoever caused it; to both on expiry).
     Cancellation,
-    /// M1.4 — no live source yet.
+    /// Someone vouched for this member (delivered to the subject; T1.4.1).
     VouchReceived,
     /// M1.6/M1.7 — no live source yet.
     ListingMatch,
@@ -55,8 +59,10 @@ pub enum EventKind {
     VoteNeeded,
 }
 
-/// One push event: its id (the log seq), its kind, and the member-relative
-/// transaction row the wallet renders.
+/// One push event: its id (the log seq), its kind, and the payload the wallet
+/// renders — a transaction row for the ledger kinds, a vouch row for a vouch.
+/// Exactly one of the two payload fields is present; the absent one is omitted
+/// from the wire so the T1.3.5 payment-event shape is unchanged.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     /// The event id — the log entry's seq. Monotonic; the mobile acks by sending
@@ -64,8 +70,32 @@ pub struct Event {
     pub id: u64,
     /// What happened.
     pub kind: EventKind,
-    /// The transaction, from `member`'s vantage point (T1.3.4 shape).
-    pub transaction: TransactionRow,
+    /// The transaction, from `member`'s vantage point (T1.3.4 shape). Present
+    /// for the four ledger kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<TransactionRow>,
+    /// The vouch, for a `vouch_received` event (T1.4.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vouch: Option<VouchRow>,
+}
+
+/// The display payload of a `vouch_received` event: who vouched, in which
+/// community, with what statement and stake. Mirrors what `submit_vouch`
+/// recorded; the `vouch_id` is the same content address it returned.
+#[derive(Debug, Clone, Serialize)]
+pub struct VouchRow {
+    /// Content address: hex of the Blake3 hash of the signed canonical bytes.
+    pub vouch_id: String,
+    /// The voucher's bech32m `rrn1…` address (the log entry's signer).
+    pub voucher_address: String,
+    /// The community the vouch was stamped into.
+    pub community: String,
+    /// The voucher's free-text statement about the subject.
+    pub statement: String,
+    /// Reputation staked, in centipoints.
+    pub stake_centi: u64,
+    /// Unix seconds when the vouch was issued.
+    pub issued_at: i64,
 }
 
 /// The events after `after_seq` (exclusive) through `tail` (inclusive) that are
@@ -98,18 +128,28 @@ pub fn events_since(db: &Database, member: &Address, after_seq: u64, tail: u64) 
                 out.push(Event {
                     id: entry.seq,
                     kind,
-                    transaction: row,
+                    transaction: Some(row),
+                    vouch: None,
                 });
             }
+        } else if let Some(row) =
+            classify_vouch(&entry.payload.bytes, &entry.payload.signer, member)
+        {
+            out.push(Event {
+                id: entry.seq,
+                kind: EventKind::VouchReceived,
+                transaction: None,
+                vouch: Some(row),
+            });
         }
     }
     out
 }
 
 /// Classifies one stored log payload into `(kind, transaction id)` **if** it is
-/// an event `member` should receive, applying the directional relevance rules.
-/// Returns `None` for an unrelated record (a vouch, or a transition that does
-/// not target this member).
+/// a ledger event `member` should receive, applying the directional relevance
+/// rules. Returns `None` for a non-ledger record (a vouch — see
+/// [`classify_vouch`]) or a transition that does not target this member.
 fn classify(
     bytes: &[u8],
     member: &Address,
@@ -140,6 +180,27 @@ fn classify(
         return targets_member.then_some((EventKind::Cancellation, cancellation.proposal_id));
     }
     None
+}
+
+/// Classifies one stored log payload into a [`VouchRow`] **if** it is a vouch
+/// whose subject is `member`. The voucher already knows they vouched, so only
+/// the subject is notified. The voucher's address comes from the entry's signer
+/// (the attestation carries no issuer field — the signature envelope is the
+/// issuer), and the `vouch_id` is the Blake3 hash of the stored canonical bytes,
+/// matching what `submit_vouch` returned to the voucher.
+fn classify_vouch(bytes: &[u8], signer: &PublicKey, member: &Address) -> Option<VouchRow> {
+    let vouch = from_canonical_bytes::<Attestation<VouchKind, VouchBody>>(bytes).ok()?;
+    if member != &vouch.subject {
+        return None;
+    }
+    Some(VouchRow {
+        vouch_id: Hash::of(bytes).to_hex(),
+        voucher_address: Address::from_public_key(*signer).to_string(),
+        community: vouch.body.community,
+        statement: vouch.body.statement,
+        stake_centi: vouch.body.reputation_stake_centi,
+        issued_at: vouch.issued_at,
+    })
 }
 
 /// The `(sender, receiver)` of the transaction `id` in the snapshot, if present.
@@ -255,7 +316,7 @@ mod tests {
 
         let to_bob = events_since(&db, &addr(&bob), 0, ALL);
         assert_eq!(kinds(&to_bob), vec![EventKind::ProposalReceived]);
-        assert_eq!(to_bob[0].transaction.direction, "in");
+        assert_eq!(to_bob[0].transaction.as_ref().unwrap().direction, "in");
         assert_eq!(to_bob[0].id, 1);
 
         // The sender is never told about their own proposal.
@@ -271,7 +332,7 @@ mod tests {
 
         let to_alice = events_since(&db, &addr(&alice), 0, ALL);
         assert_eq!(kinds(&to_alice), vec![EventKind::ConfirmationReceived]);
-        assert_eq!(to_alice[0].transaction.state, "confirmed");
+        assert_eq!(to_alice[0].transaction.as_ref().unwrap().state, "confirmed");
         assert_eq!(to_alice[0].id, 2);
 
         // Bob (the confirmer/receiver) only ever saw the proposal, not his own confirmation.
@@ -310,7 +371,7 @@ mod tests {
 
         let to_alice = events_since(&db, &addr(&alice), 0, ALL);
         assert_eq!(kinds(&to_alice), vec![EventKind::Cancellation]);
-        assert_eq!(to_alice[0].transaction.state, "cancelled");
+        assert_eq!(to_alice[0].transaction.as_ref().unwrap().state, "cancelled");
 
         // Bob rejected it, so he is not notified of the cancellation.
         assert!(!kinds(&events_since(&db, &addr(&bob), 0, ALL)).contains(&EventKind::Cancellation));
@@ -362,6 +423,48 @@ mod tests {
         // Observing tail = 1 must not leak the seq-2 proposal.
         let bounded = events_since(&db, &addr(&bob), 0, 1);
         assert_eq!(bounded.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn a_vouch_notifies_the_subject_not_the_voucher() {
+        let db = fresh_db();
+        let (alice, bob) = (Keypair::generate(), Keypair::generate());
+        let vouch = rrn_identity::vouch::create_vouch(
+            &alice,
+            &addr(&bob),
+            "rrn-phase0",
+            "I know Bob in person",
+            150,
+        );
+        let expected_id = vouch.payload_hash().to_hex();
+        rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch).unwrap();
+
+        let to_bob = events_since(&db, &addr(&bob), 0, ALL);
+        assert_eq!(kinds(&to_bob), vec![EventKind::VouchReceived]);
+        assert!(to_bob[0].transaction.is_none());
+        let row = to_bob[0].vouch.as_ref().unwrap();
+        assert_eq!(row.vouch_id, expected_id);
+        assert_eq!(row.voucher_address, addr(&alice).to_string());
+        assert_eq!(row.community, "rrn-phase0");
+        assert_eq!(row.statement, "I know Bob in person");
+        assert_eq!(row.stake_centi, 150);
+
+        // The voucher already knows they vouched; they are not notified.
+        assert!(events_since(&db, &addr(&alice), 0, ALL).is_empty());
+    }
+
+    #[test]
+    fn a_vouch_for_someone_else_is_not_delivered() {
+        let db = fresh_db();
+        let (alice, bob, carol) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let vouch = rrn_identity::vouch::create_vouch(&alice, &addr(&bob), "rrn-phase0", "", 0);
+        rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch).unwrap();
+
+        assert!(events_since(&db, &addr(&carol), 0, ALL).is_empty());
     }
 
     #[test]
