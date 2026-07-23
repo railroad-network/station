@@ -741,5 +741,51 @@ async fn authenticated_channel_happy_path_and_rejections() {
         "voucher not told of own vouch"
     );
 
+    // --- T1.4.4: vouch_counts are member-relative and truthful -------------
+    // One vouch was appended (mobile → receiver). The voucher sees given=1,
+    // received=0; the subject sees given=0, received=1. Each reads its OWN
+    // counts (the member is the authenticated signer, not a param).
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "vouch_counts",
+        "{}",
+        23,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        reply.error.is_none(),
+        "vouch_counts error: {:?}",
+        reply.error
+    );
+    let counts: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert_eq!(counts["given"], 1, "voucher gave one vouch");
+    assert_eq!(counts["received"], 0, "voucher received none");
+
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "vouch_counts",
+        "{}",
+        7,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&receiver, &station_pk, &body);
+    assert!(
+        reply.error.is_none(),
+        "vouch_counts error: {:?}",
+        reply.error
+    );
+    let counts: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert_eq!(counts["given"], 0, "subject gave none");
+    assert_eq!(counts["received"], 1, "subject received one vouch");
+
     station.shutdown().await;
 }

@@ -48,6 +48,7 @@ pub mod rpc_envelope;
 pub mod server;
 pub mod station;
 pub mod transaction_view;
+pub mod vouch_view;
 
 pub use clock::Clock;
 pub use config::StationConfig;

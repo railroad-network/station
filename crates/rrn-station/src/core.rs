@@ -46,6 +46,7 @@ use crate::paired::{self, PairedMobiles};
 use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
 use crate::rpc_envelope::{self, ChannelError, RequestEnvelope, ResponseEnvelope};
 use crate::transaction_view;
+use crate::vouch_view;
 use crate::{history, rpc};
 
 /// Community identifier stamped on Phase 0 vouches (a placeholder until real
@@ -919,6 +920,7 @@ impl Core {
             "submit_proposal" => self.channel_submit_proposal(envelope),
             "submit_confirmation" => self.channel_submit_confirmation(envelope),
             "submit_vouch" => self.channel_submit_vouch(envelope),
+            "vouch_counts" => self.channel_vouch_counts(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -1020,6 +1022,20 @@ impl Core {
         let mut log = AppendLog::new(&self.db);
         append_vouch(&mut log, signed).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "vouch_id": vouch_id }))
+    }
+
+    /// `vouch_counts` — the authenticated mobile's own vouching tallies (T1.4.4):
+    /// how many vouches it has given (signed) and received (is the subject of).
+    /// The member is the authenticated signer, not a param, so a mobile only ever
+    /// reads its own counts. A live log scan (see [`vouch_view`]).
+    fn channel_vouch_counts(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let member = Address::from_public_key(envelope.signer);
+        let counts = vouch_view::member_vouch_counts(&self.db, &member)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({ "given": counts.given, "received": counts.received }))
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
