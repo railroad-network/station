@@ -324,9 +324,12 @@ unlocked; the binding between a public key and its human-readable address; the
 authenticity of vouches (a forged vouch is a fake social relationship).
 
 > Populated through M0.3 (addresses, wallet encryption, attestation, vouch).
-> Shamir social recovery threats are added in M0.4; the social-graph /
-> Sybil-resistance analysis of vouching is a Phase 1+ concern (vouch *content*
-> trust, as opposed to vouch *authenticity*, is out of scope here).
+> Shamir social recovery threats are added in M0.4. The M1.4 in-person vouch
+> *mechanism* (handoff, mobile-signed write, directional push, member-scoped
+> reads, device-only nicknames) is analyzed in [Vouching surface
+> (M1.4)](#vouching-surface-m14); vouch *content* trust — the social-graph /
+> Sybil-resistance analysis, as opposed to vouch *authenticity* — remains
+> deferred to `rrn-reputation` (M1.5).
 
 #### Spoofing — forged identity or forged vouch
 
@@ -1286,6 +1289,108 @@ pipeline enforces (T1.3.4).
   read-scoped background token** minted at pairing, which would let the phone
   fetch events without carrying a transacting key; that is a future cross-repo
   change, out of scope for Phase 1.
+
+### Vouching surface (M1.4)
+
+*Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its
+persistent record: a member scans (or pastes) another member's address, signs a
+vouch attestation on-device, and submits it over the authenticated channel; the
+station appends it and pushes a `vouch_received` event to the subject; both
+parties can later browse their given/received vouches. This adds no new crypto —
+a vouch is the `rrn-identity::vouch` attestation from Phase 0 — but it adds new
+*surfaces*: an in-person QR handoff, a mobile-signed write, a directional push,
+member-scoped reads, and a device-only nickname. The attestation's own
+authenticity guarantees are the `rrn-identity` *Spoofing/Tampering* entries
+above; this section covers what M1.4 wraps around them.
+
+**Assets:** the authenticity of a vouch (that it was issued by the named voucher,
+about the intended subject); the confidentiality of the vouch social graph (who
+trusts whom) beyond its legitimate parties; the member's private, device-local
+label for a person; the correctness of the community a vouch is stamped into.
+
+- **Vouching as someone else (spoofing).** *Threat:* a device submits a vouch
+  attributed to another member, or relays a vouch signed by a third party.
+  *Mitigation (shipped, T1.4.3):* a vouch is an `rrn-crypto::SignedPayload` built
+  and signed on the voucher's device (`mobile/src/wallet/vouch.ts::createSignedVouch`,
+  canonical dCBOR through the one Rust encoder — there is no per-domain vouch FFI);
+  the station's `channel_submit_vouch` (`rrn-station::core`) binds the *submitter*
+  to the authenticated paired mobile (`signed.signer == envelope.signer`) and calls
+  `.verify()` explicitly before `append_vouch`, so a mobile can neither forge a
+  voucher nor relay someone else's vouch. *Residual risk:* a valid signature proves
+  authorship, not trustworthiness — a real-but-malicious member (or a Sybil cluster
+  of mutually-vouching keys) issues cryptographically-sound vouches; content trust
+  is `rrn-reputation`'s job (M1.5), see [No Sybil resistance](#known-limitations).
+- **Vouching for the wrong subject (handoff substitution).** *Threat:* an attacker
+  interposes on the in-person handoff — a swapped QR, a look-alike address — so the
+  member unknowingly stakes their word on the attacker's key. *Mitigation (shipped,
+  T1.4.1/T1.4.2):* the flow is in-person and the review step shows the subject
+  address (and identicon) before the single signing tap; the address QR is parsed
+  by `parseAddressQr`, and any nickname carried in the `rrn:address?…&n=` form is
+  treated as a **display hint only, never trusted** (pre-filled but editable);
+  vouching for your own address is blocked against the *real* wallet address, not
+  just the displayed one. *Residual risk:* a member who does not check the on-screen
+  address against the person in front of them can still be socially engineered —
+  inherent to an in-person trust act; the review step surfaces the subject but
+  cannot compel scrutiny.
+- **Tampering with a stored or relayed vouch.** *Threat:* a vouch is altered in the
+  log or in transit so it reads differently or names a different subject.
+  *Mitigation:* the signature covers the attestation's canonical CBOR and the
+  append-only log stores the exact signed bytes; the `vouch_id` the browser shows is
+  the Blake3 content address of those bytes (`member_vouches`), so any change breaks
+  both the signature and the id (inherited from `rrn-identity` *Tampering* and
+  `rrn-storage`). Submission rides the sealed, signed transport, so on-wire tampering
+  fails there too ([Mobile–station transport](#mobilestation-transport)).
+- **Disclosing the vouch social graph.** *Threat:* the read and push surfaces let
+  one member enumerate *others'* vouch relationships — a privacy-sensitive social
+  graph. *Mitigation (shipped, T1.4.1/T1.4.4/T1.4.5):* the reads are **member-scoped
+  to the authenticated signer** — `list_vouches` / `vouch_counts`
+  (`member_vouches` / `member_vouch_counts`) take no address param and only ever
+  return the caller's own given/received vouches — and the push is **directional**:
+  `classify_vouch` (`rrn-station::events`) delivers a `vouch_received` event to the
+  *subject only*, never a broadcast, so the channel cannot be used to walk another
+  member's graph (the same directional-relevance property the ledger push has).
+  *Residual risk:* the vouch records (voucher, subject, statement, stake) are
+  plaintext in the station log like all other log content — exposed to a local
+  attacker or seized station media, the accepted whole-DB-plaintext limitation.
+- **The private nickname stays private.** *Threat:* the human label a voucher types
+  for a subject leaks to the subject, or federates to other stations along with the
+  vouch. *Mitigation (shipped, T1.4.5):* the nickname is **deliberately not part of
+  the signed attestation** — it is persisted device-only
+  (`mobile/src/wallet/vouchNicknames.ts`, `SecureStoreKeys.VOUCH_NICKNAMES`), keyed
+  by subject address, as a display hint for the voucher's own browser. Because it
+  never enters the attestation, it is not in the record the station stores, not in
+  the `vouch_received` event the subject receives, and not in anything that would
+  federate in Phase 2 — the subject never learns what you called them. It is
+  non-secret and carries no biometric gate. *Residual risk:* a local attacker on the
+  *voucher's own* device can read their private labels (a device-only social hint,
+  bounded by the same device-trust assumption); the label does not survive a wallet
+  restore on a new device — a station-side store is a noted future option, weighed
+  against the privacy cost of putting the label on the station at all.
+- **Vouch spam / malformed vouch (denial of service).** *Threat:* a member floods
+  vouches to bloat the log, or feeds a malformed vouch at the parse boundary.
+  *Mitigation:* `parse_signed_record` and `.verify()` reject malformed or forged
+  vouches with a `Result`, never a panic (inherited crypto parse-boundary property),
+  and every accepted vouch is signed by the authenticated paired mobile, so it is
+  attributable and per-identity rate-limitable. *Residual risk:* no vouch rate limit
+  is shipped yet (the same "no rate limiting" edge as marketplace / governance spam,
+  planned), and the append-only log grows unbounded (shared Phase-0 limitation).
+- **Manufacturing standing via vouches (elevation of privilege).** *Threat:*
+  colluding identities vouch for each other to mint reputation or membership
+  standing. *Mitigation:* a vouch grants **no authority on its own** in M1.4 —
+  `reputation_stake_centi` is recorded but deliberately **not enforced** (there is
+  no reputation system until M1.5), and the `community` a vouch is stamped into is
+  read from the station's `whoami` at vouch time (authoritative), not chosen by the
+  phone. Reputation weighting by vouch-graph position, counterparty diversity, and
+  time decay is the *planned* `rrn-reputation` mitigation (M1.5), consistent with the
+  `rrn-reputation` *Attestation farming* entry above. *Residual risk:* Sybil clusters
+  of mutually-vouching keys are cryptographically valid — [No Sybil
+  resistance](#known-limitations); their standing is bounded only once reputation
+  lands.
+
+Vouches are only ever created in the interactive foreground flow — there is no
+background vouch path — so the opt-in background-signing credential
+([Mobile–station transport](#mobilestation-transport), T1.3.6) does not sign
+vouches; its residual risk is unchanged by M1.4.
 
 ## Cross-cutting threats
 
