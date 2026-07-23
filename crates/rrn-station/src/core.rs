@@ -921,6 +921,7 @@ impl Core {
             "submit_confirmation" => self.channel_submit_confirmation(envelope),
             "submit_vouch" => self.channel_submit_vouch(envelope),
             "vouch_counts" => self.channel_vouch_counts(envelope),
+            "list_vouches" => self.channel_list_vouches(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -1036,6 +1037,31 @@ impl Core {
         let counts = vouch_view::member_vouch_counts(&self.db, &member)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "given": counts.given, "received": counts.received }))
+    }
+
+    /// `list_vouches` — the authenticated mobile's own vouches for the vouching
+    /// browser (T1.4.5), split into `given` (it signed) and `received` (it is the
+    /// subject of), newest first. The member is the authenticated signer, not a
+    /// param, so a mobile only ever lists its own vouches. Optional `limit` /
+    /// `offset` window each list (client-side search still sees the fetched set;
+    /// see [`vouch_view::member_vouches`]). A live log scan.
+    fn channel_list_vouches(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let member = Address::from_public_key(envelope.signer);
+        // Params are optional: an empty body or `{}` lists everything.
+        let params: serde_json::Value = if envelope.params.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&envelope.params)
+                .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?
+        };
+        let limit = params.get("limit").and_then(|v| v.as_u64());
+        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let lists = vouch_view::member_vouches(&self.db, &member, limit, offset)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        serde_json::to_value(lists).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].

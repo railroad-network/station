@@ -787,5 +787,71 @@ async fn authenticated_channel_happy_path_and_rejections() {
     assert_eq!(counts["given"], 0, "subject gave none");
     assert_eq!(counts["received"], 1, "subject received one vouch");
 
+    // --- T1.4.5: list_vouches returns the browser rows, split by direction --
+    // The voucher lists one given row (naming both parties, same content
+    // address the submit returned) and no received rows.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "list_vouches",
+        "{}",
+        24,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        reply.error.is_none(),
+        "list_vouches error: {:?}",
+        reply.error
+    );
+    let lists: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        lists["given"].as_array().unwrap().len(),
+        1,
+        "voucher gave one"
+    );
+    assert!(
+        lists["received"].as_array().unwrap().is_empty(),
+        "voucher received none"
+    );
+    let row = &lists["given"][0];
+    assert_eq!(row["vouch_id"], vouch_id, "same content address as submit");
+    assert_eq!(row["voucher_address"], mobile_addr);
+    assert_eq!(row["subject_address"], receiver_addr.to_string());
+    assert_eq!(row["stake_centi"], 50);
+
+    // The subject lists the same vouch under `received`, nothing under `given`.
+    let req = sealed_request(
+        &receiver,
+        &station_pk,
+        &station_pk,
+        "list_vouches",
+        "{}",
+        8,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&receiver, &station_pk, &body);
+    assert!(
+        reply.error.is_none(),
+        "list_vouches error: {:?}",
+        reply.error
+    );
+    let lists: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert!(
+        lists["given"].as_array().unwrap().is_empty(),
+        "subject gave none"
+    );
+    assert_eq!(
+        lists["received"].as_array().unwrap().len(),
+        1,
+        "subject received one"
+    );
+    assert_eq!(lists["received"][0]["vouch_id"], vouch_id);
+
     station.shutdown().await;
 }
