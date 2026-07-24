@@ -1584,6 +1584,7 @@ dependencies = [
  "rrn-identity",
  "rrn-ledger",
  "rrn-mobile-ffi",
+ "rrn-reputation",
  "rrn-storage",
  "serde",
  "serde_json",

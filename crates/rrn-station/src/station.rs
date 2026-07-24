@@ -201,6 +201,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // Reputation snapshot refresh timer.
+        tasks.push(tokio::spawn(reputation_refresh_timer(
+            Duration::from_secs(config.timers.reputation_refresh_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -243,6 +250,13 @@ impl Station {
         self.core.sweep().await
     }
 
+    /// Forces an immediate reputation-snapshot refresh; returns the number of
+    /// identities refreshed. Lets a driver refresh deterministically without
+    /// waiting on the hourly timer.
+    pub async fn refresh_reputation(&self) -> usize {
+        self.core.refresh_reputation().await
+    }
+
     /// Signals all tasks to stop, stops the core thread, awaits the tasks, and
     /// removes the socket file. Idempotent-ish: safe to call once.
     pub async fn shutdown(mut self) {
@@ -269,6 +283,32 @@ async fn sweep_timer(interval: Duration, core: CoreHandle, mut shutdown: watch::
                 let n = core.sweep().await;
                 if n > 0 {
                     tracing::info!(settled = n, "settlement sweep");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically asks the core to refresh reputation snapshots at the current
+/// clock time.
+async fn reputation_refresh_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick so startup doesn't refresh an empty log.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.refresh_reputation().await;
+                if n > 0 {
+                    tracing::info!(refreshed = n, "reputation snapshot refresh");
                 }
             }
             _ = shutdown.changed() => {

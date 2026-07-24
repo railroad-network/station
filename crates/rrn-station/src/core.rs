@@ -76,6 +76,12 @@ pub enum Command {
         /// Count of settled transactions.
         reply: oneshot::Sender<usize>,
     },
+    /// Refresh every known identity's reputation snapshot at the core's current
+    /// clock time; reply with the number of identities refreshed.
+    RefreshReputation {
+        /// Count of identities refreshed.
+        reply: oneshot::Sender<usize>,
+    },
     /// Report this station's own address and current log tail seq (for the peer
     /// handshake).
     Handshake {
@@ -200,6 +206,16 @@ impl CoreHandle {
     pub async fn sweep(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::Sweep { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Triggers a reputation-snapshot refresh; returns the number of identities
+    /// refreshed.
+    pub async fn refresh_reputation(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::RefreshReputation { reply }).is_err() {
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -390,6 +406,10 @@ impl Core {
                 }
                 Command::Sweep { reply } => {
                     let n = self.do_sweep();
+                    let _ = reply.send(n);
+                }
+                Command::RefreshReputation { reply } => {
+                    let n = self.do_refresh_reputation();
                     let _ = reply.send(n);
                 }
                 Command::Handshake { reply } => {
@@ -651,6 +671,17 @@ impl Core {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "settlement sweep failed");
+                0
+            }
+        }
+    }
+
+    fn do_refresh_reputation(&mut self) -> usize {
+        let now = self.clock.now();
+        match rrn_reputation::snapshot::refresh_all_snapshots(&self.db, now) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "reputation snapshot refresh failed");
                 0
             }
         }

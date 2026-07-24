@@ -133,6 +133,11 @@ pub struct TimersSection {
     /// Gossip-round interval in seconds (spec default: 5).
     #[serde(default = "default_gossip_interval")]
     pub gossip_interval_secs: u64,
+    /// Reputation-snapshot refresh interval in seconds (spec default: 3600 —
+    /// hourly). The floor under ad-hoc refreshes; recomputes every known
+    /// identity's cached profile from the log.
+    #[serde(default = "default_reputation_refresh_interval")]
+    pub reputation_refresh_interval_secs: u64,
 }
 
 fn default_window_seconds() -> u64 {
@@ -143,6 +148,9 @@ fn default_sweep_interval() -> u64 {
 }
 fn default_gossip_interval() -> u64 {
     5
+}
+fn default_reputation_refresh_interval() -> u64 {
+    3600
 }
 
 impl Default for SettlementSection {
@@ -158,6 +166,7 @@ impl Default for TimersSection {
         Self {
             sweep_interval_secs: default_sweep_interval(),
             gossip_interval_secs: default_gossip_interval(),
+            reputation_refresh_interval_secs: default_reputation_refresh_interval(),
         }
     }
 }
