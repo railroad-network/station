@@ -32,6 +32,7 @@ pub mod decay;
 pub mod model;
 pub mod portability;
 pub mod scoring;
+pub mod snapshot;
 pub mod sybil;
 
 /// Something went wrong reading the evidence a reputation score is derived from.
@@ -48,6 +49,10 @@ pub enum Error {
     /// A failure replaying the ledger from the log.
     #[error("ledger: {0}")]
     Ledger(#[from] rrn_ledger::Error),
+    /// A stored snapshot's bytes were not a decodable profile — a corrupted cache
+    /// row (the log remains canonical; the snapshot can be recomputed).
+    #[error("decoding a cached snapshot: {0}")]
+    Decode(#[from] rrn_crypto::serialize::SerializeError),
 }
 
 /// Result specialized to this crate's [`Error`].

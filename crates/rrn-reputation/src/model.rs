@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 
+use dcbor::prelude::*;
 use rrn_identity::address::Address;
 
 /// Weight of trade reliability in the composite (ADR-0009).
@@ -150,6 +151,64 @@ impl ReputationBand {
     }
 }
 
+/// Discriminant string carried in a profile's canonical CBOR. Also a schema
+/// version marker: a later profile shape would use a new tag rather than silently
+/// reinterpreting these bytes.
+const PROFILE_KIND: &str = "rrn.reputation.profile.v1";
+
+impl From<ReputationProfile> for CBOR {
+    fn from(p: ReputationProfile) -> Self {
+        let mut competence = Map::new();
+        for (tag, score) in p.domain_competence {
+            competence.insert(tag.0, score);
+        }
+        let mut m = Map::new();
+        m.insert("kind", PROFILE_KIND);
+        m.insert("address", p.address);
+        m.insert("trade_reliability", p.trade_reliability);
+        m.insert("attestation_accuracy", p.attestation_accuracy);
+        m.insert("governance_participation", p.governance_participation);
+        m.insert("community_contribution", p.community_contribution);
+        m.insert("domain_competence", competence);
+        m.insert("last_updated", p.last_updated);
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for ReputationProfile {
+    type Error = dcbor::Error;
+
+    fn try_from(cbor: CBOR) -> std::result::Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        if map.extract::<&str, String>("kind")? != PROFILE_KIND {
+            return Err(dcbor::Error::WrongType);
+        }
+        let competence = match map.extract::<&str, CBOR>("domain_competence")?.into_case() {
+            CBORCase::Map(m) => m,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        let mut domain_competence = BTreeMap::new();
+        for (tag, score) in competence.iter() {
+            domain_competence.insert(
+                DomainTag(tag.clone().try_into_text()?),
+                f32::try_from(score.clone())?,
+            );
+        }
+        Ok(ReputationProfile {
+            address: map.extract::<&str, Address>("address")?,
+            trade_reliability: map.extract::<&str, f32>("trade_reliability")?,
+            attestation_accuracy: map.extract::<&str, f32>("attestation_accuracy")?,
+            governance_participation: map.extract::<&str, f32>("governance_participation")?,
+            community_contribution: map.extract::<&str, f32>("community_contribution")?,
+            domain_competence,
+            last_updated: map.extract::<&str, i64>("last_updated")?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +323,29 @@ mod tests {
         assert_eq!(uniform_profile(2.5).band(), ReputationBand::Member);
         assert_eq!(uniform_profile(4.0).band(), ReputationBand::Trusted);
         assert_eq!(uniform_profile(5.0).band(), ReputationBand::Senior);
+    }
+
+    #[test]
+    fn profile_cbor_round_trips() {
+        use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+
+        let mut domain_competence = BTreeMap::new();
+        // A non-integral and an integral score, and two tags, to exercise both the
+        // float encoding and the nested competence map.
+        domain_competence.insert(DomainTag("medical".into()), 3.5);
+        domain_competence.insert(DomainTag("agriculture".into()), 0.0);
+        let profile = ReputationProfile {
+            address: test_address(),
+            trade_reliability: 2.0, // integral: dcbor reduces to an int and back
+            attestation_accuracy: 0.8, // non-integral: stays a float
+            governance_participation: 0.0,
+            community_contribution: 0.0,
+            domain_competence,
+            last_updated: 1_700_000_000,
+        };
+
+        let bytes = to_canonical_bytes(profile.clone());
+        let back: ReputationProfile = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(profile, back);
     }
 }

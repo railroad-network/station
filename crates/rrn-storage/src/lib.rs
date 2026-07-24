@@ -19,6 +19,7 @@ pub mod db;
 pub mod log;
 pub mod migrations;
 pub mod replay;
+pub mod reputation_snapshot;
 
 /// Errors from the storage layer.
 #[derive(thiserror::Error, Debug)]
