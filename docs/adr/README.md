@@ -46,6 +46,7 @@ Decision Records) convention, using the structure in
 - [0006 — The mobile client holds the keys; the station is a local backend](0006-m1-client-architecture.md)
 - [0007 — uniffi-rs generates the mobile bindings to our Rust crypto](0007-rust-mobile-ffi-uniffi.md)
 - [0008 — The mobile↔station envelope is the security boundary; the transport is a dumb carrier](0008-mobile-station-transport.md)
+- [0009 — One reputation formula runs on every station and no community can tune it](0009-universal-reputation-algorithm.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.
