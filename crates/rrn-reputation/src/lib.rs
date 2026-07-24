@@ -17,12 +17,19 @@
 //! (transaction history is a primary input). The dependency arrows point up the
 //! stack.
 //!
-//! Phase 1 scaffold (M1.0). The modules below are placeholders; each is filled
-//! in by its own later M1 task.
+//! The module layout follows ADR-0009 (the universal reputation algorithm):
+//! [`model`] is the multidimensional profile and its composite/band view,
+//! [`scoring`] replays the log into a profile, [`decay`] applies the time
+//! weighting, [`portability`] makes a profile signed and replayable off its
+//! home station, and [`sybil`] holds the velocity and identity-anchoring
+//! defenses. Each module is a placeholder here (T1.5.2) and is filled in by its
+//! own later M1.5 task.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod attestation;
 pub mod decay;
-pub mod score;
+pub mod model;
+pub mod portability;
+pub mod scoring;
+pub mod sybil;

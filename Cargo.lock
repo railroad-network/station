@@ -1560,10 +1560,14 @@ version = "0.1.0"
 name = "rrn-reputation"
 version = "0.1.0"
 dependencies = [
+ "dcbor",
  "rrn-crypto",
  "rrn-identity",
  "rrn-ledger",
  "rrn-storage",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

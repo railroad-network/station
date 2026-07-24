@@ -16,3 +16,10 @@ rrn-storage = { path = "../rrn-storage", version = "0.1" }
 rrn-identity = { path = "../rrn-identity", version = "0.1" }
 # Scores derive from confirmed/settled transaction history on the ledger.
 rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
+# Profiles serialize to canonical CBOR for the snapshot cache (T1.5.5) and for
+# the signed, portable history (T1.5.7).
+serde = { version = "1", features = ["derive"] }
+dcbor = "0.25"
+# Typed scoring/portability errors, and diagnostics for the refresh task.
+thiserror = "1"
+tracing = "0.1"
