@@ -23,11 +23,18 @@ struct Migration {
 
 /// All migrations, in ascending version order. Append new entries; never modify
 /// or reorder existing ones.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "reputation_snapshots",
+        sql: include_str!("../migrations/0002_reputation_snapshots.sql"),
+    },
+];
 
 /// Applies every migration that has not yet been recorded, in order.
 ///
@@ -120,6 +127,7 @@ mod tests {
             "identities",
             "kv",
             "log_entries",
+            "reputation_snapshots",
             "transactions",
         ]
         .iter()
