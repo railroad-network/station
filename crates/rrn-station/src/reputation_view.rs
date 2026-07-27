@@ -472,7 +472,15 @@ mod tests {
         let signed = create_vouch(&anchor, &addr(&newcomer), "demo", "I know them", 0);
         append_vouch(&mut AppendLog::new(&db), signed).unwrap();
 
-        let view = member_reputation(&db, &addr(&newcomer), now).unwrap();
+        // `create_vouch` stamps `issued_at` from the live clock, and
+        // `anchoring_voucher` ignores a vouch issued after the time being scored
+        // — so the read must be taken *after* the vouch exists, not at the `now`
+        // captured before thirty log appends' worth of work. Reusing that `now`
+        // passed whenever the test outran the second boundary and failed when it
+        // did not, which is the sort of flake that only shows up on a loaded CI
+        // runner.
+        let read_at = wall_now();
+        let view = member_reputation(&db, &addr(&newcomer), read_at).unwrap();
 
         assert!(view.anchored);
         assert_eq!(
