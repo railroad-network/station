@@ -175,7 +175,7 @@ pub fn is_anchored(db: &Database, address: &Address, at_time: i64) -> Result<boo
 ///
 /// # Why the voucher is judged uncapped
 ///
-/// The voucher's composite is read from [`ReputationScorer::score_raw_at`] —
+/// The voucher's composite is read from the scorer's internal `score_raw_at` —
 /// their score *before* anchoring is applied. This is not a shortcut; it is what
 /// makes the rule computable. Judging a voucher by their anchored profile would
 /// make two members who vouch for each other mutually undecidable, and no member

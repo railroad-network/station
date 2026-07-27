@@ -23,7 +23,8 @@
 //!
 //! # The count-to-score mapping
 //!
-//! A dimension's raw value is [`EVENT_INCREMENT`] per qualifying event, capped at
+//! A dimension's raw value is `EVENT_INCREMENT` (0.5) per qualifying event,
+//! capped at
 //! [`DIMENSION_MAX`]; [`crate::decay`] then subtracts its monthly rate per 30-day
 //! month since that dimension's most recent event. These constants are
 //! protocol-locked alongside the ADR-0009 weights: they must be identical on
