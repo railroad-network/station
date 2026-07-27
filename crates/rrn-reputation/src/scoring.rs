@@ -24,10 +24,11 @@
 //! # The count-to-score mapping
 //!
 //! A dimension's raw value is [`EVENT_INCREMENT`] per qualifying event, capped at
-//! [`DIMENSION_MAX`]; decay then subtracts [`MONTHLY_DECAY`] per 30-day month
-//! since that dimension's most recent event. Both constants are protocol-locked
-//! alongside the ADR-0009 weights: they must be identical on every station, or a
-//! reputation exported from one would not reconcile on another.
+//! [`DIMENSION_MAX`]; [`crate::decay`] then subtracts its monthly rate per 30-day
+//! month since that dimension's most recent event. These constants are
+//! protocol-locked alongside the ADR-0009 weights: they must be identical on
+//! every station, or a reputation exported from one would not reconcile on
+//! another.
 
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
@@ -37,17 +38,13 @@ use rrn_ledger::transaction::TransactionConfirmation;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
+use crate::decay::decayed;
 use crate::model::{ReputationProfile, DIMENSION_MAX};
 use crate::Result;
 
 /// Points one qualifying event contributes to its dimension, before capping and
 /// decay. Protocol-locked (ADR-0009): 10 lifetime events reach [`DIMENSION_MAX`].
 const EVENT_INCREMENT: f32 = 0.5;
-/// Points a dimension loses per 30-day month since its most recent event
-/// (ADR-0009 time decay). Protocol-locked.
-const MONTHLY_DECAY: f32 = 0.1;
-/// Seconds in a 30-day reputation "month" — the decay unit of ADR-0009.
-const SECONDS_PER_MONTH: f32 = 30.0 * 86_400.0;
 
 /// Computes reputation profiles by replaying the log behind a borrowed database.
 pub struct ReputationScorer<'db> {
@@ -165,8 +162,7 @@ impl DimensionTally {
             return 0.0;
         };
         let raw = (EVENT_INCREMENT * self.count as f32).min(DIMENSION_MAX);
-        let months = (at_time - last) as f32 / SECONDS_PER_MONTH;
-        (raw - MONTHLY_DECAY * months).max(0.0)
+        decayed(raw, last, at_time)
     }
 }
 
