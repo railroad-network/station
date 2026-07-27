@@ -41,3 +41,26 @@ pub mod inquiry;
 pub mod lifecycle;
 pub mod listing;
 pub mod search;
+
+/// Anything that can go wrong in the marketplace.
+///
+/// The two policy variants are worth telling apart: [`Listing`](Error::Listing)
+/// means a listing's own contents broke a rule, while
+/// [`Lifecycle`](Error::Lifecycle) means the contents were fine but the writer
+/// was not entitled to write them.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A failure reading or appending to the log.
+    #[error("storage: {0}")]
+    Storage(#[from] rrn_storage::Error),
+    /// A listing that breaks one of its own validation rules (ADR-0010).
+    #[error("invalid listing: {0}")]
+    Listing(#[from] listing::ListingError),
+    /// A lifecycle record nobody was entitled to write, or that has nothing to
+    /// act on.
+    #[error("listing lifecycle: {0}")]
+    Lifecycle(#[from] lifecycle::LifecycleError),
+}
+
+/// Result specialized to this crate's [`Error`].
+pub type Result<T> = std::result::Result<T, Error>;
