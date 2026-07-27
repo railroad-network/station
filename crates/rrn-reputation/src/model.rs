@@ -38,6 +38,38 @@ pub const BAND_TRUSTED_MIN: f32 = 3.5;
 /// Lower bound (inclusive) of the "Senior" band (ADR-0009).
 pub const BAND_SENIOR_MIN: f32 = 4.5;
 
+/// The dimensions with no data source in Phase 1, with the weight each carries
+/// and the milestone that lights it up. They are structurally `0.0`, which is
+/// what caps the reachable composite ([`max_composite_now`]).
+///
+/// ADR-0009 fixes the divisor at the full weight sum precisely so these do *not*
+/// get renormalized away — a dormant dimension pulls the composite down, and a
+/// consumer's job is to say so rather than hide it.
+pub const DORMANT_DIMENSIONS: &[(&str, f32)] = &[
+    // Until M1.9 (governance).
+    ("governance_participation", WEIGHT_GOVERNANCE_PARTICIPATION),
+    // Phase 2+; no data source is planned in Phase 1.
+    ("community_contribution", WEIGHT_COMMUNITY_CONTRIBUTION),
+    // Until the marketplace tags transactions with categories (M1.7).
+    ("domain_competence", WEIGHT_DOMAIN_COMPETENCE),
+];
+
+/// The highest composite anyone can currently reach: every *live* dimension at
+/// [`DIMENSION_MAX`], every dormant one at `0.0`. Today that is
+/// `(0.30 + 0.25) × 5.0 = 2.75`, which sits inside the `Member` band — so
+/// `Trusted` and `Senior` are unreachable.
+///
+/// Derived from the ADR-0009 weights rather than written down as a literal, so
+/// it moves on its own when a milestone removes a dimension from
+/// [`DORMANT_DIMENSIONS`]. Two consumers depend on that: the mobile's Standing
+/// view, which must not imply an unreachable band is attainable (T1.5.9), and
+/// marketplace listings, whose `min_reputation` is rejected above this ceiling
+/// so that a provider cannot demand standing no member can hold (ADR-0010).
+pub fn max_composite_now() -> f32 {
+    let dormant_weight: f32 = DORMANT_DIMENSIONS.iter().map(|(_, w)| w).sum();
+    (1.0 - dormant_weight) * DIMENSION_MAX
+}
+
 /// A category label for domain competence, e.g. `"medical"`, `"agriculture"`,
 /// `"construction"`.
 ///

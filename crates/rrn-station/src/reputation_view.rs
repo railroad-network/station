@@ -29,9 +29,9 @@ use serde::Serialize;
 
 use rrn_identity::address::Address;
 use rrn_reputation::model::{
-    ReputationBand, ReputationProfile, DIMENSION_MAX, WEIGHT_ATTESTATION_ACCURACY,
-    WEIGHT_COMMUNITY_CONTRIBUTION, WEIGHT_DOMAIN_COMPETENCE, WEIGHT_GOVERNANCE_PARTICIPATION,
-    WEIGHT_TRADE_RELIABILITY,
+    max_composite_now, ReputationBand, ReputationProfile, DIMENSION_MAX, DORMANT_DIMENSIONS,
+    WEIGHT_ATTESTATION_ACCURACY, WEIGHT_COMMUNITY_CONTRIBUTION, WEIGHT_DOMAIN_COMPETENCE,
+    WEIGHT_GOVERNANCE_PARTICIPATION, WEIGHT_TRADE_RELIABILITY,
 };
 use rrn_reputation::snapshot::{get_cached_profile, refresh_snapshot};
 use rrn_reputation::sybil::{anchoring_voucher, ANCHOR_DIMENSION_CAP};
@@ -51,32 +51,6 @@ pub const OWN_PROFILE_MAX_AGE_SECS: i64 = 300;
 /// a snapshot the hourly sweep already wrote. M1.7's listing cards ask for one
 /// band per row, so this path must not be able to trigger a replay per card.
 pub const BAND_MAX_AGE_SECS: i64 = 3600;
-
-/// The dimensions with no data source in Phase 1, with the weight each carries
-/// and the milestone that lights it up. They are structurally `0.0`, which is
-/// what caps the reachable composite ([`max_composite_now`]).
-///
-/// ADR-0009 fixes the divisor at the full weight sum precisely so these do *not*
-/// get renormalized away — a dormant dimension pulls the composite down, and the
-/// UI's job is to say so rather than hide it.
-const DORMANT_DIMENSIONS: &[(&str, f32)] = &[
-    ("governance_participation", WEIGHT_GOVERNANCE_PARTICIPATION),
-    ("community_contribution", WEIGHT_COMMUNITY_CONTRIBUTION),
-    ("domain_competence", WEIGHT_DOMAIN_COMPETENCE),
-];
-
-/// The highest composite anyone can currently reach: every *live* dimension at
-/// [`DIMENSION_MAX`], every dormant one at `0.0`. Today that is
-/// `(0.30 + 0.25) × 5.0 = 2.75`, which sits inside the `Member` band — so
-/// `Trusted` and `Senior` are unreachable and the mobile must say so.
-///
-/// Derived from the ADR-0009 weights rather than written down as a literal, so
-/// it moves on its own when a milestone removes a dimension from
-/// [`DORMANT_DIMENSIONS`].
-pub fn max_composite_now() -> f32 {
-    let dormant_weight: f32 = DORMANT_DIMENSIONS.iter().map(|(_, w)| w).sum();
-    (1.0 - dormant_weight) * DIMENSION_MAX
-}
 
 /// A dimension as the mobile lists it: its score, and whether it can carry a
 /// score at all yet.
