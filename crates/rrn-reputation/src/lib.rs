@@ -53,6 +53,10 @@ pub enum Error {
     /// row (the log remains canonical; the snapshot can be recomputed).
     #[error("decoding a cached snapshot: {0}")]
     Decode(#[from] rrn_crypto::serialize::SerializeError),
+    /// An exported reputation history did not hold up: unlike the variants above,
+    /// this is a claim that failed to verify, not a local malfunction.
+    #[error("verifying an exported history: {0}")]
+    History(#[from] portability::HistoryError),
 }
 
 /// Result specialized to this crate's [`Error`].
