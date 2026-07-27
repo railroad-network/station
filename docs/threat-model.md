@@ -878,27 +878,37 @@ inherited standing.
   manufacture in parallel. Violations are logged for operator review and never
   auto-punish: an automatic penalty would be a griefing vector, since anyone who
   can drive transactions at a member could push them over the cap.
-- *Mitigation (implemented, not yet enforced, T1.5.8):* **identity anchoring** —
-  a fresh identity's dimensions are held at 1.0 until an established member
-  vouches for it (`rrn-reputation::sybil::anchored_profile` / `is_anchored`),
-  which forces a Sybil cluster to corrupt someone real rather than bootstrap among
-  itself. The cap is **not currently applied inside scoring**: ADR-0009 requires
-  the anchoring voucher to hold a composite of 3.0, and Phase 1's highest
-  reachable composite is 2.75 (three of five dimensions are structurally zero), so
-  enforcing it today would cap every member — including founding ones — at 1.0
-  permanently. Amending that threshold is a pending ADR-0009 decision; the code is
-  written and tested against it, and `sybil.rs` documents the deadlock at
-  `ANCHOR_VOUCHER_MIN_COMPOSITE`.
-- *Residual risk:* until anchoring is switched on, velocity limiting is the only
-  Sybil defense actually in force, and it bounds the *rate* of manufactured
-  standing, not its eventual ceiling — a patient attacker still gets there. Two
-  colluding identities trading with each other are indistinguishable from two real
-  members trading, so ten weeks of patience buys a full trade-reliability score;
-  detecting that pattern is the Phase 2 graph analysis. The velocity check is also
-  a known undercount: it compares consecutive snapshots rather than a true
-  trailing-7-day window (the cache retains only the latest snapshot), so a member
-  who stays just under the floor across many sub-weekly refreshes is not flagged.
-  The gap closes as the refresh interval approaches weekly.
+- *Mitigation (shipped, T1.5.8):* **identity anchoring.** Every dimension of an
+  identity is held at 1.0 until a member holding at least a Member-band composite
+  (2.0) vouches for it — applied inside `ReputationScorer::score_at`, so
+  snapshots, exports and remote re-verification all see the same capped profile.
+  The evidence keeps accruing underneath the cap, so an anchoring vouch reveals
+  the standing already earned rather than starting it. A vouch for oneself is
+  ignored. ADR-0009's original 3.0 threshold was unreachable in Phase 1 and was
+  amended to the band floor in T1.5.8; the reasoning is recorded in the ADR.
+- *Residual risk:* **anchoring stops a lone fake identity, not a patient pair.** A
+  prospective voucher is judged on their *uncapped* composite — necessarily so,
+  or no member could ever be the first anchor and mutual vouchers would be
+  undecidable — and an uncapped composite is computed from evidence, which
+  colluding identities can manufacture. Two fakes transacting with each other are
+  indistinguishable from two real members trading, so roughly ten weeks of
+  patience buys a full trade-reliability score and, with it, the standing to
+  anchor each other and any number of further identities. Velocity flagging plus
+  human review is what stands against that; detecting the pattern structurally is
+  the Phase 2 graph analysis, and a chain-of-trust walk from a genesis identity
+  (recorded in ADR-0009 as the rejected-for-now alternative) is the variant that
+  would close it. The velocity check is itself a known undercount: it compares
+  consecutive snapshots rather than a true trailing-7-day window (the cache
+  retains only the latest snapshot), so a member who stays just under the floor
+  across many sub-weekly refreshes is not flagged. That gap closes as the refresh
+  interval approaches weekly.
+- *Residual risk (disclosure):* proving an anchor to a remote station means
+  shipping the anchoring voucher's own evidence inside the subject's export
+  (`rrn-reputation::portability`), since the verifier must recompute the voucher's
+  composite rather than trust the exporter's word for it. Only the first
+  qualifying voucher's entries travel, which is the least disclosure that
+  verifies, but it does expose one member's trade history inside another member's
+  bundle. A succinct proof of the voucher's standing is the Phase 2 improvement.
 
 ### `rrn-governance`
 
@@ -1570,12 +1580,13 @@ is deliberate — the audit covers what is built, and these are the documented
 edges of that scope.
 
 - **Partial Sybil resistance.** Vouch *authenticity* is enforced
-  cryptographically; vouch *trust* is not. M1.5 adds rate-based defense — the
-  0.5/week velocity cap makes manufactured standing slow (ten weeks to max a
-  dimension) and flags implausible gains for human review — but a Sybil cluster of
-  mutually-vouching keys is still cryptographically valid and, given patience,
-  still scores. Identity anchoring, the defense that would force a cluster to
-  corrupt a real member, is implemented but not yet enforced (see
+  cryptographically; vouch *trust* is not. M1.5 adds two defenses — the 0.5/week
+  velocity cap, which makes manufactured standing slow (ten weeks to max a
+  dimension) and flags implausible gains for human review, and identity anchoring,
+  which holds an unvouched identity at 1.0 per dimension. Together they stop a
+  lone fake identity, but a *pair* of colluding identities can trade with each
+  other to raise the uncapped composites that qualify them to anchor each other,
+  and mutually-vouching keys remain cryptographically valid (see
   [Sybil clusters and manufactured standing](#sybil-clusters-and-manufactured-standing-m15)).
   Statistical graph analysis is Phase 2.
 - **No federation security.** Eclipse attacks, cross-replica ledger forks,

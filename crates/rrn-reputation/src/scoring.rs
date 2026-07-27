@@ -40,6 +40,7 @@ use rrn_storage::log::AppendLog;
 
 use crate::decay::decayed;
 use crate::model::{ReputationProfile, DIMENSION_MAX};
+use crate::sybil::{anchored_profile, is_anchored};
 use crate::Result;
 
 /// Points one qualifying event contributes to its dimension, before capping and
@@ -59,9 +60,10 @@ impl<'db> ReputationScorer<'db> {
 
     /// The address's reputation as of `now`.
     ///
-    /// Equivalent to [`score_at`](Self::score_at) at `now`; the whole log is
-    /// replayed each call (`O(N)`), which is fine at Phase 1 scale — T1.5.5 adds
-    /// a cached snapshot for hot paths.
+    /// Equivalent to [`score_at`](Self::score_at) at `now`. The whole log is
+    /// replayed each call, once for the address and once more per member who has
+    /// vouched for it (to judge the anchor), so the cost is `O(V·N)` — fine at
+    /// Phase 1 scale, and [`crate::snapshot`] caches the result for hot paths.
     pub fn score(&self, address: &Address, now: i64) -> Result<ReputationProfile> {
         self.score_at(address, now)
     }
@@ -74,7 +76,28 @@ impl<'db> ReputationScorer<'db> {
     /// and dispute review replayable. Timestamps come from the signed payloads
     /// (`settled_at`, `confirmed_at`, `issued_at`), never the log's per-replica
     /// append time, so two stations with the same log agree byte-for-byte.
+    ///
+    /// An identity no established member has vouched for is held to
+    /// [`ANCHOR_DIMENSION_CAP`](crate::sybil::ANCHOR_DIMENSION_CAP) — the
+    /// evidence still accrues underneath, so being anchored later reveals the
+    /// score rather than starting it.
     pub fn score_at(&self, address: &Address, at_time: i64) -> Result<ReputationProfile> {
+        let raw = self.score_raw_at(address, at_time)?;
+        let anchored = is_anchored(self.db, address, at_time)?;
+        Ok(anchored_profile(&raw, anchored))
+    }
+
+    /// The address's reputation from evidence alone, before identity anchoring.
+    ///
+    /// This is what [`crate::sybil::anchoring_voucher`] judges a prospective
+    /// voucher on, and the two functions must not be swapped: scoring a voucher
+    /// through [`score_at`](Self::score_at) would call back into anchoring and
+    /// recurse without terminating on a pair of members who vouch for each other.
+    pub(crate) fn score_raw_at(
+        &self,
+        address: &Address,
+        at_time: i64,
+    ) -> Result<ReputationProfile> {
         let log = AppendLog::new(self.db);
 
         let mut trade = DimensionTally::default();
@@ -179,6 +202,7 @@ mod tests {
     use rrn_storage::migrations;
 
     use crate::model::ReputationBand;
+    use crate::sybil::ANCHOR_DIMENSION_CAP;
 
     const MONTH: i64 = 30 * 86_400;
 
@@ -347,12 +371,81 @@ mod tests {
         for nonce in 0..12 {
             append_settled(&db, &alice, &bob, &station, nonce, t);
         }
-        let p = ReputationScorer::new(&db).score(&addr(&alice), t).unwrap();
+        let p = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&alice), t)
+            .unwrap();
         assert!(
             approx(p.trade_reliability, DIMENSION_MAX),
             "trade = {}",
             p.trade_reliability
         );
+    }
+
+    #[test]
+    fn an_unvouched_identity_is_held_at_the_anchor_cap() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let t = 10 * MONTH;
+        for nonce in 0..12 {
+            append_settled(&db, &alice, &bob, &station, nonce, t);
+        }
+
+        // Nobody has vouched for alice, so the evidence accrues but does not show.
+        let scorer = ReputationScorer::new(&db);
+        let scored = scorer.score(&addr(&alice), t).unwrap();
+        assert!(
+            approx(scored.trade_reliability, ANCHOR_DIMENSION_CAP),
+            "trade = {}",
+            scored.trade_reliability
+        );
+        assert!(approx(
+            scorer
+                .score_raw_at(&addr(&alice), t)
+                .unwrap()
+                .trade_reliability,
+            DIMENSION_MAX
+        ));
+    }
+
+    #[test]
+    fn an_anchoring_vouch_reveals_the_score_already_earned() {
+        let db = fresh_db();
+        let (alice, bob, patron, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let t = 10 * MONTH;
+        for nonce in 0..12 {
+            append_settled(&db, &alice, &bob, &station, nonce, t);
+        }
+        // The patron earns enough standing to anchor: ten settled trades plus ten
+        // vouches written puts their composite over the Member-band threshold.
+        for nonce in 0..10 {
+            append_settled(&db, &patron, &station, &station, nonce, t);
+        }
+        for _ in 0..10 {
+            append_vouch(&db, &patron, &addr(&Keypair::generate()), t);
+        }
+
+        let scorer = ReputationScorer::new(&db);
+        assert!(approx(
+            scorer.score(&addr(&alice), t).unwrap().trade_reliability,
+            ANCHOR_DIMENSION_CAP
+        ));
+
+        // One vouch, and the history alice already had reads at full value —
+        // the cap hid it, it did not erase it.
+        append_vouch(&db, &patron, &addr(&alice), t);
+        assert!(approx(
+            scorer.score(&addr(&alice), t).unwrap().trade_reliability,
+            DIMENSION_MAX
+        ));
     }
 
     #[test]

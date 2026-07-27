@@ -51,6 +51,7 @@ use rrn_storage::migrations;
 
 use crate::model::ReputationProfile;
 use crate::scoring::ReputationScorer;
+use crate::sybil::anchoring_voucher;
 use crate::Result;
 
 /// Discriminant string carried in a history root's canonical CBOR, and its
@@ -155,7 +156,7 @@ pub fn export_history_at(
     signer: &Keypair,
     computed_at: i64,
 ) -> Result<PortableReputationHistory> {
-    let log_entries = entries_concerning(db, address)?;
+    let log_entries = exportable_entries(db, address, computed_at)?;
     let root = HistoryRoot {
         address: *address,
         from_seq: log_entries.first().map(|e| e.seq).unwrap_or(0),
@@ -236,6 +237,37 @@ fn replay_into_profile(
         }
     }
     ReputationScorer::new(&db).score_at(&history.address, computed_at)
+}
+
+/// Everything a remote verifier needs to reach the exporter's profile: the
+/// entries concerning `address`, plus the entries concerning whichever member
+/// anchored it.
+///
+/// The anchoring voucher's own evidence has to travel too. A verifier judges an
+/// anchor by recomputing the voucher's composite
+/// ([`crate::sybil::anchoring_voucher`]), and the vouch alone says nothing about
+/// whether its author was established — without their history the verifier would
+/// score them at zero, conclude the subject is unanchored, and derive a
+/// capped profile the exporter never computed.
+///
+/// Only the *first qualifying* voucher is included, which is both sufficient and
+/// the least disclosure that works: their evidence is what proves the anchor, and
+/// a verifier who receives no such evidence computes the same unanchored profile
+/// the exporter did, since absent evidence can only lower a composite. That is
+/// still a real privacy cost — the voucher's trade history travels inside someone
+/// else's bundle — and a succinct proof of the voucher's standing, rather than
+/// their raw evidence, is the Phase 2 improvement.
+fn exportable_entries(db: &Database, address: &Address, at_time: i64) -> Result<Vec<LogEntry>> {
+    let mut entries = entries_concerning(db, address)?;
+
+    if let Some(voucher) = anchoring_voucher(db, address, at_time)? {
+        entries.extend(entries_concerning(db, &voucher)?);
+        // Both sets can name the same entry (the anchoring vouch itself, or a
+        // trade between the two); the log's order is the one the verifier checks.
+        entries.sort_by_key(|entry| entry.seq);
+        entries.dedup_by_key(|entry| entry.seq);
+    }
+    Ok(entries)
 }
 
 /// Every log entry bearing on `address`: the transactions it is a party to — with
@@ -524,6 +556,43 @@ mod tests {
         assert_eq!(bundle.log_entries.len(), 7);
         assert_eq!(bundle.signed_root.payload.from_seq, 1);
         assert_eq!(bundle.signed_root.payload.to_seq, 7);
+    }
+
+    #[test]
+    fn an_anchored_members_bundle_carries_what_proves_the_anchor() {
+        let (alice, bob, patron, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let db = fresh_db();
+        let t = 6 * MONTH;
+        for nonce in 0..12 {
+            append_settled(&db, &alice, &bob, &station, nonce, t);
+        }
+        // A patron established enough to anchor, who then vouches for alice.
+        for nonce in 0..10 {
+            append_settled(&db, &patron, &station, &station, nonce, t);
+        }
+        for _ in 0..10 {
+            append_vouch(&db, &patron, &addr(&Keypair::generate()), t);
+        }
+        append_vouch(&db, &patron, &addr(&alice), t);
+
+        let now = 6 * MONTH;
+        let expected = ReputationScorer::new(&db)
+            .score_at(&addr(&alice), now)
+            .unwrap();
+        assert!(expected.trade_reliability > 1.0, "alice must be anchored");
+
+        // A verifier holding only the bundle has to be able to establish that the
+        // voucher was established enough to anchor — which takes the voucher's own
+        // evidence, not just the vouch itself.
+        assert_eq!(
+            verify_history(&export_history_at(&db, &addr(&alice), &station, now).unwrap()).unwrap(),
+            expected
+        );
     }
 
     #[test]

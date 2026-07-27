@@ -44,21 +44,16 @@ const SECONDS_PER_WEEK: f32 = 7.0 * 86_400.0;
 /// (ADR-0009). Protocol-locked.
 pub const ANCHOR_DIMENSION_CAP: f32 = 1.0;
 
-/// Composite an existing member needs before their vouch can anchor someone
-/// (ADR-0009). Protocol-locked.
+/// Composite an existing member needs before their vouch can anchor someone:
+/// the floor of the **Member** band (ADR-0009, amended). Protocol-locked.
 ///
-/// <div class="warning">
-///
-/// Phase 1 cannot reach this value. With governance, community contribution and
-/// domain competence all structurally `0.0`, the highest composite available is
-/// `0.55 · 5.0 = 2.75`, so no member yet qualifies to anchor anyone and every
-/// identity stays capped at [`ANCHOR_DIMENSION_CAP`]. This is why the cap is
-/// **not yet applied inside scoring** — see [`anchored_profile`]. Resolving it
-/// means amending ADR-0009 (the constant is protocol-locked), which is a pending
-/// decision, not something this crate may choose locally.
-///
-/// </div>
-pub const ANCHOR_VOUCHER_MIN_COMPOSITE: f32 = 3.0;
+/// Tied to a band boundary rather than given as a bare number so it keeps meaning
+/// the same thing — "someone the community recognizes as established" — as later
+/// milestones light up the dimensions that are still `0.0`. The original 3.0 was
+/// unreachable in Phase 1 (the highest available composite is `0.55 · 5.0 = 2.75`
+/// with three of five dimensions structurally zero), which would have held every
+/// member, founders included, at [`ANCHOR_DIMENSION_CAP`] permanently.
+pub const ANCHOR_VOUCHER_MIN_COMPOSITE: f32 = crate::model::BAND_MEMBER_MIN;
 
 /// A dimension grew faster than [`VELOCITY_CAP_PER_WEEK`] allows.
 ///
@@ -165,28 +160,38 @@ fn allowance(from_time: i64, to_time: i64) -> f32 {
 }
 
 /// Whether `address` has been vouched for by a member established enough to
-/// anchor it — at least one vouch, issued at or before `at_time`, from a member
-/// whose composite is at least [`ANCHOR_VOUCHER_MIN_COMPOSITE`].
-///
-/// The voucher is judged on their *scored* profile, which today is their
-/// uncapped one. When the cap moves inside scoring, this must keep reading an
-/// uncapped score: judging vouchers by their anchored profile would make two
-/// identities that vouch for each other mutually undecidable, and the recursion
-/// would not terminate.
+/// anchor it.
 pub fn is_anchored(db: &Database, address: &Address, at_time: i64) -> Result<bool> {
-    anchored_by(db, address, at_time, ANCHOR_VOUCHER_MIN_COMPOSITE)
+    Ok(anchoring_voucher(db, address, at_time)?.is_some())
 }
 
-/// [`is_anchored`] against a given voucher threshold rather than the locked one.
+/// The member whose vouch anchors `address`, if any: the first, in log order, to
+/// have vouched for it at or before `at_time` while holding a composite of at
+/// least [`ANCHOR_VOUCHER_MIN_COMPOSITE`].
 ///
-/// Exists so the anchoring machinery can be exercised at a threshold Phase 1 can
-/// actually reach; the protocol value is not a parameter callers may choose.
-pub(crate) fn anchored_by(
+/// Callers that only need a yes/no want [`is_anchored`]; the address itself is
+/// what [`crate::portability`] needs, to ship the evidence a remote verifier must
+/// replay in order to reach the same conclusion.
+///
+/// # Why the voucher is judged uncapped
+///
+/// The voucher's composite is read from [`ReputationScorer::score_raw_at`] —
+/// their score *before* anchoring is applied. This is not a shortcut; it is what
+/// makes the rule computable. Judging a voucher by their anchored profile would
+/// make two members who vouch for each other mutually undecidable, and no member
+/// could ever be the first anchor, since an unanchored member's composite cannot
+/// exceed `0.55` — below any usable threshold.
+///
+/// The cost is that anchoring stops a lone fake identity but not a patient pair:
+/// two colluding identities trading with each other raise their *uncapped*
+/// composites on real-looking evidence and can then anchor each other. Velocity
+/// flagging and human review are what stand against that in Phase 1; see the
+/// threat model, "Sybil clusters and manufactured standing".
+pub fn anchoring_voucher(
     db: &Database,
     address: &Address,
     at_time: i64,
-    min_composite: f32,
-) -> Result<bool> {
+) -> Result<Option<Address>> {
     let log = AppendLog::new(db);
     let scorer = ReputationScorer::new(db);
 
@@ -204,11 +209,11 @@ pub(crate) fn anchored_by(
         if voucher == *address {
             continue;
         }
-        if scorer.score_at(&voucher, at_time)?.composite() >= min_composite {
-            return Ok(true);
+        if scorer.score_raw_at(&voucher, at_time)?.composite() >= ANCHOR_VOUCHER_MIN_COMPOSITE {
+            return Ok(Some(voucher));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// `profile` with every dimension held to [`ANCHOR_DIMENSION_CAP`] when
@@ -218,11 +223,9 @@ pub(crate) fn anchored_by(
 /// underlying evidence still accrues and still decays, so an identity that later
 /// gets anchored immediately reads at its true value rather than restarting.
 ///
-/// **Not yet applied by [`crate::scoring`].** Doing so today would cap every
-/// member permanently — see [`ANCHOR_VOUCHER_MIN_COMPOSITE`]. Wiring it in is
-/// deliberately held until that threshold is settled, because the cap has to sit
-/// inside scoring (so snapshots, exports and re-verification all agree) and
-/// switching it on is therefore a protocol-visible change, not a local one.
+/// Applied by [`crate::scoring::ReputationScorer::score_at`], which is where it
+/// has to sit so that snapshots, exports and remote re-verification all see the
+/// same profile.
 pub fn anchored_profile(profile: &ReputationProfile, anchored: bool) -> ReputationProfile {
     if anchored {
         return profile.clone();
@@ -447,39 +450,32 @@ mod tests {
         maxed_out_member(&db, &patron, &station, t);
         append_vouch(&db, &patron, &addr(&newcomer), t);
 
-        // Against a threshold Phase 1 can reach, the machinery lets the newcomer
-        // through — and the cap then stops holding their profile down.
-        assert!(anchored_by(&db, &addr(&newcomer), t, 2.0).unwrap());
-        let grown = profile(addr(&newcomer), 3.0, t);
-        assert_eq!(anchored_profile(&grown, true).trade_reliability, 3.0);
+        assert!(is_anchored(&db, &addr(&newcomer), t).unwrap());
+        assert_eq!(
+            anchoring_voucher(&db, &addr(&newcomer), t).unwrap(),
+            Some(addr(&patron))
+        );
     }
 
     #[test]
-    fn no_phase_one_member_can_yet_anchor_anyone() {
+    fn the_threshold_is_reachable_in_phase_one() {
         let db = fresh_db();
-        let (patron, newcomer, station) = (
-            Keypair::generate(),
-            Keypair::generate(),
-            Keypair::generate(),
-        );
+        let (patron, station) = (Keypair::generate(), Keypair::generate());
         let t = 6 * MONTH;
         maxed_out_member(&db, &patron, &station, t);
-        append_vouch(&db, &patron, &addr(&newcomer), t);
 
-        // With three of five dimensions structurally zero, the best available
-        // composite is 0.55·5.0 = 2.75 — short of the locked 3.0 threshold, so
-        // nobody can anchor anybody yet. This test encodes the pending ADR-0009
-        // decision (see ANCHOR_VOUCHER_MIN_COMPOSITE) and is meant to fail the
-        // day that threshold is amended.
+        // The ceiling with three of five dimensions structurally zero is
+        // 0.55·5.0 = 2.75. The band-relative threshold sits under it, which the
+        // original 3.0 did not — the whole reason ADR-0009 was amended.
         let composite = ReputationScorer::new(&db)
-            .score_at(&addr(&patron), t)
+            .score_raw_at(&addr(&patron), t)
             .unwrap()
             .composite();
         assert!(
-            composite < ANCHOR_VOUCHER_MIN_COMPOSITE,
-            "a maxed-out Phase 1 member reaches {composite}"
+            composite >= ANCHOR_VOUCHER_MIN_COMPOSITE,
+            "a maxed-out Phase 1 member reaches only {composite}"
         );
-        assert!(!is_anchored(&db, &addr(&newcomer), t).unwrap());
+        assert!(composite < 3.0, "and cannot reach the original 3.0");
     }
 
     #[test]

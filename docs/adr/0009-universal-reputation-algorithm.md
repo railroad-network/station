@@ -179,18 +179,49 @@ exceeding the cap is a *flag for human review*, never an automatic punishment
 
 A soft cap complementing velocity (Section 5.4): a new identity's reputation
 cannot exceed **1.0 in any dimension until it has received at least one vouch
-from a member whose composite is 3.0 or higher.** The rest of the algorithm keeps
-running; the dimension is simply capped at 1.0 until the chain-of-trust condition
-is met. Fake identities thus cannot self-anchor — they need a genuinely
-reputable member to stake on them, which is exactly the vouching-chain corruption
-cost Section 5.4 is designed to impose.
+from a member whose composite is at least the Member-band floor (2.0).** The rest
+of the algorithm keeps running; the dimension is simply capped at 1.0 until the
+chain-of-trust condition is met. Fake identities thus cannot self-anchor — they
+need a genuinely reputable member to stake on them, which is exactly the
+vouching-chain corruption cost Section 5.4 is designed to impose.
+
+**The voucher is judged on their composite *before* anchoring is applied to
+them.** This is not a relaxation but what makes the rule computable at all. An
+unanchored member's composite cannot exceed 0.55 (every dimension held at 1.0),
+so if a voucher's own cap applied to the score that qualifies them, no member
+could ever become the first anchor, and two members who vouch for each other
+would be mutually undecidable — the evaluation would not terminate. Reading the
+uncapped score makes anchoring a well-founded computation over the log.
+
+The known cost: because uncapped scores are computed from evidence rather than
+from social standing, two colluding identities transacting with each other raise
+their own uncapped composites and can then anchor each other. Anchoring therefore
+stops a lone fake identity, not a patient pair; the velocity cap and human review
+are what bound that case in Phase 1, and detecting the pattern itself is the
+Phase 2 graph analysis.
+
+> **Amended 2026-07-27 (T1.5.8).** This threshold was originally 3.0, which
+> Phase 1 could not reach: with governance participation, community contribution
+> and domain competence all structurally 0.0, the highest available composite is
+> `0.55 · 5.0 = 2.75`. Enforcing a 3.0 threshold would have held **every** member,
+> founding members included, at 1.0 in every dimension permanently — reputation
+> would have been a constant. The threshold is now tied to the Member-band floor
+> so that it keeps denoting "someone the community recognizes as established" as
+> M1.7 and M1.9 light up the remaining dimensions, instead of needing to be
+> renumbered each time. Alternatives weighed and rejected: deferring anchoring
+> until M1.9 made 3.0 reachable (leaves the pilot with no anchoring at all);
+> exempting founding identities (two carve-outs instead of one, and all anchoring
+> would still funnel through the founders); and replacing the composite test with
+> a chain-of-trust walk from a genesis identity (strictly stronger — it is the one
+> variant a Sybil pair cannot self-bootstrap — but a larger redesign, and it needs
+> a genesis definition; recorded here as the Phase 2 direction).
 
 ### What is locked, and how it changes
 
 Every constant above — the five dimensions and their weights, the full-divisor
 composite, the four band thresholds, the 0.1/month decay rate, the 0.5/week
-velocity cap, and the 1.0 anchoring cap with its 3.0 voucher threshold — is fixed
-at the federation-protocol level. A station operator cannot override any of them;
+velocity cap, and the 1.0 anchoring cap with its Member-band voucher threshold —
+is fixed at the federation-protocol level. A station operator cannot override any of them;
 there is no config surface for them by design. They change only through a
 federation-wide governance process (mechanism itself is a Phase 2 concern). This
 ADR is the source of truth; the `rrn-reputation` implementation (T1.5.2–T1.5.8)
