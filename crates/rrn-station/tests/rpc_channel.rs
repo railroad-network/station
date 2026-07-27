@@ -853,5 +853,93 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     assert_eq!(lists["received"][0]["vouch_id"], vouch_id);
 
+    // --- T1.5.9: reputation is readable over the same sealed channel ---------
+    // The member's own standing: the full five-dimension breakdown, keyed to the
+    // authenticated signer rather than a param, so a mobile cannot ask for
+    // anyone else's dimensions.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "reputation",
+        "{}",
+        25,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(reply.error.is_none(), "reputation error: {:?}", reply.error);
+    let standing: serde_json::Value =
+        serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        standing["address"], mobile_addr,
+        "own profile, not another's"
+    );
+    assert_eq!(
+        standing["dimensions"].as_array().unwrap().len(),
+        5,
+        "all five ADR-0009 dimensions, dormant ones included"
+    );
+    // The Phase-1 ceiling travels with the answer, so the phone never has to
+    // hard-code a number that a later milestone would silently invalidate.
+    assert_eq!(standing["scale_max"], 5.0);
+    let ceiling = standing["max_composite_now"].as_f64().unwrap();
+    assert!(
+        (ceiling - 2.75).abs() < 1e-5,
+        "the two live dimensions maxed, got {ceiling}"
+    );
+    assert_eq!(
+        standing["anchored"], false,
+        "nobody has vouched for this mobile"
+    );
+    assert!(standing["anchoring_voucher_address"].is_null());
+
+    // A band for *another* address — what a marketplace listing card shows.
+    // Readable for anyone, and never carries the dimension breakdown.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "reputation_band",
+        &format!("{{\"address\":\"{receiver_addr}\"}}"),
+        26,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(
+        reply.error.is_none(),
+        "reputation_band error: {:?}",
+        reply.error
+    );
+    let band: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    assert_eq!(band["address"], receiver_addr.to_string());
+    assert!(
+        ["New", "Member", "Trusted", "Senior"].contains(&band["band"].as_str().unwrap()),
+        "a band name, got {:?}",
+        band["band"]
+    );
+    assert!(
+        band.get("dimensions").is_none(),
+        "a band read discloses no dimension breakdown"
+    );
+
+    // A malformed address is a params error, not a panic or a fabricated band.
+    let req = sealed_request(
+        &mobile,
+        &station_pk,
+        &station_pk,
+        "reputation_band",
+        "{\"address\":\"not-an-address\"}",
+        27,
+        now_secs(),
+    );
+    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&mobile, &station_pk, &body);
+    assert!(reply.error.is_some(), "malformed address rejected");
+
     station.shutdown().await;
 }

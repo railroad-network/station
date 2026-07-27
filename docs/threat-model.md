@@ -910,6 +910,37 @@ inherited standing.
   verifies, but it does expose one member's trade history inside another member's
   bundle. A succinct proof of the voucher's standing is the Phase 2 improvement.
 
+#### Reading a score over the mobile channel (T1.5.9)
+
+- *Threat:* the read path that shows a member their standing becomes a way to
+  enumerate *other* members' reputations, or to make the station do expensive
+  work on demand.
+- *Mitigation (shipped, T1.5.9):* the two reads disclose deliberately different
+  amounts. `reputation` (`reputation_view::member_reputation`) is **member-scoped
+  to the authenticated signer** — it takes no address param, like `list_vouches`
+  and `vouch_counts` — so the five-dimension breakdown, the anchoring state, and
+  the anchoring voucher's identity are only ever your own. `reputation_band`
+  (`reputation_view::address_band`) does take an address, which is a considered
+  exception: a band is what one member shows another in order to be worth trading
+  with (M1.7 listing cards), and ADR-0009 puts no local policy on who may see a
+  score. It returns only the band and composite, never the breakdown. Both ride
+  the sealed, signed channel, so only a paired mobile can call either
+  ([Mobile–station transport](#mobilestation-transport)).
+- *Residual risk (disclosure):* a paired mobile can learn the band of any address
+  it already knows. That is by design, and it is not a directory — addresses are
+  32-byte public keys, so there is nothing to walk without already holding the
+  address — but a member who has collected addresses through ordinary trade can
+  score all of them. Reputation is treated as community-visible, not secret.
+- *Residual risk (availability):* a read is served from the snapshot cache, but a
+  *miss* recomputes, and since anchoring a recompute is O(V·N) — one replay per
+  candidate voucher. A paired mobile that asks for many distinct uncached
+  addresses can therefore make the core thread do repeated full replays, and that
+  thread is the single writer for everything, so sustained abuse stalls payments
+  as well as reads. The hourly sweep keeps every log-known address warm and the
+  band tolerance matches the sweep interval, so ordinary use does not miss; the
+  exposure is an *insider* one, bounded by pairing, and no rate limit stands
+  behind it yet. A per-mobile read budget is the fix if it is ever exercised.
+
 ### `rrn-governance`
 
 Binding collective decisions: signed proposals, one-member-one-vote balloting,

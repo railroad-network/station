@@ -44,6 +44,7 @@ use crate::gossip::WireEntry;
 use crate::ledger_view;
 use crate::paired::{self, PairedMobiles};
 use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
+use crate::reputation_view;
 use crate::rpc_envelope::{self, ChannelError, RequestEnvelope, ResponseEnvelope};
 use crate::transaction_view;
 use crate::vouch_view;
@@ -953,6 +954,8 @@ impl Core {
             "submit_vouch" => self.channel_submit_vouch(envelope),
             "vouch_counts" => self.channel_vouch_counts(envelope),
             "list_vouches" => self.channel_list_vouches(envelope),
+            "reputation" => self.channel_reputation(envelope),
+            "reputation_band" => self.channel_reputation_band(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -1093,6 +1096,45 @@ impl Core {
         let lists = vouch_view::member_vouches(&self.db, &member, limit, offset)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         serde_json::to_value(lists).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
+    }
+
+    /// `reputation` — the authenticated mobile's own standing (T1.5.9): the five
+    /// ADR-0009 dimensions, the composite, the band, and whether an anchoring
+    /// vouch has lifted the newcomer cap. The member is the authenticated signer,
+    /// not a param, so a mobile only ever reads its own full profile; other
+    /// members are visible only as a band (see [`Self::channel_reputation_band`]).
+    /// Served from the snapshot cache (see [`reputation_view`]).
+    fn channel_reputation(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let member = Address::from_public_key(envelope.signer);
+        let now = self.clock.now();
+        let view = reputation_view::member_reputation(&self.db, &member, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
+    }
+
+    /// `reputation_band` — the band for an arbitrary `address` param, which is
+    /// what a marketplace listing card shows about its lister (M1.7). Only the
+    /// band and composite, never the dimension breakdown: what one member needs
+    /// about another is whether to trade with them, not an audit of their
+    /// history. An address with no history answers `New` rather than erroring.
+    fn channel_reputation_band(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            address: String,
+        }
+        let params: Params = serde_json::from_str(&envelope.params)
+            .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+        let address = parse_addr(&params.address).map_err(|e| (e.code, e.message))?;
+        let now = self.clock.now();
+        let view = reputation_view::address_band(&self.db, &address, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
