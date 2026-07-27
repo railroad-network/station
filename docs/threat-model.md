@@ -817,37 +817,88 @@ prevents).
 evidence; the honesty of the evidence set; resistance to manufactured or
 inherited standing.
 
-> Phase 1 scaffold (M1.0). Mitigations below are **planned**.
+> Implemented in M1.5 (T1.5.1–T1.5.8) against [ADR-0009](adr/0009-universal-reputation-algorithm.md),
+> which locks the algorithm at the federation-protocol level: no station operator
+> can retune weights, decay, bands, or the Sybil constants, so "score my community
+> generously" is not a reachable configuration.
 
 #### Reputation laundering / whitewashing
 
 - *Threat:* a member with bad standing abandons the identity and starts fresh,
   or attempts to carry standing to a clean identity, to escape a bad history.
-- *Planned mitigation (M1 reputation task):* reputation is **non-transferable** —
-  it is bound to the identity keypair, not a token that can be moved, and a fresh
-  identity starts from zero and must be vouched in (a social cost).
+- *Mitigation (shipped, T1.5.4):* reputation is **non-transferable** — it is
+  derived from log evidence bound to the identity keypair
+  (`rrn-reputation::scoring`), never a stored token that can be moved, and a fresh
+  identity replays to an empty profile.
 - *Residual risk:* identity churn is only as expensive as vouching makes it;
   whitewashing by starting over is *mitigated, not eliminated*, and is a known
-  limitation carried from the identity layer.
+  limitation carried from the identity layer. Abandoning an identity also costs
+  nothing in Phase 1 because there is no negative evidence to escape — cancelled
+  transactions score neutral and no fraud finding exists until M1.8.
 
 #### Attestation farming
 
 - *Threat:* colluding identities issue each other positive attestations to
   inflate scores.
-- *Planned mitigation (M1 reputation task):* attestations are weighted by the
-  attester's own standing and vouch-graph position, reciprocal/clustered
-  attestations are discounted, and all inputs decay with time.
-- *Residual risk:* sophisticated collusion inside a real vouch cluster is hard to
-  detect; a full quantitative model is deferred to Phase 2.
+- *Partial mitigation (shipped, T1.5.4/T1.5.8):* the velocity cap below bounds the
+  *rate* of inflation, and all inputs decay (`rrn-reputation::decay`), so farmed
+  standing has to be continuously re-farmed.
+- *Residual risk:* **this is the largest known Phase 1 gap.** With no fraud-finding
+  mechanism, every attestation counts as accurate, so attestation accuracy rewards
+  *volume*, not correctness — writing vouches is itself the way to raise the
+  dimension (ADR-0009, Consequences). Weighting attestations by the attester's own
+  standing and discounting reciprocal or clustered ones needs the graph analysis
+  deferred to Phase 2; retroactively marking an attestation wrong needs fraud
+  findings (M1.8+). Sophisticated collusion inside a real vouch cluster remains
+  hard to detect.
 
 #### Time-decay gaming
 
 - *Threat:* a member times their behavior to exploit the decay curve — front-load
   good conduct, then coast on a slowly-decaying score.
-- *Planned mitigation (M1 reputation task):* continuous (not stepped) decay so
-  there is no cliff or window to game, with recent evidence dominating the score.
-- *Residual risk:* the decay parameters are a policy tradeoff; gaming the exact
-  curve is bounded but nonzero.
+- *Mitigation (shipped, T1.5.6):* decay is continuous rather than stepped
+  (`rrn-reputation::decay`, fractional months), so there is no cliff or reset
+  boundary to time behavior against.
+- *Residual risk:* the 0.1/month rate is a policy tradeoff; at that rate a maxed
+  dimension survives roughly four years of total inactivity before reaching zero,
+  so coasting is slow but real. Decay is also uniform, not activity-shaped: a
+  member who front-loads and stops is indistinguishable from one who is merely
+  quiet, which is deliberate (Phase 2 may add a reentry reward).
+
+#### Sybil clusters and manufactured standing (M1.5)
+
+- *Threat:* an attacker stands up many identities and transacts or vouches among
+  them to manufacture standing cheaply — the cluster scoring itself into
+  legitimacy without any real member's involvement.
+- *Mitigation (shipped, T1.5.8):* **velocity limiting.** No dimension may gain
+  more than 0.5 per week (`rrn-reputation::sybil::check_velocity`, run on every
+  snapshot refresh). Because a dimension maxes at 5.0 and each event is worth 0.5,
+  a fake identity needs ten weeks of sustained fabricated activity to reach the
+  ceiling — the defense is *time*, which is the one input an attacker cannot
+  manufacture in parallel. Violations are logged for operator review and never
+  auto-punish: an automatic penalty would be a griefing vector, since anyone who
+  can drive transactions at a member could push them over the cap.
+- *Mitigation (implemented, not yet enforced, T1.5.8):* **identity anchoring** —
+  a fresh identity's dimensions are held at 1.0 until an established member
+  vouches for it (`rrn-reputation::sybil::anchored_profile` / `is_anchored`),
+  which forces a Sybil cluster to corrupt someone real rather than bootstrap among
+  itself. The cap is **not currently applied inside scoring**: ADR-0009 requires
+  the anchoring voucher to hold a composite of 3.0, and Phase 1's highest
+  reachable composite is 2.75 (three of five dimensions are structurally zero), so
+  enforcing it today would cap every member — including founding ones — at 1.0
+  permanently. Amending that threshold is a pending ADR-0009 decision; the code is
+  written and tested against it, and `sybil.rs` documents the deadlock at
+  `ANCHOR_VOUCHER_MIN_COMPOSITE`.
+- *Residual risk:* until anchoring is switched on, velocity limiting is the only
+  Sybil defense actually in force, and it bounds the *rate* of manufactured
+  standing, not its eventual ceiling — a patient attacker still gets there. Two
+  colluding identities trading with each other are indistinguishable from two real
+  members trading, so ten weeks of patience buys a full trade-reliability score;
+  detecting that pattern is the Phase 2 graph analysis. The velocity check is also
+  a known undercount: it compares consecutive snapshots rather than a true
+  trailing-7-day window (the cache retains only the latest snapshot), so a member
+  who stays just under the floor across many sub-weekly refreshes is not flagged.
+  The gap closes as the refresh interval approaches weekly.
 
 ### `rrn-governance`
 
@@ -1518,10 +1569,15 @@ Things Phase 0 explicitly does **not** mitigate, and why. Stating these plainly
 is deliberate — the audit covers what is built, and these are the documented
 edges of that scope.
 
-- **No Sybil resistance.** Vouch *authenticity* is enforced cryptographically;
-  vouch *trust* is not. A single-community Phase 0 deployment is assumed; a
-  Sybil cluster of mutually-vouching keys is cryptographically valid. Reputation
-  / Sybil analysis is Phase 1+.
+- **Partial Sybil resistance.** Vouch *authenticity* is enforced
+  cryptographically; vouch *trust* is not. M1.5 adds rate-based defense — the
+  0.5/week velocity cap makes manufactured standing slow (ten weeks to max a
+  dimension) and flags implausible gains for human review — but a Sybil cluster of
+  mutually-vouching keys is still cryptographically valid and, given patience,
+  still scores. Identity anchoring, the defense that would force a cluster to
+  corrupt a real member, is implemented but not yet enforced (see
+  [Sybil clusters and manufactured standing](#sybil-clusters-and-manufactured-standing-m15)).
+  Statistical graph analysis is Phase 2.
 - **No federation security.** Eclipse attacks, cross-replica ledger forks,
   rollback detection, and treaty abuse are out of scope (see
   [Log fork / rollback](#log-fork--rollback) and `rrn-protocol`).

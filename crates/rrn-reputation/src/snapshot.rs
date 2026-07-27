@@ -27,6 +27,7 @@ use rrn_storage::reputation_snapshot as store;
 
 use crate::model::ReputationProfile;
 use crate::scoring::ReputationScorer;
+use crate::sybil::check_velocity;
 use crate::Result;
 
 /// Returns the cached profile for `address` if one is stored and no older than
@@ -54,11 +55,42 @@ pub fn get_cached_profile(
 
 /// Recomputes `address`'s profile as of `now` and writes it to the cache,
 /// last-write-wins on `now`. Returns the freshly computed profile.
+///
+/// The refresh is also where the velocity cap is measured, since it is the only
+/// place two consecutive profiles for an identity meet
+/// ([`crate::sybil::check_velocity`]). A violation is logged for operator review
+/// and nothing else: the snapshot is still written and the score still stands, by
+/// design — humans decide what an implausible gain means.
 pub fn refresh_snapshot(db: &Database, address: &Address, now: i64) -> Result<ReputationProfile> {
     let profile = ReputationScorer::new(db).score(address, now)?;
+
+    if let Some(previous) = stored_profile(db, address)? {
+        if let Err(violation) = check_velocity(&previous, &profile) {
+            // The operator UI that surfaces this is a later milestone; the log
+            // line is the Phase 1 alert.
+            tracing::warn!(
+                address = %address,
+                %violation,
+                "reputation velocity cap exceeded — flagged for review"
+            );
+        }
+    }
+
     let bytes = to_canonical_bytes(profile.clone());
     store::put(db, &address.public_key().to_bytes(), now, &bytes)?;
     Ok(profile)
+}
+
+/// The stored profile for `address` whatever its age, or `None` if there is no
+/// snapshot yet. Unlike [`get_cached_profile`] this ignores freshness: the
+/// velocity check wants the previous profile precisely because it is old.
+fn stored_profile(db: &Database, address: &Address) -> Result<Option<ReputationProfile>> {
+    let Some(snapshot) = store::get(db, &address.public_key().to_bytes())? else {
+        return Ok(None);
+    };
+    Ok(Some(from_canonical_bytes::<ReputationProfile>(
+        &snapshot.profile_cbor,
+    )?))
 }
 
 /// Recomputes and writes a snapshot for every identity that appears in the log.
