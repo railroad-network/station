@@ -1842,6 +1842,21 @@ edges of that scope.
 - **No rate limiting or resource caps** on the IPC socket or the gossip port,
   and no message-size cap; the gossip stub pulls a peer's whole log each round.
   O(N) full-log replay has no snapshotting yet. All Phase 1/2.
+- **The marketplace has no admission control, and its stated requirements are
+  not enforced.** Individual listings are bounded (200-byte title, 8 KiB
+  description, controlled category vocabulary), but nothing bounds how *many* a
+  member may publish onto a permanently replicated log, and low search ranking
+  hides a flood without removing its storage cost. `SearchQuery::limit` is
+  whatever the caller asks for. A listing's `Requirements` — `min_reputation` and
+  `community_member_only` — are validated as *reachable* at creation but checked
+  against no buyer anywhere, so they are provider intent, not access control,
+  until the M1.7 inquiry flow enforces them. Listings whose `expires_at` has
+  passed accumulate on the log with no close record, since no sweep is wired
+  (readers treat `Expired` as not-for-sale, so this costs storage and tidiness
+  rather than correctness). None of this is currently reachable over the network —
+  nothing depends on `rrn-marketplace` yet — and the fixes belong with the M1.7
+  wiring that first exposes publishing and search. See
+  [`rrn-marketplace`](#rrn-marketplace).
 - **Unclamped wallet KDF parameters.** A hostile `.rrnwallet` can specify a very
   large argon2 `m_cost`, forcing a large allocation on `decrypt` (accepted: you
   only decrypt your own wallet; clamping is a noted future hardening). This is
