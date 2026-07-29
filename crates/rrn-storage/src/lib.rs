@@ -16,6 +16,7 @@
 
 pub mod crdt;
 pub mod db;
+pub mod listings_index;
 pub mod log;
 pub mod migrations;
 pub mod replay;

@@ -34,6 +34,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "reputation_snapshots",
         sql: include_str!("../migrations/0002_reputation_snapshots.sql"),
     },
+    Migration {
+        version: 3,
+        name: "listings_index",
+        sql: include_str!("../migrations/0003_listings_index.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -126,6 +131,7 @@ mod tests {
             "balances",
             "identities",
             "kv",
+            "listings_index",
             "log_entries",
             "reputation_snapshots",
             "transactions",
@@ -140,6 +146,9 @@ mod tests {
             "idx_transactions_receiver",
             "idx_transactions_sender",
             "idx_transactions_state",
+            "listings_index_browse",
+            "listings_index_expiry",
+            "listings_index_provider",
         ]
         .iter()
         .map(|s| s.to_string())

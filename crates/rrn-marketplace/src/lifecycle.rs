@@ -714,12 +714,29 @@ pub fn compute_state(
 /// that. Ranking for display is [`search`](crate::search)'s job, not this
 /// function's.
 pub fn compute_all_active(log: &AppendLog, station: &PublicKey, now: i64) -> Result<Vec<Listing>> {
-    Ok(scan(log, Scope::All, station)?
-        .values()
-        .filter_map(|records| match state_of(records, now) {
-            Some(ListingState::Active(listing)) => Some(listing),
+    Ok(compute_all(log, station, now)?
+        .into_values()
+        .filter_map(|state| match state {
+            ListingState::Active(listing) => Some(listing),
             _ => None,
         })
+        .collect())
+}
+
+/// Every listing this log has seen, with the state it is in at `now`, keyed by
+/// content address.
+///
+/// The whole picture in one replay — what the materialized index (T1.6.6)
+/// rebuilds from, since it stores closed listings too and cannot be built from
+/// the active set alone.
+pub fn compute_all(
+    log: &AppendLog,
+    station: &PublicKey,
+    now: i64,
+) -> Result<BTreeMap<ListingId, ListingState>> {
+    Ok(scan(log, Scope::All, station)?
+        .into_iter()
+        .filter_map(|(id, records)| state_of(&records, now).map(|state| (id, state)))
         .collect())
 }
 

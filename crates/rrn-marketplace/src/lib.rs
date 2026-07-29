@@ -60,6 +60,18 @@ pub enum Error {
     /// act on.
     #[error("listing lifecycle: {0}")]
     Lifecycle(#[from] lifecycle::LifecycleError),
+    /// The full-text index could not be opened, written, or queried.
+    #[error("search index: {0}")]
+    Tantivy(#[from] tantivy::TantivyError),
+    /// The derived index is unusable for a reason of our own making — a corrupt
+    /// stored row, an unreadable index directory, a query that would not parse.
+    /// Distinct from [`Tantivy`](Error::Tantivy), which is the library
+    /// reporting its own trouble.
+    ///
+    /// Never fatal to the log: both indexes are caches, and a rebuild
+    /// ([`search::SearchIndex::rebuild`]) is always available (ADR-0010).
+    #[error("index: {0}")]
+    Index(String),
 }
 
 /// Result specialized to this crate's [`Error`].

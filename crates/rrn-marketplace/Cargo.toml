@@ -31,3 +31,8 @@ tantivy = "0.26"
 # Typed validation/lifecycle errors, and diagnostics for the expiry sweep.
 thiserror = "1"
 tracing = "0.1"
+
+[dev-dependencies]
+# The persistent tantivy index is exercised against a real directory, since
+# open-write-reopen is the part an in-RAM index cannot check.
+tempfile = "3"

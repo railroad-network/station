@@ -2,6 +2,7 @@ CREATE TABLE attestations ( id BLOB PRIMARY KEY, kind TEXT NOT NULL, payload BLO
 CREATE TABLE balances ( identity BLOB PRIMARY KEY, positive_increments BLOB NOT NULL, negative_increments BLOB NOT NULL ) STRICT
 CREATE TABLE identities ( pubkey BLOB PRIMARY KEY, created_at INTEGER NOT NULL, metadata BLOB ) STRICT
 CREATE TABLE kv ( key TEXT PRIMARY KEY, value BLOB ) STRICT
+CREATE TABLE listings_index ( listing_id BLOB PRIMARY KEY, provider BLOB NOT NULL, surface TEXT NOT NULL, category TEXT NOT NULL, status TEXT NOT NULL, price_centi INTEGER NOT NULL, reputation_at_creation REAL NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, listing_cbor BLOB NOT NULL ) STRICT
 CREATE TABLE log_entries ( seq INTEGER PRIMARY KEY AUTOINCREMENT, prev_hash BLOB NOT NULL, content_hash BLOB NOT NULL, payload BLOB NOT NULL, created_at INTEGER NOT NULL ) STRICT
 CREATE TABLE reputation_snapshots ( address BLOB PRIMARY KEY, last_computed_at INTEGER NOT NULL, profile_cbor BLOB NOT NULL ) STRICT
 CREATE TABLE transactions ( id BLOB PRIMARY KEY, sender BLOB NOT NULL, receiver BLOB NOT NULL, amount_centicommons INTEGER NOT NULL, state TEXT NOT NULL, nonce INTEGER NOT NULL, proposed_at INTEGER NOT NULL, settled_at INTEGER ) STRICT
@@ -9,3 +10,6 @@ CREATE INDEX idx_attestations_signer ON attestations (signer)
 CREATE INDEX idx_transactions_receiver ON transactions (receiver)
 CREATE INDEX idx_transactions_sender ON transactions (sender)
 CREATE INDEX idx_transactions_state ON transactions (state)
+CREATE INDEX listings_index_browse ON listings_index (status, surface, category, price_centi)
+CREATE INDEX listings_index_expiry ON listings_index (status, expires_at)
+CREATE INDEX listings_index_provider ON listings_index (provider)

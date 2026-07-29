@@ -135,7 +135,7 @@ pub enum Surface {
 }
 
 impl Surface {
-    fn tag(self) -> &'static str {
+    pub(crate) fn tag(self) -> &'static str {
         match self {
             Surface::Goods => "goods",
             Surface::Services => "services",
