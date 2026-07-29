@@ -765,19 +765,198 @@ between a listing and the transaction that fulfils it; fair discovery (open
 listings actually surface); a buyer's protection against a lister who takes
 credit and never delivers.
 
-> Phase 1 scaffold (M1.0). The crate is a skeleton; the mitigations below are
-> **planned**, named by the task that will ship them, not yet implemented.
+> **Where M1.6 leaves this.** The data model is shipped and covered below: the
+> record types, their authorization rules, the replay that derives state, and the
+> derived index that search reads. **No network surface reaches any of it yet** —
+> nothing in the workspace depends on `rrn-marketplace`, so a listing can only be
+> written by local code. The RPC methods, the mobile UI, and the binding between a
+> listing and the transaction that fulfils it all arrive in M1.7, and the threats
+> that live on those surfaces are marked *planned* rather than *shipped*.
+
+#### Spoofing — publishing or editing as someone else (M1.6)
+
+- *Threat:* a member publishes a listing under another member's name, or edits or
+  withdraws a listing that is not theirs, to misdirect trade or damage a rival.
+- *Mitigation (shipped, T1.6.3/T1.6.4):* every marketplace record is a
+  `SignedPayload`, and each append helper checks the envelope's signer against
+  the claim inside the record before writing.
+  `lifecycle::append_listing_created` refuses a listing whose signer is not its
+  `provider`; `append_listing_updated` refuses an update whose signer is not the
+  listing's provider **and** refuses one whose own `signed_by` disagrees with who
+  actually signed it, so a record whose content contradicts its signature is
+  rejected rather than resolved in favour of either. `Listing::id` is the Blake3
+  of the remaining fields, so a listing cannot be edited into a different offer
+  while keeping the identity buyers know it by.
+- *Residual risk:* nothing rate-limits a member publishing under *their own*
+  name — see [Listing spam](#listing-spam).
+
+#### Tampering — a record that never passed the write path (M1.6)
+
+- *Threat:* the append guards above are local. A replicated entry arrives through
+  `AppendLog::append_raw` (M0.6 gossip) and never touches them, so a peer that
+  writes whatever it likes into its own log could otherwise export forged updates
+  and closes into ours.
+- *Mitigation (shipped, T1.6.4/T1.6.5):* **replay re-applies the same
+  authorization rules it would have applied on the write path.**
+  `lifecycle::scan` — the single traversal behind both the append guards and the
+  state machine — skips any record whose signer was not entitled to write it,
+  ignores anything appearing before the listing's creation entry, and refuses a
+  creation record that fails `Listing::validate`. An unauthorized record is not
+  evidence of anything, so dropping it during replay means the two paths agree by
+  construction rather than by two sets of rules kept in step by hand. A test
+  appends impostor-signed records directly, bypassing the helpers exactly as
+  replication does, and asserts replay reaches the verdict the write path would
+  have.
+- *Residual risk:* this establishes *who may say what about a listing*, not
+  whether what they said is true. A provider is free to describe an offer
+  dishonestly; that is [listing fraud](#listing-fraud--the-lister-never-delivers)
+  and reputation, not authorization, is what stands against it.
+
+#### Elevation of privilege — the station signing beyond its remit (M1.6)
+
+- *Threat:* the station holds a key and runs unattended, so a compromised or
+  misconfigured station could sign marketplace records that look like member
+  decisions — most damagingly, withdrawing a member's offer and making it read as
+  the member's own choice.
+- *Mitigation (shipped, T1.6.4):* `lifecycle::closer_is_entitled` splits close
+  authority by reason. The provider may close their listing **only** as
+  `ProviderClosed`; the station may close it **only** as `ExpirationReached` or
+  `StationCleanup`. The station may attest to what happened with no party present
+  (ADR-0005) but may never claim a member withdrew an offer, and the reason is
+  inside the signed content, so the record itself carries which kind of authority
+  produced it. Both directions are enforced on write and again on replay.
+- *Residual risk:* a compromised station can still close listings as
+  `StationCleanup` — a denial of service against its own members' discovery, but
+  one that is attributable in the log and cannot be disguised as a member's
+  decision.
+
+#### Tampering — the derived index disagreeing with the log (M1.6)
+
+- *Threat:* search answers from two derived stores rather than from the log. If
+  either drifted, the marketplace could show offers that are closed, hide offers
+  that are open, or return a listing under an identity nothing else knows it by.
+- *Mitigation (shipped, T1.6.6):* **the index is authoritative over nothing.**
+  Both the `listings_index` table and the tantivy index are rebuilt from a full
+  replay by `search::SearchIndex::rebuild`, deleting the tantivy directory is
+  always a safe repair, and a test pins that a rebuild reproduces exactly what
+  incremental maintenance produced. Rows store only what the log says
+  (`active`/`closed`); expiry is applied against the caller's `now` at query time,
+  so a row cannot rot into a wrong answer as the clock moves. A listing decoded
+  back out of the index takes its id from the row's primary key and never from
+  the decoded bytes, because an updated listing deliberately keeps the id it was
+  published under while its content moves on — trusting the recomputed id would
+  silently detach every edited listing from its own history.
+- *Residual risk:* the tantivy index sits outside the SQLite transaction that
+  writes the log, so the two **can** diverge — the cost ADR-0010 accepted
+  knowingly when it chose tantivy over FTS5. Divergence degrades discovery until
+  a rebuild; it cannot corrupt the log or move credit.
+- *Residual risk:* a listing whose `expires_at` has passed has no close record
+  until a sweep writes one, and **no sweep is wired yet** (M1.7). The exposure is
+  contained because `Expired` is a real state that every reader must treat as
+  not-for-sale: `compute_state` reports it, `compute_all_active` omits it, and the
+  index query filters it. Sweep latency therefore never decides whether a stale
+  listing can be bought — but the log does accumulate listings that are expired in
+  fact and open on paper until the sweep ships.
+
+#### Denial of service — what a member may write onto a permanent log (M1.6)
+
+- *Threat:* the log is append-only and replicated to every station in the
+  community, so an unbounded member-writable field is a community-wide storage
+  cost that can never be reclaimed.
+- *Mitigation (shipped, T1.6.3):* listing text is bounded — `MAX_TITLE_BYTES`
+  (200) and `MAX_DESCRIPTION_BYTES` (8 KiB) — and `category` must come from the
+  controlled `CATEGORIES` vocabulary rather than being free text. The category
+  bound is not only about size: a marketplace category and a reputation
+  `DomainTag` are the same namespace, so free-form categories would let a member
+  invent a reputation dimension they were the sole participant in. Twelve
+  validation rules run on creation, and again on the result of every patch, so an
+  update cannot produce a listing that could not have been published.
+- *Residual risk:* the bounds cap one record, not how many records a member may
+  write. See [Listing spam](#listing-spam).
+
+#### Denial of service — the cost of indexing and searching (M1.6)
+
+- *Threat:* discovery must not become a way to make the station do unbounded work,
+  since the core thread is the single writer for everything including payments.
+- *Mitigation (shipped, T1.6.6):* ranking reads provider standing **only** from
+  the M1.5 snapshot cache (`get_cached_profile`, one day's tolerance against an
+  hourly sweep) and memoizes it per provider within a search, so a page of fifty
+  results from one prolific provider is one lookup rather than fifty. A cache miss
+  ranks the provider as unscored rather than triggering a replay — scoring is O(N)
+  in the log and anchoring made it O(V·N), so a search must never be able to
+  provoke one. Structured filters run in SQLite before text relevance is computed,
+  so relevance is only ever calculated for listings that could be returned.
+- *Residual risk:* `reputation_at_creation` **is** computed by a replay
+  (`score_at`), once per listing at index time. That is the one place the cost is
+  affordable and it is paid off the search path entirely, but a burst of new
+  listings is a burst of replays, and no rate limit stands behind it. Whoever
+  wires indexing into the station in M1.7 owns that budget.
+- *Residual risk:* result size is the **caller's** choice. `SearchQuery::limit`
+  is honoured as given — `find_matches` itself passes `usize::MAX` internally, to
+  rank the whole candidate set before truncating to `search::DEFAULT_LIMIT` — so
+  the page size is not a defence against anything, and nothing yet limits how
+  often a caller may ask. Whoever exposes search over the network in M1.7 must
+  clamp the limit there. A per-mobile read budget is the same fix already named
+  for the reputation read path in T1.5.9, and it should cover both.
+
+#### Information disclosure — offers and demand are both public (M1.6)
+
+- *Threat:* a listing states what a member has, and a `Need` states what they
+  lack. Both are signed records on a log that replicates to the whole community,
+  so both are permanently readable by every member and every station.
+- *Mitigation:* none, by design — discovery requires disclosure, and a
+  marketplace nobody can read is not a marketplace. What *is* controlled is that
+  nothing beyond the offer travels: a listing carries no location, no contact
+  route, and no counterparty, and `federation_visible` and
+  `requirements.federation_only` must both be `false` in Phase 1 (validation
+  rejects `true`), so nothing leaves the community until federation ships a
+  mechanism that honours the flag rather than a promise nothing enforces.
+- *Residual risk:* a `Need` is a standing, attributable statement that a member
+  wants something — useful to a price-gouger or to anyone building a profile of a
+  household's circumstances, and it cannot be retracted from the log once said.
+  Needs carry no expiry sweep either; `valid_until` only stops them matching.
+  Whether needs should be ephemeral rather than logged is worth revisiting when
+  M1.7 gives them a UI and real members start writing them.
+
+#### Requirements that are stated but not yet enforced (M1.6 → M1.7)
+
+- *Threat:* `Requirements` lets a provider say a buyer must hold a minimum
+  reputation or be a community member. A requirement that is displayed but not
+  checked is worse than none, because it tells a provider they are protected when
+  they are not.
+- *Mitigation (shipped, T1.6.3):* what M1.6 guarantees is that the requirement is
+  *reachable*. `min_reputation` is rejected above the highest composite anyone can
+  currently attain (derived from ADR-0009's dormant-dimension weights, never a
+  literal), so a provider cannot publish an offer that is arithmetically closed to
+  every member; the bound only ever moves up as dimensions come online, so it is a
+  create-time gate and is never re-applied on read. It is compared against the
+  capped, public composite, never the raw score, which exists only to make
+  anchoring computable.
+- *Residual risk:* **nothing enforces `min_reputation` or `community_member_only`
+  against a buyer yet.** M1.6 validates them; the check belongs at the point a
+  buyer approaches a provider, which is the inquiry flow in M1.7. Until then they
+  are provider intent recorded on the log, not access control, and the UI must not
+  present them as the latter.
 
 #### Listing fraud — the lister never delivers
 
 - *Threat:* a member posts a listing, the buyer transacts, and the good or
   service never arrives.
-- *Planned mitigation (M1 marketplace task, building on `rrn-ledger`):* a sale
-  is not final on posting — it settles through the ledger's bilateral
-  confirmation + settlement window (the Tier 1/2 oracle), so credit is not
-  released until the buyer confirms delivery, and a non-delivery leaves the
-  transaction unconfirmed/disputed and dents the lister's reputation
-  (`rrn-reputation`).
+- *Planned mitigation (M1.7, building on `rrn-ledger`):* a sale is not final on
+  posting — it settles through the ledger's bilateral confirmation + settlement
+  window (the Tier 1/2 oracle), so credit is not released until the buyer
+  confirms delivery, and a non-delivery leaves the transaction
+  unconfirmed/disputed and dents the lister's reputation (`rrn-reputation`).
+- *Residual risk (M1.6):* **the binding between a listing and the transaction
+  that fulfils it does not exist yet**, so none of the above is wired. ADR-0010
+  decided that `listing_id` belongs on `TransactionProposal` and deferred the
+  field itself to M1.7; until it lands, a settled transaction carries no record of
+  which offer it answered, and a dispute cannot be tied back to what was promised.
+  The field must be **omitted** from a proposal's CBOR when absent rather than
+  encoded as null — `TransactionProposal` recomputes its id from its encoded
+  bytes, so a new key present in every map would change the recomputed id of every
+  proposal already on the log and break the confirmations and settlements
+  referencing them.
 - *Residual risk:* a scam conducted entirely off-ledger (payment arranged
   outside the system) is out of scope; the first victim of a new defrauder is
   unprotected — reputation only punishes *after* the fact.
@@ -786,24 +965,43 @@ credit and never delivers.
 
 - *Threat:* colluding identities run wash sales against each other's listings to
   manufacture positive transaction history and inflate standing.
-- *Planned mitigation (M1 marketplace + `rrn-reputation`):* reputation inputs are
-  weighted by the counterparties' position in the social vouching graph
-  (`rrn-identity`) and by counterparty diversity, and decay over time, so a tight
-  ring of self-dealing accounts yields little durable score. Sybil creation is
-  bounded by the cost of getting vouched in.
+- *Mitigation (shipped, M1.5):* this threat is owned by `rrn-reputation` and its
+  Phase 1 answer is in place — velocity limiting caps any dimension at 0.5 per
+  week, and identity anchoring holds every dimension at 1.0 until an established
+  member vouches, so a ring of self-dealing accounts scores slowly and visibly.
+  See [Sybil clusters and manufactured
+  standing](#sybil-clusters-and-manufactured-standing-m15), which also records
+  what those measures do *not* stop.
+- *Mitigation (shipped, T1.6.6):* the marketplace side is that standing actually
+  affects discovery — search ranks relevance **multiplied** by a provider's
+  current composite, so manufactured standing does lift a listing, and the
+  reputation defences above are what bound how much of it can be manufactured.
 - *Residual risk:* collusion among genuinely-vouched real members is hard to
   distinguish from honest trade; quantitative detection is deferred to Phase 2.
+- *Residual risk:* nothing yet feeds marketplace activity *back* into reputation.
+  `domain_competence` — the dimension a category was made a controlled vocabulary
+  to protect — is still structurally `0.0`, and its first inputs arrive with the
+  M1.7 transaction flow. Wash sales against listings therefore buy nothing extra
+  today, and the moment they could is the moment that dimension goes live.
 
 #### Listing spam
 
 - *Threat:* an identity floods the marketplace with junk listings to bury real
   ones or degrade discovery.
-- *Planned mitigation (M1 marketplace task):* listings are signed, so they are
-  attributable and rate-limitable per identity; identity creation is Sybil-
-  bounded by vouching; search ranking demotes low-reputation and unvouched
-  listers.
-- *Residual risk:* no rate limit exists yet (planned, not shipped); a vouched
-  member can still post up to whatever limit is chosen.
+- *Mitigation (shipped, T1.6.3/T1.6.6):* listings are signed, so every one is
+  attributable to an identity whose creation is Sybil-bounded by vouching; each is
+  bounded in size (200-byte title, 8 KiB description) and confined to the
+  controlled category vocabulary; and ranking multiplies relevance by the
+  provider's current standing, so a flood from a new or unvouched identity ranks
+  below established members rather than burying them. A listing is content-
+  addressed and `append_listing_created` refuses a duplicate id, so the same
+  listing cannot simply be posted repeatedly.
+- *Residual risk:* **no rate limit exists.** A vouched member may publish
+  unlimited *distinct* listings, each permanently replicated to every station in
+  the community, and low ranking hides them from search without removing their
+  storage cost. Ranking is a discovery defence, not an admission-control one. A
+  per-identity publication budget is the missing piece and belongs with the M1.7
+  wiring that first exposes publishing over the network.
 
 ### `rrn-reputation`
 
@@ -816,6 +1014,13 @@ prevents).
 **Assets:** the re-derivability of a score from signed, content-addressed
 evidence; the honesty of the evidence set; resistance to manufactured or
 inherited standing.
+
+> As of M1.6 a score has a second consumer: search ranking multiplies text
+> relevance by the provider's current composite, read from the snapshot cache
+> ([`rrn-marketplace`](#rrn-marketplace)). That makes standing worth
+> manufacturing for commercial reasons as well as social ones, and it is why the
+> marketplace section treats the reputation defences here as *its* Sybil
+> mitigation rather than restating them.
 
 > Implemented in M1.5 (T1.5.1–T1.5.8) against [ADR-0009](adr/0009-universal-reputation-algorithm.md),
 > which locks the algorithm at the federation-protocol level: no station operator
