@@ -29,9 +29,19 @@
 //!
 //! The helpers here guard the *local* write path. A replicated entry arrives
 //! through `AppendLog::append_raw` (M0.6 gossip) and never passes through this
-//! module, so replay must re-apply the same authorization rules when it computes
-//! state (T1.6.5). Enforcing here is what stops this station writing a bad
-//! record; enforcing in replay is what stops it believing someone else's.
+//! module, so [`scan`] re-applies the same authorization rules when it derives
+//! state. Enforcing on the write path is what stops this station writing a bad
+//! record; enforcing in replay is what stops it believing someone else's. Both
+//! read the log through that one function, so they cannot drift apart.
+//!
+//! # State is derived, never stored
+//!
+//! [`compute_state`] and [`compute_all_active`] replay the records into a
+//! [`ListingState`]. Nothing writes that state down: the log is canonical, and
+//! the materialized index built on top of it (T1.6.6) is a cache that can be
+//! thrown away and rebuilt (ADR-0010).
+
+use std::collections::BTreeMap;
 
 use dcbor::prelude::*;
 use rrn_crypto::keypair::PublicKey;
@@ -349,41 +359,67 @@ impl ListingRecords {
     }
 }
 
-/// Collects every record for `listing_id` in one pass over the log.
+/// Which listings a scan collects.
+enum Scope<'a> {
+    /// Just this one — what the append guards and [`compute_state`] need.
+    One(&'a ListingId),
+    /// Every listing on the log, for [`compute_all_active`].
+    All,
+}
+
+impl Scope<'_> {
+    fn wants(&self, id: &ListingId) -> bool {
+        match self {
+            Scope::One(wanted) => *wanted == id,
+            Scope::All => true,
+        }
+    }
+}
+
+/// Collects the records for every listing in `scope` in **one** pass.
 ///
 /// A payload that is not one of the three marketplace kinds is skipped, as are
-/// records for other listings. Entries whose signer was not entitled to write
+/// records outside the scope. Entries whose signer was not entitled to write
 /// them are skipped too: an unauthorized record is not evidence of anything, and
 /// dropping it here means replay and the append guards agree by construction.
-pub fn listing_records(
+///
+/// A key exists in the returned map only once a valid creation record has been
+/// seen, which is what makes "no record before creation counts" fall out of the
+/// structure rather than out of a separate check.
+fn scan(
     log: &AppendLog,
-    listing_id: &ListingId,
+    scope: Scope<'_>,
     station: &PublicKey,
-) -> Result<ListingRecords> {
-    let mut records = ListingRecords::default();
+) -> Result<BTreeMap<ListingId, ListingRecords>> {
+    let mut found: BTreeMap<ListingId, ListingRecords> = BTreeMap::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
         let signer = Address::from_public_key(entry.payload.signer);
 
         if let Ok(listing) = from_canonical_bytes::<Listing>(&entry.payload.bytes) {
-            if listing.id == *listing_id
-                && records.created.is_none()
-                && signer == listing.provider
-                && listing.validate().is_ok()
+            if scope.wants(&listing.id) && signer == listing.provider && listing.validate().is_ok()
             {
-                records.created = Some(listing);
+                // First creation wins; a later duplicate id is not a second
+                // listing, and `append_listing_created` refuses to write one.
+                found
+                    .entry(listing.id)
+                    .or_default()
+                    .created
+                    .get_or_insert(listing);
             }
             continue;
         }
-        // Only records for a listing this station has already seen created can
-        // be authorized, so anything before the creation entry is ignored.
-        let Some(created) = records.created.as_ref() else {
-            continue;
-        };
         if let Ok(update) = from_canonical_bytes::<ListingUpdated>(&entry.payload.bytes) {
-            if update.listing_id == *listing_id
-                && records.closed.is_none()
-                && update.signed_by == created.provider
+            // Only a listing this station has already seen created can have
+            // authorized records, so anything before its creation is ignored.
+            let Some(records) = found.get_mut(&update.listing_id) else {
+                continue;
+            };
+            let Some(provider) = records.created.as_ref().map(|c| c.provider) else {
+                continue;
+            };
+            if records.closed.is_none()
+                && update.signed_by == provider
                 && signer == update.signed_by
             {
                 records.updates.push(update);
@@ -391,15 +427,33 @@ pub fn listing_records(
             continue;
         }
         if let Ok(close) = from_canonical_bytes::<ListingClosed>(&entry.payload.bytes) {
-            if close.listing_id == *listing_id
-                && records.closed.is_none()
-                && closer_is_entitled(&signer, &created.provider, station, close.reason)
+            let Some(records) = found.get_mut(&close.listing_id) else {
+                continue;
+            };
+            let Some(provider) = records.created.as_ref().map(|c| c.provider) else {
+                continue;
+            };
+            if records.closed.is_none()
+                && closer_is_entitled(&signer, &provider, station, close.reason)
             {
                 records.closed = Some(close);
             }
         }
     }
-    Ok(records)
+    Ok(found)
+}
+
+/// Collects every record for `listing_id` in one pass over the log.
+///
+/// Returns empty records for a listing this log has never seen created.
+pub fn listing_records(
+    log: &AppendLog,
+    listing_id: &ListingId,
+    station: &PublicKey,
+) -> Result<ListingRecords> {
+    Ok(scan(log, Scope::One(listing_id), station)?
+        .remove(listing_id)
+        .unwrap_or_default())
 }
 
 /// Whether this signer may close the listing for this reason: the provider may
@@ -538,6 +592,137 @@ fn find_created(log: &AppendLog, listing_id: &ListingId) -> Result<Option<Listin
     Ok(None)
 }
 
+/// Where a listing stands, derived by replaying the log.
+///
+/// This is a *computed view*, never stored: the records in [`ListingRecords`]
+/// are the facts, and the state is what they add up to at a given `now`. Two
+/// stations holding the same records agree on the state without having to
+/// exchange it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ListingState {
+    /// Built but not yet published, so no record of it exists anywhere.
+    ///
+    /// [`compute_state`] never returns this — a listing absent from the log is
+    /// `Ok(None)`, because the log cannot distinguish "drafted elsewhere" from
+    /// "never existed". The variant is for a caller holding a [`Listing`] it has
+    /// not appended yet, so that such a listing has a name in the same
+    /// vocabulary as a published one.
+    Draft,
+    /// Published, not closed, and not past its expiry: on offer.
+    Active(Listing),
+    /// Closed for good. Terminal — no later record changes it.
+    Closed {
+        /// The listing as it last read before closing.
+        listing: Listing,
+        /// Why it closed.
+        reason: CloseReason,
+        /// When, from the closer's clock.
+        closed_at: i64,
+    },
+    /// `expires_at` has passed but no close record has been written yet.
+    ///
+    /// A real state, not a gap in the data: the station's sweep converts it to a
+    /// signed [`ListingClosed`] eventually, and until it does, every reader must
+    /// already treat the listing as off the market (ADR-0010). Sweep latency
+    /// must never be what decides whether a stale listing can be bought.
+    Expired {
+        /// The listing as it last read.
+        listing: Listing,
+    },
+}
+
+impl ListingState {
+    /// The listing itself, whatever state it is in. `None` only for
+    /// [`Draft`](ListingState::Draft), which holds no listing.
+    pub fn listing(&self) -> Option<&Listing> {
+        match self {
+            ListingState::Draft => None,
+            ListingState::Active(listing)
+            | ListingState::Closed { listing, .. }
+            | ListingState::Expired { listing } => Some(listing),
+        }
+    }
+
+    /// Whether the listing is on offer right now.
+    ///
+    /// The one question most callers actually have, answered in one place so
+    /// that "expired but not yet swept" cannot be read as purchasable by a
+    /// caller who forgot the case.
+    pub fn is_on_offer(&self) -> bool {
+        matches!(self, ListingState::Active(_))
+    }
+}
+
+/// Whether `expires_at` has passed at `now`.
+///
+/// The window is inclusive of its last second — expiry at `t` means the listing
+/// stands *through* `t`, matching `rrn_ledger`'s `proposed_at <= now <=
+/// expires_at`. Unlike the ledger, no clock-skew grace is allowed: skew there
+/// buys a live handshake room to complete, whereas here it would keep an expired
+/// listing purchasable for a few seconds longer, and ADR-0010 puts the burden of
+/// error on closing early rather than selling late.
+fn has_expired(listing: &Listing, now: i64) -> bool {
+    listing
+        .expires_at
+        .is_some_and(|expires_at| now > expires_at)
+}
+
+/// Resolves records into the state they add up to at `now`.
+fn state_of(records: &ListingRecords, now: i64) -> Option<ListingState> {
+    let listing = records.current()?;
+    // Closed first: it is terminal, and it records *why* the listing ended.
+    // A listing closed after its expiry passed reads as `Closed`, not
+    // `Expired` — the sweep already did its job.
+    if let Some(closed) = records.closed {
+        return Some(ListingState::Closed {
+            listing,
+            reason: closed.reason,
+            closed_at: closed.closed_at,
+        });
+    }
+    if has_expired(&listing, now) {
+        return Some(ListingState::Expired { listing });
+    }
+    Some(ListingState::Active(listing))
+}
+
+/// Where one listing stands at `now`, or `None` if this log has no valid
+/// creation record for it.
+///
+/// `station` is needed because whether the listing is closed depends on whether
+/// a station-signed close counts, which only the station's own key settles —
+/// the same reason [`append_listing_closed`] takes it.
+pub fn compute_state(
+    log: &AppendLog,
+    listing_id: &ListingId,
+    station: &PublicKey,
+    now: i64,
+) -> Result<Option<ListingState>> {
+    let records = listing_records(log, listing_id, station)?;
+    Ok(state_of(&records, now))
+}
+
+/// Every listing on offer at `now`, in a deterministic order.
+///
+/// One pass over the log for all listings, not one pass each: the browse index
+/// this feeds (T1.6.6) would otherwise replay the whole log once per listing on
+/// the station's single writer thread.
+///
+/// Results are ordered by [`ListingId`], which is a content address — so two
+/// stations return the same order even if gossip delivered the entries to them
+/// in different sequences. Ordering by anything chronological would not survive
+/// that. Ranking for display is [`search`](crate::search)'s job, not this
+/// function's.
+pub fn compute_all_active(log: &AppendLog, station: &PublicKey, now: i64) -> Result<Vec<Listing>> {
+    Ok(scan(log, Scope::All, station)?
+        .values()
+        .filter_map(|records| match state_of(records, now) {
+            Some(ListingState::Active(listing)) => Some(listing),
+            _ => None,
+        })
+        .collect())
+}
+
 /// A lifecycle record the log would not accept. One variant per rule, so a
 /// caller can tell which entitlement was missing.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -602,7 +787,14 @@ mod tests {
         db
     }
 
+    const CREATED_AT: i64 = 1_800_000_000;
+    const EXPIRES_AT: i64 = 1_900_000_000;
+
     fn listing_of(provider: &Keypair) -> Listing {
+        listing_expiring(provider, Some(EXPIRES_AT))
+    }
+
+    fn listing_expiring(provider: &Keypair, expires_at: Option<i64>) -> Listing {
         Listing::new(
             Address::from_public_key(provider.public_key()),
             "blue_ridge_collective".into(),
@@ -627,8 +819,8 @@ mod tests {
             },
             1,
             false,
-            1_800_000_000,
-            Some(1_900_000_000),
+            CREATED_AT,
+            expires_at,
         )
         .unwrap()
     }
@@ -1147,5 +1339,322 @@ mod tests {
             assert_eq!(cbor.clone().try_into_text().unwrap(), tag);
             assert_eq!(CloseReason::try_from(cbor).unwrap(), reason);
         }
+    }
+
+    // --- T1.6.5: the state machine ---------------------------------------
+
+    /// A moment comfortably inside the listing's window.
+    const WHILE_OPEN: i64 = 1_850_000_000;
+
+    #[test]
+    fn a_listing_walks_from_active_through_an_update_to_closed() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+        let listing = listing_of(&provider);
+
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, ListingState::Active(listing.clone()));
+        assert!(state.is_on_offer());
+
+        // An update leaves it active, carrying the patched content.
+        append_listing_updated(
+            &mut log,
+            update_of(&provider, &listing, price_patch(199)),
+            &station_key,
+        )
+        .unwrap();
+        let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
+            .unwrap()
+            .unwrap();
+        assert!(state.is_on_offer());
+        assert_eq!(state.listing().unwrap().pricing.amount_centi, 199);
+
+        append_listing_closed(
+            &mut log,
+            close_of(&provider, &listing, CloseReason::ProviderClosed),
+            &station_key,
+        )
+        .unwrap();
+        let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
+            .unwrap()
+            .unwrap();
+        assert!(!state.is_on_offer());
+        assert!(matches!(
+            state,
+            ListingState::Closed {
+                reason: CloseReason::ProviderClosed,
+                closed_at: 1_850_000_000,
+                ..
+            }
+        ));
+        // The closed state keeps the listing as it last read, not as published.
+        assert_eq!(state.listing().unwrap().pricing.amount_centi, 199);
+    }
+
+    #[test]
+    fn an_expired_listing_stays_expired_until_the_station_closes_it() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+        let listing = listing_of(&provider);
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+
+        // The expiry passes. No record has been written — the sweep has not run
+        // — but the listing must already be off the market, or sweep latency
+        // would decide whether a stale offer can be bought.
+        let after = EXPIRES_AT + 1;
+        let state = compute_state(&log, &listing.id, &station_key, after)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state,
+            ListingState::Expired {
+                listing: listing.clone()
+            }
+        );
+        assert!(!state.is_on_offer());
+        assert!(compute_all_active(&log, &station_key, after)
+            .unwrap()
+            .is_empty());
+
+        // The sweep catches up and turns the derived state into a real record.
+        append_listing_closed(
+            &mut log,
+            close_of(&provider, &listing, CloseReason::ProviderClosed),
+            &station_key,
+        )
+        .unwrap();
+        assert!(matches!(
+            compute_state(&log, &listing.id, &station_key, after)
+                .unwrap()
+                .unwrap(),
+            ListingState::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_listing_stands_through_its_last_second() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station_key = Keypair::generate().public_key();
+        let listing = listing_of(&provider);
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+
+        // Inclusive of `expires_at` itself, matching the ledger's window — and
+        // expired the very next second, with no skew grace.
+        let at = |now| {
+            compute_state(&log, &listing.id, &station_key, now)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(at(EXPIRES_AT - 1).is_on_offer());
+        assert!(at(EXPIRES_AT).is_on_offer());
+        assert!(!at(EXPIRES_AT + 1).is_on_offer());
+    }
+
+    #[test]
+    fn a_listing_without_an_expiry_never_expires() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station_key = Keypair::generate().public_key();
+        let listing = listing_expiring(&provider, None);
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+
+        assert!(compute_state(&log, &listing.id, &station_key, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_on_offer());
+    }
+
+    #[test]
+    fn a_listing_closed_after_its_expiry_reads_as_closed_not_expired() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+        let listing = listing_of(&provider);
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_closed(
+            &mut log,
+            close_of(&station, &listing, CloseReason::ExpirationReached),
+            &station_key,
+        )
+        .unwrap();
+
+        // Closed is terminal and says *why*; reporting `Expired` here would
+        // throw away the record that already answered the question.
+        assert!(matches!(
+            compute_state(&log, &listing.id, &station_key, EXPIRES_AT + 10_000)
+                .unwrap()
+                .unwrap(),
+            ListingState::Closed {
+                reason: CloseReason::ExpirationReached,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_listing_this_log_never_saw_has_no_state() {
+        let db = open_log_db();
+        let log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station_key = Keypair::generate().public_key();
+        let listing = listing_of(&provider);
+
+        // Absent, not `Draft`: the log cannot tell "drafted elsewhere" from
+        // "never existed", so it declines to guess.
+        assert_eq!(
+            compute_state(&log, &listing.id, &station_key, WHILE_OPEN).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_draft_holds_no_listing_and_is_not_on_offer() {
+        assert_eq!(ListingState::Draft.listing(), None);
+        assert!(!ListingState::Draft.is_on_offer());
+    }
+
+    #[test]
+    fn only_active_listings_are_returned_in_content_order() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+
+        // Four listings from four providers, so four distinct content addresses.
+        let providers: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
+        let listings: Vec<Listing> = providers.iter().map(listing_of).collect();
+        for (provider, listing) in providers.iter().zip(&listings) {
+            append_listing_created(&mut log, SignedPayload::sign(listing.clone(), provider))
+                .unwrap();
+        }
+
+        // One closed, one updated (still active), one never expiring.
+        append_listing_closed(
+            &mut log,
+            close_of(&providers[0], &listings[0], CloseReason::ProviderClosed),
+            &station_key,
+        )
+        .unwrap();
+        append_listing_updated(
+            &mut log,
+            update_of(&providers[1], &listings[1], price_patch(199)),
+            &station_key,
+        )
+        .unwrap();
+
+        let active = compute_all_active(&log, &station_key, WHILE_OPEN).unwrap();
+
+        let mut expected: Vec<Listing> = listings[1..].to_vec();
+        expected[0] = price_patch(199).apply_to(&listings[1]);
+        // Ordered by content address, so every station agrees regardless of the
+        // order gossip happened to deliver the entries in.
+        expected.sort_by_key(|l| l.id);
+        assert_eq!(active, expected);
+
+        // Past every expiry, nothing is on offer.
+        assert!(compute_all_active(&log, &station_key, EXPIRES_AT + 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_whole_log_and_one_listing_are_read_the_same_way() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let station_key = Keypair::generate().public_key();
+        let providers: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        let listings: Vec<Listing> = providers.iter().map(listing_of).collect();
+        for (provider, listing) in providers.iter().zip(&listings) {
+            append_listing_created(&mut log, SignedPayload::sign(listing.clone(), provider))
+                .unwrap();
+        }
+
+        // The batch scan and the single-listing scan are the same function; this
+        // pins that they cannot answer differently.
+        let active = compute_all_active(&log, &station_key, WHILE_OPEN).unwrap();
+        for listing in &listings {
+            let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.is_on_offer(), active.contains(listing));
+        }
+    }
+
+    #[test]
+    fn replay_is_deterministic_across_runs() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+        let providers: Vec<Keypair> = (0..5).map(|_| Keypair::generate()).collect();
+        let listings: Vec<Listing> = providers.iter().map(listing_of).collect();
+        for (provider, listing) in providers.iter().zip(&listings) {
+            append_listing_created(&mut log, SignedPayload::sign(listing.clone(), provider))
+                .unwrap();
+        }
+        append_listing_updated(
+            &mut log,
+            update_of(&providers[2], &listings[2], price_patch(199)),
+            &station_key,
+        )
+        .unwrap();
+        append_listing_closed(
+            &mut log,
+            close_of(&providers[3], &listings[3], CloseReason::ProviderClosed),
+            &station_key,
+        )
+        .unwrap();
+
+        let first = compute_all_active(&log, &station_key, WHILE_OPEN).unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                compute_all_active(&log, &station_key, WHILE_OPEN).unwrap(),
+                first
+            );
+        }
+        assert_eq!(first.len(), 4);
+    }
+
+    #[test]
+    fn a_gossiped_record_nobody_was_entitled_to_write_does_not_move_the_state() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let impostor = Keypair::generate();
+        let station_key = Keypair::generate().public_key();
+        let listing = listing_of(&provider);
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+
+        // Replication bypasses the append guards entirely, so the state machine
+        // has to refuse these on its own.
+        log.append(update_of(&impostor, &listing, price_patch(1)))
+            .unwrap();
+        log.append(close_of(&impostor, &listing, CloseReason::ProviderClosed))
+            .unwrap();
+
+        assert_eq!(
+            compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
+                .unwrap()
+                .unwrap(),
+            ListingState::Active(listing.clone())
+        );
+        assert_eq!(
+            compute_all_active(&log, &station_key, WHILE_OPEN).unwrap(),
+            vec![listing]
+        );
     }
 }
