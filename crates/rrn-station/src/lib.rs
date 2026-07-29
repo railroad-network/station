@@ -38,6 +38,7 @@ pub mod events;
 pub mod gossip;
 pub mod history;
 pub mod ledger_view;
+pub mod marketplace_view;
 pub mod mdns;
 pub mod mobile_server;
 pub mod paired;

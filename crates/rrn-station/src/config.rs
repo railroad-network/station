@@ -138,6 +138,14 @@ pub struct TimersSection {
     /// identity's cached profile from the log.
     #[serde(default = "default_reputation_refresh_interval")]
     pub reputation_refresh_interval_secs: u64,
+    /// Listing-expiry sweep interval in seconds (default: 300 — five minutes).
+    ///
+    /// Longer than the settlement sweep on purpose. Settlement latency delays
+    /// money a member is waiting for, whereas an expired listing is already
+    /// unbuyable to every reader the moment its expiry passes (ADR-0010); this
+    /// sweep only writes that down, so it is housekeeping rather than a deadline.
+    #[serde(default = "default_listing_expiry_interval")]
+    pub listing_expiry_interval_secs: u64,
 }
 
 fn default_window_seconds() -> u64 {
@@ -151,6 +159,9 @@ fn default_gossip_interval() -> u64 {
 }
 fn default_reputation_refresh_interval() -> u64 {
     3600
+}
+fn default_listing_expiry_interval() -> u64 {
+    300
 }
 
 impl Default for SettlementSection {
@@ -167,6 +178,7 @@ impl Default for TimersSection {
             sweep_interval_secs: default_sweep_interval(),
             gossip_interval_secs: default_gossip_interval(),
             reputation_refresh_interval_secs: default_reputation_refresh_interval(),
+            listing_expiry_interval_secs: default_listing_expiry_interval(),
         }
     }
 }

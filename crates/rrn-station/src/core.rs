@@ -30,6 +30,11 @@ use rrn_ledger::state::TransactionState;
 use rrn_ledger::transaction::{
     SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId, TransactionProposal,
 };
+use rrn_marketplace::lifecycle::{
+    append_listing_closed, touched_listing, CloseReason, ListingClosed, ListingState,
+};
+use rrn_marketplace::listing::{ListingId, Surface};
+use rrn_marketplace::search::{SearchIndex, SearchQuery};
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, StoredPayload};
 
@@ -42,6 +47,7 @@ use crate::clock::Clock;
 use crate::events::{self, Event};
 use crate::gossip::WireEntry;
 use crate::ledger_view;
+use crate::marketplace_view;
 use crate::paired::{self, PairedMobiles};
 use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
 use crate::reputation_view;
@@ -81,6 +87,12 @@ pub enum Command {
     /// clock time; reply with the number of identities refreshed.
     RefreshReputation {
         /// Count of identities refreshed.
+        reply: oneshot::Sender<usize>,
+    },
+    /// Close every listing whose `expires_at` has passed with a station-signed
+    /// [`ListingClosed`]; reply with the number closed (T1.7.0).
+    ExpireListings {
+        /// Count of listings closed.
         reply: oneshot::Sender<usize>,
     },
     /// Report this station's own address and current log tail seq (for the peer
@@ -217,6 +229,15 @@ impl CoreHandle {
     pub async fn refresh_reputation(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::RefreshReputation { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Triggers the listing-expiry sweep; returns the number closed.
+    pub async fn expire_listings(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ExpireListings { reply }).is_err() {
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -362,17 +383,26 @@ pub struct Core {
     /// Publishes the log tail after every append so a parked `/subscribe`
     /// long-poll wakes and re-polls for events (T1.3.5).
     tail_tx: watch::Sender<u64>,
+    /// The marketplace's full-text index (T1.6.6), kept in step with the log as
+    /// listing records are appended or replicated.
+    ///
+    /// A cache and nothing more: it is rebuilt from the log at startup and can
+    /// be deleted at any time (ADR-0010), so a station whose index is corrupt or
+    /// absent loses browse until the next boot and loses no marketplace *data*
+    /// ever.
+    listings: SearchIndex,
 }
 
 impl Core {
-    /// Builds a core over an opened `db`, decrypted `wallet`, and the persisted
-    /// paired-mobile list.
+    /// Builds a core over an opened `db`, decrypted `wallet`, the persisted
+    /// paired-mobile list, and the marketplace search index.
     pub fn new(
         db: Database,
         wallet: WalletContents,
         settlement: SettlementConfig,
         clock: Clock,
         paired: PairedMobiles,
+        listings: SearchIndex,
     ) -> Self {
         let (tail_tx, _) = watch::channel(0u64);
         Core {
@@ -383,6 +413,7 @@ impl Core {
             paired,
             pending: BTreeMap::new(),
             tail_tx,
+            listings,
         }
     }
 
@@ -400,6 +431,7 @@ impl Core {
     /// The blocking command loop. Returns when a [`Command::Shutdown`] arrives or
     /// all handles are dropped.
     fn run(mut self, rx: mpsc::Receiver<Command>) {
+        self.rebuild_listing_index();
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Command::Call { request, reply } => {
@@ -411,6 +443,10 @@ impl Core {
                 }
                 Command::RefreshReputation { reply } => {
                     let n = self.do_refresh_reputation();
+                    let _ = reply.send(n);
+                }
+                Command::ExpireListings { reply } => {
+                    let n = self.do_expire_listings();
                     let _ = reply.send(n);
                 }
                 Command::Handshake { reply } => {
@@ -688,6 +724,135 @@ impl Core {
         }
     }
 
+    // --- marketplace index maintenance (T1.7.0) -----------------------------
+
+    /// Rebuilds the listing index from a full log replay.
+    ///
+    /// Run once at startup, unconditionally. Nothing appends to the log while the
+    /// station is down, so the index a previous run left behind is *usually*
+    /// still correct — but "usually" is the wrong standard for a derived view
+    /// with no transaction binding it to the log (ADR-0010 accepted exactly this
+    /// drift when it chose tantivy over FTS5), and the log is the only thing that
+    /// can settle it. One replay per boot buys the guarantee that browse never
+    /// serves a listing state the log disagrees with.
+    ///
+    /// A failure here is logged and tolerated: browse degrades to empty, and
+    /// every other thing the station does is unaffected. The index is
+    /// authoritative over nothing, so it must never be able to keep a station
+    /// from starting.
+    fn rebuild_listing_index(&mut self) {
+        let now = self.clock.now();
+        let station = self.wallet.address.public_key();
+        let log = AppendLog::new(&self.db);
+        match self.listings.rebuild(&self.db, &log, station, now) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(listings = n, "rebuilt the marketplace index"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "marketplace index rebuild failed; browse will be empty until the next restart"
+            ),
+        }
+    }
+
+    /// Brings one listing's index entry back in step with the log.
+    ///
+    /// Called after anything that could have changed a listing — a local append,
+    /// a replicated entry — with the id that record named. The state comes from
+    /// the log via `compute_state`, so an entry written by someone not entitled
+    /// to write it changes nothing here either: this re-derives rather than
+    /// applying the record it was told about.
+    ///
+    /// A listing no longer on offer is *removed* from the index rather than
+    /// updated, because the index exists to answer "what can I buy".
+    fn reindex_listing(&self, listing_id: &ListingId) {
+        let now = self.clock.now();
+        let station = self.wallet.address.public_key();
+        let log = AppendLog::new(&self.db);
+        let state = match rrn_marketplace::lifecycle::compute_state(&log, listing_id, station, now)
+        {
+            Ok(Some(state)) => state,
+            // Nothing valid on the log for this id — an impostor's record, or a
+            // record about a listing this station never saw created.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not compute listing state for reindex");
+                return;
+            }
+        };
+
+        let result = match (&state, state.listing()) {
+            (ListingState::Active(_), Some(listing)) => {
+                self.listings.upsert(&self.db, listing, &state)
+            }
+            _ => self.listings.remove(&self.db, listing_id),
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "could not update the marketplace index");
+        }
+    }
+
+    /// Closes every listing whose expiry has passed, with a station-signed
+    /// [`ListingClosed`] (T1.6.5, ADR-0005's station-as-signer pattern).
+    ///
+    /// `Expired` is a *derived* state, not a record: readers already treat it as
+    /// off the market, so this sweep is not what makes an expired listing
+    /// unbuyable — it is what turns a derivation everyone recomputes into a fact
+    /// on the log, which is what a peer replicating this log later needs. The
+    /// station may sign this reason and never `ProviderClosed` (a station must
+    /// not be able to claim a provider withdrew an offer).
+    fn do_expire_listings(&mut self) -> usize {
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+
+        let log = AppendLog::new(&self.db);
+        let expired: Vec<ListingId> =
+            match rrn_marketplace::lifecycle::compute_all(&log, &station_pk, now) {
+                Ok(states) => states
+                    .into_iter()
+                    .filter(|(_, state)| matches!(state, ListingState::Expired { .. }))
+                    .map(|(id, _)| id)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "listing expiry sweep could not read the log");
+                    return 0;
+                }
+            };
+        if expired.is_empty() {
+            return 0;
+        }
+
+        let mut closed = 0;
+        for listing_id in expired {
+            let record = ListingClosed {
+                listing_id,
+                reason: CloseReason::ExpirationReached,
+                closed_at: now,
+            };
+            let mut log = AppendLog::new(&self.db);
+            match append_listing_closed(
+                &mut log,
+                rrn_crypto::signed::SignedPayload::sign(record, &station),
+                &station_pk,
+            ) {
+                Ok(_) => closed += 1,
+                // Most likely a race with a provider's own close landing first,
+                // which is a fine outcome — the listing is closed either way.
+                Err(e) => tracing::warn!(error = %e, "could not close an expired listing"),
+            }
+            // Drop it from browse whether or not the append succeeded: it is
+            // past its expiry either way, and an expired listing has no business
+            // in the index. Only the listings this sweep found are touched —
+            // re-deriving the whole corpus here would cost one index writer per
+            // listing on the station's single thread, to change the few that
+            // moved.
+            if let Err(e) = self.listings.remove(&self.db, &listing_id) {
+                tracing::warn!(error = %e, "could not drop an expired listing from the index");
+            }
+        }
+        closed
+    }
+
     fn tail_seq(&self) -> u64 {
         AppendLog::new(&self.db)
             .tail()
@@ -715,6 +880,11 @@ impl Core {
 
     fn do_append_entries(&mut self, entries: Vec<WireEntry>) -> usize {
         let mut appended = 0;
+        // Listings a replicated entry claims to be about, so the browse index
+        // can be brought back in step below. Collected rather than reindexed
+        // inline because each reindex replays the log, and a gossip round can
+        // carry many records for one listing.
+        let mut touched: Vec<ListingId> = Vec::new();
         let mut log = AppendLog::new(&self.db);
         for w in entries {
             let stored = match w.to_stored() {
@@ -724,8 +894,16 @@ impl Core {
                     continue;
                 }
             };
+            let listing = touched_listing(&stored.bytes);
             match log.append_raw(stored) {
-                Ok(Some(_)) => appended += 1,
+                Ok(Some(_)) => {
+                    appended += 1;
+                    if let Some(id) = listing {
+                        if !touched.contains(&id) {
+                            touched.push(id);
+                        }
+                    }
+                }
                 Ok(None) => {} // already held — dedup
                 Err(e) => {
                     // A peer's entry that fails signature verification (or any
@@ -733,6 +911,9 @@ impl Core {
                     tracing::warn!(error = %e, "rejecting peer log entry");
                 }
             }
+        }
+        for listing_id in &touched {
+            self.reindex_listing(listing_id);
         }
         appended
     }
@@ -956,6 +1137,8 @@ impl Core {
             "list_vouches" => self.channel_list_vouches(envelope),
             "reputation" => self.channel_reputation(envelope),
             "reputation_band" => self.channel_reputation_band(envelope),
+            "marketplace_search" => self.channel_marketplace_search(envelope),
+            "marketplace_listing" => self.channel_marketplace_listing(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -1135,6 +1318,94 @@ impl Core {
         let view = reputation_view::address_band(&self.db, &address, now)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
+    }
+
+    /// `marketplace_search` — the browse read (T1.7.1). Every filter is
+    /// optional; an empty `{}` returns the most relevant page of everything on
+    /// offer. Results are ranked by text relevance times the provider's standing
+    /// (T1.6.6) and carry the provider's band inline, so a browse screen renders
+    /// a page from one round trip (see [`marketplace_view`]).
+    ///
+    /// `limit` is clamped, not validated — a client asking for more than
+    /// [`marketplace_view::MAX_SEARCH_LIMIT`] gets that many rather than an
+    /// error, so no request can turn into an unbounded index read.
+    fn channel_marketplace_search(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            text: Option<String>,
+            surface: Option<String>,
+            category: Option<String>,
+            max_price_centi: Option<i64>,
+            min_provider_reputation: Option<f32>,
+            limit: Option<usize>,
+            offset: Option<usize>,
+        }
+        // An empty body is a valid "show me everything" search.
+        let params: Params = if envelope.params.trim().is_empty() {
+            serde_json::from_str("{}")
+        } else {
+            serde_json::from_str(&envelope.params)
+        }
+        .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+
+        // An unknown surface is refused rather than ignored: silently dropping
+        // the filter would answer a question the caller did not ask.
+        let surface = match params.surface.as_deref() {
+            None => None,
+            Some(tag) => Some(Surface::from_tag(tag).ok_or_else(|| {
+                (
+                    rpc::INVALID_PARAMS,
+                    format!("unknown surface: {tag} (goods, services, or commons)"),
+                )
+            })?),
+        };
+
+        let default = SearchQuery::default();
+        let query = SearchQuery {
+            text: params.text,
+            surface,
+            category: params.category,
+            max_price_centi: params.max_price_centi,
+            min_provider_reputation: params.min_provider_reputation,
+            limit: params.limit.unwrap_or(default.limit),
+            offset: params.offset.unwrap_or(default.offset),
+        };
+        let now = self.clock.now();
+        let listings = marketplace_view::search(&self.listings, &self.db, query, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({ "listings": listings }))
+    }
+
+    /// `marketplace_listing` — one listing in full, by hex `listing_id`
+    /// (T1.7.1). Read from the log rather than the index, so a detail screen
+    /// cannot be the place a stale cache is taken as authoritative.
+    fn channel_marketplace_listing(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            listing_id: String,
+        }
+        let params: Params = serde_json::from_str(&envelope.params)
+            .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+        let listing_id = parse_listing_id(&params.listing_id)?;
+        let now = self.clock.now();
+        let station = self.wallet.address.public_key();
+        match marketplace_view::detail(&self.db, &listing_id, station, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+        {
+            Some(view) => {
+                serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
+            }
+            None => Err((
+                rpc::INVALID_PARAMS,
+                "no such listing on this station".into(),
+            )),
+        }
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
@@ -1318,6 +1589,20 @@ fn hex_param(params: &str, field: &str) -> Result<Vec<u8>, (i32, String)> {
     unhex(hex_str).ok_or_else(|| (rpc::INVALID_PARAMS, format!("{field} is not hex")))
 }
 
+/// Parses a hex [`ListingId`] as it appears in a marketplace view, in the
+/// `(code, message)` form the channel handlers build a response envelope from.
+fn parse_listing_id(s: &str) -> Result<ListingId, (i32, String)> {
+    let bytes =
+        unhex(s).ok_or_else(|| (rpc::INVALID_PARAMS, "listing_id is not hex".to_string()))?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        (
+            rpc::INVALID_PARAMS,
+            "listing_id is not 32 bytes".to_string(),
+        )
+    })?;
+    Ok(ListingId(Hash::from_bytes(bytes)))
+}
+
 /// Lowercase hex of a byte slice.
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1382,6 +1667,7 @@ mod tests {
             SettlementConfig::default(),
             Clock::manual(1_000),
             PairedMobiles::default(),
+            SearchIndex::in_memory(),
         )
     }
 
@@ -1442,5 +1728,290 @@ mod tests {
         };
         let v = core.handle_call(&req).unwrap();
         assert_eq!(v["balance_centi"], 0);
+    }
+
+    // --- marketplace wiring (T1.7.0) ----------------------------------------
+
+    use rrn_marketplace::lifecycle::append_listing_created;
+    use rrn_marketplace::listing::{
+        Availability, AvailabilityStatus, Listing, Pricing, PricingModel, Requirements,
+    };
+
+    /// The core's manual clock is at 1_000, so a listing created "now" with an
+    /// expiry beyond it is on offer and one below it has expired.
+    const NOW: i64 = 1_000;
+
+    fn test_listing(provider: &Keypair, title: &str, expires_at: Option<i64>) -> Listing {
+        Listing::new(
+            Address::from_public_key(provider.public_key()),
+            "blue_ridge_collective".into(),
+            Surface::Goods,
+            "food".into(),
+            title.into(),
+            "Picked this week.".into(),
+            Pricing {
+                amount_centi: 250,
+                model: PricingModel::Fixed,
+                negotiable: false,
+            },
+            Availability {
+                status: AvailabilityStatus::Available,
+                capacity: Some(12),
+                next_slot: None,
+            },
+            Requirements {
+                min_reputation: 0.0,
+                community_member_only: false,
+                federation_only: false,
+            },
+            1,
+            false,
+            NOW - 100,
+            expires_at,
+        )
+        .unwrap()
+    }
+
+    /// Publishes a listing straight onto the core's log, as a provider would, and
+    /// brings the index up to date the way an append path will.
+    fn publish(core: &mut Core, provider: &Keypair, listing: &Listing) {
+        append_to_log(core, provider, listing);
+        core.reindex_listing(&listing.id);
+    }
+
+    /// Appends a provider's signed listing and nothing else — no reindex. Scoped
+    /// so the log's borrow of the core ends before the caller reads back.
+    fn append_to_log(core: &Core, provider: &Keypair, listing: &Listing) {
+        let mut log = AppendLog::new(&core.db);
+        append_listing_created(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
+        )
+        .unwrap();
+    }
+
+    /// A channel envelope for `method` with `params`, signed by `signer`. The
+    /// marketplace read methods authorize on nothing but being a paired mobile,
+    /// so the envelope's other fields do not matter to them.
+    fn envelope(signer: &Keypair, method: &str, params: serde_json::Value) -> RequestEnvelope {
+        RequestEnvelope {
+            method: method.into(),
+            params: params.to_string(),
+            signer: signer.public_key(),
+            recipient: signer.public_key(),
+            nonce: 1,
+            timestamp: NOW,
+        }
+    }
+
+    #[test]
+    fn marketplace_search_finds_a_published_listing_with_its_providers_band() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Winter squash, by the crate", None);
+        publish(&mut core, &provider, &listing);
+
+        let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
+        let result = core.route_channel_method(&env).unwrap();
+        let listings = result["listings"].as_array().unwrap();
+
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0]["title"], "Winter squash, by the crate");
+        assert_eq!(listings[0]["surface"], "goods");
+        assert_eq!(listings[0]["amount_centi"], 250);
+        // The card carries the band inline so a browse page is one round trip. An
+        // unscored provider reads as `New`, which is what they are.
+        assert_eq!(listings[0]["provider_band"], "New");
+    }
+
+    #[test]
+    fn marketplace_search_filters_by_surface_and_refuses_an_unknown_one() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Winter squash", None);
+        publish(&mut core, &provider, &listing);
+
+        // The listing is Goods, so a Services tab must not show it.
+        let env = envelope(
+            &provider,
+            "marketplace_search",
+            serde_json::json!({ "surface": "services" }),
+        );
+        let result = core.route_channel_method(&env).unwrap();
+        assert!(result["listings"].as_array().unwrap().is_empty());
+
+        // An unknown surface is an error, not a silently-dropped filter: the
+        // caller would otherwise get an answer to a question they did not ask.
+        let env = envelope(
+            &provider,
+            "marketplace_search",
+            serde_json::json!({ "surface": "livestock" }),
+        );
+        let (code, message) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("livestock"), "{message}");
+    }
+
+    #[test]
+    fn marketplace_search_clamps_an_oversized_limit() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        // One more listing than the clamp allows through, so the clamp is what
+        // decides the page size rather than the corpus.
+        for i in 0..(marketplace_view::MAX_SEARCH_LIMIT + 1) {
+            let listing = test_listing(&provider, &format!("Crate {i} of squash"), None);
+            publish(&mut core, &provider, &listing);
+        }
+
+        let env = envelope(
+            &provider,
+            "marketplace_search",
+            serde_json::json!({ "limit": 100_000 }),
+        );
+        let result = core.route_channel_method(&env).unwrap();
+        assert_eq!(
+            result["listings"].as_array().unwrap().len(),
+            marketplace_view::MAX_SEARCH_LIMIT
+        );
+    }
+
+    #[test]
+    fn marketplace_listing_reads_one_in_full_and_rejects_an_unknown_id() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Winter squash", None);
+        publish(&mut core, &provider, &listing);
+
+        let env = envelope(
+            &provider,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": hex(&listing.id.to_bytes()) }),
+        );
+        let result = core.route_channel_method(&env).unwrap();
+        assert_eq!(result["title"], "Winter squash");
+        assert_eq!(result["description"], "Picked this week.");
+        assert_eq!(result["community"], "blue_ridge_collective");
+        assert_eq!(result["state"], "active");
+        assert_eq!(result["oracle_tier"], 1);
+
+        let env = envelope(
+            &provider,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": hex(&[0u8; 32]) }),
+        );
+        let (code, _) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn expiry_sweep_closes_a_past_expiry_listing_and_drops_it_from_browse() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        // Expired at the core's clock: on the log, past its expiry, no close
+        // record yet — the `Expired` state the sweep exists to convert.
+        let listing = test_listing(&provider, "Last week's squash", Some(NOW - 10));
+        append_to_log(&core, &provider, &listing);
+
+        assert_eq!(core.do_expire_listings(), 1);
+
+        // The close is on the log, station-signed, and says why.
+        let station = core.wallet.address.public_key();
+        let state = rrn_marketplace::lifecycle::compute_state(
+            &AppendLog::new(&core.db),
+            &listing.id,
+            station,
+            NOW,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            state,
+            ListingState::Closed {
+                reason: CloseReason::ExpirationReached,
+                ..
+            }
+        ));
+
+        // And browse no longer offers it.
+        let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
+        let result = core.route_channel_method(&env).unwrap();
+        assert!(result["listings"].as_array().unwrap().is_empty());
+
+        // Nothing left to close: the sweep is idempotent.
+        assert_eq!(core.do_expire_listings(), 0);
+    }
+
+    #[test]
+    fn expiry_sweep_leaves_a_listing_that_is_still_on_offer() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Next week's squash", Some(NOW + 10_000));
+        publish(&mut core, &provider, &listing);
+
+        assert_eq!(core.do_expire_listings(), 0);
+        let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
+        let result = core.route_channel_method(&env).unwrap();
+        assert_eq!(result["listings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_replicated_listing_reaches_browse_but_an_impostors_does_not() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Winter squash", None);
+
+        // Arriving by gossip rather than by a local append — the path that
+        // bypasses every append guard.
+        let signed = rrn_crypto::signed::SignedPayload::sign(listing.clone(), &provider);
+        let entry = WireEntry {
+            signer: signed.signer.to_bytes().to_vec(),
+            signature: signed.signature.to_bytes().to_vec(),
+            bytes: to_canonical_bytes(listing.clone()),
+        };
+        assert_eq!(core.do_append_entries(vec![entry]), 1);
+
+        let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
+        let result = core.route_channel_method(&env).unwrap();
+        assert_eq!(result["listings"].as_array().unwrap().len(), 1);
+
+        // A listing someone else signed in the provider's name is validly
+        // *signed* — so gossip accepts the entry — and is still not a listing,
+        // because replay refuses a creation record whose signer is not the
+        // provider. It must not reach browse.
+        let impostor = Keypair::generate();
+        let forged = test_listing(&provider, "Squash that is not on offer", None);
+        let signed = rrn_crypto::signed::SignedPayload::sign(forged.clone(), &impostor);
+        let entry = WireEntry {
+            signer: signed.signer.to_bytes().to_vec(),
+            signature: signed.signature.to_bytes().to_vec(),
+            bytes: to_canonical_bytes(forged),
+        };
+        assert_eq!(core.do_append_entries(vec![entry]), 1);
+
+        let result = core.route_channel_method(&env).unwrap();
+        let listings = result["listings"].as_array().unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0]["title"], "Winter squash");
+    }
+
+    #[test]
+    fn the_index_is_rebuilt_from_the_log_at_startup() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Winter squash", None);
+
+        // Appended with no reindex — the state a station is in when its index
+        // directory was deleted, or written by a version that did not maintain
+        // one. Browse is empty until the rebuild runs.
+        append_to_log(&core, &provider, &listing);
+
+        let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
+        let before = core.route_channel_method(&env).unwrap();
+        assert!(before["listings"].as_array().unwrap().is_empty());
+
+        core.rebuild_listing_index();
+
+        let after = core.route_channel_method(&env).unwrap();
+        assert_eq!(after["listings"].as_array().unwrap().len(), 1);
     }
 }

@@ -765,13 +765,20 @@ between a listing and the transaction that fulfils it; fair discovery (open
 listings actually surface); a buyer's protection against a lister who takes
 credit and never delivers.
 
-> **Where M1.6 leaves this.** The data model is shipped and covered below: the
-> record types, their authorization rules, the replay that derives state, and the
-> derived index that search reads. **No network surface reaches any of it yet** —
-> nothing in the workspace depends on `rrn-marketplace`, so a listing can only be
-> written by local code. The RPC methods, the mobile UI, and the binding between a
-> listing and the transaction that fulfils it all arrive in M1.7, and the threats
-> that live on those surfaces are marked *planned* rather than *shipped*.
+> **Where M1.7 leaves this (supersedes the M1.6 framing).** M1.6 could say that
+> no network surface reached any of this, because nothing in the workspace
+> depended on `rrn-marketplace`. **That is no longer true.** T1.7.0 makes
+> `rrn-station` its first dependent: the daemon holds the search index, rebuilds
+> it from the log at startup, keeps it in step as listing records are appended or
+> replicated, and serves two **read** methods to paired mobiles —
+> `marketplace_search` and `marketplace_listing`. Two gaps M1.6 named as deferred
+> are closed by that same wiring (the search `limit` clamp and the expiry sweep,
+> both below). What is still *not* reachable is every marketplace **write**: no
+> RPC method appends a listing, an update, or a close, so the only writers remain
+> local code and gossip. Listing creation over RPC arrives in T1.7.2/T1.7.3, and
+> the `Requirements` enforcement that turns recorded provider intent into an
+> access check arrives in T1.7.4 — until then the note under *Requirements that
+> are stated but not yet enforced* stands.
 
 #### Spoofing — publishing or editing as someone else (M1.6)
 
@@ -850,13 +857,21 @@ credit and never delivers.
   writes the log, so the two **can** diverge — the cost ADR-0010 accepted
   knowingly when it chose tantivy over FTS5. Divergence degrades discovery until
   a rebuild; it cannot corrupt the log or move credit.
-- *Residual risk:* a listing whose `expires_at` has passed has no close record
-  until a sweep writes one, and **no sweep is wired yet** (M1.7). The exposure is
-  contained because `Expired` is a real state that every reader must treat as
-  not-for-sale: `compute_state` reports it, `compute_all_active` omits it, and the
-  index query filters it. Sweep latency therefore never decides whether a stale
-  listing can be bought — but the log does accumulate listings that are expired in
-  fact and open on paper until the sweep ships.
+- *Mitigation (shipped, T1.7.0 — closes the M1.6 gap):* the expiry sweep is
+  wired. `Core::do_expire_listings` runs on a timer
+  (`timers.listing_expiry_interval_secs`, default 300s), finds every listing whose
+  derived state is `Expired`, and appends a station-signed `ListingClosed
+  { ExpirationReached }` — the ADR-0005 station-as-signer pattern. The station can
+  sign only `ExpirationReached` and `StationCleanup`; `CloseReason::station_may_sign`
+  is what stops a station ever claiming a provider withdrew an offer. The log no
+  longer accumulates listings that are expired in fact and open on paper.
+- *Residual risk:* sweep latency is still latency — a listing can be expired for
+  up to one interval before the record exists. This never decides whether a stale
+  listing can be bought, because `Expired` remains a real state every reader
+  treats as not-for-sale (`compute_state` reports it, `compute_all_active` omits
+  it, the index query filters it, and the sweep drops it from the browse index).
+  The sweep makes the derivation a fact on the log for peers replicating it; it is
+  not what protects a buyer.
 
 #### Denial of service — what a member may write onto a permanent log (M1.6)
 
@@ -886,18 +901,26 @@ credit and never delivers.
   in the log and anchoring made it O(V·N), so a search must never be able to
   provoke one. Structured filters run in SQLite before text relevance is computed,
   so relevance is only ever calculated for listings that could be returned.
+- *Mitigation (shipped, T1.7.0 — closes the M1.6 gap):* result size is no longer
+  the network caller's choice. `marketplace_view::search` clamps `limit` to
+  `MAX_SEARCH_LIMIT` (100) before the query reaches the index, and the
+  `marketplace_search` channel method is the only path a mobile has to it. The
+  clamp overrides rather than rejects, so an oversized request gets a bounded page
+  instead of an error, and no single request can become an unbounded index read.
+  Inside the crate `SearchQuery::limit` is still honoured as given — `find_matches`
+  passes `usize::MAX` deliberately, to rank the whole candidate set before
+  truncating — which is why the clamp lives at the network boundary and not in the
+  crate.
 - *Residual risk:* `reputation_at_creation` **is** computed by a replay
   (`score_at`), once per listing at index time. That is the one place the cost is
   affordable and it is paid off the search path entirely, but a burst of new
-  listings is a burst of replays, and no rate limit stands behind it. Whoever
-  wires indexing into the station in M1.7 owns that budget.
-- *Residual risk:* result size is the **caller's** choice. `SearchQuery::limit`
-  is honoured as given — `find_matches` itself passes `usize::MAX` internally, to
-  rank the whole candidate set before truncating to `search::DEFAULT_LIMIT` — so
-  the page size is not a defence against anything, and nothing yet limits how
-  often a caller may ask. Whoever exposes search over the network in M1.7 must
-  clamp the limit there. A per-mobile read budget is the same fix already named
-  for the reputation read path in T1.5.9, and it should cover both.
+  listings is a burst of replays, and no rate limit stands behind it. T1.7.2/T1.7.3
+  bring the first write surface that can produce such a burst, and own that budget.
+- *Residual risk:* the clamp bounds one request, not the **rate** of requests.
+  Nothing limits how often a paired mobile may search, and a startup index rebuild
+  plus each expiry sweep are full log replays on the single writer thread. A
+  per-mobile read budget is the same fix already named for the reputation read path
+  in T1.5.9, and it should cover both.
 
 #### Information disclosure — offers and demand are both public (M1.6)
 
@@ -934,9 +957,13 @@ credit and never delivers.
   anchoring computable.
 - *Residual risk:* **nothing enforces `min_reputation` or `community_member_only`
   against a buyer yet.** M1.6 validates them; the check belongs at the point a
-  buyer approaches a provider, which is the inquiry flow in M1.7. Until then they
+  buyer approaches a provider, which is the inquiry flow in T1.7.4. Until then they
   are provider intent recorded on the log, not access control, and the UI must not
-  present them as the latter.
+  present them as the latter. T1.7.0 sharpens this rather than fixing it: the
+  `marketplace_listing` detail view now carries both fields to any paired mobile,
+  so the requirement is *displayed* over the network before anything checks it. The
+  view's field docs say so explicitly, so that whoever renders them cannot mistake
+  the display for a gate.
 
 #### Listing fraud — the lister never delivers
 
@@ -1649,6 +1676,16 @@ label for a person; the correctness of the community a vouch is stamped into.
   *Residual risk:* the vouch records (voucher, subject, statement, stake) are
   plaintext in the station log like all other log content — exposed to a local
   attacker or seized station media, the accepted whole-DB-plaintext limitation.
+  *Residual risk (T1.7.0 — narrows the member-scoping claim above):* the
+  `marketplace_listing` detail view returns `provider_vouches_received`, a *count*
+  of vouches naming another member, so that a buyer weighing an offer can see
+  whether the provider is socially attested. It is deliberately a scalar and not a
+  list: no voucher identity, statement, or stake leaves the station this way, so
+  the graph itself still cannot be walked. But it is the first read that answers a
+  question about somebody else's vouches, and it is only reachable for a member who
+  has *published a listing* — a member choosing to trade publicly. The
+  member-scoped guarantee above should be read as applying to `list_vouches` /
+  `vouch_counts`, not to every vouch-derived number on the surface.
 - **The private nickname stays private.** *Threat:* the human label a voucher types
   for a subject leaks to the subject, or federates to other stations along with the
   vouch. *Mitigation (shipped, T1.4.5):* the nickname is **deliberately not part of
@@ -1846,16 +1883,14 @@ edges of that scope.
   not enforced.** Individual listings are bounded (200-byte title, 8 KiB
   description, controlled category vocabulary), but nothing bounds how *many* a
   member may publish onto a permanently replicated log, and low search ranking
-  hides a flood without removing its storage cost. `SearchQuery::limit` is
-  whatever the caller asks for. A listing's `Requirements` — `min_reputation` and
-  `community_member_only` — are validated as *reachable* at creation but checked
-  against no buyer anywhere, so they are provider intent, not access control,
-  until the M1.7 inquiry flow enforces them. Listings whose `expires_at` has
-  passed accumulate on the log with no close record, since no sweep is wired
-  (readers treat `Expired` as not-for-sale, so this costs storage and tidiness
-  rather than correctness). None of this is currently reachable over the network —
-  nothing depends on `rrn-marketplace` yet — and the fixes belong with the M1.7
-  wiring that first exposes publishing and search. See
+  hides a flood without removing its storage cost. A listing's `Requirements` —
+  `min_reputation` and `community_member_only` — are validated as *reachable* at
+  creation but checked against no buyer anywhere, so they are provider intent, not
+  access control, until the T1.7.4 inquiry flow enforces them. Marketplace
+  **reads** are now network-reachable (T1.7.0: `marketplace_search` /
+  `marketplace_listing` to paired mobiles) with the page size clamped and the
+  expiry sweep wired; **writes** are not yet, so admission control is still owed by
+  the T1.7.2/T1.7.3 publishing path, and nothing rate-limits reads. See
   [`rrn-marketplace`](#rrn-marketplace).
 - **Unclamped wallet KDF parameters.** A hostile `.rrnwallet` can specify a very
   large argon2 `m_cost`, forcing a large allocation on `decrypt` (accepted: you

@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use rrn_identity::address::Address;
 use rrn_identity::wallet::WalletContents;
 use rrn_ledger::settlement::SettlementConfig;
+use rrn_marketplace::search::SearchIndex;
 use rrn_storage::db::Database;
 use rrn_storage::migrations;
 
@@ -36,6 +37,11 @@ pub const DB_FILE: &str = "station.db";
 pub const SOCKET_FILE: &str = "station.sock";
 /// Config file name within the data dir.
 pub const CONFIG_FILE: &str = "config.toml";
+/// Marketplace full-text index directory within the data dir (T1.6.6).
+///
+/// A derived cache, not data: per ADR-0010 deleting this directory is a
+/// supported repair, and the core rebuilds it from the log at startup.
+pub const LISTING_INDEX_DIR: &str = "marketplace_index";
 
 /// Inputs needed to bring a station up.
 pub struct StationParams {
@@ -107,7 +113,33 @@ impl Station {
             window_seconds: config.settlement.window_seconds,
         };
         let paired = paired::PairedMobiles::load(&data_dir).context("load paired mobiles")?;
-        let core = Core::new(db, wallet, settlement, params.clock.clone(), paired).spawn();
+
+        // The marketplace index (T1.6.6). Failing to open it must not keep the
+        // station down — it is a cache the core rebuilds from the log anyway — so
+        // fall back to an in-memory index, which costs this run's browse nothing
+        // and simply does not survive a restart.
+        let index_dir = data_dir.join(LISTING_INDEX_DIR);
+        let listings = match SearchIndex::open(&index_dir) {
+            Ok(index) => index,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dir = %index_dir.display(),
+                    "could not open the marketplace index; using an in-memory one for this run"
+                );
+                SearchIndex::in_memory()
+            }
+        };
+
+        let core = Core::new(
+            db,
+            wallet,
+            settlement,
+            params.clock.clone(),
+            paired,
+            listings,
+        )
+        .spawn();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -208,6 +240,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // Listing expiry sweep timer (T1.7.0).
+        tasks.push(tokio::spawn(listing_expiry_timer(
+            Duration::from_secs(config.timers.listing_expiry_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -257,6 +296,13 @@ impl Station {
         self.core.refresh_reputation().await
     }
 
+    /// Forces an immediate listing-expiry sweep; returns the number closed. Lets
+    /// a driver advance the clock past an expiry and see the close record
+    /// written without waiting on the timer.
+    pub async fn expire_listings(&self) -> usize {
+        self.core.expire_listings().await
+    }
+
     /// Signals all tasks to stop, stops the core thread, awaits the tasks, and
     /// removes the socket file. Idempotent-ish: safe to call once.
     pub async fn shutdown(mut self) {
@@ -283,6 +329,36 @@ async fn sweep_timer(interval: Duration, core: CoreHandle, mut shutdown: watch::
                 let n = core.sweep().await;
                 if n > 0 {
                     tracing::info!(settled = n, "settlement sweep");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically asks the core to close listings whose expiry has passed
+/// (T1.7.0).
+///
+/// Latency here is not a correctness problem — every reader already treats a
+/// past-expiry listing as off the market (ADR-0010), so this converts a
+/// derivation into a signed record rather than deciding anything.
+async fn listing_expiry_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick, as the other timers do.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.expire_listings().await;
+                if n > 0 {
+                    tracing::info!(closed = n, "listing expiry sweep");
                 }
             }
             _ = shutdown.changed() => {

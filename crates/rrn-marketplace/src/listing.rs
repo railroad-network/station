@@ -135,11 +135,29 @@ pub enum Surface {
 }
 
 impl Surface {
-    pub(crate) fn tag(self) -> &'static str {
+    /// The wire discriminant, as it appears in canonical CBOR.
+    ///
+    /// Public because it is also what a client filters and displays on: a read
+    /// path outside this crate that spelled these strings itself would be a
+    /// second copy of the vocabulary, free to drift from the one the log records.
+    pub fn tag(self) -> &'static str {
         match self {
             Surface::Goods => "goods",
             Surface::Services => "services",
             Surface::Commons => "commons",
+        }
+    }
+
+    /// The inverse of [`tag`](Self::tag), for a caller parsing a surface out of
+    /// something that is not CBOR — a search filter off the wire, a CLI flag.
+    /// Lives here so that the decoder below and every such caller agree on the
+    /// vocabulary by construction.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "goods" => Some(Surface::Goods),
+            "services" => Some(Surface::Services),
+            "commons" => Some(Surface::Commons),
+            _ => None,
         }
     }
 }
@@ -154,12 +172,7 @@ impl TryFrom<CBOR> for Surface {
     type Error = dcbor::Error;
 
     fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
-        match cbor.try_into_text()?.as_str() {
-            "goods" => Ok(Surface::Goods),
-            "services" => Ok(Surface::Services),
-            "commons" => Ok(Surface::Commons),
-            _ => Err(dcbor::Error::WrongType),
-        }
+        Surface::from_tag(&cbor.try_into_text()?).ok_or(dcbor::Error::WrongType)
     }
 }
 
@@ -173,7 +186,8 @@ pub enum PricingModel {
 }
 
 impl PricingModel {
-    fn tag(self) -> &'static str {
+    /// The wire discriminant (see [`Surface::tag`] on why it is public).
+    pub fn tag(self) -> &'static str {
         match self {
             PricingModel::Fixed => "fixed",
             PricingModel::Negotiable => "negotiable",
@@ -255,7 +269,8 @@ pub enum AvailabilityStatus {
 }
 
 impl AvailabilityStatus {
-    fn tag(self) -> &'static str {
+    /// The wire discriminant (see [`Surface::tag`] on why it is public).
+    pub fn tag(self) -> &'static str {
         match self {
             AvailabilityStatus::Available => "available",
             AvailabilityStatus::LimitedStock => "limited_stock",

@@ -249,9 +249,20 @@ fn default_data_dir() -> PathBuf {
     home.join(".railroad").join("station")
 }
 
+/// The default log filter: our own crates at `info`, and tantivy quieted to
+/// `warn`.
+///
+/// tantivy narrates every commit at `info` — "Preparing commit", "save metas",
+/// "Running garbage collection" — and the marketplace index commits once per
+/// listing change, so at `info` its bookkeeping would drown out the station's own
+/// events. `RRN_LOG=tantivy=info` brings it back when the index itself is what
+/// you are debugging.
+const DEFAULT_LOG_FILTER: &str = "info,tantivy=warn";
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_env("RRN_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_env("RRN_LOG").unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

@@ -250,7 +250,7 @@ fn dormant(name: &'static str, value: f32, weight: f32) -> DimensionRow {
 /// The band's wire name. A stable string rather than a serde derive on
 /// [`ReputationBand`], so the wire shape is owned here and not by the scoring
 /// crate's enum spelling.
-fn band_name(band: ReputationBand) -> &'static str {
+pub(crate) fn band_name(band: ReputationBand) -> &'static str {
     match band {
         ReputationBand::New => "New",
         ReputationBand::Member => "Member",

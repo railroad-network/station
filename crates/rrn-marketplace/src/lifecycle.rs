@@ -575,6 +575,33 @@ pub fn append_listing_closed(
     Ok(log.append(signed)?)
 }
 
+/// Which listing a log payload concerns, or `None` for a payload that is not one
+/// of the three marketplace listing kinds.
+///
+/// For a caller maintaining a derived view incrementally — the station's search
+/// index (T1.7.0) — which has just appended or replicated entries and needs to
+/// know which listings to recompute. The kind discriminants and the record shapes
+/// behind them belong to this module, and a daemon matching on kind strings
+/// itself would be a second copy of that mapping to keep in step.
+///
+/// Deliberately **not** an authorization check: it reports which listing the
+/// bytes claim to be about, not whether the claim counts. The recompute that
+/// follows goes through [`compute_state`], which is where entitlement is decided
+/// — so pointing this at an impostor's record costs a wasted recompute and
+/// changes no view.
+pub fn touched_listing(payload_bytes: &[u8]) -> Option<ListingId> {
+    if let Ok(listing) = from_canonical_bytes::<Listing>(payload_bytes) {
+        return Some(listing.id);
+    }
+    if let Ok(update) = from_canonical_bytes::<ListingUpdated>(payload_bytes) {
+        return Some(update.listing_id);
+    }
+    if let Ok(close) = from_canonical_bytes::<ListingClosed>(payload_bytes) {
+        return Some(close.listing_id);
+    }
+    None
+}
+
 /// Finds a listing's creation record without caring about its later history.
 fn find_created(log: &AppendLog, listing_id: &ListingId) -> Result<Option<Listing>> {
     for entry in log.iter_from(1) {
@@ -1673,5 +1700,53 @@ mod tests {
             compute_all_active(&log, &station_key, WHILE_OPEN).unwrap(),
             vec![listing]
         );
+    }
+
+    #[test]
+    fn touched_listing_names_the_listing_behind_each_record_kind() {
+        use rrn_crypto::serialize::to_canonical_bytes;
+
+        let provider = Keypair::generate();
+        let listing = listing_of(&provider);
+
+        // All three kinds point at the same listing, which is what lets a caller
+        // recompute one listing's derived state from any record about it.
+        assert_eq!(
+            touched_listing(&to_canonical_bytes(listing.clone())),
+            Some(listing.id)
+        );
+        assert_eq!(
+            touched_listing(&to_canonical_bytes(
+                update_of(&provider, &listing, price_patch(199)).payload
+            )),
+            Some(listing.id)
+        );
+        assert_eq!(
+            touched_listing(&to_canonical_bytes(
+                close_of(&provider, &listing, CloseReason::ProviderClosed).payload
+            )),
+            Some(listing.id)
+        );
+    }
+
+    #[test]
+    fn touched_listing_ignores_a_payload_that_is_not_a_listing_record() {
+        use rrn_crypto::serialize::to_canonical_bytes;
+
+        // A vouch is the nearest neighbour on a real log: also a signed
+        // attestation, also a map with a `kind`. It must not be mistaken for a
+        // listing record.
+        let voucher = Keypair::generate();
+        let subject = Keypair::generate();
+        let vouch = rrn_identity::vouch::create_vouch(
+            &voucher,
+            &Address::from_public_key(subject.public_key()),
+            "blue_ridge_collective",
+            "Known them for years.",
+            100,
+        );
+
+        assert_eq!(touched_listing(&to_canonical_bytes(vouch.payload)), None);
+        assert_eq!(touched_listing(b"not cbor at all"), None);
     }
 }
