@@ -4,10 +4,12 @@
 //! This crate turns the mutual-credit ledger into a place people actually
 //! transact: a member publishes a signed [`listing`] (an offer of a good or
 //! service), other members raise an [`inquiry`] against it, and [`search`]
-//! makes the set of open listings discoverable. A listing that leads to a
-//! completed sale is settled as an ordinary transaction on `rrn-ledger`, so the
-//! marketplace adds discovery and intent on top of the ledger rather than a
-//! second money path.
+//! makes the set of open listings discoverable. Demand is stated as well as
+//! supply — a [`need`] is a member saying what they are looking for, matched
+//! against the offers already standing. A listing that leads to a completed sale
+//! is settled as an ordinary transaction on `rrn-ledger`, so the marketplace
+//! adds discovery and intent on top of the ledger rather than a second money
+//! path.
 //!
 //! # The log is canonical; the indexes are caches
 //!
@@ -31,8 +33,10 @@
 //! listing is a helper *here* over `AppendLog::append` rather than a method on
 //! `rrn-storage`.
 //!
-//! Phase 1 skeleton (T1.6.2). The modules below are placeholders shaped to
-//! ADR-0010; each is filled in by its own later M1.6 task.
+//! [`listing`], [`lifecycle`], [`search`], and [`need`] are implemented
+//! (T1.6.3–T1.6.7). [`inquiry`] is still the T1.6.2 placeholder and is filled in
+//! by M1.7, which is where a buyer's approach to a provider gets a UI to arrive
+//! from.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -40,6 +44,7 @@
 pub mod inquiry;
 pub mod lifecycle;
 pub mod listing;
+pub mod need;
 pub mod search;
 
 /// Anything that can go wrong in the marketplace.
@@ -60,6 +65,10 @@ pub enum Error {
     /// act on.
     #[error("listing lifecycle: {0}")]
     Lifecycle(#[from] lifecycle::LifecycleError),
+    /// A need that breaks its own rules, or that nobody was entitled to
+    /// announce.
+    #[error("need: {0}")]
+    Need(#[from] need::NeedError),
     /// The full-text index could not be opened, written, or queried.
     #[error("search index: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
