@@ -98,6 +98,143 @@ async fn cli_drives_daemon() {
         // init prints guidance and exits 0 (no daemon contact).
         let out = Command::new(RRN).arg("init").output().unwrap();
         assert!(out.status.success());
+
+        // --- marketplace (T1.7.3) ---------------------------------------
+        //
+        // The whole operator loop against a live daemon: publish, browse, read
+        // one in full, state a need, see it matched, then withdraw the offer.
+
+        // Nothing on offer yet, and that reads as a sentence rather than as
+        // empty stdout.
+        assert_eq!(rrn(&socket, &["browse"]), "no listings");
+
+        // list → a content address on stdout.
+        let listing_id = rrn(
+            &socket,
+            &[
+                "list",
+                "goods",
+                "Winter squash, by the crate",
+                "--price",
+                "2.50",
+                "--category",
+                "food",
+                "--capacity",
+                "12",
+                "--description",
+                "Picked this week.",
+            ],
+        );
+        assert_eq!(
+            listing_id.len(),
+            64,
+            "listing id should be hex: {listing_id}"
+        );
+
+        // browse (text) finds it, with the price and band on the row.
+        let browsed = rrn(&socket, &["browse"]);
+        assert!(browsed.contains("Winter squash"), "browse: {browsed}");
+        assert!(browsed.contains("2.50 Commons"), "browse: {browsed}");
+        assert!(browsed.contains("goods"), "browse: {browsed}");
+        // The row leads with the id's first 12 chars, which is what gets retyped.
+        assert!(
+            browsed.contains(&listing_id[..12]),
+            "browse should carry the short id: {browsed}"
+        );
+
+        // browse (json) is one line of valid JSON with the full id.
+        let j = rrn(&socket, &["--format", "json", "browse"]);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("valid json");
+        assert_eq!(v["listings"][0]["listing_id"], listing_id);
+        assert_eq!(v["listings"][0]["amount_centi"], 250);
+
+        // Filters narrow it, and a filter that excludes it returns nothing.
+        let hit = rrn(
+            &socket,
+            &["browse", "--category", "food", "--text", "squash"],
+        );
+        assert!(hit.contains("Winter squash"), "filtered browse: {hit}");
+        assert_eq!(
+            rrn(&socket, &["browse", "--surface", "services"]),
+            "no listings"
+        );
+        assert_eq!(
+            rrn(&socket, &["browse", "--max-price", "1.00"]),
+            "no listings"
+        );
+
+        // An unknown surface is an error, not a silently dropped filter. Caught
+        // by the arg parser here, and independently by the station (see the
+        // `marketplace_search` tests in `core`) for clients that are not this one.
+        let out = Command::new(RRN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["browse", "--surface", "livestock"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "an unknown surface should fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("goods"),
+            "the error should name the surfaces that do exist"
+        );
+
+        // show-listing renders labelled fields, greppable by name.
+        let detail = rrn(&socket, &["show-listing", &listing_id]);
+        assert!(detail.contains("Picked this week."), "detail: {detail}");
+        assert!(detail.contains("oracle_tier"), "detail: {detail}");
+        assert!(detail.contains("active"), "detail: {detail}");
+        let j = rrn(&socket, &["--format", "json", "show-listing", &listing_id]);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("valid json");
+        assert_eq!(v["state"], "active");
+        assert_eq!(v["community_member_only"], false);
+
+        // my-listings carries the lifecycle state alongside the row.
+        let mine = rrn(&socket, &["my-listings"]);
+        assert!(mine.contains("active"), "my-listings: {mine}");
+        assert!(mine.contains("Winter squash"), "my-listings: {mine}");
+
+        // need → a log seq, and matches finds the listing that answers it.
+        let seq = rrn(
+            &socket,
+            &[
+                "need",
+                "food",
+                "6",
+                "--max-price",
+                "3.00",
+                "--valid-until",
+                "+30d",
+            ],
+        );
+        assert!(seq.parse::<u64>().is_ok(), "need should print a seq: {seq}");
+
+        let matched = rrn(&socket, &["matches"]);
+        assert!(matched.contains("need "), "matches: {matched}");
+        assert!(matched.contains("Winter squash"), "matches: {matched}");
+        let j = rrn(&socket, &["--format", "json", "matches", &seq]);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("valid json");
+        assert_eq!(v["needs"][0]["seq"].to_string(), seq);
+        assert_eq!(v["needs"][0]["expired"], false);
+        assert_eq!(v["needs"][0]["listings"][0]["listing_id"], listing_id);
+
+        // --color always adds escape codes; the default does not.
+        let plain = rrn(&socket, &["browse"]);
+        let painted = rrn(&socket, &["--color", "always", "browse"]);
+        assert!(!plain.contains('\x1b'), "default output must be plain");
+        assert!(painted.contains('\x1b'), "--color always should colorize");
+
+        // close-listing takes it off browse but keeps it in my-listings.
+        assert_eq!(
+            rrn(&socket, &["close-listing", &listing_id]),
+            "provider_closed"
+        );
+        assert_eq!(rrn(&socket, &["browse"]), "no listings");
+        let mine = rrn(&socket, &["my-listings"]);
+        assert!(mine.contains("closed"), "my-listings after close: {mine}");
+
+        // And the need now matches nothing, since nothing is on offer.
+        let matched = rrn(&socket, &["matches"]);
+        assert!(matched.contains("no matches"), "matches: {matched}");
     })
     .await;
 

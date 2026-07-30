@@ -300,6 +300,159 @@ pub struct NextNonceParams {
     pub address: Option<String>,
 }
 
+// --- marketplace (T1.7.3) ---------------------------------------------------
+//
+// The operator-facing half of the marketplace. The read methods answer with the
+// same [`crate::marketplace_view`] shapes the mobile channel serves, so a browse
+// row means one thing on the network however it was asked for; the results below
+// are typed only where the CLI renders a text mode from them.
+//
+// Writes here are signed by the **station's own wallet**, which on an operator's
+// socket is the operator's identity — the precedent `vouch` and `propose` set.
+// A mobile's marketplace writes are a different path (T1.7.2): the phone holds
+// the key and the station only records what it already signed.
+
+/// `marketplace_search` params — every filter optional, so `{}` is a valid
+/// "show me everything on offer". Shared by the mobile channel and the CLI
+/// socket: browse is one query with one meaning, whoever asks it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SearchParams {
+    /// Free-text query over title and description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `goods`, `services`, or `commons`. An unknown tag is an error, not an
+    /// ignored filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    /// One of the controlled-vocabulary categories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Price ceiling in centicommons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_price_centi: Option<i64>,
+    /// Only listings whose provider's capped composite is at least this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_provider_reputation: Option<f32>,
+    /// Page size, clamped to [`crate::marketplace_view::MAX_SEARCH_LIMIT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// How many ranked hits to skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+}
+
+/// `marketplace_listing` params — one listing in full, by content address.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListingParams {
+    /// The hex listing id.
+    pub listing_id: String,
+}
+
+/// `marketplace_create_listing` params. Mirrors [`rrn_marketplace::listing::Listing`]
+/// minus what the station fills in for itself: the provider (the station's own
+/// address), the community, `created_at`, and the derived content address.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateListingParams {
+    /// `goods`, `services`, or `commons`.
+    pub surface: String,
+    /// One of the controlled-vocabulary categories.
+    pub category: String,
+    /// Short human-readable name for the offer.
+    pub title: String,
+    /// Longer prose; empty is fine.
+    #[serde(default)]
+    pub description: String,
+    /// Price in centicommons. Negative is legal only on `commons`.
+    pub amount_centi: i64,
+    /// Whether the provider invites offers. Sets `PricingModel::Negotiable` too,
+    /// since a listing that invites offers but is priced `Fixed` is the
+    /// contradiction [`rrn_marketplace::listing::Listing::validate`] refuses.
+    #[serde(default)]
+    pub negotiable: bool,
+    /// Units available, for `goods`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
+    /// Unix seconds of the next open slot, for `services`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_slot: Option<i64>,
+    /// Minimum capped composite an inquirer must hold; `0.0` asks nothing.
+    #[serde(default)]
+    pub min_reputation: f32,
+    /// Whether the provider will deal only inside their own community.
+    #[serde(default)]
+    pub community_member_only: bool,
+    /// Claimed oracle tier. `None` takes the price-based suggestion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_tier: Option<u8>,
+    /// Unix seconds the listing goes off offer; `None` stands until closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+/// `marketplace_create_listing` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateListingResult {
+    /// The listing's content address, hex-encoded.
+    pub listing_id: String,
+    /// The oracle tier actually recorded (the suggestion, when none was given).
+    pub oracle_tier: u8,
+}
+
+/// `marketplace_close_listing` params.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloseListingParams {
+    /// The hex listing id to withdraw.
+    pub listing_id: String,
+}
+
+/// `marketplace_close_listing` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloseListingResult {
+    /// The listing that was closed, hex-encoded.
+    pub listing_id: String,
+    /// The reason recorded — always `provider_closed` on this path, since a
+    /// station may never claim a provider withdrew an offer (ADR-0005).
+    pub reason: String,
+}
+
+/// `marketplace_announce_need` params.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnounceNeedParams {
+    /// One of the controlled-vocabulary categories.
+    pub category: String,
+    /// How many units are wanted; at least one.
+    pub quantity_needed: u32,
+    /// The most the seeker will pay, or `None` for no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_price_centi: Option<i64>,
+    /// Unix seconds through which the need stands.
+    pub valid_until: i64,
+}
+
+/// `marketplace_announce_need` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnnounceNeedResult {
+    /// The log sequence number that identifies the need — needs are not
+    /// content-addressed (see [`rrn_marketplace::need::AnnouncedNeed`]).
+    pub seq: u64,
+}
+
+/// `marketplace_matches` params.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MatchesParams {
+    /// The log seq of one of the caller's needs, or `None` for all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+// The marketplace *read* results are not typed here. They are
+// [`crate::marketplace_view`]'s view structs, which carry `&'static str` tags and
+// so are `Serialize`-only by construction — there is no type for a client to
+// deserialize back into. Both clients read them as JSON: the mobile already does
+// (T1.7.0), and the CLI's text mode renders from the same `serde_json::Value` it
+// would otherwise print. A struct here with a `serde_json::Value` hole in it
+// would document less than the view does.
+
 /// `next_nonce` result — the nonce a member's next proposal must carry (T1.3.4).
 ///
 /// The ledger requires each sender's proposals to be strictly sequential, and

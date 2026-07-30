@@ -17,6 +17,7 @@
 //! no notion of: whether the offer can actually fill the quantity asked for.
 
 use dcbor::prelude::*;
+use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_storage::db::Database;
@@ -163,6 +164,55 @@ pub fn append_need_announced(log: &mut AppendLog, signed: SignedNeed) -> Result<
     }
     need.validate()?;
     Ok(log.append(signed)?)
+}
+
+/// A need as it sits on the log, with the sequence number that identifies it.
+///
+/// A [`Need`] is not content-addressed — nothing references one, so it carries no
+/// id of its own. But a member with three needs standing has to be able to say
+/// *which*, so the log's own sequence number is the handle: it is already unique,
+/// already assigned, and already what the entry is filed under. It is local to
+/// one station's log and deliberately not a network identifier; a seeker naming a
+/// need to their own station is the only case that needs to name one at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncedNeed {
+    /// The log sequence number of the entry that announced it.
+    pub seq: u64,
+    /// The need itself.
+    pub need: Need,
+}
+
+/// Every need `seeker` has announced on this log, in log order.
+///
+/// Scoped to one seeker because that is the only question asked of it: a member
+/// reviewing what they are still looking for. Skips entries whose signer is not
+/// the seeker the need names, exactly as [`append_need_announced`] refuses to
+/// write one — so a gossiped need attributed to someone who did not sign it is
+/// not visible here either.
+///
+/// Expired needs are returned rather than filtered: `valid_until` is judged
+/// against the reader's clock, and a seeker looking at their own list should see
+/// the stale ones too (that is how they know to restate them). Callers that only
+/// want live needs filter on [`Need::has_expired`].
+pub fn announced_needs(log: &AppendLog, seeker: &Address) -> Result<Vec<AnnouncedNeed>> {
+    let mut found = Vec::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(need) = from_canonical_bytes::<Need>(&entry.payload.bytes) else {
+            continue;
+        };
+        if need.seeker != *seeker {
+            continue;
+        }
+        if Address::from_public_key(entry.payload.signer) != need.seeker {
+            continue;
+        }
+        found.push(AnnouncedNeed {
+            seq: entry.seq,
+            need,
+        });
+    }
+    Ok(found)
 }
 
 /// How well an offer's stock covers what was asked for: `1.0` when it fills the
@@ -738,5 +788,59 @@ mod tests {
         let decoded =
             rrn_crypto::serialize::from_canonical_bytes::<Need>(&entry.payload.bytes).unwrap();
         assert_eq!(decoded, need);
+    }
+
+    #[test]
+    fn announced_needs_lists_one_seekers_needs_in_log_order_with_their_seqs() {
+        let db = open_db();
+        let mut log = AppendLog::new(&db);
+        let seeker = Keypair::generate();
+        let other = Keypair::generate();
+
+        let first = need_for(&seeker, "food", 12, Some(250));
+        let second = need_for(&seeker, "tools", 1, None);
+        let theirs = need_for(&other, "food", 3, None);
+        append_need_announced(&mut log, SignedPayload::sign(first.clone(), &seeker)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(theirs, &other)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(second.clone(), &seeker)).unwrap();
+
+        let mine = announced_needs(&log, &Address::from_public_key(seeker.public_key())).unwrap();
+        assert_eq!(mine.len(), 2, "another seeker's need is not mine");
+        assert_eq!(mine[0].need, first);
+        assert_eq!(mine[1].need, second);
+        // The seq is the log's own, so it skips the entry in between.
+        assert_eq!(mine[0].seq, 1);
+        assert_eq!(mine[1].seq, 3);
+    }
+
+    #[test]
+    fn announced_needs_skips_a_need_its_signer_did_not_seek() {
+        let db = open_db();
+        let seeker = Keypair::generate();
+        let impostor = Keypair::generate();
+        // A need naming `seeker` but signed by someone else — what a gossiped
+        // entry could carry, since replication does not run the append guard.
+        let need = need_for(&seeker, "food", 12, None);
+        let mut log = AppendLog::new(&db);
+        log.append(SignedPayload::sign(need, &impostor)).unwrap();
+
+        let mine = announced_needs(&log, &Address::from_public_key(seeker.public_key())).unwrap();
+        assert!(mine.is_empty(), "an unsigned-for need is not evidence");
+    }
+
+    #[test]
+    fn announced_needs_returns_expired_needs_too() {
+        let db = open_db();
+        let mut log = AppendLog::new(&db);
+        let seeker = Keypair::generate();
+        let mut need = need_for(&seeker, "food", 1, None);
+        need.valid_until = NOW - 1;
+        append_need_announced(&mut log, SignedPayload::sign(need, &seeker)).unwrap();
+
+        // Listing them is not judging them: a seeker reviewing what they asked
+        // for needs to see the stale entries to know to restate them.
+        let mine = announced_needs(&log, &Address::from_public_key(seeker.public_key())).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert!(mine[0].need.has_expired(NOW));
     }
 }

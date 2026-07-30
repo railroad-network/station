@@ -773,12 +773,33 @@ credit and never delivers.
 > replicated, and serves two **read** methods to paired mobiles —
 > `marketplace_search` and `marketplace_listing`. Two gaps M1.6 named as deferred
 > are closed by that same wiring (the search `limit` clamp and the expiry sweep,
-> both below). What is still *not* reachable is every marketplace **write**: no
-> RPC method appends a listing, an update, or a close, so the only writers remain
-> local code and gossip. Listing creation over RPC arrives in T1.7.2/T1.7.3, and
-> the `Requirements` enforcement that turns recorded provider intent into an
-> access check arrives in T1.7.4 — until then the note under *Requirements that
-> are stated but not yet enforced* stands.
+> both below).
+>
+> **T1.7.3 adds the first marketplace writes reachable over a socket**, so the
+> M1.7.0 note that "every marketplace write is unreachable" no longer holds
+> either. `marketplace_create_listing`, `marketplace_close_listing`, and
+> `marketplace_announce_need` append listing and need records, signed by the
+> **station's own wallet**, and `marketplace_my_listings` / `marketplace_matches`
+> read back what the station itself published or sought. All five are on the
+> **operator's Unix socket only** — `route_channel_method`'s allowlist is an
+> explicit match and none of them appear in it, so no paired mobile can reach a
+> marketplace write. That matters for two of the properties below: the close
+> path signs `ProviderClosed` and so is bounded by
+> `closer_is_entitled` exactly as a member's own close is (the station is the
+> provider here, not a third party attesting), and the operator socket is
+> already the trust boundary where `propose` and `vouch` spend the station's key.
+> Anyone who can reach that socket can already move the station's credit;
+> publishing a listing under its name is strictly less than that.
+>
+> Two things are still deferred and named here rather than in a task doc. A
+> **member's** marketplace writes — a phone signing its own listing, which the
+> station records without holding the key — arrive in T1.7.2, and are a different
+> authorization question from the operator path above: the envelope's signer must
+> equal the record's provider, as `submit_vouch` already requires. And the
+> `Requirements` enforcement that turns recorded provider intent into an access
+> check arrives in T1.7.4 — until then the note under *Requirements that are
+> stated but not yet enforced* stands, and note that T1.7.3 makes it *easier* to
+> reach: `rrn list --min-reputation` records a threshold that nothing yet checks.
 
 #### Spoofing — publishing or editing as someone else (M1.6)
 
@@ -903,10 +924,13 @@ credit and never delivers.
   so relevance is only ever calculated for listings that could be returned.
 - *Mitigation (shipped, T1.7.0 — closes the M1.6 gap):* result size is no longer
   the network caller's choice. `marketplace_view::search` clamps `limit` to
-  `MAX_SEARCH_LIMIT` (100) before the query reaches the index, and the
-  `marketplace_search` channel method is the only path a mobile has to it. The
-  clamp overrides rather than rejects, so an oversized request gets a bounded page
-  instead of an error, and no single request can become an unbounded index read.
+  `MAX_SEARCH_LIMIT` (100) before the query reaches the index, and every caller
+  goes through it: T1.7.3 added a second transport (the operator socket's
+  `marketplace_search`) and routed it through the *same* `run_marketplace_search`
+  the channel method calls, rather than a parallel path that would have needed its
+  own clamp to be remembered. The clamp overrides rather than rejects, so an
+  oversized request gets a bounded page instead of an error, and no single request
+  can become an unbounded index read.
   Inside the crate `SearchQuery::limit` is still honoured as given — `find_matches`
   passes `usize::MAX` deliberately, to rank the whole candidate set before
   truncating — which is why the clamp lives at the network boundary and not in the
@@ -914,8 +938,18 @@ credit and never delivers.
 - *Residual risk:* `reputation_at_creation` **is** computed by a replay
   (`score_at`), once per listing at index time. That is the one place the cost is
   affordable and it is paid off the search path entirely, but a burst of new
-  listings is a burst of replays, and no rate limit stands behind it. T1.7.2/T1.7.3
-  bring the first write surface that can produce such a burst, and own that budget.
+  listings is a burst of replays, and no rate limit stands behind it. **T1.7.3
+  shipped the first write surface that can produce such a burst and did not add a
+  budget** — deliberately, because that surface is the operator's own socket, where
+  the only caller who can drive it is the one who already holds the station's key
+  and could spend its credit instead. The budget becomes load-bearing in T1.7.2,
+  which is the first path letting a *member* publish over the network, and it
+  should be a per-identity publication limit rather than a per-request one:
+  clamping one request does nothing about a thousand of them. Note also that
+  `marketplace_my_listings` and `marketplace_matches` are each a full `compute_all`
+  replay per call, on the same single writer thread — affordable for an operator
+  reading their own handful of listings, and not something to expose to mobiles
+  unchanged.
 - *Residual risk:* the clamp bounds one request, not the **rate** of requests.
   Nothing limits how often a paired mobile may search, and a startup index rebuild
   plus each expiry sweep are full log replays on the single writer thread. A
@@ -1027,8 +1061,11 @@ credit and never delivers.
   unlimited *distinct* listings, each permanently replicated to every station in
   the community, and low ranking hides them from search without removing their
   storage cost. Ranking is a discovery defence, not an admission-control one. A
-  per-identity publication budget is the missing piece and belongs with the M1.7
-  wiring that first exposes publishing over the network.
+  per-identity publication budget is still the missing piece. T1.7.3 exposed
+  publishing over a socket without adding one, which is defensible only because
+  that socket is the operator's own (see the note at the head of this section);
+  T1.7.2 exposes it to paired mobiles, and that is where the budget has to land
+  rather than being deferred again.
 
 ### `rrn-reputation`
 

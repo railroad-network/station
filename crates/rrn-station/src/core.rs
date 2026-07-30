@@ -526,6 +526,16 @@ impl Core {
             "vouch" => self.m_vouch(req),
             "backup_export" => self.m_backup_export(req),
             "recover_import" => self.m_recover_import(req),
+            // Operator-facing marketplace (T1.7.3). The reads answer with the
+            // same views the mobile channel serves; the writes are signed by
+            // this station's own wallet, as `propose` and `vouch` are.
+            "marketplace_search" => self.m_marketplace_search(req),
+            "marketplace_listing" => self.m_marketplace_listing(req),
+            "marketplace_create_listing" => self.m_marketplace_create_listing(req),
+            "marketplace_close_listing" => self.m_marketplace_close_listing(req),
+            "marketplace_my_listings" => self.m_marketplace_my_listings(),
+            "marketplace_announce_need" => self.m_marketplace_announce_need(req),
+            "marketplace_matches" => self.m_marketplace_matches(req),
             // Operator-facing pairing management (T1.3.3), invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
@@ -661,6 +671,221 @@ impl Core {
         append_vouch(&mut log, vouch).map_err(internal)?;
 
         ok(&rpc::VouchResult { vouch_id })
+    }
+
+    // --- operator marketplace (T1.7.3) --------------------------------------
+
+    /// `marketplace_search` — browse, for the CLI. The same read the mobile gets.
+    fn m_marketplace_search(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        // `null` params (an absent `params` key) is a valid "everything" browse.
+        let params: rpc::SearchParams = if req.params.is_null() {
+            rpc::SearchParams::default()
+        } else {
+            parse_params(req)?
+        };
+        self.run_marketplace_search(params)
+    }
+
+    /// `marketplace_listing` — one listing in full, for the CLI.
+    fn m_marketplace_listing(
+        &self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::ListingParams = parse_params(req)?;
+        self.run_marketplace_listing(&params.listing_id)
+    }
+
+    /// `marketplace_create_listing` — publish a station-signed listing.
+    ///
+    /// The station's wallet is the provider, which on the operator's socket is
+    /// the operator themselves; a member publishing from a phone signs their own
+    /// listing instead (T1.7.2). `community` comes from this station rather than
+    /// the caller for the same reason `provider` does — both are facts about who
+    /// is publishing, not choices the request gets to make.
+    fn m_marketplace_create_listing(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::CreateListingParams = parse_params(req)?;
+        let surface = Surface::from_tag(&params.surface).ok_or_else(|| {
+            invalid_params(format!(
+                "unknown surface: {} (goods, services, or commons)",
+                params.surface
+            ))
+        })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let oracle_tier = params
+            .oracle_tier
+            .unwrap_or_else(|| suggest_oracle_tier(params.amount_centi));
+
+        let listing = rrn_marketplace::listing::Listing::new(
+            self.wallet.address,
+            VOUCH_COMMUNITY.to_string(),
+            surface,
+            params.category,
+            params.title,
+            params.description,
+            rrn_marketplace::listing::Pricing {
+                amount_centi: params.amount_centi,
+                // A listing that invites offers must say so in both places, or
+                // `validate` rejects it as contradictory pricing.
+                model: if params.negotiable {
+                    rrn_marketplace::listing::PricingModel::Negotiable
+                } else {
+                    rrn_marketplace::listing::PricingModel::Fixed
+                },
+                negotiable: params.negotiable,
+            },
+            availability_for(surface, params.capacity, params.next_slot),
+            rrn_marketplace::listing::Requirements {
+                min_reputation: params.min_reputation,
+                community_member_only: params.community_member_only,
+                federation_only: false,
+            },
+            oracle_tier,
+            false,
+            now,
+            params.expires_at,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+
+        let listing_id = listing.id;
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::lifecycle::append_listing_created(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(listing, &station),
+        )
+        .map_err(marketplace_err)?;
+        // Bring browse in step in the same call that published, so a listing is
+        // findable the moment the command returns rather than at the next boot.
+        self.reindex_listing(&listing_id);
+
+        ok(&rpc::CreateListingResult {
+            listing_id: hex(&listing_id.to_bytes()),
+            oracle_tier,
+        })
+    }
+
+    /// `marketplace_close_listing` — withdraw one of the station's own listings.
+    ///
+    /// Always `ProviderClosed`: this path signs as the provider, and the two
+    /// station-signable reasons belong to the sweep and to housekeeping, not to a
+    /// person asking for their offer to come down.
+    fn m_marketplace_close_listing(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::CloseListingParams = parse_params(req)?;
+        let listing_id = parse_listing_id(&params.listing_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+
+        let record = ListingClosed {
+            listing_id,
+            reason: CloseReason::ProviderClosed,
+            closed_at: now,
+        };
+        let mut log = AppendLog::new(&self.db);
+        append_listing_closed(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(record, &station),
+            &station_pk,
+        )
+        .map_err(marketplace_err)?;
+        self.reindex_listing(&listing_id);
+
+        ok(&rpc::CloseListingResult {
+            listing_id: params.listing_id,
+            reason: "provider_closed".into(),
+        })
+    }
+
+    /// `marketplace_my_listings` — every listing this station has published, in
+    /// whatever state, newest first.
+    fn m_marketplace_my_listings(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let now = self.clock.now();
+        let station = self.wallet.address.public_key();
+        let listings = marketplace_view::my_listings(&self.db, &self.wallet.address, station, now)
+            .map_err(internal)?;
+        ok(&serde_json::json!({ "listings": listings }))
+    }
+
+    /// `marketplace_announce_need` — state what this station is looking for.
+    ///
+    /// Returns the log seq, which is how a need is named: needs are not
+    /// content-addressed (see [`rrn_marketplace::need::AnnouncedNeed`]).
+    fn m_marketplace_announce_need(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::AnnounceNeedParams = parse_params(req)?;
+        let station = self.station_keypair();
+        let need = rrn_marketplace::need::Need::new(
+            self.wallet.address,
+            params.category,
+            params.quantity_needed,
+            params.max_price_centi,
+            params.valid_until,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+
+        let mut log = AppendLog::new(&self.db);
+        let entry = rrn_marketplace::need::append_need_announced(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(need, &station),
+        )
+        .map_err(marketplace_err)?;
+
+        ok(&rpc::AnnounceNeedResult { seq: entry.seq })
+    }
+
+    /// `marketplace_matches` — the listings answering this station's needs, one
+    /// group per need. With no `seq`, every need it has announced; with one, just
+    /// that need.
+    fn m_marketplace_matches(
+        &self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::MatchesParams = if req.params.is_null() {
+            rpc::MatchesParams::default()
+        } else {
+            parse_params(req)?
+        };
+        let now = self.clock.now();
+        let log = AppendLog::new(&self.db);
+        let mut announced =
+            rrn_marketplace::need::announced_needs(&log, &self.wallet.address).map_err(internal)?;
+        if let Some(seq) = params.seq {
+            announced.retain(|a| a.seq == seq);
+            if announced.is_empty() {
+                return Err(invalid_params(format!(
+                    "no need announced by this station at log seq {seq}"
+                )));
+            }
+        }
+
+        let mut needs = Vec::with_capacity(announced.len());
+        for entry in announced {
+            // An expired need matches nothing, and `find_matches` says so by
+            // returning empty. The row carries `expired` so the difference
+            // between "stale" and "nothing on offer" is visible.
+            let listings = marketplace_view::matches(&self.listings, &self.db, &entry.need, now)
+                .map_err(internal)?;
+            let expired = entry.need.has_expired(now);
+            needs.push(marketplace_view::NeedMatchRow {
+                seq: entry.seq,
+                category: entry.need.category,
+                quantity_needed: entry.need.quantity_needed,
+                max_price_centi: entry.need.max_price_centi,
+                valid_until: entry.need.valid_until,
+                expired,
+                listings,
+            });
+        }
+        ok(&serde_json::json!({ "needs": needs }))
     }
 
     fn m_backup_export(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -1333,50 +1558,15 @@ impl Core {
         &mut self,
         envelope: &RequestEnvelope,
     ) -> Result<serde_json::Value, (i32, String)> {
-        #[derive(serde::Deserialize)]
-        struct Params {
-            text: Option<String>,
-            surface: Option<String>,
-            category: Option<String>,
-            max_price_centi: Option<i64>,
-            min_provider_reputation: Option<f32>,
-            limit: Option<usize>,
-            offset: Option<usize>,
-        }
         // An empty body is a valid "show me everything" search.
-        let params: Params = if envelope.params.trim().is_empty() {
+        let params: rpc::SearchParams = if envelope.params.trim().is_empty() {
             serde_json::from_str("{}")
         } else {
             serde_json::from_str(&envelope.params)
         }
         .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
-
-        // An unknown surface is refused rather than ignored: silently dropping
-        // the filter would answer a question the caller did not ask.
-        let surface = match params.surface.as_deref() {
-            None => None,
-            Some(tag) => Some(Surface::from_tag(tag).ok_or_else(|| {
-                (
-                    rpc::INVALID_PARAMS,
-                    format!("unknown surface: {tag} (goods, services, or commons)"),
-                )
-            })?),
-        };
-
-        let default = SearchQuery::default();
-        let query = SearchQuery {
-            text: params.text,
-            surface,
-            category: params.category,
-            max_price_centi: params.max_price_centi,
-            min_provider_reputation: params.min_provider_reputation,
-            limit: params.limit.unwrap_or(default.limit),
-            offset: params.offset.unwrap_or(default.offset),
-        };
-        let now = self.clock.now();
-        let listings = marketplace_view::search(&self.listings, &self.db, query, now)
-            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
-        Ok(serde_json::json!({ "listings": listings }))
+        self.run_marketplace_search(params)
+            .map_err(|e| (e.code, e.message))
     }
 
     /// `marketplace_listing` — one listing in full, by hex `listing_id`
@@ -1392,19 +1582,57 @@ impl Core {
         }
         let params: Params = serde_json::from_str(&envelope.params)
             .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
-        let listing_id = parse_listing_id(&params.listing_id)?;
+        self.run_marketplace_listing(&params.listing_id)
+            .map_err(|e| (e.code, e.message))
+    }
+
+    /// The browse read itself, shared by the mobile channel and the CLI socket
+    /// (T1.7.3). One query with one meaning however it arrived — the transports
+    /// differ in who is asking, not in what browse is.
+    fn run_marketplace_search(
+        &self,
+        params: rpc::SearchParams,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        // An unknown surface is refused rather than ignored: silently dropping
+        // the filter would answer a question the caller did not ask.
+        let surface = match params.surface.as_deref() {
+            None => None,
+            Some(tag) => Some(Surface::from_tag(tag).ok_or_else(|| {
+                invalid_params(format!(
+                    "unknown surface: {tag} (goods, services, or commons)"
+                ))
+            })?),
+        };
+
+        let default = SearchQuery::default();
+        let query = SearchQuery {
+            text: params.text,
+            surface,
+            category: params.category,
+            max_price_centi: params.max_price_centi,
+            min_provider_reputation: params.min_provider_reputation,
+            limit: params.limit.unwrap_or(default.limit),
+            offset: params.offset.unwrap_or(default.offset),
+        };
+        let now = self.clock.now();
+        let listings =
+            marketplace_view::search(&self.listings, &self.db, query, now).map_err(internal)?;
+        ok(&serde_json::json!({ "listings": listings }))
+    }
+
+    /// The detail read itself, shared by both transports as
+    /// [`Self::run_marketplace_search`] is.
+    fn run_marketplace_listing(
+        &self,
+        listing_id: &str,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let listing_id = parse_listing_id(listing_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
         let now = self.clock.now();
         let station = self.wallet.address.public_key();
-        match marketplace_view::detail(&self.db, &listing_id, station, now)
-            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
-        {
-            Some(view) => {
-                serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
-            }
-            None => Err((
-                rpc::INVALID_PARAMS,
-                "no such listing on this station".into(),
-            )),
+        match marketplace_view::detail(&self.db, &listing_id, station, now).map_err(internal)? {
+            Some(view) => ok(&view),
+            None => Err(invalid_params("no such listing on this station")),
         }
     }
 
@@ -1555,6 +1783,67 @@ fn internal(e: impl std::fmt::Display) -> rpc::RpcError {
     rpc::RpcError {
         code: rpc::INTERNAL_ERROR,
         message: e.to_string(),
+    }
+}
+
+/// The oracle tier a listing at this price defaults to — the bottom of the M1.8
+/// ladder for small trades, the next rung above it for the rest.
+///
+/// Phase 1 supports tiers 1 and 2 only
+/// ([`ORACLE_TIER_MAX`](rrn_marketplace::listing::ORACLE_TIER_MAX)), so the
+/// ladder's higher rungs cannot be suggested yet however large the amount: a
+/// 500-Commons listing gets tier 2 and an explicit `--oracle-tier` is refused
+/// above the range by `validate`. Commons-surface subsidies can be negative,
+/// which the absolute value folds in with small trades where they belong.
+fn suggest_oracle_tier(amount_centi: i64) -> u8 {
+    // 5 Commons, the boundary the M1.8.2 ladder puts between tier 1 and tier 2.
+    const TIER_2_FROM_CENTI: i64 = 500;
+    if amount_centi.saturating_abs() < TIER_2_FROM_CENTI {
+        1
+    } else {
+        2
+    }
+}
+
+/// The availability a new listing records, given what the caller supplied.
+///
+/// The three surfaces mean different things by "available": Goods have a count,
+/// Services have a next slot, and Commons have neither. Each surface keeps only
+/// the field that means something to it, so a `--capacity` passed to a Services
+/// listing is dropped rather than recorded as a number nothing will read.
+/// `capacity: Some(0)` is honored as sold out, since that is a thing a provider
+/// may legitimately say.
+fn availability_for(
+    surface: Surface,
+    capacity: Option<u32>,
+    next_slot: Option<i64>,
+) -> rrn_marketplace::listing::Availability {
+    use rrn_marketplace::listing::{Availability, AvailabilityStatus};
+    let (capacity, next_slot) = match surface {
+        Surface::Goods => (capacity, None),
+        Surface::Services => (None, next_slot),
+        Surface::Commons => (None, None),
+    };
+    let status = match capacity {
+        Some(0) => AvailabilityStatus::Unavailable,
+        _ => AvailabilityStatus::Available,
+    };
+    Availability {
+        status,
+        capacity,
+        next_slot,
+    }
+}
+
+/// Maps a marketplace error to an RPC error. A rule the caller's own request
+/// broke — an unknown category, a listing that is not theirs to close, one
+/// already closed — is their mistake to fix; only storage and index trouble is
+/// ours.
+fn marketplace_err(e: rrn_marketplace::Error) -> rpc::RpcError {
+    use rrn_marketplace::Error::*;
+    match e {
+        Storage(_) | Tantivy(_) | Index(_) => internal(e),
+        Listing(_) | Lifecycle(_) | Need(_) => invalid_params(e.to_string()),
     }
 }
 
@@ -1952,6 +2241,416 @@ mod tests {
         let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
         let result = core.route_channel_method(&env).unwrap();
         assert_eq!(result["listings"].as_array().unwrap().len(), 1);
+    }
+
+    // --- operator marketplace (T1.7.3) --------------------------------------
+
+    /// A CLI-style call: the operator's socket, no envelope and no signer, since
+    /// the station's own wallet is the identity every write here is signed by.
+    fn call(core: &mut Core, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let req = rpc::Request {
+            id: "1".into(),
+            method: method.into(),
+            params,
+        };
+        core.handle_call(&req).unwrap()
+    }
+
+    fn call_err(core: &mut Core, method: &str, params: serde_json::Value) -> rpc::RpcError {
+        let req = rpc::Request {
+            id: "1".into(),
+            method: method.into(),
+            params,
+        };
+        core.handle_call(&req).unwrap_err()
+    }
+
+    /// The params a `rrn list` invocation sends for a plain Goods listing.
+    fn create_params(title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "surface": "goods",
+            "category": "food",
+            "title": title,
+            "description": "Picked this week.",
+            "amount_centi": 250,
+            "capacity": 12,
+        })
+    }
+
+    #[test]
+    fn cli_creates_a_listing_that_browse_finds_immediately() {
+        let mut core = test_core();
+        let created = call(
+            &mut core,
+            "marketplace_create_listing",
+            create_params("Squash"),
+        );
+        let listing_id = created["listing_id"].as_str().unwrap().to_string();
+        assert_eq!(listing_id.len(), 64, "a content address in hex");
+
+        // Findable in the same process, without waiting for the boot rebuild —
+        // the create path reindexes rather than leaving that to the next start.
+        let browsed = call(&mut core, "marketplace_search", serde_json::Value::Null);
+        let rows = browsed["listings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "Squash");
+        assert_eq!(rows[0]["listing_id"], listing_id);
+        // The station is the provider on this path: an operator's listing is
+        // published under the station's own identity.
+        assert_eq!(rows[0]["provider"], core.wallet.address.to_string());
+
+        // And the detail read agrees with the card.
+        let detail = call(
+            &mut core,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": listing_id }),
+        );
+        assert_eq!(detail["state"], "active");
+        assert_eq!(detail["description"], "Picked this week.");
+        assert_eq!(detail["availability"]["capacity"], 12);
+    }
+
+    #[test]
+    fn a_created_listings_oracle_tier_follows_the_price_unless_it_is_given() {
+        let mut core = test_core();
+        // Under 5 Commons → tier 1; at or above → tier 2 (the M1.8.2 ladder).
+        let mut params = create_params("Cheap squash");
+        params["amount_centi"] = serde_json::json!(499);
+        assert_eq!(
+            call(&mut core, "marketplace_create_listing", params)["oracle_tier"],
+            1
+        );
+
+        let mut params = create_params("Dear squash");
+        params["amount_centi"] = serde_json::json!(500);
+        assert_eq!(
+            call(&mut core, "marketplace_create_listing", params)["oracle_tier"],
+            2
+        );
+
+        // An explicit tier overrides the suggestion.
+        let mut params = create_params("Squash, tier by hand");
+        params["amount_centi"] = serde_json::json!(100);
+        params["oracle_tier"] = serde_json::json!(2);
+        assert_eq!(
+            call(&mut core, "marketplace_create_listing", params)["oracle_tier"],
+            2
+        );
+
+        // And one outside the Phase-1 range is the caller's mistake.
+        let mut params = create_params("Squash, tier 9");
+        params["oracle_tier"] = serde_json::json!(9);
+        assert_eq!(
+            call_err(&mut core, "marketplace_create_listing", params).code,
+            rpc::INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn creating_a_listing_refuses_a_bad_surface_category_and_price() {
+        let mut core = test_core();
+
+        let mut params = create_params("Squash");
+        params["surface"] = serde_json::json!("livestock");
+        let err = call_err(&mut core, "marketplace_create_listing", params);
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        assert!(err.message.contains("livestock"), "{}", err.message);
+
+        let mut params = create_params("Squash");
+        params["category"] = serde_json::json!("cryptocurrency");
+        let err = call_err(&mut core, "marketplace_create_listing", params);
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        assert!(err.message.contains("cryptocurrency"), "{}", err.message);
+
+        // A negative price is a subsidy, legal only on the Commons surface.
+        let mut params = create_params("Squash, but we pay you");
+        params["amount_centi"] = serde_json::json!(-250);
+        assert_eq!(
+            call_err(&mut core, "marketplace_create_listing", params).code,
+            rpc::INVALID_PARAMS
+        );
+
+        let mut params = create_params("Watch the grain store");
+        params["surface"] = serde_json::json!("commons");
+        params["amount_centi"] = serde_json::json!(-250);
+        call(&mut core, "marketplace_create_listing", params);
+    }
+
+    #[test]
+    fn availability_keeps_only_what_the_surface_means_by_it() {
+        let mut core = test_core();
+        // A Services listing's capacity is dropped and its slot kept; the Goods
+        // case is covered by the create test above.
+        let mut params = create_params("Cart repair, by appointment");
+        params["surface"] = serde_json::json!("services");
+        params["category"] = serde_json::json!("tools");
+        params["next_slot"] = serde_json::json!(NOW + 3_600);
+        let created = call(&mut core, "marketplace_create_listing", params);
+
+        let detail = call(
+            &mut core,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": created["listing_id"] }),
+        );
+        assert!(detail["availability"]["capacity"].is_null());
+        assert_eq!(detail["availability"]["next_slot"], NOW + 3_600);
+
+        // Zero units is a provider saying "sold out", not an error.
+        let mut params = create_params("Squash, all gone");
+        params["capacity"] = serde_json::json!(0);
+        let created = call(&mut core, "marketplace_create_listing", params);
+        let detail = call(
+            &mut core,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": created["listing_id"] }),
+        );
+        assert_eq!(detail["availability"]["status"], "unavailable");
+    }
+
+    #[test]
+    fn closing_a_listing_takes_it_off_browse_and_keeps_it_in_my_listings() {
+        let mut core = test_core();
+        let created = call(
+            &mut core,
+            "marketplace_create_listing",
+            create_params("Squash"),
+        );
+        let listing_id = created["listing_id"].as_str().unwrap().to_string();
+
+        let closed = call(
+            &mut core,
+            "marketplace_close_listing",
+            serde_json::json!({ "listing_id": listing_id }),
+        );
+        // Never `expiration_reached`: a station may not claim a provider
+        // withdrew, and this path is the provider withdrawing.
+        assert_eq!(closed["reason"], "provider_closed");
+
+        let browsed = call(&mut core, "marketplace_search", serde_json::Value::Null);
+        assert!(browsed["listings"].as_array().unwrap().is_empty());
+
+        // Off offer but not gone: a closed listing that vanished would read as
+        // deleted to the provider who closed it.
+        let mine = call(
+            &mut core,
+            "marketplace_my_listings",
+            serde_json::Value::Null,
+        );
+        let rows = mine["listings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["state"], "closed");
+        assert_eq!(rows[0]["close_reason"], "provider_closed");
+
+        // Closing it twice is the caller's mistake, reported as such.
+        let err = call_err(
+            &mut core,
+            "marketplace_close_listing",
+            serde_json::json!({ "listing_id": listing_id }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn closing_someone_elses_listing_is_refused() {
+        let mut core = test_core();
+        // Published by another member, so the station is not its provider.
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Not yours to withdraw", None);
+        publish(&mut core, &provider, &listing);
+
+        let err = call_err(
+            &mut core,
+            "marketplace_close_listing",
+            serde_json::json!({ "listing_id": hex(&listing.id.to_bytes()) }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        // Still on offer.
+        let browsed = call(&mut core, "marketplace_search", serde_json::Value::Null);
+        assert_eq!(browsed["listings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn my_listings_shows_only_the_stations_own_newest_first() {
+        let mut core = test_core();
+        let other = Keypair::generate();
+        let theirs = test_listing(&other, "Someone else's squash", None);
+        publish(&mut core, &other, &theirs);
+
+        // The core's clock does not move, so both of these are created at NOW and
+        // the tie-break on listing id is what orders them deterministically.
+        call(
+            &mut core,
+            "marketplace_create_listing",
+            create_params("Mine A"),
+        );
+        call(
+            &mut core,
+            "marketplace_create_listing",
+            create_params("Mine B"),
+        );
+
+        let mine = call(
+            &mut core,
+            "marketplace_my_listings",
+            serde_json::Value::Null,
+        );
+        let rows = mine["listings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "another member's listing is not mine");
+        let titles: Vec<&str> = rows.iter().map(|r| r["title"].as_str().unwrap()).collect();
+        assert!(titles.contains(&"Mine A") && titles.contains(&"Mine B"));
+        for row in rows {
+            assert_eq!(row["provider"], core.wallet.address.to_string());
+            assert_eq!(row["state"], "active");
+        }
+    }
+
+    #[test]
+    fn a_need_matches_the_listing_that_answers_it() {
+        let mut core = test_core();
+        // Someone else is offering food; the station announces it wants food.
+        let provider = Keypair::generate();
+        let listing = test_listing(&provider, "Winter squash, by the crate", None);
+        publish(&mut core, &provider, &listing);
+
+        let announced = call(
+            &mut core,
+            "marketplace_announce_need",
+            serde_json::json!({
+                "category": "food",
+                "quantity_needed": 6,
+                "max_price_centi": 300,
+                "valid_until": NOW + 10_000,
+            }),
+        );
+        let seq = announced["seq"].as_u64().unwrap();
+        assert!(seq > 0, "a need is named by its log seq");
+
+        let matched = call(&mut core, "marketplace_matches", serde_json::Value::Null);
+        let needs = matched["needs"].as_array().unwrap();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0]["seq"], seq);
+        assert_eq!(needs[0]["expired"], false);
+        let listings = needs[0]["listings"].as_array().unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0]["title"], "Winter squash, by the crate");
+
+        // Asking for that one need by seq is the same answer.
+        let one = call(
+            &mut core,
+            "marketplace_matches",
+            serde_json::json!({ "seq": seq }),
+        );
+        assert_eq!(one["needs"].as_array().unwrap().len(), 1);
+
+        // A seq that is not one of ours is a caller mistake, not an empty list.
+        let err = call_err(
+            &mut core,
+            "marketplace_matches",
+            serde_json::json!({ "seq": 9_999 }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn a_needs_price_ceiling_and_expiry_both_bound_its_matches() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        // Priced at 250 by `test_listing`.
+        let listing = test_listing(&provider, "Winter squash", None);
+        publish(&mut core, &provider, &listing);
+
+        // A ceiling under the asking price matches nothing.
+        call(
+            &mut core,
+            "marketplace_announce_need",
+            serde_json::json!({
+                "category": "food",
+                "quantity_needed": 1,
+                "max_price_centi": 100,
+                "valid_until": NOW + 10_000,
+            }),
+        );
+        // An expired need matches nothing whatever is on offer, and says why.
+        call(
+            &mut core,
+            "marketplace_announce_need",
+            serde_json::json!({
+                "category": "food",
+                "quantity_needed": 1,
+                "valid_until": NOW - 1,
+            }),
+        );
+
+        let matched = call(&mut core, "marketplace_matches", serde_json::Value::Null);
+        let needs = matched["needs"].as_array().unwrap();
+        assert_eq!(needs.len(), 2);
+        assert_eq!(needs[0]["expired"], false);
+        assert!(needs[0]["listings"].as_array().unwrap().is_empty());
+        assert_eq!(needs[1]["expired"], true);
+        assert!(needs[1]["listings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn announcing_a_need_refuses_an_unknown_category_and_a_zero_quantity() {
+        let mut core = test_core();
+        let err = call_err(
+            &mut core,
+            "marketplace_announce_need",
+            serde_json::json!({
+                "category": "cryptocurrency",
+                "quantity_needed": 1,
+                "valid_until": NOW + 10_000,
+            }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+
+        let err = call_err(
+            &mut core,
+            "marketplace_announce_need",
+            serde_json::json!({
+                "category": "food",
+                "quantity_needed": 0,
+                "valid_until": NOW + 10_000,
+            }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn the_cli_and_the_mobile_read_the_same_browse() {
+        let mut core = test_core();
+        call(
+            &mut core,
+            "marketplace_create_listing",
+            create_params("Squash"),
+        );
+
+        // Same query, two transports, one answer — the point of routing both
+        // through `run_marketplace_search`.
+        let over_socket = call(&mut core, "marketplace_search", serde_json::json!({}));
+        let mobile = Keypair::generate();
+        let env = envelope(&mobile, "marketplace_search", serde_json::json!({}));
+        let over_channel = core.route_channel_method(&env).unwrap();
+        assert_eq!(over_socket, over_channel);
+    }
+
+    #[test]
+    fn browse_over_the_socket_clamps_an_oversized_limit_too() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        for i in 0..(marketplace_view::MAX_SEARCH_LIMIT + 1) {
+            let listing = test_listing(&provider, &format!("Crate {i} of squash"), None);
+            publish(&mut core, &provider, &listing);
+        }
+        let browsed = call(
+            &mut core,
+            "marketplace_search",
+            serde_json::json!({ "limit": 100_000 }),
+        );
+        assert_eq!(
+            browsed["listings"].as_array().unwrap().len(),
+            marketplace_view::MAX_SEARCH_LIMIT
+        );
     }
 
     #[test]

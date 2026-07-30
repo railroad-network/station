@@ -39,6 +39,14 @@ use rrn_storage::log::AppendLog;
 
 use crate::reputation_view::band_name;
 
+/// The controlled category vocabulary, re-exported so a client can name it
+/// without depending on [`rrn_marketplace`] directly.
+///
+/// The CLI builds `--category`'s accepted values from this (T1.7.3), which is the
+/// same reason it shares [`crate::rpc`]'s wire types rather than restating them: a
+/// second copy of the list would drift, and expanding it is a protocol change.
+pub use rrn_marketplace::listing::CATEGORIES;
+
 /// The most listings one search may return, however large a `limit` the caller
 /// sends. Generous next to a phone screen (a page is ~20 rows) and small enough
 /// that a hostile client cannot make one request expensive.
@@ -125,6 +133,44 @@ pub struct ListingDetailView {
     pub provider_vouches_received: u64,
 }
 
+/// One of the caller's own listings, whatever state it is in.
+///
+/// The browse card plus its lifecycle, which is the difference between "what can
+/// I buy" and "what have I put up": a provider's own list has to show the closed
+/// and expired ones too, or a listing that quietly went off offer looks deleted.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MyListingRow {
+    /// The same fields a browse card carries.
+    #[serde(flatten)]
+    pub card: ListingCard,
+    /// `active`, `closed`, or `expired`.
+    pub state: &'static str,
+    /// Why it closed, when `state` is `closed`.
+    pub close_reason: Option<&'static str>,
+    /// Unix seconds it closed, when `state` is `closed`.
+    pub closed_at: Option<i64>,
+}
+
+/// One of the caller's needs and the listings currently answering it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct NeedMatchRow {
+    /// The log sequence number identifying the need.
+    pub seq: u64,
+    /// The need's category.
+    pub category: String,
+    /// How many units were asked for.
+    pub quantity_needed: u32,
+    /// The price ceiling, if the seeker set one.
+    pub max_price_centi: Option<i64>,
+    /// Unix seconds through which the need stands.
+    pub valid_until: i64,
+    /// Whether `valid_until` has passed. An expired need matches nothing, and
+    /// saying so beats an empty list the seeker has to explain to themselves.
+    pub expired: bool,
+    /// The listings that answer it, best match first.
+    pub listings: Vec<ListingCard>,
+}
+
 /// Runs a search and shapes the hits into cards, clamping `limit` to
 /// [`MAX_SEARCH_LIMIT`].
 ///
@@ -195,6 +241,83 @@ pub fn detail(
         },
         provider_vouches_received: vouches,
     }))
+}
+
+/// Every listing `provider` has published on this log, newest first, in whatever
+/// state it is now in.
+///
+/// Reads from the **log** rather than the index for the reason [`detail`] does,
+/// and one the index could not satisfy anyway: the index holds only what is on
+/// offer, and this list is mostly interesting for the entries that no longer are.
+/// One replay per call, which is what a provider's own list of a handful of
+/// listings costs — [`search`] is the path that had to be cheap.
+pub fn my_listings(
+    db: &Database,
+    provider: &Address,
+    station: &rrn_crypto::keypair::PublicKey,
+    now: i64,
+) -> rrn_marketplace::Result<Vec<MyListingRow>> {
+    let log = AppendLog::new(db);
+    let composite = provider_composite(db, provider, now);
+    let mut rows: Vec<MyListingRow> = rrn_marketplace::lifecycle::compute_all(&log, station, now)?
+        .into_values()
+        .filter_map(|state| {
+            let listing = state.listing().filter(|l| l.provider == *provider)?;
+            Some(MyListingRow {
+                card: card_of(listing, composite),
+                state: state_name(&state),
+                close_reason: match &state {
+                    ListingState::Closed { reason, .. } => Some(close_reason_name(*reason)),
+                    _ => None,
+                },
+                closed_at: match &state {
+                    ListingState::Closed { closed_at, .. } => Some(*closed_at),
+                    _ => None,
+                },
+            })
+        })
+        .collect();
+    // `compute_all` keys by content address, which is a stable order but not a
+    // meaningful one. A provider reads their own list chronologically.
+    rows.sort_by(|a, b| {
+        b.card
+            .created_at
+            .cmp(&a.card.created_at)
+            .then_with(|| a.card.listing_id.cmp(&b.card.listing_id))
+    });
+    Ok(rows)
+}
+
+/// The active listings that answer one need, best match first, as browse cards.
+///
+/// Ranking and the fill-fraction weighting are [`rrn_marketplace::need`]'s
+/// (T1.6.7); this only shapes the result, so a match list and a browse list
+/// render through the same card.
+///
+/// `find_matches` returns listings rather than ranked hits, so unlike [`search`]
+/// this cannot reuse the composite ranking already read and has to look each
+/// provider up. The lookups are memoized per provider: the snapshot cache is a
+/// database read, and one member offering several of the matched listings is the
+/// common shape of a small market.
+pub fn matches(
+    index: &SearchIndex,
+    db: &Database,
+    need: &rrn_marketplace::need::Need,
+    now: i64,
+) -> rrn_marketplace::Result<Vec<ListingCard>> {
+    // Keyed by the provider's public-key bytes: `Address` is not `Ord`, and the
+    // bytes are what identity it is anyway.
+    let mut composites: std::collections::BTreeMap<[u8; 32], f32> =
+        std::collections::BTreeMap::new();
+    Ok(rrn_marketplace::need::find_matches(index, db, need, now)?
+        .iter()
+        .map(|listing| {
+            let composite = *composites
+                .entry(listing.provider.public_key().to_bytes())
+                .or_insert_with(|| provider_composite(db, &listing.provider, now));
+            card_of(listing, composite)
+        })
+        .collect())
 }
 
 /// The provider's current composite from the snapshot cache, or `0.0` on a miss.

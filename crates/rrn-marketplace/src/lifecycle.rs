@@ -788,13 +788,13 @@ pub enum LifecycleError {
         claimed: Address,
     },
     /// A listing with this id is already on the log.
-    #[error("listing {0:?} has already been created")]
+    #[error("listing {0} has already been created")]
     AlreadyCreated(ListingId),
     /// No creation record for this id — nothing to update or close.
-    #[error("no listing {0:?} on this log")]
+    #[error("no listing {0} on this log")]
     UnknownListing(ListingId),
     /// The listing is already closed; `Closed` is terminal.
-    #[error("listing {listing_id:?} was closed at {closed_at}")]
+    #[error("listing {listing_id} was closed at {closed_at}")]
     AlreadyClosed {
         /// The listing.
         listing_id: ListingId,
@@ -802,7 +802,7 @@ pub enum LifecycleError {
         closed_at: i64,
     },
     /// An update that changes nothing — a permanent log entry for no effect.
-    #[error("update to listing {0:?} changes nothing")]
+    #[error("update to listing {0} changes nothing")]
     EmptyPatch(ListingId),
     /// This signer may not close the listing for this reason. In particular the
     /// station may attest to expiry or cleanup but never to a provider's

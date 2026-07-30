@@ -90,6 +90,16 @@ impl ListingId {
     }
 }
 
+/// Bare hex, the form a listing id takes everywhere a person meets one — a CLI
+/// argument, a wire field, an error message. `Debug` stays wrapped
+/// (`ListingId(Hash(…))`) for panics and assertions; error text uses this, since
+/// `{listing_id:?}` in a message a member reads is a leaked Rust type name.
+impl std::fmt::Display for ListingId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // A total order over the hash bytes, so a `ListingId` can key a `BTreeMap`
 // during replay. Content, not chronology: arbitrary but identical everywhere.
 impl Ord for ListingId {
