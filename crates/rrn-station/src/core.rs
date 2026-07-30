@@ -1364,6 +1364,9 @@ impl Core {
             "reputation_band" => self.channel_reputation_band(envelope),
             "marketplace_search" => self.channel_marketplace_search(envelope),
             "marketplace_listing" => self.channel_marketplace_listing(envelope),
+            "submit_listing" => self.channel_submit_listing(envelope),
+            "submit_listing_close" => self.channel_submit_listing_close(envelope),
+            "marketplace_my_listings" => self.channel_marketplace_my_listings(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -1465,6 +1468,114 @@ impl Core {
         let mut log = AppendLog::new(&self.db);
         append_vouch(&mut log, signed).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "vouch_id": vouch_id }))
+    }
+
+    /// `submit_listing` — accept a mobile-signed [`SignedListing`] and publish it
+    /// (T1.7.2). The member is the provider and signs the listing on the phone,
+    /// exactly as they sign a vouch; the station verifies the signature, that the
+    /// signer is this paired mobile, and that the listing names this station's
+    /// community, then leaves signer-is-provider, self-validity, and
+    /// no-duplicate-id to [`append_listing_created`] — so the local write path and
+    /// replay's `scan` agree by construction. `params` carries the canonical dCBOR
+    /// of the signed listing, hex-encoded.
+    fn channel_submit_listing(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_listing")?;
+        let signed: rrn_marketplace::listing::SignedListing =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed listing".into()))?;
+        // A mobile submits only listings it signed: the provider must be the
+        // authenticated signer bound to this paired mobile.
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "provider is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "listing signature does not verify".into(),
+            )
+        })?;
+        // A member publishes into the community this station serves, not an
+        // arbitrary string they happened to sign — the same reason the operator
+        // path stamps the community rather than taking it from the request.
+        if signed.payload.community.as_str() != VOUCH_COMMUNITY {
+            return Err((
+                rpc::INVALID_PARAMS,
+                format!(
+                    "listing community {:?} is not this station's community",
+                    signed.payload.community
+                ),
+            ));
+        }
+        let listing_id = signed.payload.id;
+        let oracle_tier = signed.payload.oracle_tier;
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::lifecycle::append_listing_created(&mut log, signed)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        // Bring browse in step in the same call that published, as the operator
+        // path does, so the listing is findable the moment the reply returns.
+        self.reindex_listing(&listing_id);
+        Ok(serde_json::json!({
+            "listing_id": hex(&listing_id.to_bytes()),
+            "oracle_tier": oracle_tier,
+        }))
+    }
+
+    /// `submit_listing_close` — accept a mobile-signed [`SignedListingClose`] and
+    /// take the member's own listing off offer (T1.7.2). A provider may only sign
+    /// `ProviderClosed`; entitlement, existence, and not-already-closed are
+    /// [`append_listing_closed`]'s to enforce.
+    fn channel_submit_listing_close(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_listing_close")?;
+        let signed: rrn_marketplace::lifecycle::SignedListingClose =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed close".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "closer is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "close signature does not verify".into(),
+            )
+        })?;
+        let listing_id = signed.payload.listing_id;
+        let station_pk = self.station_keypair().public_key();
+        let mut log = AppendLog::new(&self.db);
+        append_listing_closed(&mut log, signed, &station_pk)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        self.reindex_listing(&listing_id);
+        Ok(serde_json::json!({
+            "listing_id": hex(&listing_id.to_bytes()),
+            "reason": "provider_closed",
+        }))
+    }
+
+    /// `marketplace_my_listings` — the authenticated mobile's own listings, in
+    /// whatever state, newest first (T1.7.2). The member is the signer, not a
+    /// param, so a mobile only ever reads its own; the operator's socket keeps its
+    /// station-scoped variant ([`Self::m_marketplace_my_listings`]).
+    fn channel_marketplace_my_listings(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let address = Address::from_public_key(envelope.signer);
+        let now = self.clock.now();
+        let station = self.wallet.address.public_key();
+        let listings = marketplace_view::my_listings(&self.db, &address, station, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({ "listings": listings }))
     }
 
     /// `vouch_counts` — the authenticated mobile's own vouching tallies (T1.4.4):
