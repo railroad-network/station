@@ -20,8 +20,8 @@ use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    CreateListingResult, HistoryResult, ProposeResult, RecoverImportResult, VouchResult,
-    WhoamiResult,
+    CreateListingResult, HistoryResult, InquireResult, InquiryStateResult, ProposeResult,
+    RecoverImportResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -242,6 +242,47 @@ enum Command {
     Matches {
         /// The log seq of one need (from `rrn need`); omitted means all of them.
         seq: Option<u64>,
+    },
+    /// Open an inquiry against a listing.
+    Inquire {
+        /// The hex listing id.
+        listing_id: String,
+        /// Your opening offer, in Commons; omitted accepts the listed price.
+        #[arg(long, allow_hyphen_values = true)]
+        offer: Option<String>,
+        /// An opening message.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Show one inquiry thread in full.
+    ShowInquiry {
+        /// The hex inquiry id.
+        inquiry_id: String,
+    },
+    /// Show the inquiries you are a party to.
+    Inquiries,
+    /// Reply in an inquiry, optionally with a counter-offer.
+    InquiryReply {
+        /// The hex inquiry id.
+        inquiry_id: String,
+        /// A counter-offer, in Commons.
+        #[arg(long, allow_hyphen_values = true)]
+        offer: Option<String>,
+        /// The message body.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Close an inquiry: agree on a price, or decline.
+    InquiryClose {
+        /// The hex inquiry id.
+        inquiry_id: String,
+        /// How it ends.
+        #[arg(long, value_parser = PossibleValuesParser::new(["agreed", "declined"]))]
+        outcome: String,
+        /// The agreed price, in Commons (for `--outcome agreed`); omitted takes
+        /// the listed price.
+        #[arg(long, allow_hyphen_values = true)]
+        price: Option<String>,
     },
 }
 
@@ -497,6 +538,70 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let v = client.call("marketplace_matches", params).await?;
             emit(fmt, &v, || Ok(render_matches(&v["needs"], color)))
+        }
+        Command::Inquire {
+            listing_id,
+            offer,
+            message,
+        } => {
+            let mut params = json!({ "listing_id": listing_id });
+            if let Some(m) = message {
+                params["message"] = json!(m);
+            }
+            if let Some(o) = offer {
+                params["offer_centi"] = json!(parse_signed_amount(&o)?);
+            }
+            let v = client.call("marketplace_inquire", params).await?;
+            emit(fmt, &v, || {
+                let r: InquireResult = parse(&v)?;
+                Ok(r.inquiry_id)
+            })
+        }
+        Command::ShowInquiry { inquiry_id } => {
+            let v = client
+                .call(
+                    "marketplace_inquiry_thread",
+                    json!({ "inquiry_id": inquiry_id }),
+                )
+                .await?;
+            emit(fmt, &v, || Ok(render_thread(&v, color)))
+        }
+        Command::Inquiries => {
+            let v = client.call("marketplace_my_inquiries", json!({})).await?;
+            emit(fmt, &v, || Ok(render_inquiries(&v["inquiries"], color)))
+        }
+        Command::InquiryReply {
+            inquiry_id,
+            offer,
+            message,
+        } => {
+            let mut params = json!({ "inquiry_id": inquiry_id });
+            if let Some(m) = message {
+                params["message"] = json!(m);
+            }
+            if let Some(o) = offer {
+                params["counter_offer_centi"] = json!(parse_signed_amount(&o)?);
+            }
+            let v = client.call("marketplace_inquiry_message", params).await?;
+            emit(fmt, &v, || {
+                let r: InquireResult = parse(&v)?;
+                Ok(r.inquiry_id)
+            })
+        }
+        Command::InquiryClose {
+            inquiry_id,
+            outcome,
+            price,
+        } => {
+            let mut params = json!({ "inquiry_id": inquiry_id, "outcome": outcome });
+            if let Some(p) = price {
+                params["final_price_centi"] = json!(parse_signed_amount(&p)?);
+            }
+            let v = client.call("marketplace_inquiry_close", params).await?;
+            emit(fmt, &v, || {
+                let r: InquiryStateResult = parse(&v)?;
+                Ok(r.state)
+            })
         }
         Command::Recover { package, shards } => {
             let shard_paths: Vec<String> = shards
@@ -768,6 +873,107 @@ fn render_matches(needs: &serde_json::Value, color: ColorMode) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Renders `inquiries` rows: state, the caller's role, the price on the table,
+/// the counterparty, and the listing title — one greppable line each.
+fn render_inquiries(inquiries: &serde_json::Value, color: ColorMode) -> String {
+    let Some(rows) = inquiries.as_array() else {
+        return "no inquiries".to_string();
+    };
+    if rows.is_empty() {
+        return "no inquiries".to_string();
+    }
+    rows.iter()
+        .map(|row| {
+            let offer = i(row, "latest_offer_centi")
+                .map(fmt_commons)
+                .unwrap_or_else(|| "—".to_string());
+            format!(
+                "{}  {:<8} {:<9} {:>12}  {}  {}",
+                s(row, "inquiry_id"),
+                s(row, "state"),
+                s(row, "role"),
+                offer,
+                s(row, "counterparty"),
+                paint(color, BOLD, &s(row, "listing_title")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Renders one inquiry thread: a header of who and where it stands, then the
+/// messages in order, each tagged with the side that sent it and any offer.
+fn render_thread(v: &serde_json::Value, color: ColorMode) -> String {
+    let buyer = s(v, "buyer");
+    let mut out = vec![
+        format!("{:<14}{}", "inquiry_id", s(v, "inquiry_id")),
+        format!(
+            "{:<14}{}",
+            "listing",
+            paint(color, BOLD, &s(v, "listing_title"))
+        ),
+        format!(
+            "{:<14}{} ({})",
+            "listed_price",
+            fmt_commons(i(v, "listed_amount_centi").unwrap_or(0)),
+            if v.get("negotiable")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false)
+            {
+                "negotiable"
+            } else {
+                "fixed price"
+            }
+        ),
+        format!("{:<14}{}", "buyer", buyer),
+        format!("{:<14}{}", "provider", s(v, "provider")),
+        format!("{:<14}{}", "state", s(v, "state")),
+    ];
+    if let Some(outcome) = v.get("outcome").and_then(|x| x.as_str()) {
+        out.push(format!("{:<14}{}", "outcome", outcome));
+    }
+    if let Some(p) = i(v, "final_price_centi") {
+        out.push(format!("{:<14}{}", "final_price", fmt_commons(p)));
+    }
+    out.push(String::new());
+
+    // The opening is the buyer's, by definition.
+    out.push(format!(
+        "[buyer]    {}",
+        message_line(&s(v, "initial_message"), i(v, "initial_offer_centi"))
+    ));
+    if let Some(msgs) = v.get("messages").and_then(|x| x.as_array()) {
+        for m in msgs {
+            let who = if s(m, "sender") == buyer {
+                "buyer"
+            } else {
+                "provider"
+            };
+            out.push(format!(
+                "[{:<8}] {}",
+                who,
+                message_line(&s(m, "body"), i(m, "counter_offer_centi"))
+            ));
+        }
+    }
+    out.join("\n")
+}
+
+/// A message body prefixed with its offer, when it carried one.
+fn message_line(body: &str, offer_centi: Option<i64>) -> String {
+    match offer_centi {
+        Some(o) => {
+            let offer = format!("(offer {})", fmt_commons(o));
+            if body.trim().is_empty() {
+                offer
+            } else {
+                format!("{offer} {body}")
+            }
+        }
+        None => body.to_string(),
+    }
 }
 
 /// Parses a point value (a reputation composite, e.g. `1.5`) from the same

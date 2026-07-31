@@ -247,6 +247,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // Inquiry expiry sweep timer (T1.7.4).
+        tasks.push(tokio::spawn(inquiry_expiry_timer(
+            Duration::from_secs(config.timers.inquiry_expiry_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -359,6 +366,36 @@ async fn listing_expiry_timer(
                 let n = core.expire_listings().await;
                 if n > 0 {
                     tracing::info!(closed = n, "listing expiry sweep");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically asks the core to close inquiries gone quiet past the TTL
+/// (T1.7.4).
+///
+/// Like the listing sweep, this converts a derivation into a signed record
+/// rather than deciding anything: a party already treats a long-dormant thread
+/// as done, and this writes that down.
+async fn inquiry_expiry_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick, as the other timers do.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.expire_inquiries().await;
+                if n > 0 {
+                    tracing::info!(closed = n, "inquiry expiry sweep");
                 }
             }
             _ = shutdown.changed() => {

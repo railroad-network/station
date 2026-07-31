@@ -445,6 +445,79 @@ pub struct MatchesParams {
     pub seq: Option<u64>,
 }
 
+/// `marketplace_inquire` params (operator socket) — open an inquiry against a
+/// listing, signed by the station wallet. The mobile signs its own
+/// [`rrn_marketplace::inquiry::InquiryOpened`] and submits it over the channel
+/// instead (T1.7.4).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InquireParams {
+    /// The hex listing id to inquire about.
+    pub listing_id: String,
+    /// The opening message; empty is fine.
+    #[serde(default)]
+    pub message: String,
+    /// The opening offer in centicommons, or `None` to accept the listed price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_centi: Option<i64>,
+}
+
+/// `marketplace_inquire` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InquireResult {
+    /// The inquiry's content address, hex-encoded.
+    pub inquiry_id: String,
+}
+
+/// `marketplace_inquiry_message` params (operator socket) — send a message,
+/// optionally with a counter-offer, in an inquiry the station is a party to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InquiryMessageParams {
+    /// The hex inquiry id.
+    pub inquiry_id: String,
+    /// The message body; empty is allowed only alongside a `counter_offer_centi`.
+    #[serde(default)]
+    pub message: String,
+    /// A revised price in centicommons, or `None` for a message that only says
+    /// something.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_offer_centi: Option<i64>,
+}
+
+/// `marketplace_inquiry_close` params (operator socket) — end an inquiry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InquiryCloseParams {
+    /// The hex inquiry id.
+    pub inquiry_id: String,
+    /// `agreed` or `declined` — how it ended. (`expired` is the station sweep's
+    /// alone.)
+    pub outcome: String,
+    /// The agreed price in centicommons; required for `agreed`, ignored
+    /// otherwise. `None` on `agreed` takes the listing's listed price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_price_centi: Option<i64>,
+}
+
+/// `marketplace_inquiry_close` / `marketplace_inquire` shared result naming the
+/// inquiry and its resulting state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InquiryStateResult {
+    /// The inquiry's content address, hex-encoded.
+    pub inquiry_id: String,
+    /// The inquiry's state after the call: `open`, `closed`, or `expired_pending`.
+    pub state: String,
+}
+
+/// `marketplace_inquiry_thread` params.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InquiryThreadParams {
+    /// The hex inquiry id.
+    pub inquiry_id: String,
+}
+
+// The inquiry *read* results (thread, my-inquiries) are not typed here, for the
+// reason the listing reads are not: they are [`crate::inquiry_view`]'s view
+// structs with `&'static str` tags, `Serialize`-only by construction.
+
 // The marketplace *read* results are not typed here. They are
 // [`crate::marketplace_view`]'s view structs, which carry `&'static str` tags and
 // so are `Serialize`-only by construction — there is no type for a client to

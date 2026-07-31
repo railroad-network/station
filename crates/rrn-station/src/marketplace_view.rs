@@ -131,6 +131,43 @@ pub struct ListingDetailView {
     /// buyer weighs alongside the band. A live log scan, affordable because it
     /// is one member on one tap (see [`crate::vouch_view`]).
     pub provider_vouches_received: u64,
+    /// Whether the *authenticated* caller may open an inquiry against this
+    /// listing, computed against its [`Requirements`](rrn_marketplace::listing::Requirements)
+    /// (T1.7.4). `None` for an anonymous read (the operator socket). A courtesy
+    /// that lets the client disable "Inquire" with a reason — the enforcement
+    /// point is `submit_inquiry`, not this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_eligible: Option<ViewerEligibility>,
+}
+
+/// Whether a viewer meets a listing's requirements, and if not, why.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ViewerEligibility {
+    /// Whether the viewer may open an inquiry.
+    pub eligible: bool,
+    /// The unmet requirement in words, when `eligible` is false — the same
+    /// message the buyer would see if they tried and were refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmet: Option<String>,
+}
+
+impl ViewerEligibility {
+    /// Shapes a [`check_requirements`](rrn_marketplace::inquiry::check_requirements)
+    /// result into the wire view.
+    pub fn from_check(
+        check: std::result::Result<(), rrn_marketplace::inquiry::RequirementUnmet>,
+    ) -> Self {
+        match check {
+            Ok(()) => Self {
+                eligible: true,
+                unmet: None,
+            },
+            Err(reason) => Self {
+                eligible: false,
+                unmet: Some(reason.to_string()),
+            },
+        }
+    }
 }
 
 /// One of the caller's own listings, whatever state it is in.
@@ -240,7 +277,17 @@ pub fn detail(
             _ => None,
         },
         provider_vouches_received: vouches,
+        // Filled in by the caller, which knows who is authenticated; a bare
+        // detail read (the operator socket) leaves it `None`.
+        viewer_eligible: None,
     }))
+}
+
+/// The caller's capped (public) composite from the snapshot cache, for the
+/// requirements check a listing detail and an inquiry both run against a buyer.
+/// The same read [`detail`]'s provider band uses — never a fresh replay.
+pub fn capped_composite(db: &Database, member: &Address, now: i64) -> f32 {
+    provider_composite(db, member, now)
 }
 
 /// Every listing `provider` has published on this log, newest first, in whatever

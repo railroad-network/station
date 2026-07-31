@@ -146,6 +146,13 @@ pub struct TimersSection {
     /// sweep only writes that down, so it is housekeeping rather than a deadline.
     #[serde(default = "default_listing_expiry_interval")]
     pub listing_expiry_interval_secs: u64,
+    /// Inquiry-expiry sweep interval in seconds (default: 3600 — hourly).
+    ///
+    /// Coarser than the listing sweep: an inquiry expires after seven days of no
+    /// activity (T1.7.4), so a few minutes of latency on writing that close down
+    /// changes nothing a party would notice.
+    #[serde(default = "default_inquiry_expiry_interval")]
+    pub inquiry_expiry_interval_secs: u64,
 }
 
 fn default_window_seconds() -> u64 {
@@ -163,6 +170,9 @@ fn default_reputation_refresh_interval() -> u64 {
 fn default_listing_expiry_interval() -> u64 {
     300
 }
+fn default_inquiry_expiry_interval() -> u64 {
+    3600
+}
 
 impl Default for SettlementSection {
     fn default() -> Self {
@@ -179,6 +189,7 @@ impl Default for TimersSection {
             gossip_interval_secs: default_gossip_interval(),
             reputation_refresh_interval_secs: default_reputation_refresh_interval(),
             listing_expiry_interval_secs: default_listing_expiry_interval(),
+            inquiry_expiry_interval_secs: default_inquiry_expiry_interval(),
         }
     }
 }

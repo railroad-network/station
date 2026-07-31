@@ -33,7 +33,7 @@ use rrn_ledger::transaction::{
 use rrn_marketplace::lifecycle::{
     append_listing_closed, touched_listing, CloseReason, ListingClosed, ListingState,
 };
-use rrn_marketplace::listing::{ListingId, Surface};
+use rrn_marketplace::listing::{Listing, ListingId, Surface};
 use rrn_marketplace::search::{SearchIndex, SearchQuery};
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, StoredPayload};
@@ -46,6 +46,7 @@ use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
 use crate::clock::Clock;
 use crate::events::{self, Event};
 use crate::gossip::WireEntry;
+use crate::inquiry_view;
 use crate::ledger_view;
 use crate::marketplace_view;
 use crate::paired::{self, PairedMobiles};
@@ -93,6 +94,13 @@ pub enum Command {
     /// [`ListingClosed`]; reply with the number closed (T1.7.0).
     ExpireListings {
         /// Count of listings closed.
+        reply: oneshot::Sender<usize>,
+    },
+    /// Close every inquiry gone quiet past [`INQUIRY_TTL_SECS`](rrn_marketplace::inquiry::INQUIRY_TTL_SECS)
+    /// with a station-signed `InquiryClosed { Expired }`; reply with the number
+    /// closed (T1.7.4).
+    ExpireInquiries {
+        /// Count of inquiries closed.
         reply: oneshot::Sender<usize>,
     },
     /// Report this station's own address and current log tail seq (for the peer
@@ -238,6 +246,15 @@ impl CoreHandle {
     pub async fn expire_listings(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::ExpireListings { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Triggers the inquiry-expiry sweep; returns the number closed.
+    pub async fn expire_inquiries(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ExpireInquiries { reply }).is_err() {
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -449,6 +466,10 @@ impl Core {
                     let n = self.do_expire_listings();
                     let _ = reply.send(n);
                 }
+                Command::ExpireInquiries { reply } => {
+                    let n = self.do_expire_inquiries();
+                    let _ = reply.send(n);
+                }
                 Command::Handshake { reply } => {
                     let tail = self.tail_seq();
                     let _ = reply.send((self.wallet.address.to_string(), tail));
@@ -536,6 +557,11 @@ impl Core {
             "marketplace_my_listings" => self.m_marketplace_my_listings(),
             "marketplace_announce_need" => self.m_marketplace_announce_need(req),
             "marketplace_matches" => self.m_marketplace_matches(req),
+            "marketplace_inquire" => self.m_marketplace_inquire(req),
+            "marketplace_inquiry_message" => self.m_marketplace_inquiry_message(req),
+            "marketplace_inquiry_close" => self.m_marketplace_inquiry_close(req),
+            "marketplace_inquiry_thread" => self.m_marketplace_inquiry_thread(req),
+            "marketplace_my_inquiries" => self.m_marketplace_my_inquiries(),
             // Operator-facing pairing management (T1.3.3), invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
@@ -692,7 +718,9 @@ impl Core {
         req: &rpc::Request,
     ) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::ListingParams = parse_params(req)?;
-        self.run_marketplace_listing(&params.listing_id)
+        // The operator socket is anonymous for eligibility — whoever holds the
+        // key is not a marketplace member with a standing to weigh.
+        self.run_marketplace_listing(&params.listing_id, None)
     }
 
     /// `marketplace_create_listing` — publish a station-signed listing.
@@ -888,6 +916,161 @@ impl Core {
         ok(&serde_json::json!({ "needs": needs }))
     }
 
+    /// `marketplace_inquire` — open a station-signed inquiry against a listing.
+    ///
+    /// The station wallet is the buyer, which on the operator's socket is the
+    /// operator themselves (a member inquires from a phone with their own key,
+    /// T1.7.4). The listing's requirements are checked against the operator's own
+    /// standing, so an operator below a listing's floor is refused just as a
+    /// member would be.
+    fn m_marketplace_inquire(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::InquireParams = parse_params(req)?;
+        let listing_id = parse_listing_id(&params.listing_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let listing = self
+            .active_listing_for_inquiry(&listing_id, now)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let station = self.station_keypair();
+        let opened = rrn_marketplace::inquiry::InquiryOpened::new(
+            listing_id,
+            self.wallet.address,
+            params.message,
+            params.offer_centi,
+            now,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let composite = marketplace_view::capped_composite(&self.db, &self.wallet.address, now);
+        let in_community = listing.community == VOUCH_COMMUNITY;
+        let inquiry_id = opened.inquiry_id;
+
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::inquiry::append_inquiry_opened(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(opened, &station),
+            &listing,
+            composite,
+            in_community,
+        )
+        .map_err(marketplace_err)?;
+        ok(&rpc::InquireResult {
+            inquiry_id: hex(&inquiry_id.to_bytes()),
+        })
+    }
+
+    /// `marketplace_inquiry_message` — send a station-signed message (optionally a
+    /// counter-offer) in an inquiry the station is a party to.
+    fn m_marketplace_inquiry_message(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::InquiryMessageParams = parse_params(req)?;
+        let inquiry_id = parse_inquiry_id(&params.inquiry_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let message = rrn_marketplace::inquiry::InquiryMessage {
+            inquiry_id,
+            sender: self.wallet.address,
+            body: params.message,
+            counter_offer_centi: params.counter_offer_centi,
+            sent_at: now,
+        };
+        let admits = self.inquiry_admits(now);
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::inquiry::append_inquiry_message(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(message, &station),
+            &station_pk,
+            &admits,
+        )
+        .map_err(marketplace_err)?;
+        ok(&rpc::InquireResult {
+            inquiry_id: params.inquiry_id,
+        })
+    }
+
+    /// `marketplace_inquiry_close` — end an inquiry the station is a party to:
+    /// agree on a price, or decline the station's own side. `expired` is not
+    /// available here — that outcome belongs to the sweep alone.
+    fn m_marketplace_inquiry_close(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::InquiryCloseParams = parse_params(req)?;
+        let inquiry_id = parse_inquiry_id(&params.inquiry_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let admits = self.inquiry_admits(now);
+
+        // Resolve the inquiry to learn the station's role (which decline) and the
+        // listed price (the fallback for an `agreed` with no explicit price).
+        let records = {
+            let log = AppendLog::new(&self.db);
+            rrn_marketplace::inquiry::inquiry_records(&log, &inquiry_id, &station_pk, &admits)
+                .map_err(internal)?
+                .ok_or_else(|| invalid_params("no such inquiry on this station"))?
+        };
+        let me = self.wallet.address;
+        let outcome = match params.outcome.as_str() {
+            "agreed" => rrn_marketplace::inquiry::InquiryOutcome::Agreed {
+                final_price_centi: params
+                    .final_price_centi
+                    .unwrap_or(records.listing.pricing.amount_centi),
+            },
+            "declined" if records.buyer() == me => {
+                rrn_marketplace::inquiry::InquiryOutcome::DeclinedByBuyer
+            }
+            "declined" if records.provider() == me => {
+                rrn_marketplace::inquiry::InquiryOutcome::DeclinedBySeller
+            }
+            "declined" => return Err(invalid_params("not a party to this inquiry")),
+            other => {
+                return Err(invalid_params(format!(
+                    "unknown outcome {other:?} (agreed or declined)"
+                )))
+            }
+        };
+
+        let record = rrn_marketplace::inquiry::InquiryClosed {
+            inquiry_id,
+            outcome,
+            closed_at: now,
+        };
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::inquiry::append_inquiry_closed(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(record, &station),
+            &station_pk,
+            &admits,
+        )
+        .map_err(marketplace_err)?;
+        ok(&rpc::InquiryStateResult {
+            inquiry_id: params.inquiry_id,
+            state: "closed".into(),
+        })
+    }
+
+    /// `marketplace_inquiry_thread` — one inquiry the station is a party to.
+    fn m_marketplace_inquiry_thread(
+        &self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::InquiryThreadParams = parse_params(req)?;
+        self.run_inquiry_thread(&params.inquiry_id, self.wallet.address)
+    }
+
+    /// `marketplace_my_inquiries` — every inquiry the station is a party to.
+    fn m_marketplace_my_inquiries(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        self.run_my_inquiries(self.wallet.address)
+    }
+
     fn m_backup_export(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::BackupExportParams = parse_params(req)?;
         let mut holders = Vec::with_capacity(params.holders.len());
@@ -1073,6 +1256,58 @@ impl Core {
             // moved.
             if let Err(e) = self.listings.remove(&self.db, &listing_id) {
                 tracing::warn!(error = %e, "could not drop an expired listing from the index");
+            }
+        }
+        closed
+    }
+
+    /// Closes every inquiry gone quiet past the TTL with a station-signed
+    /// `InquiryClosed { Expired }` (T1.7.4), mirroring [`Self::do_expire_listings`].
+    ///
+    /// Inquiries are not indexed, so there is nothing to drop from a cache here —
+    /// this only writes the terminal record a stale thread already reads as. A
+    /// close that races a party's own decline is a fine outcome: the inquiry is
+    /// closed either way, and the loser's append is refused as already-closed.
+    fn do_expire_inquiries(&mut self) -> usize {
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let admits = self.inquiry_admits(now);
+
+        let stale: Vec<rrn_marketplace::inquiry::InquiryId> = {
+            let log = AppendLog::new(&self.db);
+            match rrn_marketplace::inquiry::all_inquiry_records(&log, &station_pk, &admits) {
+                Ok(all) => all
+                    .into_iter()
+                    .filter(|(_, records)| records.is_stale(now))
+                    .map(|(id, _)| id)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "inquiry expiry sweep could not read the log");
+                    return 0;
+                }
+            }
+        };
+        if stale.is_empty() {
+            return 0;
+        }
+
+        let mut closed = 0;
+        for inquiry_id in stale {
+            let record = rrn_marketplace::inquiry::InquiryClosed {
+                inquiry_id,
+                outcome: rrn_marketplace::inquiry::InquiryOutcome::Expired,
+                closed_at: now,
+            };
+            let mut log = AppendLog::new(&self.db);
+            match rrn_marketplace::inquiry::append_inquiry_closed(
+                &mut log,
+                rrn_crypto::signed::SignedPayload::sign(record, &station),
+                &station_pk,
+                &admits,
+            ) {
+                Ok(_) => closed += 1,
+                Err(e) => tracing::warn!(error = %e, "could not close an expired inquiry"),
             }
         }
         closed
@@ -1367,6 +1602,11 @@ impl Core {
             "submit_listing" => self.channel_submit_listing(envelope),
             "submit_listing_close" => self.channel_submit_listing_close(envelope),
             "marketplace_my_listings" => self.channel_marketplace_my_listings(envelope),
+            "submit_inquiry" => self.channel_submit_inquiry(envelope),
+            "submit_inquiry_message" => self.channel_submit_inquiry_message(envelope),
+            "submit_inquiry_close" => self.channel_submit_inquiry_close(envelope),
+            "inquiry_thread" => self.channel_inquiry_thread(envelope),
+            "my_inquiries" => self.channel_my_inquiries(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -1578,6 +1818,173 @@ impl Core {
         Ok(serde_json::json!({ "listings": listings }))
     }
 
+    /// `submit_inquiry` — open a mobile-signed inquiry against a listing (T1.7.4).
+    ///
+    /// The buyer signs the [`InquiryOpened`](rrn_marketplace::inquiry::InquiryOpened)
+    /// on the phone, as they sign a listing or a vouch. The station verifies the
+    /// signature and that the signer is this paired mobile, resolves the listing
+    /// (which must be on offer), reads the buyer's capped composite from the
+    /// snapshot cache, and lets [`append_inquiry_opened`](rrn_marketplace::inquiry::append_inquiry_opened)
+    /// apply the listing's requirements — the first place a listing's `min_reputation`
+    /// / `community_member_only` becomes a check against a specific buyer. A
+    /// refusal comes back as `INVALID_PARAMS` naming the unmet requirement.
+    fn channel_submit_inquiry(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_inquiry")?;
+        let signed: rrn_marketplace::inquiry::SignedInquiryOpened =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed inquiry".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "buyer is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "inquiry signature does not verify".into(),
+            )
+        })?;
+
+        let now = self.clock.now();
+        let listing = self.active_listing_for_inquiry(&signed.payload.listing_id, now)?;
+        let composite = marketplace_view::capped_composite(&self.db, &signed.payload.buyer, now);
+        // Phase 1: any paired member is in this station's single community.
+        let in_community = listing.community == VOUCH_COMMUNITY;
+        let inquiry_id = signed.payload.inquiry_id;
+
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::inquiry::append_inquiry_opened(
+            &mut log,
+            signed,
+            &listing,
+            composite,
+            in_community,
+        )
+        .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
+    }
+
+    /// Resolves the listing an inquiry names, requiring it to be on offer right
+    /// now — an inquiry against a closed or expired listing is refused, as is one
+    /// against a listing this station has never seen. Shared by the mobile and
+    /// operator open paths so both refuse the same way.
+    fn active_listing_for_inquiry(
+        &self,
+        listing_id: &ListingId,
+        now: i64,
+    ) -> Result<Listing, (i32, String)> {
+        let station_pk = self.wallet.address.public_key();
+        let log = AppendLog::new(&self.db);
+        let state = rrn_marketplace::lifecycle::compute_state(&log, listing_id, station_pk, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        match state {
+            Some(ListingState::Active(listing)) => Ok(listing),
+            Some(_) => Err((rpc::INVALID_PARAMS, "listing is not on offer".into())),
+            None => Err((
+                rpc::INVALID_PARAMS,
+                "no such listing on this station".into(),
+            )),
+        }
+    }
+
+    /// `submit_inquiry_message` — a mobile-signed message in an open inquiry the
+    /// member is a party to (T1.7.4).
+    fn channel_submit_inquiry_message(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_message")?;
+        let signed: rrn_marketplace::inquiry::SignedInquiryMessage =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed message".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "sender is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "message signature does not verify".into(),
+            )
+        })?;
+
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let inquiry_id = signed.payload.inquiry_id;
+        let admits = self.inquiry_admits(now);
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::inquiry::append_inquiry_message(&mut log, signed, station_pk, &admits)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
+    }
+
+    /// `submit_inquiry_close` — a mobile-signed close of an inquiry the member is
+    /// a party to: agreeing on a price, or declining their side (T1.7.4).
+    fn channel_submit_inquiry_close(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_close")?;
+        let signed: rrn_marketplace::inquiry::SignedInquiryClosed =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed close".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "closer is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "close signature does not verify".into(),
+            )
+        })?;
+
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let inquiry_id = signed.payload.inquiry_id;
+        let admits = self.inquiry_admits(now);
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::inquiry::append_inquiry_closed(&mut log, signed, station_pk, &admits)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
+    }
+
+    /// `inquiry_thread` — one inquiry's full thread, for the authenticated mobile
+    /// (T1.7.4). Only a party to the inquiry may read it.
+    fn channel_inquiry_thread(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            inquiry_id: String,
+        }
+        let params: Params = serde_json::from_str(&envelope.params)
+            .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+        let viewer = Address::from_public_key(envelope.signer);
+        self.run_inquiry_thread(&params.inquiry_id, viewer)
+            .map_err(|e| (e.code, e.message))
+    }
+
+    /// `my_inquiries` — the authenticated mobile's own inquiries (as buyer or
+    /// provider), newest activity first (T1.7.4).
+    fn channel_my_inquiries(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let viewer = Address::from_public_key(envelope.signer);
+        self.run_my_inquiries(viewer)
+            .map_err(|e| (e.code, e.message))
+    }
+
     /// `vouch_counts` — the authenticated mobile's own vouching tallies (T1.4.4):
     /// how many vouches it has given (signed) and received (is the subject of).
     /// The member is the authenticated signer, not a param, so a mobile only ever
@@ -1693,7 +2100,10 @@ impl Core {
         }
         let params: Params = serde_json::from_str(&envelope.params)
             .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
-        self.run_marketplace_listing(&params.listing_id)
+        // The authenticated mobile is the viewer, so the detail carries whether
+        // *they* may inquire.
+        let viewer = Address::from_public_key(envelope.signer);
+        self.run_marketplace_listing(&params.listing_id, Some(viewer))
             .map_err(|e| (e.code, e.message))
     }
 
@@ -1736,15 +2146,108 @@ impl Core {
     fn run_marketplace_listing(
         &self,
         listing_id: &str,
+        viewer: Option<Address>,
     ) -> Result<serde_json::Value, rpc::RpcError> {
         let listing_id = parse_listing_id(listing_id)
             .map_err(|(code, message)| rpc::RpcError { code, message })?;
         let now = self.clock.now();
         let station = self.wallet.address.public_key();
         match marketplace_view::detail(&self.db, &listing_id, station, now).map_err(internal)? {
-            Some(view) => ok(&view),
+            Some(mut view) => {
+                // Fill in whether *this* caller qualifies to inquire, so the
+                // client can disable the CTA with the reason. An anonymous read
+                // (the operator socket) leaves it out.
+                if let Some(viewer) = viewer {
+                    view.viewer_eligible = Some(self.viewer_eligibility(&view, &viewer, now));
+                }
+                ok(&view)
+            }
             None => Err(invalid_params("no such listing on this station")),
         }
+    }
+
+    /// Whether `viewer` meets a listing detail's requirements, reusing the same
+    /// [`check_requirements`](rrn_marketplace::inquiry::check_requirements) the
+    /// inquiry write path enforces — so the courtesy the client shows and the
+    /// refusal the server would return cannot disagree.
+    fn viewer_eligibility(
+        &self,
+        view: &marketplace_view::ListingDetailView,
+        viewer: &Address,
+        now: i64,
+    ) -> marketplace_view::ViewerEligibility {
+        let composite = marketplace_view::capped_composite(&self.db, viewer, now);
+        let reqs = rrn_marketplace::listing::Requirements {
+            min_reputation: view.min_reputation,
+            community_member_only: view.community_member_only,
+            federation_only: false,
+        };
+        // Phase 1: any paired member is in this station's single community.
+        let in_community = view.community == VOUCH_COMMUNITY;
+        marketplace_view::ViewerEligibility::from_check(
+            rrn_marketplace::inquiry::check_requirements(
+                &reqs,
+                &view.community,
+                composite,
+                in_community,
+            ),
+        )
+    }
+
+    /// The inquiry requirements gate for both reads and writes: reads the buyer's
+    /// capped composite from the snapshot cache and treats any member as
+    /// belonging to this station's single community (Phase 1). Built per call so
+    /// it carries the current clock; borrows `&self.db`.
+    fn inquiry_admits(&self, now: i64) -> impl Fn(&Listing, &Address) -> bool + '_ {
+        move |listing: &Listing, buyer: &Address| {
+            let composite = marketplace_view::capped_composite(&self.db, buyer, now);
+            let in_community = listing.community == VOUCH_COMMUNITY;
+            rrn_marketplace::inquiry::check_requirements(
+                &listing.requirements,
+                &listing.community,
+                composite,
+                in_community,
+            )
+            .is_ok()
+        }
+    }
+
+    /// The inquiry-thread read, shared by the mobile channel and the CLI socket.
+    /// `viewer` must be the inquiry's buyer or provider — a thread is private to
+    /// its two parties, so a non-party gets the same "no such inquiry" a missing
+    /// one would, rather than a confirmation the inquiry exists.
+    fn run_inquiry_thread(
+        &self,
+        inquiry_id: &str,
+        viewer: Address,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let inquiry_id = parse_inquiry_id(inquiry_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let admits = self.inquiry_admits(now);
+        let log = AppendLog::new(&self.db);
+        match rrn_marketplace::inquiry::inquiry_records(&log, &inquiry_id, station_pk, &admits)
+            .map_err(internal)?
+        {
+            Some(records) if records.buyer() == viewer || records.provider() == viewer => {
+                ok(&inquiry_view::thread(&records, now))
+            }
+            _ => Err(invalid_params("no such inquiry for this member")),
+        }
+    }
+
+    /// The my-inquiries read, shared by both transports. Returns the inquiries
+    /// `viewer` is a party to, newest activity first.
+    fn run_my_inquiries(&self, viewer: Address) -> Result<serde_json::Value, rpc::RpcError> {
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let admits = self.inquiry_admits(now);
+        let log = AppendLog::new(&self.db);
+        let all = rrn_marketplace::inquiry::all_inquiry_records(&log, station_pk, &admits)
+            .map_err(internal)?;
+        let rows = inquiry_view::my_inquiries(all.into_values(), &viewer, now);
+        ok(&serde_json::json!({ "inquiries": rows }))
     }
 
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
@@ -2001,6 +2504,18 @@ fn parse_listing_id(s: &str) -> Result<ListingId, (i32, String)> {
         )
     })?;
     Ok(ListingId(Hash::from_bytes(bytes)))
+}
+
+fn parse_inquiry_id(s: &str) -> Result<rrn_marketplace::inquiry::InquiryId, (i32, String)> {
+    let bytes =
+        unhex(s).ok_or_else(|| (rpc::INVALID_PARAMS, "inquiry_id is not hex".to_string()))?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        (
+            rpc::INVALID_PARAMS,
+            "inquiry_id is not 32 bytes".to_string(),
+        )
+    })?;
+    Ok(rrn_marketplace::inquiry::InquiryId(Hash::from_bytes(bytes)))
 }
 
 /// Lowercase hex of a byte slice.

@@ -37,6 +37,7 @@ pub mod core;
 pub mod events;
 pub mod gossip;
 pub mod history;
+pub mod inquiry_view;
 pub mod ledger_view;
 pub mod marketplace_view;
 pub mod mdns;

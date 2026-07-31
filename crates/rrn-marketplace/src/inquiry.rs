@@ -661,7 +661,7 @@ fn scan(
     log: &AppendLog,
     scope: Scope<'_>,
     station: &PublicKey,
-    admits: &Admits,
+    admits: &dyn Fn(&Listing, &Address) -> bool,
 ) -> Result<BTreeMap<InquiryId, InquiryRecords>> {
     use std::collections::btree_map::Entry;
 
@@ -739,7 +739,7 @@ pub fn inquiry_records(
     log: &AppendLog,
     inquiry_id: &InquiryId,
     station: &PublicKey,
-    admits: &Admits,
+    admits: &dyn Fn(&Listing, &Address) -> bool,
 ) -> Result<Option<InquiryRecords>> {
     Ok(scan(log, Scope::One(inquiry_id), station, admits)?.remove(inquiry_id))
 }
@@ -749,7 +749,7 @@ pub fn inquiry_records(
 pub fn all_inquiry_records(
     log: &AppendLog,
     station: &PublicKey,
-    admits: &Admits,
+    admits: &dyn Fn(&Listing, &Address) -> bool,
 ) -> Result<BTreeMap<InquiryId, InquiryRecords>> {
     scan(log, Scope::All, station, admits)
 }
@@ -761,7 +761,7 @@ pub fn compute_inquiry_state(
     inquiry_id: &InquiryId,
     station: &PublicKey,
     now: i64,
-    admits: &Admits,
+    admits: &dyn Fn(&Listing, &Address) -> bool,
 ) -> Result<Option<InquiryState>> {
     Ok(inquiry_records(log, inquiry_id, station, admits)?.map(|r| r.state(now)))
 }
@@ -851,7 +851,7 @@ pub fn append_inquiry_message(
     log: &mut AppendLog,
     signed: SignedInquiryMessage,
     station: &PublicKey,
-    admits: &Admits,
+    admits: &dyn Fn(&Listing, &Address) -> bool,
 ) -> Result<LogEntry> {
     let message = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -890,7 +890,7 @@ pub fn append_inquiry_closed(
     log: &mut AppendLog,
     signed: SignedInquiryClosed,
     station: &PublicKey,
-    admits: &Admits,
+    admits: &dyn Fn(&Listing, &Address) -> bool,
 ) -> Result<LogEntry> {
     let close = signed.payload;
     let signer = Address::from_public_key(signed.signer);
