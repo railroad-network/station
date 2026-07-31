@@ -98,6 +98,11 @@ pub struct MyInquiryRow {
     pub counterparty: String,
     /// `open`, `expired_pending`, or `closed`.
     pub state: &'static str,
+    /// How it ended, when `state` is `closed`: `agreed`, `declined_by_buyer`,
+    /// `declined_by_seller`, or `expired`. Absent while the inquiry is live, so
+    /// the inbox can tell an agreed deal from a declined one at a glance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<&'static str>,
     /// The most recent offer on the table (opening, last counter, or agreed
     /// price), in centicommons — what the row previews.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,13 +172,19 @@ where
             } else {
                 return None;
             };
+            let state = records.state(now);
+            let outcome = match state {
+                InquiryState::Closed { outcome, .. } => Some(outcome_tag(outcome)),
+                _ => None,
+            };
             Some(MyInquiryRow {
                 inquiry_id: hex(&records.opened.inquiry_id.to_bytes()),
                 listing_id: hex(&records.listing.id.to_bytes()),
                 listing_title: records.listing.title.clone(),
                 role,
                 counterparty: counterparty.to_string(),
-                state: records.state(now).tag(),
+                state: state.tag(),
+                outcome,
                 latest_offer_centi: latest_offer(&records),
                 last_activity_at: records.last_activity_at(),
             })
