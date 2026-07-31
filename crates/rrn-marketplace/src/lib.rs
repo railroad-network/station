@@ -33,10 +33,10 @@
 //! listing is a helper *here* over `AppendLog::append` rather than a method on
 //! `rrn-storage`.
 //!
-//! [`listing`], [`lifecycle`], [`search`], and [`need`] are implemented
-//! (T1.6.3–T1.6.7). [`inquiry`] is still the T1.6.2 placeholder and is filled in
-//! by M1.7, which is where a buyer's approach to a provider gets a UI to arrive
-//! from.
+//! [`listing`], [`lifecycle`], [`search`], [`need`], and [`inquiry`] are all
+//! implemented (T1.6.3–T1.6.7, T1.7.4): a buyer's approach to a provider is the
+//! signed [`inquiry`] thread, where a listing's requirements first become a
+//! check against a specific buyer.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -69,6 +69,10 @@ pub enum Error {
     /// announce.
     #[error("need: {0}")]
     Need(#[from] need::NeedError),
+    /// An inquiry record nobody was entitled to write, or whose buyer did not
+    /// meet the listing's requirements.
+    #[error("inquiry: {0}")]
+    Inquiry(#[from] inquiry::InquiryError),
     /// The full-text index could not be opened, written, or queried.
     #[error("search index: {0}")]
     Tantivy(#[from] tantivy::TantivyError),

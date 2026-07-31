@@ -1954,7 +1954,7 @@ fn marketplace_err(e: rrn_marketplace::Error) -> rpc::RpcError {
     use rrn_marketplace::Error::*;
     match e {
         Storage(_) | Tantivy(_) | Index(_) => internal(e),
-        Listing(_) | Lifecycle(_) | Need(_) => invalid_params(e.to_string()),
+        Listing(_) | Lifecycle(_) | Need(_) | Inquiry(_) => invalid_params(e.to_string()),
     }
 }
 
