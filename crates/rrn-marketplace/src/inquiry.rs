@@ -612,8 +612,9 @@ impl Scope<'_> {
     }
 }
 
-/// Whether this signer may close the inquiry with this outcome: a party may
-/// agree or decline on their own side, and the station may attest to expiry.
+/// Whether this signer may close the inquiry with this outcome: only the
+/// provider may accept (grant) it, either party may decline their own side, and
+/// the station may attest to expiry.
 fn closer_is_entitled(
     outcome: InquiryOutcome,
     signer: &Address,
@@ -622,8 +623,12 @@ fn closer_is_entitled(
     station: &PublicKey,
 ) -> bool {
     match outcome {
-        // Either party may accept the standing offer (T1.7.5).
-        InquiryOutcome::Agreed { .. } => signer == buyer || signer == provider,
+        // Only the provider grants an inquiry. The buyer opens it and sends
+        // offers, but accepting the deal is the provider's to do — they own the
+        // thing on offer — so a buyer can never "agree" with themselves. To take
+        // a provider's counter, the buyer re-offers that price and the provider
+        // grants it.
+        InquiryOutcome::Agreed { .. } => signer == provider,
         InquiryOutcome::DeclinedByBuyer => signer == buyer,
         InquiryOutcome::DeclinedBySeller => signer == provider,
         InquiryOutcome::Expired => {
@@ -639,6 +644,40 @@ fn agreed_price_ok(outcome: InquiryOutcome, listing: &Listing) -> bool {
     match outcome {
         InquiryOutcome::Agreed { final_price_centi } => {
             listing.pricing.negotiable || final_price_centi == listing.pricing.amount_centi
+        }
+        _ => true,
+    }
+}
+
+/// The offer currently on the table, and whether the *buyer* is the one who made
+/// it: the most recent counter (by either party), else the opening offer, else
+/// the listed price — which the buyer, by inquiring, is in effect asking for.
+///
+/// This is the pivot of "the provider grants the inquiry": the provider may
+/// accept only an offer the buyer is standing behind. Their own counter is not an
+/// agreement until the buyer re-offers it, at which point the buyer owns that
+/// number and the provider can grant it.
+fn standing_offer(records: &InquiryRecords) -> (i64, bool) {
+    for m in records.messages.iter().rev() {
+        if let Some(centi) = m.counter_offer_centi {
+            return (centi, m.sender == records.opened.buyer);
+        }
+    }
+    match records.opened.initial_offer_centi {
+        Some(centi) => (centi, true),
+        None => (records.listing.pricing.amount_centi, true),
+    }
+}
+
+/// Whether an `Agreed` names the buyer's standing offer. Only the provider signs
+/// an `Agreed` (see [`closer_is_entitled`]); this is the other half of the rule —
+/// the provider may grant only what the buyer currently asks, never impose their
+/// own counter. Non-`Agreed` outcomes always pass.
+fn agreed_is_buyers_offer(outcome: InquiryOutcome, records: &InquiryRecords) -> bool {
+    match outcome {
+        InquiryOutcome::Agreed { final_price_centi } => {
+            let (standing, by_buyer) = standing_offer(records);
+            by_buyer && final_price_centi == standing
         }
         _ => true,
     }
@@ -725,6 +764,7 @@ fn scan(
                     station,
                 )
                 && agreed_price_ok(close.outcome, &records.listing)
+                && agreed_is_buyers_offer(close.outcome, records)
             {
                 records.closed = Some(close);
             }
@@ -925,6 +965,17 @@ pub fn append_inquiry_closed(
         }
         .into());
     }
+    if let InquiryOutcome::Agreed { final_price_centi } = close.outcome {
+        let (expected, by_buyer) = standing_offer(&records);
+        if !by_buyer || final_price_centi != expected {
+            return Err(InquiryError::AgreedNotBuyersOffer {
+                inquiry_id: close.inquiry_id,
+                price: final_price_centi,
+                expected,
+            }
+            .into());
+        }
+    }
 
     Ok(log.append(signed)?)
 }
@@ -1026,6 +1077,18 @@ pub enum InquiryError {
         inquiry_id: InquiryId,
         /// The listing's listed price.
         listed: i64,
+    },
+    /// The provider tried to grant a price that is not the buyer's standing
+    /// offer — they may accept only what the buyer currently asks, not impose
+    /// their own counter. The buyer must re-offer that price first.
+    #[error("inquiry {inquiry_id} cannot be agreed at {price}: the buyer's standing offer is {expected}")]
+    AgreedNotBuyersOffer {
+        /// The inquiry.
+        inquiry_id: InquiryId,
+        /// The price the provider tried to grant.
+        price: i64,
+        /// The buyer's standing offer, the only price the provider may grant.
+        expected: i64,
     },
 }
 
@@ -1490,11 +1553,21 @@ mod tests {
         )
         .unwrap();
 
-        // Buyer accepts the provider's counter.
+        // To take the provider's counter, the buyer re-offers that price: only
+        // then is 2.75 the buyer's standing offer, which the provider may grant.
+        append_inquiry_message(
+            &mut log,
+            message_of(&buyer, inquiry_id, "Deal — 2.75", Some(275), OPENED_AT + 8),
+            &station_key,
+            &admit_all(),
+        )
+        .unwrap();
+
+        // The provider grants the inquiry at the buyer's standing offer.
         append_inquiry_closed(
             &mut log,
             close_of(
-                &buyer,
+                &provider,
                 inquiry_id,
                 InquiryOutcome::Agreed {
                     final_price_centi: 275,
@@ -1552,11 +1625,11 @@ mod tests {
         let inquiry_id = opened.payload.inquiry_id;
         append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
 
-        // Agreeing at anything but the listed price is refused.
+        // The provider agreeing at anything but the listed price is refused.
         let err = append_inquiry_closed(
             &mut log,
             close_of(
-                &buyer,
+                &provider,
                 inquiry_id,
                 InquiryOutcome::Agreed {
                     final_price_centi: 250,
@@ -1576,7 +1649,7 @@ mod tests {
         append_inquiry_closed(
             &mut log,
             close_of(
-                &buyer,
+                &provider,
                 inquiry_id,
                 InquiryOutcome::Agreed {
                     final_price_centi: 300,
@@ -1629,6 +1702,101 @@ mod tests {
                 inquiry_id,
                 InquiryOutcome::Expired,
                 OPENED_AT + 10,
+            ),
+            &station_key,
+            &admit_all(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_the_provider_grants_and_only_the_buyers_standing_offer() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let buyer = Keypair::generate();
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+        let listing = publish(&mut log, &provider, true); // negotiable
+        let opened = opened_of(&buyer, &listing, Some(250));
+        let inquiry_id = opened.payload.inquiry_id;
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+
+        // The buyer cannot accept their own inquiry — only the provider grants.
+        let err = append_inquiry_closed(
+            &mut log,
+            close_of(
+                &buyer,
+                inquiry_id,
+                InquiryOutcome::Agreed {
+                    final_price_centi: 250,
+                },
+                OPENED_AT + 5,
+            ),
+            &station_key,
+            &admit_all(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Inquiry(InquiryError::CloseNotPermitted { .. })
+        ));
+
+        // The provider counters. Now they may grant neither their own counter
+        // (2.75) nor the buyer's now-stale opening (2.50): the ball is in the
+        // buyer's court until they re-offer.
+        append_inquiry_message(
+            &mut log,
+            message_of(
+                &provider,
+                inquiry_id,
+                "I can do 2.75",
+                Some(275),
+                OPENED_AT + 6,
+            ),
+            &station_key,
+            &admit_all(),
+        )
+        .unwrap();
+        for price in [275, 250] {
+            let err = append_inquiry_closed(
+                &mut log,
+                close_of(
+                    &provider,
+                    inquiry_id,
+                    InquiryOutcome::Agreed {
+                        final_price_centi: price,
+                    },
+                    OPENED_AT + 7,
+                ),
+                &station_key,
+                &admit_all(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                Error::Inquiry(InquiryError::AgreedNotBuyersOffer { .. })
+            ));
+        }
+
+        // The buyer re-offers (taking the provider's number); now 2.75 is the
+        // buyer's standing offer and the provider may grant it.
+        append_inquiry_message(
+            &mut log,
+            message_of(&buyer, inquiry_id, "ok, 2.75", Some(275), OPENED_AT + 8),
+            &station_key,
+            &admit_all(),
+        )
+        .unwrap();
+        append_inquiry_closed(
+            &mut log,
+            close_of(
+                &provider,
+                inquiry_id,
+                InquiryOutcome::Agreed {
+                    final_price_centi: 275,
+                },
+                OPENED_AT + 9,
             ),
             &station_key,
             &admit_all(),
