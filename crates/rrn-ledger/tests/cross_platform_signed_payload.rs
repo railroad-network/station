@@ -34,7 +34,7 @@ use rrn_crypto::keypair::{Keypair, PublicKey, SecretKey};
 use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
-use rrn_ledger::transaction::TransactionProposal;
+use rrn_ledger::transaction::{ListingRef, TransactionProposal};
 use rrn_mobile_ffi::canonical_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -58,6 +58,10 @@ struct ProposalVector {
     receiver_pubkey: String,
     amount_centi: String,
     memo: Option<String>,
+    /// The linked listing id, hex — present only on the marketplace-payment
+    /// vectors, absent on direct-pay ones (mirrors the omit-when-`None` encoding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listing_id: Option<String>,
     nonce: String,
     proposed_at: String,
     expires_at: String,
@@ -118,6 +122,15 @@ fn memo_node(memo: &Option<String>) -> Value {
     }
 }
 
+/// The optional marketplace listing link (T1.7.6): present on some indices,
+/// absent on the rest, so the fixture exercises both a linked (an agreed
+/// inquiry's payment) and an unlinked (direct-pay) proposal. Unlike `memo`,
+/// `listing_id` is OMITTED — not null — when absent, so an unlinked proposal is
+/// byte-identical to one written before the field existed.
+fn listing_for(i: u32) -> Option<[u8; 32]> {
+    (i % 4 == 3).then(|| derive("rrn-signed-payload-fixture:v1:listing:", i))
+}
+
 fn build_vector(i: u32) -> ProposalVector {
     let sender_seed = derive("rrn-signed-payload-fixture:v1:sender:", i);
     let sender_kp = keypair_from_seed(sender_seed);
@@ -127,6 +140,7 @@ fn build_vector(i: u32) -> ProposalVector {
 
     let amount = amount_for(i);
     let memo = memo_for(i);
+    let listing = listing_for(i);
     let nonce = nonce_for(i);
     let proposed_at = 1_700_000_000_i64 + i64::from(i);
     let expires_at = proposed_at + 86_400;
@@ -140,22 +154,32 @@ fn build_vector(i: u32) -> ProposalVector {
         proposed_at,
         expires_at,
     );
+    let proposal = match listing {
+        Some(bytes) => proposal.with_listing(ListingRef(bytes)),
+        None => proposal,
+    };
 
     let canonical = to_canonical_bytes(proposal.clone());
     let signed = SignedPayload::sign(proposal, &sender_kp);
 
     // The tagged-value payload the mobile app builds for this proposal. Field
     // order is irrelevant — dCBOR sorts map keys — but it mirrors the struct.
-    let payload = json!({ "map": [
-        ["kind", { "text": PROPOSAL_KIND }],
-        ["sender", { "bytes": hex::encode(sender_pk.to_bytes()) }],
-        ["receiver", { "bytes": hex::encode(receiver_pk.to_bytes()) }],
-        ["amount_centi", { "int": amount.to_string() }],
-        ["memo", memo_node(&memo)],
-        ["nonce", { "int": nonce.to_string() }],
-        ["proposed_at", { "int": proposed_at.to_string() }],
-        ["expires_at", { "int": expires_at.to_string() }],
-    ]});
+    // `listing_id` is pushed only when present, matching the encoder's omit-when-
+    // `None` rule (a null here would not).
+    let mut map_entries = vec![
+        json!(["kind", { "text": PROPOSAL_KIND }]),
+        json!(["sender", { "bytes": hex::encode(sender_pk.to_bytes()) }]),
+        json!(["receiver", { "bytes": hex::encode(receiver_pk.to_bytes()) }]),
+        json!(["amount_centi", { "int": amount.to_string() }]),
+        json!(["memo", memo_node(&memo)]),
+    ];
+    if let Some(bytes) = listing {
+        map_entries.push(json!(["listing_id", { "bytes": hex::encode(bytes) }]));
+    }
+    map_entries.push(json!(["nonce", { "int": nonce.to_string() }]));
+    map_entries.push(json!(["proposed_at", { "int": proposed_at.to_string() }]));
+    map_entries.push(json!(["expires_at", { "int": expires_at.to_string() }]));
+    let payload = json!({ "map": map_entries });
 
     // The heart of the cross-platform contract: the mobile tagged-JSON path must
     // yield the exact bytes the typed encoder produced.
@@ -171,6 +195,7 @@ fn build_vector(i: u32) -> ProposalVector {
         receiver_pubkey: hex::encode(receiver_pk.to_bytes()),
         amount_centi: amount.to_string(),
         memo,
+        listing_id: listing.map(hex::encode),
         nonce: nonce.to_string(),
         proposed_at: proposed_at.to_string(),
         expires_at: expires_at.to_string(),
@@ -217,7 +242,7 @@ fn public_key(hex_pk: &str) -> PublicKey {
 /// Rebuilds the proposal from a vector's recorded fields (as the mobile app's
 /// inputs would), independent of the stored `payload`/`canonical_hex`.
 fn proposal_from(v: &ProposalVector) -> TransactionProposal {
-    TransactionProposal::new(
+    let proposal = TransactionProposal::new(
         Address::from_public_key(public_key(&v.sender_pubkey)),
         Address::from_public_key(public_key(&v.receiver_pubkey)),
         v.amount_centi.parse().unwrap(),
@@ -225,7 +250,14 @@ fn proposal_from(v: &ProposalVector) -> TransactionProposal {
         v.nonce.parse().unwrap(),
         v.proposed_at.parse().unwrap(),
         v.expires_at.parse().unwrap(),
-    )
+    );
+    match &v.listing_id {
+        Some(hex) => {
+            let bytes: [u8; 32] = hex::decode(hex).unwrap().as_slice().try_into().unwrap();
+            proposal.with_listing(ListingRef(bytes))
+        }
+        None => proposal,
+    }
 }
 
 #[test]

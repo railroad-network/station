@@ -88,6 +88,35 @@ impl TryFrom<CBOR> for TransactionId {
     }
 }
 
+/// A reference to the marketplace listing a proposal settles (T1.7.6).
+///
+/// The ledger holds it as **opaque 32 bytes** — a marketplace `ListingId` in raw
+/// form — so `rrn-ledger` stays free of a dependency on `rrn-marketplace`, which
+/// already depends on it (the reverse would cycle). Marketplace and mobile code
+/// convert via `ListingId::to_bytes()` / `hexToBytes`. Encoded as a CBOR byte
+/// string, exactly as a listing or inquiry id is.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListingRef(pub [u8; 32]);
+
+impl From<ListingRef> for CBOR {
+    fn from(r: ListingRef) -> Self {
+        CBOR::to_byte_string(r.0)
+    }
+}
+
+impl TryFrom<CBOR> for ListingRef {
+    type Error = dcbor::Error;
+
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let bytes: [u8; 32] = cbor
+            .try_into_byte_string()?
+            .as_slice()
+            .try_into()
+            .map_err(|_| dcbor::Error::WrongType)?;
+        Ok(ListingRef(bytes))
+    }
+}
+
 /// A proposed transaction: the sender's signed offer to move Commons.
 ///
 /// Positive `amount_centi` means the sender pays the receiver; negative means
@@ -105,6 +134,11 @@ pub struct TransactionProposal {
     pub amount_centi: i64,
     /// Optional human-readable note. Part of the signed content.
     pub memo: Option<String>,
+    /// The marketplace listing this proposal settles, when it came from an agreed
+    /// inquiry (T1.7.6); `None` for a direct pay. **Additive to a content-addressed
+    /// record**, so it is OMITTED from the CBOR when `None` (never `null`) — see
+    /// the `From`/`TryFrom` impls below and ADR-0010.
+    pub listing_id: Option<ListingRef>,
     /// Per-sender monotonic nonce; the engine rejects gaps and duplicates.
     pub nonce: u64,
     /// Unix seconds when the proposal was made.
@@ -133,12 +167,25 @@ impl TransactionProposal {
             receiver,
             amount_centi,
             memo,
+            // A direct pay carries no listing link; the marketplace path adds one
+            // with `with_listing`. Absent-when-`None` keeps direct sends
+            // byte-identical to before this field existed.
+            listing_id: None,
             nonce,
             proposed_at,
             expires_at,
         };
         proposal.id = proposal.compute_id();
         proposal
+    }
+
+    /// Links this proposal to the marketplace listing it settles (T1.7.6),
+    /// recomputing its content [`id`](Self::id) with the link included. Used when
+    /// an agreed inquiry produces a payment; a direct send never calls this.
+    pub fn with_listing(mut self, listing: ListingRef) -> Self {
+        self.listing_id = Some(listing);
+        self.id = self.compute_id();
+        self
     }
 
     /// Recomputes the content address from the current field values.
@@ -161,6 +208,15 @@ impl From<TransactionProposal> for CBOR {
         match p.memo {
             Some(text) => m.insert("memo", text),
             None => m.insert("memo", CBOR::null()),
+        }
+        // ⚠️ Unlike `memo` above, `listing_id` is OMITTED when `None` — never
+        // `null`. It was added to an already content-addressed record (ADR-0010):
+        // a key present in *every* proposal's map would change the recomputed id
+        // of every proposal already on the log, breaking the confirmations and
+        // settlements that reference them. Absent-when-unset keeps old proposals
+        // byte-identical; only a linked proposal carries the key.
+        if let Some(listing) = p.listing_id {
+            m.insert("listing_id", listing);
         }
         m.insert("nonce", p.nonce);
         m.insert("proposed_at", p.proposed_at);
@@ -190,6 +246,13 @@ impl TryFrom<CBOR> for TransactionProposal {
             map.extract::<&str, i64>("proposed_at")?,
             map.extract::<&str, i64>("expires_at")?,
         );
+        // Absent listing_id decodes to `None` (a direct pay); a byte string to a
+        // link — the omit-when-`None` counterpart of the encoder above. Applied
+        // after construction so the recomputed id matches the sender's.
+        let proposal = match map.get::<&str, ListingRef>("listing_id") {
+            Some(listing) => proposal.with_listing(listing),
+            None => proposal,
+        };
         Ok(proposal)
     }
 }
@@ -292,6 +355,38 @@ mod tests {
         q.amount_centi += 1;
         q.id = q.compute_id();
         assert_ne!(q.id, p.id);
+    }
+
+    /// True if `needle` appears anywhere in `haystack`. Used to assert a key is
+    /// (or is not) present in canonical CBOR bytes.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn listing_link_is_absent_when_unlinked_and_leaves_the_id_stable() {
+        let unlinked = sample_proposal(); // listing_id: None
+        let bytes = to_canonical_bytes(unlinked.clone());
+        // Absent, never null: the key must not appear at all, so a proposal
+        // written before this field existed hashes — and so is id'd — identically.
+        // This is the ADR-0010 guard against corrupting the log on upgrade.
+        assert!(!contains(&bytes, b"listing_id"));
+
+        // Linking is additive content, so the key appears and the id changes.
+        let linked = unlinked.clone().with_listing(ListingRef([7u8; 32]));
+        assert!(contains(&to_canonical_bytes(linked.clone()), b"listing_id"));
+        assert_ne!(linked.id, unlinked.id);
+    }
+
+    #[test]
+    fn a_listing_linked_proposal_round_trips() {
+        let linked = sample_proposal().with_listing(ListingRef([9u8; 32]));
+        let bytes = to_canonical_bytes(linked.clone());
+        let decoded: TransactionProposal = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, linked);
+        assert_eq!(decoded.listing_id, Some(ListingRef([9u8; 32])));
+        // The recomputed id agrees with the link included.
+        assert_eq!(decoded.id, linked.id);
     }
 
     #[test]
