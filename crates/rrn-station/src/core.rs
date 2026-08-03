@@ -28,10 +28,12 @@ use rrn_ledger::engine::Engine;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::TransactionState;
 use rrn_ledger::transaction::{
-    SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId, TransactionProposal,
+    ListingRef, SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId,
+    TransactionProposal,
 };
 use rrn_marketplace::lifecycle::{
-    append_listing_closed, touched_listing, CloseReason, ListingClosed, ListingState,
+    append_listing_closed, append_stock_consumed, touched_listing, CloseReason, ListingClosed,
+    ListingState, StockConsumed,
 };
 use rrn_marketplace::listing::{Listing, ListingId, Surface};
 use rrn_marketplace::search::{SearchIndex, SearchQuery};
@@ -659,9 +661,16 @@ impl Core {
     fn m_transactions(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::TransactionsParams = parse_params(req)?;
         let member = parse_addr(&params.address)?;
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
-        let transactions = transaction_view::member_transactions(&snapshot, &member, params.limit);
+        let log = AppendLog::new(&self.db);
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&log).map_err(internal)?;
+        let station_pk = self.station_keypair().public_key();
+        let transactions = transaction_view::member_transactions(
+            &snapshot,
+            &member,
+            params.limit,
+            &log,
+            &station_pk,
+        );
         ok(&rpc::TransactionsResult { transactions })
     }
 
@@ -1108,16 +1117,84 @@ impl Core {
 
     // --- internal operations ------------------------------------------------
 
+    /// Settles every transaction whose window has closed, and — for a settled
+    /// marketplace payment — attests the sale against its listing (T1.7.6 Stage
+    /// B): one settled, listing-linked payment consumes one unit of stock.
     fn do_sweep(&mut self) -> usize {
         let now = self.clock.now();
-        let station = self.station_keypair();
-        let mut settler = Settler::new(&self.db, station, self.settlement);
-        match settler.sweep(now) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "settlement sweep failed");
-                0
+
+        // Which transactions are due, and the listing each marketplace one pays
+        // for — captured from the snapshot *before* settling, since settling
+        // changes it. A direct pay carries no link and settles as it always has.
+        let due: Vec<(TransactionId, Option<ListingId>)> = {
+            let log = AppendLog::new(&self.db);
+            let snapshot = match rrn_ledger::state::LedgerSnapshot::derive(&log) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "settlement sweep could not read the log");
+                    return 0;
+                }
+            };
+            let settler = Settler::new(&self.db, self.station_keypair(), self.settlement);
+            match settler.find_eligible(now) {
+                Ok(ids) => ids
+                    .into_iter()
+                    .map(|id| (id, snapshot.get(&id).and_then(linked_listing)))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "settlement sweep: find_eligible failed");
+                    return 0;
+                }
             }
+        };
+
+        let mut settled = 0;
+        for (tx_id, listing_id) in due {
+            let mut settler = Settler::new(&self.db, self.station_keypair(), self.settlement);
+            if let Err(e) = settler.settle(&tx_id, now) {
+                tracing::warn!(error = %e, tx = ?tx_id, "could not settle a transaction");
+                continue;
+            }
+            settled += 1;
+            if let Some(listing_id) = listing_id {
+                self.attest_sale(listing_id, tx_id, now);
+            }
+        }
+        settled
+    }
+
+    /// Appends a station-signed [`StockConsumed`] for a settled marketplace
+    /// payment, and refreshes the listing in browse. Only a listing still on
+    /// offer that *tracks* stock is decremented — a service slot, a commons
+    /// offer, or an already-closed listing has no unit to take, so nothing is
+    /// written for it. A duplicate would be inert anyway (state counts distinct
+    /// transactions), so a race here costs at most a redundant record.
+    fn attest_sale(&mut self, listing_id: ListingId, tx_id: TransactionId, now: i64) {
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+
+        let log = AppendLog::new(&self.db);
+        let tracks_stock = matches!(
+            rrn_marketplace::lifecycle::compute_state(&log, &listing_id, &station_pk, now),
+            Ok(Some(ListingState::Active(ref l))) if l.availability.capacity.is_some()
+        );
+        if !tracks_stock {
+            return;
+        }
+
+        let record = StockConsumed {
+            listing_id,
+            tx_id,
+            consumed_at: now,
+        };
+        let mut log = AppendLog::new(&self.db);
+        match append_stock_consumed(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(record, &station),
+            &station_pk,
+        ) {
+            Ok(_) => self.reindex_listing(&listing_id),
+            Err(e) => tracing::warn!(error = %e, "could not attest a sale"),
         }
     }
 
@@ -2516,6 +2593,22 @@ fn parse_inquiry_id(s: &str) -> Result<rrn_marketplace::inquiry::InquiryId, (i32
         )
     })?;
     Ok(rrn_marketplace::inquiry::InquiryId(Hash::from_bytes(bytes)))
+}
+
+/// The listing a transaction pays for, if it is a marketplace payment (T1.7.6):
+/// the `listing_id` the buyer signed into the proposal, named as a marketplace
+/// [`ListingId`]. `None` for a direct pay.
+fn linked_listing(state: &TransactionState) -> Option<ListingId> {
+    let proposal = match state {
+        TransactionState::Proposed { proposal }
+        | TransactionState::Confirmed { proposal, .. }
+        | TransactionState::Settled { proposal, .. }
+        | TransactionState::Cancelled { proposal, .. } => &proposal.payload,
+        TransactionState::DisputedStub => return None,
+    };
+    proposal
+        .listing_id
+        .map(|ListingRef(bytes)| ListingId(Hash::from_bytes(bytes)))
 }
 
 /// Lowercase hex of a byte slice.

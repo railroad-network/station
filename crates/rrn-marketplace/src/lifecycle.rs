@@ -41,13 +41,14 @@
 //! the materialized index built on top of it (T1.6.6) is a cache that can be
 //! thrown away and rebuilt (ADR-0010).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dcbor::prelude::*;
 use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
+use rrn_ledger::transaction::TransactionId;
 use rrn_storage::log::{AppendLog, LogEntry};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ use crate::Result;
 /// record's own tag lives in [`crate::listing`].
 pub(crate) const UPDATED_KIND: &str = "rrn.marketplace.listing_updated.v1";
 pub(crate) const CLOSED_KIND: &str = "rrn.marketplace.listing_closed.v1";
+pub(crate) const CONSUMED_KIND: &str = "rrn.marketplace.stock_consumed.v1";
 
 /// What an update does to `expires_at`.
 ///
@@ -243,6 +245,12 @@ pub enum CloseReason {
     ProviderClosed,
     /// The station closed it for housekeeping.
     StationCleanup,
+    /// Every unit sold — the last settled sale took the stock to zero
+    /// (T1.7.6 Stage B). Unlike the others this is **derived**: [`state_of`]
+    /// synthesizes it from the [`StockConsumed`] records, and no signed
+    /// `ListingClosed` ever carries it (`station_may_sign` refuses it below), so
+    /// no party can *claim* sold-out — it is only ever what the sales add up to.
+    SoldOut,
 }
 
 impl CloseReason {
@@ -251,12 +259,14 @@ impl CloseReason {
             CloseReason::ExpirationReached => "expiration_reached",
             CloseReason::ProviderClosed => "provider_closed",
             CloseReason::StationCleanup => "station_cleanup",
+            CloseReason::SoldOut => "sold_out",
         }
     }
 
     /// Whether the station may sign this reason. It may attest to what happened
     /// with no party present (ADR-0005), but it may never claim the provider
-    /// withdrew an offer.
+    /// withdrew an offer — nor claim sold-out, which is derived from the sales,
+    /// not asserted by anyone.
     fn station_may_sign(self) -> bool {
         matches!(
             self,
@@ -279,6 +289,7 @@ impl TryFrom<CBOR> for CloseReason {
             "expiration_reached" => Ok(CloseReason::ExpirationReached),
             "provider_closed" => Ok(CloseReason::ProviderClosed),
             "station_cleanup" => Ok(CloseReason::StationCleanup),
+            "sold_out" => Ok(CloseReason::SoldOut),
             _ => Err(dcbor::Error::WrongType),
         }
     }
@@ -325,10 +336,62 @@ impl TryFrom<CBOR> for ListingClosed {
     }
 }
 
+/// The station's attestation that a settled marketplace payment took one unit of
+/// a listing's stock (T1.7.6 Stage B).
+///
+/// When a listing-linked transaction settles, the provider is long gone — the
+/// settlement window closes 48h after the payment, with no party present — so,
+/// exactly as with expiry, only the station can witness the sale (ADR-0005). One
+/// settled payment consumes one unit; the model carries no quantity. `tx_id` is
+/// the settled transaction, both for traceability and as the idempotency key:
+/// [`state_of`] counts *distinct* transactions, so a replayed or gossiped
+/// duplicate takes no second unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StockConsumed {
+    /// The listing a unit was taken from.
+    pub listing_id: ListingId,
+    /// The settled transaction that took it.
+    pub tx_id: TransactionId,
+    /// Unix seconds the sale settled, from the station's clock.
+    pub consumed_at: i64,
+}
+
+impl From<StockConsumed> for CBOR {
+    fn from(c: StockConsumed) -> Self {
+        let mut m = Map::new();
+        m.insert("kind", CONSUMED_KIND);
+        m.insert("listing_id", c.listing_id);
+        m.insert("tx_id", c.tx_id);
+        m.insert("consumed_at", c.consumed_at);
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for StockConsumed {
+    type Error = dcbor::Error;
+
+    fn try_from(cbor: CBOR) -> std::result::Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        if map.extract::<&str, String>("kind")? != CONSUMED_KIND {
+            return Err(dcbor::Error::WrongType);
+        }
+        Ok(StockConsumed {
+            listing_id: map.extract::<&str, ListingId>("listing_id")?,
+            tx_id: map.extract::<&str, TransactionId>("tx_id")?,
+            consumed_at: map.extract::<&str, i64>("consumed_at")?,
+        })
+    }
+}
+
 /// A [`ListingUpdated`] signed by the provider.
 pub type SignedListingUpdate = SignedPayload<ListingUpdated>;
 /// A [`ListingClosed`] signed by the provider or the station.
 pub type SignedListingClose = SignedPayload<ListingClosed>;
+/// A [`StockConsumed`] signed by the station (the only party entitled to it).
+pub type SignedStockConsumed = SignedPayload<StockConsumed>;
 
 /// Every record on the log concerning one listing, in log order.
 ///
@@ -340,13 +403,17 @@ pub struct ListingRecords {
     pub created: Option<Listing>,
     /// Every update, in log order.
     pub updates: Vec<ListingUpdated>,
+    /// Every station-attested sale, in log order (T1.7.6 Stage B).
+    pub consumed: Vec<StockConsumed>,
     /// The close, if it has happened.
     pub closed: Option<ListingClosed>,
 }
 
 impl ListingRecords {
     /// The listing as it currently reads: creation with every update applied,
-    /// in log order. `None` when the listing was never created here.
+    /// in log order. `None` when the listing was never created here. Stock
+    /// consumed by sales is applied in [`state_of`], not here, so this stays the
+    /// provider's own view of the listing.
     pub fn current(&self) -> Option<Listing> {
         let created = self.created.as_ref()?;
         Some(
@@ -356,6 +423,21 @@ impl ListingRecords {
                     update.patch.apply_to(&listing)
                 }),
         )
+    }
+
+    /// Units taken by settled sales, counted over **distinct** transactions so a
+    /// duplicated [`StockConsumed`] (gossip, replay) never double-counts.
+    fn units_consumed(&self) -> u32 {
+        self.consumed
+            .iter()
+            .map(|c| c.tx_id)
+            .collect::<BTreeSet<_>>()
+            .len() as u32
+    }
+
+    /// When the last sale settled — the moment a sold-out listing went off offer.
+    fn last_consumed_at(&self) -> Option<i64> {
+        self.consumed.iter().map(|c| c.consumed_at).max()
     }
 }
 
@@ -423,6 +505,18 @@ fn scan(
                 && signer == update.signed_by
             {
                 records.updates.push(update);
+            }
+            continue;
+        }
+        if let Ok(consumed) = from_canonical_bytes::<StockConsumed>(&entry.payload.bytes) {
+            let Some(records) = found.get_mut(&consumed.listing_id) else {
+                continue;
+            };
+            // Only the station attests a sale (ADR-0005). A record from anyone
+            // else is not evidence of anything and is dropped, exactly as an
+            // unauthorized close would be.
+            if records.created.is_some() && signer == Address::from_public_key(*station) {
+                records.consumed.push(consumed);
             }
             continue;
         }
@@ -575,6 +669,32 @@ pub fn append_listing_closed(
     Ok(log.append(signed)?)
 }
 
+/// Records a station-attested sale against a listing (T1.7.6 Stage B): appends a
+/// [`StockConsumed`] the settlement sweep signs when a listing-linked payment
+/// settles. Only the station may sign it (ADR-0005), and only against a listing
+/// this log has seen created.
+///
+/// Intentionally does not check capacity or double-consumption: [`state_of`]
+/// applies a sale only to a stock-bearing listing and counts distinct `tx_id`s,
+/// so an attestation against a service, a sold-out listing, or a duplicate is
+/// simply inert rather than an error — the sweep should never have to reason
+/// about listing internals to stay correct.
+pub fn append_stock_consumed(
+    log: &mut AppendLog,
+    signed: SignedStockConsumed,
+    station: &PublicKey,
+) -> Result<LogEntry> {
+    let consumed = signed.payload;
+    let signer = Address::from_public_key(signed.signer);
+    if signer != Address::from_public_key(*station) {
+        return Err(LifecycleError::ConsumeNotPermitted { signer }.into());
+    }
+    if find_created(log, &consumed.listing_id)?.is_none() {
+        return Err(LifecycleError::UnknownListing(consumed.listing_id).into());
+    }
+    Ok(log.append(signed)?)
+}
+
 /// Which listing a log payload concerns, or `None` for a payload that is not one
 /// of the three marketplace listing kinds.
 ///
@@ -598,6 +718,9 @@ pub fn touched_listing(payload_bytes: &[u8]) -> Option<ListingId> {
     }
     if let Ok(close) = from_canonical_bytes::<ListingClosed>(payload_bytes) {
         return Some(close.listing_id);
+    }
+    if let Ok(consumed) = from_canonical_bytes::<StockConsumed>(payload_bytes) {
+        return Some(consumed.listing_id);
     }
     None
 }
@@ -696,16 +819,32 @@ fn has_expired(listing: &Listing, now: i64) -> bool {
 
 /// Resolves records into the state they add up to at `now`.
 fn state_of(records: &ListingRecords, now: i64) -> Option<ListingState> {
-    let listing = records.current()?;
-    // Closed first: it is terminal, and it records *why* the listing ended.
-    // A listing closed after its expiry passed reads as `Closed`, not
-    // `Expired` — the sweep already did its job.
+    let mut listing = records.current()?;
+    // A signed close is terminal and records *why* the listing ended, so it wins
+    // over a derived sold-out: a listing closed after its expiry passed reads as
+    // `Closed`, not `Expired`, and the same holds for a provider close that
+    // landed alongside its final sales.
     if let Some(closed) = records.closed {
         return Some(ListingState::Closed {
             listing,
             reason: closed.reason,
             closed_at: closed.closed_at,
         });
+    }
+    // Sales consume stock (T1.7.6 Stage B). Only a listing that *tracks* stock
+    // (goods with a capacity) is affected; a service slot or a commons offer has
+    // `capacity == None` and sells indefinitely. When the last unit goes, the
+    // listing is sold out — derived here, never a stored close.
+    if let Some(capacity) = listing.availability.capacity {
+        let remaining = capacity.saturating_sub(records.units_consumed());
+        listing.availability.capacity = Some(remaining);
+        if remaining == 0 {
+            return Some(ListingState::Closed {
+                listing,
+                reason: CloseReason::SoldOut,
+                closed_at: records.last_consumed_at().unwrap_or(now),
+            });
+        }
     }
     if has_expired(&listing, now) {
         return Some(ListingState::Expired { listing });
@@ -813,6 +952,12 @@ pub enum LifecycleError {
         signer: Address,
         /// The reason they claimed.
         reason: CloseReason,
+    },
+    /// Only the station may attest a sale; this signer is not it (T1.7.6 Stage B).
+    #[error("{signer} may not attest a sale — only the station can")]
+    ConsumeNotPermitted {
+        /// Who tried.
+        signer: Address,
     },
 }
 
@@ -1439,6 +1584,134 @@ mod tests {
         ));
         // The closed state keeps the listing as it last read, not as published.
         assert_eq!(state.listing().unwrap().pricing.amount_centi, 199);
+    }
+
+    // --- Stock consumption on settlement (T1.7.6 Stage B) -------------------
+
+    fn tx(n: u8) -> TransactionId {
+        TransactionId(rrn_crypto::hash::Hash::from_bytes([n; 32]))
+    }
+
+    fn consumed(listing: &Listing, tx_id: TransactionId, at: i64) -> StockConsumed {
+        StockConsumed {
+            listing_id: listing.id,
+            tx_id,
+            consumed_at: at,
+        }
+    }
+
+    fn records_with(listing: Listing, consumed: Vec<StockConsumed>) -> ListingRecords {
+        ListingRecords {
+            created: Some(listing),
+            updates: vec![],
+            consumed,
+            closed: None,
+        }
+    }
+
+    #[test]
+    fn a_stock_consumed_record_roundtrips() {
+        let listing = listing_of(&Keypair::generate());
+        let record = consumed(&listing, tx(7), WHILE_OPEN);
+        let cbor: CBOR = record.into();
+        assert_eq!(StockConsumed::try_from(cbor).unwrap(), record);
+    }
+
+    #[test]
+    fn sales_take_units_and_the_last_one_sells_out() {
+        let mut listing = listing_of(&Keypair::generate());
+        listing.availability.capacity = Some(2);
+
+        // One sale: a unit gone, still on offer.
+        let one = records_with(listing.clone(), vec![consumed(&listing, tx(1), WHILE_OPEN)]);
+        let state = state_of(&one, WHILE_OPEN).unwrap();
+        assert!(state.is_on_offer());
+        assert_eq!(state.listing().unwrap().availability.capacity, Some(1));
+
+        // A second, distinct sale takes the last unit: sold out, off offer, and
+        // closed as of the settling sale — all derived, no stored close record.
+        let two = records_with(
+            listing.clone(),
+            vec![
+                consumed(&listing, tx(1), WHILE_OPEN),
+                consumed(&listing, tx(2), WHILE_OPEN + 5),
+            ],
+        );
+        let state = state_of(&two, WHILE_OPEN + 5).unwrap();
+        assert!(!state.is_on_offer());
+        assert!(matches!(
+            state,
+            ListingState::Closed {
+                reason: CloseReason::SoldOut,
+                closed_at,
+                ..
+            } if closed_at == WHILE_OPEN + 5
+        ));
+        assert_eq!(state.listing().unwrap().availability.capacity, Some(0));
+    }
+
+    #[test]
+    fn a_duplicate_sale_takes_no_second_unit() {
+        let mut listing = listing_of(&Keypair::generate());
+        listing.availability.capacity = Some(2);
+        // The same transaction attested twice (gossip, replay) is one sale.
+        let records = records_with(
+            listing.clone(),
+            vec![
+                consumed(&listing, tx(1), WHILE_OPEN),
+                consumed(&listing, tx(1), WHILE_OPEN),
+            ],
+        );
+        let state = state_of(&records, WHILE_OPEN).unwrap();
+        assert!(state.is_on_offer());
+        assert_eq!(state.listing().unwrap().availability.capacity, Some(1));
+    }
+
+    #[test]
+    fn a_sale_against_a_listing_that_tracks_no_stock_is_inert() {
+        let mut listing = listing_of(&Keypair::generate());
+        listing.availability.capacity = None; // a service slot or commons offer
+        let records = records_with(listing.clone(), vec![consumed(&listing, tx(1), WHILE_OPEN)]);
+        assert_eq!(
+            state_of(&records, WHILE_OPEN).unwrap(),
+            ListingState::Active(listing)
+        );
+    }
+
+    #[test]
+    fn only_the_station_may_attest_a_sale() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station = Keypair::generate();
+        let station_key = station.public_key();
+        let listing = listing_of(&provider);
+        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+
+        // The provider — anyone but the station — may not attest a sale.
+        let record = consumed(&listing, tx(1), WHILE_OPEN);
+        let err = append_stock_consumed(
+            &mut log,
+            SignedPayload::sign(record, &provider),
+            &station_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Lifecycle(LifecycleError::ConsumeNotPermitted { .. })
+        ));
+
+        // The station may, and the listing reads one unit lighter.
+        append_stock_consumed(
+            &mut log,
+            SignedPayload::sign(record, &station),
+            &station_key,
+        )
+        .unwrap();
+        let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.listing().unwrap().availability.capacity, Some(11));
     }
 
     #[test]

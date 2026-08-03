@@ -437,5 +437,6 @@ fn close_reason_name(reason: CloseReason) -> &'static str {
         CloseReason::ExpirationReached => "expiration_reached",
         CloseReason::ProviderClosed => "provider_closed",
         CloseReason::StationCleanup => "station_cleanup",
+        CloseReason::SoldOut => "sold_out",
     }
 }

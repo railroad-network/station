@@ -268,6 +268,15 @@ pub struct TransactionRow {
     /// Optional memo carried on the proposal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
+    /// The marketplace listing this paid for, hex — present on a marketplace
+    /// payment, absent on a direct pay (T1.7.6 Stage B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_id: Option<String>,
+    /// That listing's title, resolved from the marketplace log so history reads
+    /// as what it bought ("Seed potatoes") rather than a memo string. Present
+    /// when the listing is one this station has seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_title: Option<String>,
     /// Lifecycle: `pending` | `confirmed` | `settled` | `cancelled`.
     pub state: String,
     /// Unix seconds the proposal was made (the row's sort key).

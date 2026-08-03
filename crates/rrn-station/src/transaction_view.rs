@@ -9,17 +9,32 @@
 //! member is not party to. Doing the correlation here, once, keeps the phone a
 //! renderer rather than a second implementation of the ledger's lifecycle.
 
+use std::collections::BTreeMap;
+
+use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
+use rrn_ledger::transaction::ListingRef;
+use rrn_marketplace::lifecycle::listing_records;
+use rrn_marketplace::listing::ListingId;
+use rrn_storage::log::AppendLog;
 
 use crate::core::hex;
 use crate::rpc::TransactionRow;
 
 /// The member's transactions, most recent first, capped at `limit` if given.
+///
+/// `log`/`station` are used only to resolve the title of any marketplace payment
+/// (T1.7.6 Stage B), so history reads as what it bought. The lookup is memoised
+/// by [`ListingId`] and, when a limit is given, runs only on the rows kept — a
+/// member with many marketplace payments pays per-listing once, not per-row.
 pub fn member_transactions(
     snapshot: &LedgerSnapshot,
     member: &Address,
     limit: Option<u64>,
+    log: &AppendLog,
+    station: &PublicKey,
 ) -> Vec<TransactionRow> {
     let mut rows: Vec<TransactionRow> = snapshot
         .iter()
@@ -31,7 +46,33 @@ pub fn member_transactions(
     if let Some(limit) = limit {
         rows.truncate(limit as usize);
     }
+    let mut titles: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for row in &mut rows {
+        if let Some(listing_hex) = &row.listing_id {
+            row.listing_title = titles
+                .entry(listing_hex.clone())
+                .or_insert_with(|| listing_title(log, station, listing_hex))
+                .clone();
+        }
+    }
     rows
+}
+
+/// The title of the listing named by `listing_hex`, read from the marketplace
+/// log, or `None` if this station has never seen it created. A closed or
+/// sold-out listing still has a title — `current()` is the provider's own view,
+/// independent of how the listing ended.
+pub(crate) fn listing_title(
+    log: &AppendLog,
+    station: &PublicKey,
+    listing_hex: &str,
+) -> Option<String> {
+    let bytes: [u8; 32] = crate::core::unhex(listing_hex)?.try_into().ok()?;
+    let listing_id = ListingId(Hash::from_bytes(bytes));
+    listing_records(log, &listing_id, station)
+        .ok()?
+        .current()
+        .map(|listing| listing.title)
 }
 
 /// Maps one correlated state to a row for `member`, or `None` if the member is
@@ -80,6 +121,11 @@ pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<Tran
         direction: direction.to_string(),
         amount_centi,
         memo: proposal.memo.clone(),
+        // The listing this paid for; the title is filled in by the caller, which
+        // has the log to resolve it (a push event leaves it `None` and the phone
+        // falls back to the memo).
+        listing_id: proposal.listing_id.map(|ListingRef(b)| hex(&b)),
+        listing_title: None,
         state: state_str.to_string(),
         timestamp: proposal.proposed_at,
         // Only a still-open proposal has a meaningful expiry.
@@ -156,5 +202,32 @@ mod tests {
             300,
         );
         assert!(row_for(&state, &stranger).is_none());
+    }
+
+    #[test]
+    fn a_linked_proposal_carries_its_listing_id_but_leaves_the_title_for_later() {
+        use rrn_ledger::transaction::ListingRef;
+        let sender = Keypair::generate();
+        let sender_addr = Address::from_public_key(sender.public_key());
+        let receiver = Address::from_public_key(Keypair::generate().public_key());
+        let proposal = TransactionProposal::new(sender_addr, receiver, 500, None, 1, 1_000, 87_400)
+            .with_listing(ListingRef([9u8; 32]));
+        let state = TransactionState::Proposed {
+            proposal: SignedProposal::sign(proposal, &sender),
+        };
+        let row = row_for(&state, &sender_addr).unwrap();
+        assert_eq!(row.listing_id, Some("09".repeat(32)));
+        // The title is resolved by `member_transactions`, which has the log — not
+        // by `row_for`, which does not.
+        assert_eq!(row.listing_title, None);
+    }
+
+    #[test]
+    fn an_unknown_listing_resolves_to_no_title() {
+        let db = rrn_storage::db::Database::open_in_memory().unwrap();
+        rrn_storage::migrations::run(&db).unwrap();
+        let log = AppendLog::new(&db);
+        let station_pk = Keypair::generate().public_key();
+        assert_eq!(listing_title(&log, &station_pk, &"aa".repeat(32)), None);
     }
 }
