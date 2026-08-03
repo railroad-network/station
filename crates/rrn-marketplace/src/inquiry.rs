@@ -986,7 +986,11 @@ pub fn append_inquiry_closed(
 #[derive(Clone, Debug, PartialEq, Error)]
 pub enum RequirementUnmet {
     /// The buyer's capped composite is below what the listing demands.
-    #[error("listing requires reputation {required}, but yours is {have}")]
+    //
+    // `have` is a computed composite, so round it to two places — a bare f32
+    // prints as "1.0408456", which reads as a bug. `required` is a whole-number
+    // floor (Anyone / Member+), so it needs no rounding.
+    #[error("listing requires reputation {required}, but yours is {have:.2}")]
     ReputationTooLow {
         /// The listing's `min_reputation`.
         required: f32,
