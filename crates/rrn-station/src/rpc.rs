@@ -396,6 +396,21 @@ pub struct CreateListingParams {
     /// Unix seconds the listing goes off offer; `None` stands until closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// The cadence of a recurring service: `daily`, `weekly`, or `monthly`.
+    /// `None` for a one-off listing. Only a `services` listing may recur, and the
+    /// remaining `recurring_*` fields are read only when this is set (T1.7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+    /// How many periods a recurring commitment runs for; required with `every`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub periods: Option<u32>,
+    /// Days of notice to end a recurring contract early. `None` defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_days: Option<u32>,
+    /// The early-termination penalty in centicommons on a recurring contract.
+    /// `None` defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub penalty_centi: Option<i64>,
 }
 
 /// `marketplace_create_listing` result.
@@ -521,6 +536,43 @@ pub struct InquiryStateResult {
 pub struct InquiryThreadParams {
     /// The hex inquiry id.
     pub inquiry_id: String,
+}
+
+/// `marketplace_contract` params (operator socket) — sign up to a recurring
+/// service, born from an agreed inquiry. The station wallet is the buyer; a mobile
+/// signs its own [`rrn_marketplace::contract::ServiceContract`] in Stage 2.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContractParams {
+    /// The hex id of the agreed inquiry this contract commits to.
+    pub inquiry_id: String,
+    /// Free-form notes to record on the contract (labels the buyer chose). No
+    /// logic reads them; they are not part of the terms match.
+    #[serde(default)]
+    pub metrics: std::collections::BTreeMap<String, String>,
+}
+
+/// `marketplace_contract` / `marketplace_contract_terminate` shared result naming
+/// the contract and its resulting state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContractStateResult {
+    /// The contract's content address, hex-encoded.
+    pub contract_id: String,
+    /// The contract's state after the call: `active`, `terminating`, or `ended`.
+    pub state: String,
+}
+
+/// `marketplace_contract_show` params.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContractShowParams {
+    /// The hex contract id.
+    pub contract_id: String,
+}
+
+/// `marketplace_contract_terminate` params.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContractTerminateParams {
+    /// The hex contract id.
+    pub contract_id: String,
 }
 
 // The inquiry *read* results (thread, my-inquiries) are not typed here, for the

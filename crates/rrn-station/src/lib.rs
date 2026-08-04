@@ -33,6 +33,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod contract_view;
 pub mod core;
 pub mod events;
 pub mod gossip;

@@ -368,7 +368,7 @@ pub enum TerminatedBy {
 
 impl TerminatedBy {
     /// The wire discriminant carried in the `terminated_by` field.
-    fn tag(self) -> &'static str {
+    pub fn tag(self) -> &'static str {
         match self {
             TerminatedBy::Buyer => "buyer",
             TerminatedBy::Provider => "provider",

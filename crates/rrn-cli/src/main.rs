@@ -20,8 +20,8 @@ use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    CreateListingResult, HistoryResult, InquireResult, InquiryStateResult, ProposeResult,
-    RecoverImportResult, VouchResult, WhoamiResult,
+    ContractStateResult, CreateListingResult, HistoryResult, InquireResult, InquiryStateResult,
+    ProposeResult, RecoverImportResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -184,6 +184,21 @@ enum Command {
         /// Take the listing off offer after this date (or unix seconds).
         #[arg(long)]
         expires: Option<String>,
+        /// Make this a recurring service: how often a period falls due
+        /// (`services` only).
+        #[arg(long, value_parser = PossibleValuesParser::new(["daily", "weekly", "monthly"]))]
+        every: Option<String>,
+        /// How many periods a recurring commitment runs for (required with
+        /// `--every`).
+        #[arg(long)]
+        periods: Option<u32>,
+        /// Days of notice to end a recurring contract early.
+        #[arg(long)]
+        notice: Option<u32>,
+        /// Early-termination penalty in Commons, charged to whoever ends a
+        /// recurring contract before its natural end.
+        #[arg(long)]
+        penalty: Option<String>,
     },
     /// Browse what is on offer.
     Browse {
@@ -283,6 +298,27 @@ enum Command {
         /// the listed price.
         #[arg(long, allow_hyphen_values = true)]
         price: Option<String>,
+    },
+    /// Sign up to a recurring service, from an inquiry the provider has agreed.
+    Contract {
+        /// The hex id of the agreed inquiry.
+        inquiry_id: String,
+        /// A free-form note to record on the contract, as `key=value`;
+        /// repeatable. No logic reads these; they are not part of the terms.
+        #[arg(long = "metric", value_parser = parse_kv)]
+        metrics: Vec<(String, String)>,
+    },
+    /// Show the service contracts you are a party to.
+    Contracts,
+    /// Show one service contract in full.
+    ShowContract {
+        /// The hex contract id.
+        contract_id: String,
+    },
+    /// End one of your service contracts early.
+    TerminateContract {
+        /// The hex contract id.
+        contract_id: String,
     },
 }
 
@@ -422,6 +458,10 @@ async fn run(cli: Cli) -> Result<()> {
             community_only,
             oracle_tier,
             expires,
+            every,
+            periods,
+            notice,
+            penalty,
         } => {
             let mut params = json!({
                 "surface": surface,
@@ -448,6 +488,18 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(e) = expires {
                 params["expires_at"] = json!(parse_when(&e)?);
+            }
+            if let Some(e) = every {
+                params["every"] = json!(e);
+            }
+            if let Some(p) = periods {
+                params["periods"] = json!(p);
+            }
+            if let Some(n) = notice {
+                params["notice_days"] = json!(n);
+            }
+            if let Some(p) = penalty {
+                params["penalty_centi"] = json!(parse_signed_amount(&p)?);
             }
             let v = client.call("marketplace_create_listing", params).await?;
             emit(fmt, &v, || {
@@ -600,6 +652,43 @@ async fn run(cli: Cli) -> Result<()> {
             let v = client.call("marketplace_inquiry_close", params).await?;
             emit(fmt, &v, || {
                 let r: InquiryStateResult = parse(&v)?;
+                Ok(r.state)
+            })
+        }
+        Command::Contract {
+            inquiry_id,
+            metrics,
+        } => {
+            let metrics: std::collections::BTreeMap<String, String> = metrics.into_iter().collect();
+            let params = json!({ "inquiry_id": inquiry_id, "metrics": metrics });
+            let v = client.call("marketplace_contract", params).await?;
+            emit(fmt, &v, || {
+                let r: ContractStateResult = parse(&v)?;
+                Ok(r.contract_id)
+            })
+        }
+        Command::Contracts => {
+            let v = client.call("marketplace_contracts", json!({})).await?;
+            emit(fmt, &v, || Ok(render_contracts(&v["contracts"], color)))
+        }
+        Command::ShowContract { contract_id } => {
+            let v = client
+                .call(
+                    "marketplace_contract_show",
+                    json!({ "contract_id": contract_id }),
+                )
+                .await?;
+            emit(fmt, &v, || Ok(render_contract(&v, color)))
+        }
+        Command::TerminateContract { contract_id } => {
+            let v = client
+                .call(
+                    "marketplace_contract_terminate",
+                    json!({ "contract_id": contract_id }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: ContractStateResult = parse(&v)?;
                 Ok(r.state)
             })
         }
@@ -973,6 +1062,118 @@ fn message_line(body: &str, offer_centi: Option<i64>) -> String {
             }
         }
         None => body.to_string(),
+    }
+}
+
+/// Renders `contracts` rows: state, the caller's role, the per-period price, how
+/// many periods have been charged, the counterparty, and the listing title.
+fn render_contracts(contracts: &serde_json::Value, color: ColorMode) -> String {
+    let Some(rows) = contracts.as_array() else {
+        return "no contracts".to_string();
+    };
+    if rows.is_empty() {
+        return "no contracts".to_string();
+    }
+    rows.iter()
+        .map(|row| {
+            let charged = i(row, "periods_charged").unwrap_or(0);
+            let total = charged + i(row, "periods_remaining").unwrap_or(0);
+            format!(
+                "{}  {:<11} {:<9} {:>10}/period  {}/{} charged  {}  {}",
+                s(row, "contract_id"),
+                s(row, "state"),
+                s(row, "role"),
+                fmt_commons(i(row, "commons_per_period_centi").unwrap_or(0)),
+                charged,
+                total,
+                s(row, "counterparty"),
+                paint(color, BOLD, &s(row, "listing_title")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Renders one contract in full: the terms, where it stands, and any free-form
+/// notes the buyer recorded. Timestamps are raw unix seconds, as elsewhere.
+fn render_contract(v: &serde_json::Value, color: ColorMode) -> String {
+    let mut out = vec![
+        format!(
+            "{:<24}{}",
+            "listing",
+            paint(color, BOLD, &s(v, "listing_title"))
+        ),
+        format!("{:<24}{}", "contract_id", s(v, "contract_id")),
+        format!("{:<24}{}", "inquiry_id", s(v, "inquiry_id")),
+        format!("{:<24}{}", "state", s(v, "state")),
+        format!("{:<24}{}", "buyer", s(v, "buyer")),
+        format!("{:<24}{}", "provider", s(v, "provider")),
+        format!(
+            "{:<24}{} (every {}s)",
+            "cadence",
+            s(v, "frequency"),
+            i(v, "period_secs").unwrap_or(0)
+        ),
+        format!(
+            "{:<24}{}/period",
+            "price",
+            fmt_commons(i(v, "commons_per_period_centi").unwrap_or(0))
+        ),
+        format!(
+            "{:<24}{} charged, {} left of {}",
+            "periods",
+            i(v, "periods_charged").unwrap_or(0),
+            i(v, "periods_remaining").unwrap_or(0),
+            i(v, "duration_periods").unwrap_or(0)
+        ),
+        format!(
+            "{:<24}{} days",
+            "notice",
+            i(v, "notice_period_days").unwrap_or(0)
+        ),
+        format!(
+            "{:<24}{}",
+            "penalty",
+            fmt_commons(i(v, "early_termination_penalty_centi").unwrap_or(0))
+        ),
+        format!("{:<24}{}", "started_at", i(v, "started_at").unwrap_or(0)),
+    ];
+    if let Some(t) = i(v, "next_charge_due") {
+        out.push(format!("{:<24}{}", "next_charge_due", t));
+    }
+    if let Some(t) = i(v, "terminating_effective_at") {
+        out.push(format!("{:<24}{}", "terminating_at", t));
+    }
+    if let Some(r) = v.get("ended_reason").and_then(|x| x.as_str()) {
+        out.push(format!("{:<24}{}", "ended_reason", r));
+    }
+    if let Some(b) = v.get("terminated_by").and_then(|x| x.as_str()) {
+        out.push(format!("{:<24}{}", "terminated_by", b));
+    }
+    if let Some(e) = v.get("ended_early").and_then(|x| x.as_bool()) {
+        out.push(format!("{:<24}{}", "ended_early", e));
+    }
+    if let Some(t) = i(v, "ended_at") {
+        out.push(format!("{:<24}{}", "ended_at", t));
+    }
+    if let Some(metrics) = v.get("performance_metrics").and_then(|x| x.as_object()) {
+        if !metrics.is_empty() {
+            out.push(String::new());
+            out.push("metrics".to_string());
+            for (k, val) in metrics {
+                out.push(format!("  {:<22}{}", k, val.as_str().unwrap_or("")));
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// Parses a `key=value` metric pair for `rrn contract --metric`. The key may not
+/// be empty; the value may (a bare `note=` records an empty note).
+fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected key=value, got {s:?}")),
     }
 }
 

@@ -33,7 +33,10 @@ use rrn_ledger::transaction::{
     ListingRef, SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId,
     TransactionProposal,
 };
-use rrn_marketplace::contract::{all_contract_records, ContractState, EndReason, TerminatedBy};
+use rrn_marketplace::contract::{
+    all_contract_records, append_service_contract, ContractId, ContractState, ContractTermination,
+    ContractTerms, EndReason, ServiceContract, TerminatedBy,
+};
 use rrn_marketplace::lifecycle::{
     append_listing_closed, append_stock_consumed, touched_listing, CloseReason, ListingClosed,
     ListingState, StockConsumed,
@@ -49,6 +52,7 @@ use rrn_crypto::keypair::{PublicKey, Signature};
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
 
 use crate::clock::Clock;
+use crate::contract_view;
 use crate::events::{self, Event};
 use crate::gossip::WireEntry;
 use crate::inquiry_view;
@@ -589,6 +593,10 @@ impl Core {
             "marketplace_inquiry_close" => self.m_marketplace_inquiry_close(req),
             "marketplace_inquiry_thread" => self.m_marketplace_inquiry_thread(req),
             "marketplace_my_inquiries" => self.m_marketplace_my_inquiries(),
+            "marketplace_contract" => self.m_marketplace_contract(req),
+            "marketplace_contracts" => self.m_marketplace_contracts(),
+            "marketplace_contract_show" => self.m_marketplace_contract_show(req),
+            "marketplace_contract_terminate" => self.m_marketplace_contract_terminate(req),
             // Operator-facing pairing management (T1.3.3), invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
@@ -811,6 +819,27 @@ impl Core {
             params.expires_at,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
+
+        // A recurring service carries the standing terms a later contract
+        // snapshots. `with_recurring` re-derives the id but does not re-validate,
+        // so check the whole listing again — this is where "recurring only on a
+        // service" and the duration/penalty rules are enforced at the boundary.
+        let listing = match params.every {
+            Some(ref every) => {
+                let terms = recurring_terms_from(
+                    every,
+                    params.periods,
+                    params.notice_days,
+                    params.penalty_centi,
+                )?;
+                let listing = listing.with_recurring(terms);
+                listing
+                    .validate()
+                    .map_err(|e| invalid_params(e.to_string()))?;
+                listing
+            }
+            None => listing,
+        };
 
         let listing_id = listing.id;
         let mut log = AppendLog::new(&self.db);
@@ -1103,6 +1132,165 @@ impl Core {
     /// `marketplace_my_inquiries` — every inquiry the station is a party to.
     fn m_marketplace_my_inquiries(&self) -> Result<serde_json::Value, rpc::RpcError> {
         self.run_my_inquiries(self.wallet.address)
+    }
+
+    /// `marketplace_contract` — sign up to a recurring service, born from an
+    /// agreed inquiry (T1.7.7).
+    ///
+    /// The station wallet is the buyer, which on the operator's socket is the
+    /// operator themselves (a member signs their own contract from a phone in
+    /// Stage 2). The terms are snapshotted from the agreed inquiry — the listing's
+    /// standing cadence and the price the two parties settled on — so the request
+    /// chooses nothing but the free-form notes: everything binding was already
+    /// agreed. [`append_service_contract`] re-checks all of it against the log.
+    fn m_marketplace_contract(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::ContractParams = parse_params(req)?;
+        let inquiry_id = parse_inquiry_id(&params.inquiry_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let admits = self.inquiry_admits(now);
+
+        // Resolve the agreed inquiry to snapshot the terms the contract commits to:
+        // the listing's standing cadence and the price the grant settled on.
+        let inquiry = {
+            let log = AppendLog::new(&self.db);
+            rrn_marketplace::inquiry::inquiry_records(&log, &inquiry_id, &station_pk, &admits)
+                .map_err(internal)?
+                .ok_or_else(|| invalid_params("no such inquiry on this station"))?
+        };
+        let recurring = inquiry
+            .listing
+            .recurring
+            .ok_or_else(|| invalid_params("that inquiry's listing is not a recurring service"))?;
+        let final_price_centi = match inquiry.closed.as_ref().map(|c| c.outcome) {
+            Some(rrn_marketplace::inquiry::InquiryOutcome::Agreed { final_price_centi }) => {
+                final_price_centi
+            }
+            _ => return Err(invalid_params("that inquiry is not agreed")),
+        };
+
+        let terms = ContractTerms {
+            frequency: recurring.frequency,
+            duration_periods: recurring.duration_periods,
+            commons_per_period_centi: final_price_centi,
+            performance_metrics: params.metrics,
+            notice_period_days: recurring.notice_period_days,
+            early_termination_penalty_centi: recurring.early_termination_penalty_centi,
+        };
+        let contract = ServiceContract::new(
+            inquiry_id,
+            inquiry.listing.id,
+            self.wallet.address,
+            inquiry.provider(),
+            terms,
+            now,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let contract_id = contract.contract_id;
+
+        let mut log = AppendLog::new(&self.db);
+        append_service_contract(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(contract, &station),
+            &station_pk,
+            &admits,
+        )
+        .map_err(marketplace_err)?;
+
+        // A fresh contract has charged nothing, so it stands `active` at `now`.
+        ok(&rpc::ContractStateResult {
+            contract_id: hex(&contract_id.to_bytes()),
+            state: "active".into(),
+        })
+    }
+
+    /// `marketplace_contracts` — every contract the station is a party to.
+    fn m_marketplace_contracts(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        self.run_my_contracts(self.wallet.address)
+    }
+
+    /// `marketplace_contract_show` — one contract the station is a party to.
+    fn m_marketplace_contract_show(
+        &self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::ContractShowParams = parse_params(req)?;
+        self.run_contract_detail(&params.contract_id, self.wallet.address)
+    }
+
+    /// `marketplace_contract_terminate` — end a contract the station is a party
+    /// to. Either party may; the notice window (and any penalty) is the charge
+    /// sweep's to apply.
+    fn m_marketplace_contract_terminate(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::ContractTerminateParams = parse_params(req)?;
+        let contract_id = parse_contract_id(&params.contract_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let admits = self.inquiry_admits(now);
+
+        // Resolve the contract to learn which side the station is on — the record
+        // must claim the party that actually signed it.
+        let records = {
+            let log = AppendLog::new(&self.db);
+            rrn_marketplace::contract::contract_records(&log, &contract_id, &station_pk, &admits)
+                .map_err(internal)?
+                .ok_or_else(|| invalid_params("no such contract on this station"))?
+        };
+        let me = self.wallet.address;
+        let terminated_by = if records.buyer() == me {
+            TerminatedBy::Buyer
+        } else if records.provider() == me {
+            TerminatedBy::Provider
+        } else {
+            return Err(invalid_params("not a party to this contract"));
+        };
+
+        let record = ContractTermination {
+            contract_id,
+            terminated_by,
+            requested_at: now,
+        };
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::contract::append_contract_termination(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(record, &station),
+            &station_pk,
+            &admits,
+        )
+        .map_err(marketplace_err)?;
+
+        // Report where it now stands — within its notice window (`terminating`) or
+        // already past it (`ended`) — by re-reading the contract with the
+        // termination on the log.
+        let state = {
+            let log = AppendLog::new(&self.db);
+            let records = rrn_marketplace::contract::contract_records(
+                &log,
+                &contract_id,
+                &station_pk,
+                &admits,
+            )
+            .map_err(internal)?
+            .ok_or_else(|| internal("contract vanished after termination"))?;
+            let charged = charged_periods_by_contract(&log);
+            let periods_charged =
+                periods_charged_of(&charged, &contract_id, records.total_periods());
+            records.state(now, periods_charged).tag()
+        };
+        ok(&rpc::ContractStateResult {
+            contract_id: params.contract_id,
+            state: state.into(),
+        })
     }
 
     fn m_backup_export(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -2465,6 +2653,52 @@ impl Core {
         ok(&serde_json::json!({ "inquiries": rows }))
     }
 
+    /// The contract-detail read (T1.7.7). `viewer` must be the contract's buyer or
+    /// provider — a contract is private to its two parties, so a non-party gets
+    /// the same "no such contract" a missing one would.
+    fn run_contract_detail(
+        &self,
+        contract_id: &str,
+        viewer: Address,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let contract_id = parse_contract_id(contract_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let admits = self.inquiry_admits(now);
+        let log = AppendLog::new(&self.db);
+        match rrn_marketplace::contract::contract_records(&log, &contract_id, station_pk, &admits)
+            .map_err(internal)?
+        {
+            Some(records) if records.buyer() == viewer || records.provider() == viewer => {
+                let charged = charged_periods_by_contract(&log);
+                let periods_charged =
+                    periods_charged_of(&charged, &contract_id, records.total_periods());
+                ok(&contract_view::detail(&records, periods_charged, now))
+            }
+            _ => Err(invalid_params("no such contract for this member")),
+        }
+    }
+
+    /// The my-contracts read (T1.7.7). Returns the contracts `viewer` is a party
+    /// to, newest first, each with the count of periods the ledger has charged so
+    /// the state and next-due date are current.
+    fn run_my_contracts(&self, viewer: Address) -> Result<serde_json::Value, rpc::RpcError> {
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let admits = self.inquiry_admits(now);
+        let log = AppendLog::new(&self.db);
+        let all = rrn_marketplace::contract::all_contract_records(&log, station_pk, &admits)
+            .map_err(internal)?;
+        let charged = charged_periods_by_contract(&log);
+        let paired = all.into_iter().map(|(id, records)| {
+            let periods_charged = periods_charged_of(&charged, &id, records.total_periods());
+            (records, periods_charged)
+        });
+        let rows = contract_view::my_contracts(paired, &viewer, now);
+        ok(&serde_json::json!({ "contracts": rows }))
+    }
+
     /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
     fn prune_pending(&mut self, now: i64) {
         self.pending
@@ -2664,6 +2898,39 @@ fn availability_for(
     }
 }
 
+/// Builds a listing's [`RecurringTerms`](rrn_marketplace::listing::RecurringTerms)
+/// from the `every`/`periods`/`notice`/`penalty` a create request carried. The
+/// CLI offers only the three named cadences; a `Custom` interval exists in the
+/// model but has no operator surface. `notice` and `penalty` default to zero (no
+/// notice, no penalty). The listing's own `validate` enforces the rest — that
+/// the surface is a service and the duration is at least one period.
+fn recurring_terms_from(
+    every: &str,
+    periods: Option<u32>,
+    notice_days: Option<u32>,
+    penalty_centi: Option<i64>,
+) -> Result<rrn_marketplace::listing::RecurringTerms, rpc::RpcError> {
+    use rrn_marketplace::listing::Frequency;
+    let frequency = match every {
+        "daily" => Frequency::Daily,
+        "weekly" => Frequency::Weekly,
+        "monthly" => Frequency::Monthly,
+        other => {
+            return Err(invalid_params(format!(
+                "unknown cadence {other:?} (daily, weekly, or monthly)"
+            )))
+        }
+    };
+    let duration_periods =
+        periods.ok_or_else(|| invalid_params("a recurring listing needs --periods"))?;
+    Ok(rrn_marketplace::listing::RecurringTerms {
+        frequency,
+        duration_periods,
+        notice_period_days: notice_days.unwrap_or(0),
+        early_termination_penalty_centi: penalty_centi.unwrap_or(0),
+    })
+}
+
 /// Maps a marketplace error to an RPC error. A rule the caller's own request
 /// broke — an unknown category, a listing that is not theirs to close, one
 /// already closed — is their mistake to fix; only storage and index trouble is
@@ -2735,9 +3002,18 @@ fn parse_inquiry_id(s: &str) -> Result<rrn_marketplace::inquiry::InquiryId, (i32
     Ok(rrn_marketplace::inquiry::InquiryId(Hash::from_bytes(bytes)))
 }
 
-/// The listing a transaction pays for, if it is a marketplace payment (T1.7.6):
-/// the `listing_id` the buyer signed into the proposal, named as a marketplace
-/// [`ListingId`]. `None` for a direct pay.
+fn parse_contract_id(s: &str) -> Result<ContractId, (i32, String)> {
+    let bytes =
+        unhex(s).ok_or_else(|| (rpc::INVALID_PARAMS, "contract_id is not hex".to_string()))?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        (
+            rpc::INVALID_PARAMS,
+            "contract_id is not 32 bytes".to_string(),
+        )
+    })?;
+    Ok(ContractId(Hash::from_bytes(bytes)))
+}
+
 /// The `period_index` a contract's early-termination penalty rides on. Chosen
 /// past any real period so it neither counts toward `periods_charged` nor
 /// collides with a period's own idempotency key — a contract's duration is a
@@ -2762,6 +3038,23 @@ fn charged_periods_by_contract(log: &AppendLog) -> BTreeMap<ContractRef, BTreeSe
     map
 }
 
+/// How many real periods a contract has been charged, from a
+/// [`charged_periods_by_contract`] map. The penalty's sentinel index is excluded
+/// so it never counts as a period, matching what the charge sweep counts.
+fn periods_charged_of(
+    charged: &BTreeMap<ContractRef, BTreeSet<u32>>,
+    id: &ContractId,
+    total: u32,
+) -> u32 {
+    charged
+        .get(&ContractRef(id.to_bytes()))
+        .map(|periods| periods.iter().filter(|&&p| p < total).count() as u32)
+        .unwrap_or(0)
+}
+
+/// The listing a transaction pays for, if it is a marketplace payment (T1.7.6):
+/// the `listing_id` the buyer signed into the proposal, named as a marketplace
+/// [`ListingId`]. `None` for a direct pay.
 fn linked_listing(state: &TransactionState) -> Option<ListingId> {
     let proposal = match state {
         TransactionState::Proposed { proposal }
@@ -3822,5 +4115,48 @@ mod tests {
             ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
             -(2 * CONTRACT_PRICE) - CONTRACT_PENALTY
         );
+    }
+
+    #[test]
+    fn contract_reads_shape_detail_and_list_and_scope_to_a_party() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let contract_id = seed_contract(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let cid = hex(&contract_id.to_bytes());
+
+        // Detail, before any charge: active, four periods to run, next due now.
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["contract_id"], cid);
+        assert_eq!(detail["state"], "active");
+        assert_eq!(detail["frequency"], "weekly");
+        assert_eq!(detail["commons_per_period_centi"], CONTRACT_PRICE);
+        assert_eq!(detail["periods_charged"], 0);
+        assert_eq!(detail["periods_remaining"], CONTRACT_PERIODS);
+        assert_eq!(detail["next_charge_due"], NOW);
+
+        // The list shows the one contract, with the viewer's role on it.
+        let rows = core.run_my_contracts(buyer_addr).unwrap();
+        let rows = rows["contracts"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["role"], "buyer");
+        assert_eq!(rows[0]["periods_charged"], 0);
+
+        // After the sweep bills period 0, the read reflects the ledger's count —
+        // one charged, three left, next due a week out.
+        assert_eq!(core.do_charge_contracts(), 1);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["periods_charged"], 1);
+        assert_eq!(detail["periods_remaining"], CONTRACT_PERIODS - 1);
+        assert_eq!(detail["next_charge_due"], NOW + WEEK_SECS);
+
+        // A contract is private to its two parties: a stranger sees neither the
+        // detail nor a row for it.
+        let stranger = Address::from_public_key(Keypair::generate().public_key());
+        assert!(core.run_contract_detail(&cid, stranger).is_err());
+        assert!(core.run_my_contracts(stranger).unwrap()["contracts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }
