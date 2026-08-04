@@ -153,6 +153,16 @@ pub struct TimersSection {
     /// changes nothing a party would notice.
     #[serde(default = "default_inquiry_expiry_interval")]
     pub inquiry_expiry_interval_secs: u64,
+    /// Service-contract charge sweep interval in seconds (default: 300 — five
+    /// minutes).
+    ///
+    /// Each tick bills every period a live contract has due (T1.7.7). Latency here
+    /// only delays *writing down* a charge the contract already authorized, and a
+    /// re-swept period folds to nothing (the `(contract, period)` idempotency key),
+    /// so a coarse cadence is safe; a test drives it directly through
+    /// [`charge_contracts`](crate::core::CoreHandle::charge_contracts).
+    #[serde(default = "default_contract_charge_interval")]
+    pub contract_charge_interval_secs: u64,
 }
 
 fn default_window_seconds() -> u64 {
@@ -173,6 +183,9 @@ fn default_listing_expiry_interval() -> u64 {
 fn default_inquiry_expiry_interval() -> u64 {
     3600
 }
+fn default_contract_charge_interval() -> u64 {
+    300
+}
 
 impl Default for SettlementSection {
     fn default() -> Self {
@@ -190,6 +203,7 @@ impl Default for TimersSection {
             reputation_refresh_interval_secs: default_reputation_refresh_interval(),
             listing_expiry_interval_secs: default_listing_expiry_interval(),
             inquiry_expiry_interval_secs: default_inquiry_expiry_interval(),
+            contract_charge_interval_secs: default_contract_charge_interval(),
         }
     }
 }

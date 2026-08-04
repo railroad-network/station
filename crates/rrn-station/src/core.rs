@@ -12,18 +12,20 @@
 //! receiving commands over a [`std::sync::mpsc`] channel and replying over Tokio
 //! oneshots — which can be fulfilled from any thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
 use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
+use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::recovery::flow::{reconstruct_wallet, RecoveryPackage};
 use rrn_identity::recovery::shamir::{RawShard, ShardIndex};
 use rrn_identity::vouch::{append_vouch, create_vouch, SignedVouch};
 use rrn_identity::wallet::WalletContents;
+use rrn_ledger::contract::{ContractCharge, ContractRef};
 use rrn_ledger::engine::Engine;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::TransactionState;
@@ -31,6 +33,7 @@ use rrn_ledger::transaction::{
     ListingRef, SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId,
     TransactionProposal,
 };
+use rrn_marketplace::contract::{all_contract_records, ContractState, EndReason, TerminatedBy};
 use rrn_marketplace::lifecycle::{
     append_listing_closed, append_stock_consumed, touched_listing, CloseReason, ListingClosed,
     ListingState, StockConsumed,
@@ -103,6 +106,14 @@ pub enum Command {
     /// closed (T1.7.4).
     ExpireInquiries {
         /// Count of inquiries closed.
+        reply: oneshot::Sender<usize>,
+    },
+    /// Charge every service contract's periods that have fallen due with a
+    /// station-signed [`ContractCharge`], plus the early-termination penalty of a
+    /// contract whose notice window has closed; reply with the number of charge
+    /// records appended (T1.7.7).
+    ChargeContracts {
+        /// Count of charge records appended.
         reply: oneshot::Sender<usize>,
     },
     /// Report this station's own address and current log tail seq (for the peer
@@ -257,6 +268,16 @@ impl CoreHandle {
     pub async fn expire_inquiries(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::ExpireInquiries { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Triggers the service-contract charge sweep; returns the number of charge
+    /// records appended.
+    pub async fn charge_contracts(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ChargeContracts { reply }).is_err() {
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -470,6 +491,10 @@ impl Core {
                 }
                 Command::ExpireInquiries { reply } => {
                     let n = self.do_expire_inquiries();
+                    let _ = reply.send(n);
+                }
+                Command::ChargeContracts { reply } => {
+                    let n = self.do_charge_contracts();
                     let _ = reply.send(n);
                 }
                 Command::Handshake { reply } => {
@@ -1388,6 +1413,119 @@ impl Core {
             }
         }
         closed
+    }
+
+    /// Executes every service contract's due periods as direct debits, and levies
+    /// the early-termination penalty on a terminated contract once its notice
+    /// window has closed (T1.7.7 Part D).
+    ///
+    /// The buyer's one `ServiceContract` signature pre-authorized every period, so
+    /// no party is present to sign the individual charges: the station appends a
+    /// station-signed [`ContractCharge`] per due period, exactly as it signs a
+    /// settlement no transacting party is present for. `periods_charged` — the
+    /// count this crate treats as an input — is read back from the ledger's own
+    /// charge records, not held anywhere, so a boot-time re-sweep replays the same
+    /// verdict and the `(contract_ref, period_index)` idempotency key in the
+    /// balance fold makes a re-charge inert.
+    ///
+    /// A charge that races a duplicate (a gossiped record, an overlapping sweep)
+    /// costs at most a redundant log entry that folds to nothing.
+    fn do_charge_contracts(&mut self) -> usize {
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let admits = self.inquiry_admits(now);
+
+        // Every contract on the log, and — per contract — the period indices the
+        // ledger has already charged, captured in one pass before we append.
+        let (contracts, charged) = {
+            let log = AppendLog::new(&self.db);
+            let contracts = match all_contract_records(&log, &station_pk, &admits) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "contract charge sweep could not read the log");
+                    return 0;
+                }
+            };
+            (contracts, charged_periods_by_contract(&log))
+        };
+
+        let mut appended = 0;
+        for (id, records) in contracts {
+            let contract_ref = ContractRef(id.to_bytes());
+            let already = charged.get(&contract_ref).cloned().unwrap_or_default();
+
+            // A real period's index is `< total_periods`; the penalty rides a
+            // sentinel index so it never counts as a period nor collides with one.
+            let total = records.total_periods();
+            let mut periods_charged = already.iter().filter(|&&p| p < total).count() as u32;
+
+            // Catch up every period due since the last sweep — after downtime a
+            // contract can owe several at once.
+            while let Some(index) = records.next_due_charge(now, periods_charged) {
+                let charge = ContractCharge {
+                    contract_ref,
+                    buyer: records.buyer(),
+                    provider: records.provider(),
+                    amount_centi: records.contract.terms.commons_per_period_centi,
+                    period_index: index,
+                    charged_at: now,
+                };
+                if !self.append_contract_charge(charge, &station) {
+                    break;
+                }
+                appended += 1;
+                periods_charged += 1;
+            }
+
+            // Once, after the notice window closes on an early termination, levy
+            // the penalty on whoever ended it: the buyer pays the provider (the
+            // usual direction), or the provider pays the buyer (the reversed sign
+            // the balance fold reads as provider→buyer). A contract that ran its
+            // full course reads `Completed`, never `Terminated`, so it never pays.
+            let penalty = records.contract.terms.early_termination_penalty_centi;
+            let penalty_due = penalty > 0 && !already.contains(&PENALTY_PERIOD_INDEX);
+            if penalty_due {
+                if let ContractState::Ended {
+                    reason: EndReason::Terminated { by, early: true },
+                    ..
+                } = records.state(now, periods_charged)
+                {
+                    let amount_centi = match by {
+                        TerminatedBy::Buyer => penalty,
+                        TerminatedBy::Provider => -penalty,
+                    };
+                    let charge = ContractCharge {
+                        contract_ref,
+                        buyer: records.buyer(),
+                        provider: records.provider(),
+                        amount_centi,
+                        period_index: PENALTY_PERIOD_INDEX,
+                        charged_at: now,
+                    };
+                    if self.append_contract_charge(charge, &station) {
+                        appended += 1;
+                    }
+                }
+            }
+        }
+        appended
+    }
+
+    /// Appends one station-signed [`ContractCharge`], returning whether it landed.
+    /// The station is the only party that can produce a valid one, so — like a
+    /// settlement record — it needs no append-time entitlement guard beyond the
+    /// signature; the balance fold's per-period dedup absorbs any duplicate.
+    fn append_contract_charge(&self, charge: ContractCharge, station: &Keypair) -> bool {
+        match AppendLog::new(&self.db)
+            .append(rrn_crypto::signed::SignedPayload::sign(charge, station))
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not append a contract charge");
+                false
+            }
+        }
     }
 
     fn tail_seq(&self) -> u64 {
@@ -2600,6 +2738,30 @@ fn parse_inquiry_id(s: &str) -> Result<rrn_marketplace::inquiry::InquiryId, (i32
 /// The listing a transaction pays for, if it is a marketplace payment (T1.7.6):
 /// the `listing_id` the buyer signed into the proposal, named as a marketplace
 /// [`ListingId`]. `None` for a direct pay.
+/// The `period_index` a contract's early-termination penalty rides on. Chosen
+/// past any real period so it neither counts toward `periods_charged` nor
+/// collides with a period's own idempotency key — a contract's duration is a
+/// handful of periods, never near `u32::MAX`.
+const PENALTY_PERIOD_INDEX: u32 = u32::MAX;
+
+/// The set of period indices already charged for each contract, in one log pass.
+///
+/// This is where the station reads back `periods_charged` — the count the
+/// contract crate takes as an input rather than deriving — so the charge sweep
+/// and every state read agree on what the ledger has actually billed.
+fn charged_periods_by_contract(log: &AppendLog) -> BTreeMap<ContractRef, BTreeSet<u32>> {
+    let mut map: BTreeMap<ContractRef, BTreeSet<u32>> = BTreeMap::new();
+    for entry in log.iter_from(1) {
+        let Ok(entry) = entry else { continue };
+        if let Ok(charge) = from_canonical_bytes::<ContractCharge>(&entry.payload.bytes) {
+            map.entry(charge.contract_ref)
+                .or_default()
+                .insert(charge.period_index);
+        }
+    }
+    map
+}
+
 fn linked_listing(state: &TransactionState) -> Option<ListingId> {
     let proposal = match state {
         TransactionState::Proposed { proposal }
@@ -3433,5 +3595,232 @@ mod tests {
 
         let after = core.route_channel_method(&env).unwrap();
         assert_eq!(after["listings"].as_array().unwrap().len(), 1);
+    }
+
+    // --- service contract charge sweep (T1.7.7 Part D) ----------------------
+
+    use rrn_marketplace::contract::{
+        append_contract_termination, append_service_contract, ContractId, ContractTermination,
+        ContractTerms, ServiceContract, TerminatedBy,
+    };
+    use rrn_marketplace::inquiry::{
+        append_inquiry_closed, append_inquiry_opened, InquiryClosed, InquiryOpened, InquiryOutcome,
+    };
+    use rrn_marketplace::listing::{Frequency, RecurringTerms};
+
+    const CONTRACT_PRICE: i64 = 500;
+    const CONTRACT_PERIODS: u32 = 4;
+    const CONTRACT_NOTICE_DAYS: u32 = 7;
+    const CONTRACT_PENALTY: i64 = 300;
+    const WEEK_SECS: i64 = 7 * 86_400;
+
+    /// A recurring weekly services listing in the station's own community, so the
+    /// sweep's real requirements gate admits a fresh buyer (min reputation 0).
+    fn recurring_listing(provider: &Keypair) -> Listing {
+        Listing::new(
+            Address::from_public_key(provider.public_key()),
+            VOUCH_COMMUNITY.into(),
+            Surface::Services,
+            "education".into(),
+            "Weekly house clean".into(),
+            "Every Tuesday.".into(),
+            Pricing {
+                amount_centi: CONTRACT_PRICE,
+                model: PricingModel::Fixed,
+                negotiable: false,
+            },
+            Availability {
+                status: AvailabilityStatus::Available,
+                capacity: None,
+                next_slot: Some(NOW + WEEK_SECS),
+            },
+            Requirements {
+                min_reputation: 0.0,
+                community_member_only: false,
+                federation_only: false,
+            },
+            2,
+            false,
+            NOW,
+            None,
+        )
+        .unwrap()
+        .with_recurring(RecurringTerms {
+            frequency: Frequency::Weekly,
+            duration_periods: CONTRACT_PERIODS,
+            notice_period_days: CONTRACT_NOTICE_DAYS,
+            early_termination_penalty_centi: CONTRACT_PENALTY,
+        })
+    }
+
+    /// Stands up a whole valid contract on the core's log — recurring listing,
+    /// buyer's inquiry, provider's grant at the listed price, buyer's signed
+    /// contract starting at `NOW` — and returns the contract's id and parties.
+    fn seed_contract(core: &Core, provider: &Keypair, buyer: &Keypair) -> ContractId {
+        let station = core.station_keypair();
+        let station_pk = station.public_key();
+        let admit_all = |_: &Listing, _: &Address| true;
+        let listing = recurring_listing(provider);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+
+        let mut log = AppendLog::new(&core.db);
+        append_listing_created(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
+        )
+        .unwrap();
+
+        let opened =
+            InquiryOpened::new(listing.id, buyer_addr, "Sign me up.".into(), None, NOW).unwrap();
+        let inquiry_id = opened.inquiry_id;
+        append_inquiry_opened(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(opened, buyer),
+            &listing,
+            0.0,
+            true,
+        )
+        .unwrap();
+        append_inquiry_closed(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(
+                InquiryClosed {
+                    inquiry_id,
+                    outcome: InquiryOutcome::Agreed {
+                        final_price_centi: CONTRACT_PRICE,
+                    },
+                    closed_at: NOW,
+                },
+                provider,
+            ),
+            &station_pk,
+            &admit_all,
+        )
+        .unwrap();
+
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            buyer_addr,
+            provider_addr,
+            ContractTerms {
+                frequency: Frequency::Weekly,
+                duration_periods: CONTRACT_PERIODS,
+                commons_per_period_centi: CONTRACT_PRICE,
+                performance_metrics: std::collections::BTreeMap::new(),
+                notice_period_days: CONTRACT_NOTICE_DAYS,
+                early_termination_penalty_centi: CONTRACT_PENALTY,
+            },
+            NOW,
+        )
+        .unwrap();
+        let contract_id = contract.contract_id;
+        append_service_contract(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(contract, buyer),
+            &station_pk,
+            &admit_all,
+        )
+        .unwrap();
+        contract_id
+    }
+
+    #[test]
+    fn the_charge_sweep_bills_due_periods_once_and_catches_up() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        seed_contract(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+
+        // At NOW only period 0 is due: one charge, buyer debited, provider paid.
+        assert_eq!(core.do_charge_contracts(), 1);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            -500
+        );
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr).unwrap(),
+            500
+        );
+
+        // Re-running the sweep at the same instant charges nothing more — the
+        // per-period idempotency key in the balance fold is the backstop.
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            -500
+        );
+
+        // Jump past the final period: the sweep catches up every period still
+        // owed in one pass (1, 2, 3), then stops — a completed contract owes
+        // nothing further.
+        core.clock.set(NOW + 3 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 3);
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            -2000
+        );
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr).unwrap(),
+            2000
+        );
+    }
+
+    #[test]
+    fn an_early_termination_bills_through_notice_then_the_penalty_once() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let contract_id = seed_contract(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+
+        // Period 0 charges up front.
+        assert_eq!(core.do_charge_contracts(), 1);
+
+        // The buyer terminates at NOW; the notice window closes one week later.
+        {
+            let mut log = AppendLog::new(&core.db);
+            append_contract_termination(
+                &mut log,
+                rrn_crypto::signed::SignedPayload::sign(
+                    ContractTermination {
+                        contract_id,
+                        terminated_by: TerminatedBy::Buyer,
+                        requested_at: NOW,
+                    },
+                    &buyer,
+                ),
+                &core.station_keypair().public_key(),
+                &|_: &Listing, _: &Address| true,
+            )
+            .unwrap();
+        }
+
+        // At the moment the notice window closes: period 1 falls due on that same
+        // instant (charged through the window, inclusive), and the early-exit
+        // penalty is levied once on the buyer who ended it. Periods 2 and 3 never
+        // charge — they fall past the effective date.
+        core.clock.set(NOW + WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 2); // period 1 + the penalty
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            -(2 * CONTRACT_PRICE) - CONTRACT_PENALTY
+        );
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr).unwrap(),
+            2 * CONTRACT_PRICE + CONTRACT_PENALTY
+        );
+
+        // The sweep is terminal now: no further period, and the penalty is never
+        // charged twice.
+        core.clock.set(NOW + 10 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            -(2 * CONTRACT_PRICE) - CONTRACT_PENALTY
+        );
     }
 }

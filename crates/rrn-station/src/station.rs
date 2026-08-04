@@ -254,6 +254,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // Service-contract charge sweep timer (T1.7.7).
+        tasks.push(tokio::spawn(contract_charge_timer(
+            Duration::from_secs(config.timers.contract_charge_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -308,6 +315,13 @@ impl Station {
     /// written without waiting on the timer.
     pub async fn expire_listings(&self) -> usize {
         self.core.expire_listings().await
+    }
+
+    /// Forces an immediate service-contract charge sweep; returns the number of
+    /// charge records appended. Lets a driver advance the clock past a period and
+    /// see the direct debit taken without waiting on the timer.
+    pub async fn charge_contracts(&self) -> usize {
+        self.core.charge_contracts().await
     }
 
     /// Signals all tasks to stop, stops the core thread, awaits the tasks, and
@@ -396,6 +410,38 @@ async fn inquiry_expiry_timer(
                 let n = core.expire_inquiries().await;
                 if n > 0 {
                     tracing::info!(closed = n, "inquiry expiry sweep");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically asks the core to bill every service contract's due periods
+/// (T1.7.7).
+///
+/// Unlike the settlement sweep, a charge here has no window to close and no party
+/// to confirm it — the buyer's contract signature pre-authorized it — so this is
+/// the only thing that turns an owed period into a balance move. A missed or
+/// coalesced tick is caught up on the next one: the sweep bills every period due,
+/// not just the newest, and a re-charge is idempotent.
+async fn contract_charge_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick, as the other timers do.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.charge_contracts().await;
+                if n > 0 {
+                    tracing::info!(charged = n, "contract charge sweep");
                 }
             }
             _ = shutdown.changed() => {
