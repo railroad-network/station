@@ -16,6 +16,9 @@
 //! - [`engine`] — the [`engine::Engine`] front door: submit a proposal, submit a
 //!   confirmation, cancel, or query state, with nonce + timestamp replay
 //!   protection.
+//! - [`contract`] — the [`contract::ContractCharge`], a second station-signed
+//!   balance record: the per-period direct debit a recurring service contract
+//!   executes (T1.7.7), a sibling of the settlement record.
 //!
 //! # The log is the source of truth
 //!
@@ -47,6 +50,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod contract;
 pub mod engine;
 pub mod settlement;
 pub mod state;
