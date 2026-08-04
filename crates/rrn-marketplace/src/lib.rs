@@ -41,6 +41,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod contract;
 pub mod inquiry;
 pub mod lifecycle;
 pub mod listing;
@@ -73,6 +74,10 @@ pub enum Error {
     /// meet the listing's requirements.
     #[error("inquiry: {0}")]
     Inquiry(#[from] inquiry::InquiryError),
+    /// A service-contract record nobody was entitled to write, or that is not
+    /// born from a matching agreed inquiry.
+    #[error("contract: {0}")]
+    Contract(#[from] contract::ContractError),
     /// The full-text index could not be opened, written, or queried.
     #[error("search index: {0}")]
     Tantivy(#[from] tantivy::TantivyError),

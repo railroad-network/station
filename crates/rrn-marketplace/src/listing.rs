@@ -398,6 +398,113 @@ impl TryFrom<CBOR> for Requirements {
     }
 }
 
+/// How often a recurring service bills (T1.7.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Frequency {
+    /// Once a day.
+    Daily,
+    /// Once a week.
+    Weekly,
+    /// Once every 30 days (fixed in Phase 1 — no calendar months).
+    Monthly,
+    /// A bespoke period, in seconds (must be positive).
+    Custom(u32),
+}
+
+impl Frequency {
+    /// The period length in seconds — how far apart charges fall.
+    pub fn period_secs(self) -> i64 {
+        match self {
+            Frequency::Daily => 86_400,
+            Frequency::Weekly => 7 * 86_400,
+            Frequency::Monthly => 30 * 86_400,
+            Frequency::Custom(secs) => i64::from(secs),
+        }
+    }
+}
+
+impl From<Frequency> for CBOR {
+    fn from(f: Frequency) -> Self {
+        let mut m = Map::new();
+        match f {
+            Frequency::Daily => m.insert("unit", "daily"),
+            Frequency::Weekly => m.insert("unit", "weekly"),
+            Frequency::Monthly => m.insert("unit", "monthly"),
+            Frequency::Custom(secs) => {
+                m.insert("unit", "custom");
+                m.insert("secs", secs);
+            }
+        }
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for Frequency {
+    type Error = dcbor::Error;
+
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        match map.extract::<&str, String>("unit")?.as_str() {
+            "daily" => Ok(Frequency::Daily),
+            "weekly" => Ok(Frequency::Weekly),
+            "monthly" => Ok(Frequency::Monthly),
+            "custom" => Ok(Frequency::Custom(map.extract::<&str, u32>("secs")?)),
+            _ => Err(dcbor::Error::WrongType),
+        }
+    }
+}
+
+/// The recurring cadence a service listing declares (T1.7.7): the provider's
+/// standing terms for a subscription, which a [`ServiceContract`](crate::contract::ServiceContract)
+/// snapshots when a buyer signs up. The per-period price is the listing's own
+/// [`Pricing`]; these are the *other* terms of the commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecurringTerms {
+    /// How often a period falls due.
+    pub frequency: Frequency,
+    /// How many periods the commitment runs for.
+    pub duration_periods: u32,
+    /// How much notice either side must give to end it early.
+    pub notice_period_days: u32,
+    /// A charge levied on the party who ends it before its natural end.
+    pub early_termination_penalty_centi: i64,
+}
+
+impl From<RecurringTerms> for CBOR {
+    fn from(t: RecurringTerms) -> Self {
+        let mut m = Map::new();
+        m.insert("frequency", t.frequency);
+        m.insert("duration_periods", t.duration_periods);
+        m.insert("notice_period_days", t.notice_period_days);
+        m.insert(
+            "early_termination_penalty_centi",
+            t.early_termination_penalty_centi,
+        );
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for RecurringTerms {
+    type Error = dcbor::Error;
+
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        Ok(RecurringTerms {
+            frequency: map.extract::<&str, Frequency>("frequency")?,
+            duration_periods: map.extract::<&str, u32>("duration_periods")?,
+            notice_period_days: map.extract::<&str, u32>("notice_period_days")?,
+            early_termination_penalty_centi: map
+                .extract::<&str, i64>("early_termination_penalty_centi")?,
+        })
+    }
+}
+
 /// A standing, signed offer on the log.
 ///
 /// Every field is provider-asserted: nothing here verifies that the grain
@@ -438,6 +545,11 @@ pub struct Listing {
     /// Unix seconds after which the listing is stale and the station's sweep
     /// should close it. `None` means it stands until closed by hand.
     pub expires_at: Option<i64>,
+    /// The recurring cadence, when this is a subscription service (T1.7.7);
+    /// `None` for a one-off offer. **Additive to a content-addressed record**, so
+    /// it is OMITTED from the CBOR when `None` (ADR-0010) — a listing published
+    /// before this field existed keeps its id.
+    pub recurring: Option<RecurringTerms>,
 }
 
 impl Listing {
@@ -515,9 +627,22 @@ impl Listing {
             federation_visible,
             created_at,
             expires_at,
+            // A one-off offer carries no cadence; a subscription adds one with
+            // `with_recurring`. Absent-when-`None` keeps a plain listing's bytes
+            // (and id) as they were before this field existed.
+            recurring: None,
         };
         listing.id = listing.compute_id();
         listing
+    }
+
+    /// Declares this listing a recurring service on the given terms (T1.7.7),
+    /// recomputing its content [`id`](Self::id) with the cadence included. Only a
+    /// `Services` listing may carry one — [`validate`](Self::validate) enforces it.
+    pub fn with_recurring(mut self, terms: RecurringTerms) -> Self {
+        self.recurring = Some(terms);
+        self.id = self.compute_id();
+        self
     }
 
     /// Recomputes the content address from the current field values.
@@ -590,6 +715,26 @@ impl Listing {
                 return Err(ListingError::ExpiryNotAfterCreation {
                     created_at: self.created_at,
                     expires_at,
+                });
+            }
+        }
+        if let Some(terms) = self.recurring {
+            // A subscription is a service commitment; goods and commons don't run
+            // on a cadence.
+            if self.surface != Surface::Services {
+                return Err(ListingError::RecurringNotAService {
+                    surface: self.surface,
+                });
+            }
+            if terms.duration_periods == 0 {
+                return Err(ListingError::RecurringZeroDuration);
+            }
+            if matches!(terms.frequency, Frequency::Custom(0)) {
+                return Err(ListingError::RecurringZeroPeriod);
+            }
+            if terms.early_termination_penalty_centi < 0 {
+                return Err(ListingError::NegativePenalty {
+                    penalty_centi: terms.early_termination_penalty_centi,
                 });
             }
         }
@@ -671,6 +816,24 @@ pub enum ListingError {
         /// The offending expiry.
         expires_at: i64,
     },
+    /// A recurring cadence on a surface that is not `Services` (T1.7.7).
+    #[error("only a Services listing may recur, not {surface:?}")]
+    RecurringNotAService {
+        /// The surface that forbids it.
+        surface: Surface,
+    },
+    /// A recurring listing that runs for zero periods.
+    #[error("a recurring listing must run for at least one period")]
+    RecurringZeroDuration,
+    /// A `Frequency::Custom(0)` — a period of no length.
+    #[error("a custom billing period must be a positive number of seconds")]
+    RecurringZeroPeriod,
+    /// A negative early-termination penalty.
+    #[error("early-termination penalty {penalty_centi} is negative")]
+    NegativePenalty {
+        /// The offending penalty.
+        penalty_centi: i64,
+    },
 }
 
 impl From<Listing> for CBOR {
@@ -694,6 +857,12 @@ impl From<Listing> for CBOR {
             Some(t) => m.insert("expires_at", t),
             None => m.insert("expires_at", CBOR::null()),
         }
+        // Unlike the fields above, `recurring` was added to an already
+        // content-addressed record, so it is OMITTED when `None` — never `null`
+        // — or every existing listing's id would change (ADR-0010).
+        if let Some(terms) = l.recurring {
+            m.insert("recurring", terms);
+        }
         m.into()
     }
 }
@@ -709,7 +878,7 @@ impl TryFrom<CBOR> for Listing {
         if map.extract::<&str, String>("kind")? != LISTING_KIND {
             return Err(dcbor::Error::WrongType);
         }
-        Ok(Self::assembled(
+        let listing = Self::assembled(
             map.extract::<&str, Address>("provider")?,
             map.extract::<&str, String>("community")?,
             map.extract::<&str, Surface>("surface")?,
@@ -724,7 +893,13 @@ impl TryFrom<CBOR> for Listing {
             map.extract::<&str, i64>("created_at")?,
             // A null (or absent) expiry decodes to `None`.
             map.get::<&str, i64>("expires_at"),
-        ))
+        );
+        // Absent `recurring` decodes to a one-off; present, to a subscription —
+        // applied after assembly so the recomputed id matches the signer's.
+        Ok(match map.get::<&str, RecurringTerms>("recurring") {
+            Some(terms) => listing.with_recurring(terms),
+            None => listing,
+        })
     }
 }
 
