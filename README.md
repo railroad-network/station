@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/railroad-network/station/actions/workflows/ci.yml/badge.svg)](https://github.com/railroad-network/station/actions/workflows/ci.yml)
 
-> **Status:** Phase 0 — Foundation. Implementation complete. Pre-audit.
-> **Do not use with real value.**
+> **Status:** Phase 1 — in progress (identity, ledger transport, vouching,
+> reputation, and marketplace landed; M1.7 underway). The Phase 0 foundation
+> remains pre-audit. **Do not use with real value.**
 
 **Railroad Network** is a federated platform for self-organizing communities: a
 mutual-credit economy denominated in a single unit (the "Common"),
@@ -15,10 +16,14 @@ radio, and paper fallback.
 
 This repository, **`station`**, is the canonical Rust implementation: a Cargo
 workspace of crates that produce the `station` daemon binary and the `rrn`
-command-line client. Phase 0's goal is a correct, externally-audited
-cryptographic and ledger foundation, demonstrated end-to-end by two communities
-transacting locally. That foundation is now implemented; the external audit is
-the gate to Phase 1 (see [Audit status](#audit-status)).
+command-line client. Phase 0's goal was a correct cryptographic and ledger
+foundation, demonstrated end-to-end by two communities transacting locally.
+That foundation is implemented and is being prepared for an external security
+audit (see [Audit status](#audit-status)).
+
+Phase 1 builds on it: mobile↔station transport, social vouching, reputation
+scoring, and the marketplace have landed, with the marketplace UI + transaction
+work (M1.7) currently underway. This work is pre-audit and experimental.
 
 > This is research-stage software. The cryptography has **not** yet been
 > independently audited. Do not use it to hold, transfer, or represent anything
@@ -51,26 +56,37 @@ Everything below is implemented, tested, and exercised end-to-end by the demo:
   `rrn` client, demonstrated by two independent stations converging on the same
   balances and the same log.
 
-## What does NOT work in Phase 0
+## What's landed in Phase 1
 
-Out of scope by design — deferred to Phase 1+ — and **not** implemented here:
+Built on the Phase 0 foundation, and exercised end-to-end with the
+[`mobile`](https://github.com/railroad-network/mobile) app on a physical device:
+
+- **Mobile↔station transport (M1.3).** Sealed-envelope RPC over local HTTP (per
+  ADR-0008), pairing, push-style updates via long-poll subscription, and the
+  `rrn-mobile-ffi` crate exposing the crypto core to the app over uniffi.
+- **Vouching (M1.4).** The vouching surface end-to-end: attest, browse, and the
+  read paths the app consumes.
+- **Reputation (M1.5).** `rrn-reputation` — composite scoring (per ADR-0009),
+  decay, portability, stake enforcement, Sybil velocity limits, and identity
+  anchoring, with a snapshot cache and the Standing read path.
+- **Marketplace (M1.6 → M1.7, in progress).** `rrn-marketplace` — listings,
+  inquiries, requirement enforcement, recurring service contracts, and
+  transaction proposals that link the listing they settle.
+
+## What does NOT work yet
+
+Out of scope so far — deferred to later Phase 1+ work — and **not** implemented:
 
 - **No federation.** `rrn-protocol` is stubs; the gossip surface is a minimal
-  Phase 0 stub for the local two-station demo, with no transport authentication
-  or encryption, no fork resolution, and no cross-replica nonce coordination.
-- **No marketplace.** No listings, matching, or goods/services exchange.
-- **No governance.** No voting, charters, or dispute tribunals beyond automated
-  Tier 1/2 escalation.
+  stub for the local demo, with no transport authentication or encryption, no
+  fork resolution, and no cross-replica nonce coordination.
+- **No governance.** `rrn-governance` is a scaffold — no voting, charters, or
+  dispute tribunals beyond automated Tier 1/2 escalation.
 - **No higher oracle tiers.** Only bilateral confirmation + settlement window;
   Tier 3 (physical evidence) and Tier 4 (cross-community/governance) are absent.
-- **No Sybil resistance.** Vouch *authenticity* is enforced; vouch *trust* and
-  Sybil/reputation analysis are not — Phase 0 assumes a single, trusting
-  community.
-- **No credit limits.** A sender can settle into arbitrary debt in Phase 0.
 - **No at-rest encryption of the database** (only the wallet key is encrypted),
   no memory locking, and no defense against a compromised host OS.
-- **No UI, no mobile app, no radio/LoRa or mesh transport.** Phase 0 runs over
-  loopback/local network only.
+- **No radio/LoRa or mesh transport.** Runs over loopback/local network only.
 - **No production binaries or crates.io release.** Source-only, on purpose.
 
 See [`docs/threat-model.md`](docs/threat-model.md) for the full, STRIDE-organized
@@ -114,10 +130,12 @@ rrn history                     # the local append-only log, decoded
 
 ## Audit status
 
-**Pre-audit.** The Phase 0 implementation is feature-complete and is being
-prepared for an external security audit (the gate to Phase 1). The audit-prep
-materials — finalized threat model, expanded fuzz harnesses, and the coverage
-report — live under [`docs/`](docs/) and the CI workflows.
+**Pre-audit.** The Phase 0 cryptographic and ledger foundation is being
+prepared for an external security audit. Phase 1 work continues on top of it in
+parallel, but the whole stack — foundation and Phase 1 alike — remains
+unaudited and experimental until that review lands. The audit-prep materials —
+finalized threat model, expanded fuzz harnesses, and the coverage report — live
+under [`docs/`](docs/) and the CI workflows.
 
 This section will be updated as the audit progresses (planned → scheduled →
 in progress → complete), and will link to the published report once received.
