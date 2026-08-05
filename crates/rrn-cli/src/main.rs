@@ -21,7 +21,8 @@ use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
     ContractStateResult, CreateListingResult, EditListingResult, HistoryResult, InquireResult,
-    InquiryStateResult, ProposeResult, RecoverImportResult, VouchResult, WhoamiResult,
+    InquiryStateResult, ProposeResult, RecoverImportResult, TransactionRow, TransactionsResult,
+    VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -106,6 +107,15 @@ enum Command {
     /// Print recent log history.
     History {
         /// Maximum number of (most-recent-first) entries.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Show settled and pending transactions, naming the listing each
+    /// marketplace payment settled.
+    Transactions {
+        /// The `rrn1…` address to view; omitted means your own.
+        address: Option<String>,
+        /// Maximum number of (most-recent-first) rows.
         #[arg(long)]
         limit: Option<u64>,
     },
@@ -445,6 +455,26 @@ async fn run(cli: Cli) -> Result<()> {
                     out.push_str(&format!("{:>4}  {:<12}  {}\n", e.seq, e.kind, e.summary));
                 }
                 Ok(out.trim_end().to_string())
+            })
+        }
+        Command::Transactions { address, limit } => {
+            // `transactions` is expressed relative to a member; default to this
+            // station's own address, as `balance` does.
+            let address = match address {
+                Some(a) => a,
+                None => {
+                    let v = client.call("whoami", json!({})).await?;
+                    parse::<WhoamiResult>(&v)?.address
+                }
+            };
+            let mut params = json!({ "address": address });
+            if let Some(limit) = limit {
+                params["limit"] = json!(limit);
+            }
+            let v = client.call("transactions", params).await?;
+            emit(fmt, &v, || {
+                let r: TransactionsResult = parse(&v)?;
+                Ok(render_transactions(&r.transactions, color))
             })
         }
         Command::Vouch {
@@ -914,6 +944,37 @@ fn render_my_listings(listings: &serde_json::Value, color: ColorMode) -> String 
                 "{:<8}  {}",
                 s(row, "state"),
                 card_line(row, color).trim_end()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Renders `transactions` rows: id, state, the amount signed relative to the
+/// viewer, the counterparty, and — for a marketplace payment — the listing it
+/// settled (falling back to the memo). One greppable line each.
+fn render_transactions(rows: &[TransactionRow], color: ColorMode) -> String {
+    if rows.is_empty() {
+        return "no transactions".to_string();
+    }
+    rows.iter()
+        .map(|r| {
+            let short = r.id.chars().take(12).collect::<String>();
+            let party = r.counterparty_address.chars().take(12).collect::<String>();
+            // What the payment was for: the resolved listing title on a
+            // marketplace payment, else the memo, else nothing.
+            let for_ = r
+                .listing_title
+                .clone()
+                .or_else(|| r.memo.clone())
+                .unwrap_or_default();
+            format!(
+                "{}  {:<9} {:>14}  {}  {}",
+                paint(color, DIM, &short),
+                r.state,
+                fmt_commons(r.amount_centi),
+                paint(color, DIM, &party),
+                paint(color, BOLD, &for_),
             )
         })
         .collect::<Vec<_>>()
@@ -1506,6 +1567,44 @@ mod tests {
             render_matches(&serde_json::json!([]), ColorMode::Never),
             "no needs announced"
         );
+        assert_eq!(
+            render_transactions(&[], ColorMode::Never),
+            "no transactions"
+        );
+    }
+
+    #[test]
+    fn a_transaction_row_leads_with_its_listing_then_falls_back_to_memo() {
+        let base = TransactionRow {
+            id: "abcdef0123456789".into(),
+            counterparty_address: "rrn1counterparty000".into(),
+            direction: "out".into(),
+            amount_centi: -400,
+            memo: Some("Fresh eggs · #a63d8d06".into()),
+            listing_id: Some("3c3738c4".into()),
+            listing_title: Some("Fresh eggs".into()),
+            state: "settled".into(),
+            timestamp: 1_000,
+            expires_at: None,
+            confirmed_at: None,
+            settled_at: Some(1_010),
+            nonce: 0,
+        };
+        // The resolved listing title wins over the memo.
+        let with_title = render_transactions(std::slice::from_ref(&base), ColorMode::Never);
+        assert!(with_title.contains("Fresh eggs"), "{with_title}");
+        assert!(with_title.contains("-4.00 Commons"), "{with_title}");
+        assert!(with_title.contains("abcdef012345"), "{with_title}");
+
+        // A direct pay with no listing shows the memo instead.
+        let direct = TransactionRow {
+            listing_id: None,
+            listing_title: None,
+            memo: Some("lunch".into()),
+            ..base
+        };
+        let out = render_transactions(&[direct], ColorMode::Never);
+        assert!(out.contains("lunch"), "{out}");
     }
 
     #[test]

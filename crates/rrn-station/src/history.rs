@@ -7,6 +7,8 @@
 //! forward-compatible record from a newer station, say). This is presentation
 //! only; nothing here is authoritative.
 
+use dcbor::prelude::*;
+
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::vouch::Vouch;
 use rrn_ledger::settlement::SettlementRecord;
@@ -46,16 +48,16 @@ fn summarize(entry: &LogEntry) -> HistoryEntry {
     let (kind, summary) = decode_summary(bytes);
     HistoryEntry {
         seq: entry.seq,
-        kind: kind.to_string(),
+        kind,
         summary,
         created_at: entry.created_at,
     }
 }
 
-fn decode_summary(bytes: &[u8]) -> (&'static str, String) {
+fn decode_summary(bytes: &[u8]) -> (String, String) {
     if let Ok(p) = from_canonical_bytes::<TransactionProposal>(bytes) {
         return (
-            "proposal",
+            "proposal".into(),
             format!(
                 "propose {} from {} to {} (tx {})",
                 fmt_commons(p.amount_centi),
@@ -67,7 +69,7 @@ fn decode_summary(bytes: &[u8]) -> (&'static str, String) {
     }
     if let Ok(c) = from_canonical_bytes::<TransactionConfirmation>(bytes) {
         return (
-            "confirmation",
+            "confirmation".into(),
             format!(
                 "confirm tx {} by {}",
                 short_tx(&c.proposal_id),
@@ -77,7 +79,7 @@ fn decode_summary(bytes: &[u8]) -> (&'static str, String) {
     }
     if let Ok(s) = from_canonical_bytes::<SettlementRecord>(bytes) {
         return (
-            "settlement",
+            "settlement".into(),
             format!(
                 "settle {} from {} to {} (tx {})",
                 fmt_commons(s.amount_centi),
@@ -89,13 +91,13 @@ fn decode_summary(bytes: &[u8]) -> (&'static str, String) {
     }
     if let Ok(c) = from_canonical_bytes::<CancellationRecord>(bytes) {
         return (
-            "cancellation",
+            "cancellation".into(),
             format!("cancel tx {} ({:?})", short_tx(&c.proposal_id), c.reason),
         );
     }
     if let Ok(v) = from_canonical_bytes::<Vouch>(bytes) {
         return (
-            "vouch",
+            "vouch".into(),
             format!(
                 "vouch for {}: {:?}",
                 short_addr(&v.subject.to_string()),
@@ -103,7 +105,46 @@ fn decode_summary(bytes: &[u8]) -> (&'static str, String) {
             ),
         );
     }
-    ("unknown", format!("{} bytes", bytes.len()))
+    // Anything without a bespoke summary above — every marketplace and contract
+    // record — still names itself from the `kind` tag every record carries,
+    // rather than reading "unknown". No concrete type is decoded, so this holds
+    // for a forward-compatible record from a newer station too.
+    if let Some(kind) = record_kind(bytes) {
+        return friendly_kind(&kind);
+    }
+    ("unknown".into(), format!("{} bytes", bytes.len()))
+}
+
+/// The `kind` string every signed record carries at its CBOR map's `"kind"` key,
+/// read without decoding the concrete type. `None` if the payload is not a CBOR
+/// map or carries no `kind`.
+fn record_kind(bytes: &[u8]) -> Option<String> {
+    let cbor = CBOR::try_from_data(bytes).ok()?;
+    let CBORCase::Map(map) = cbor.into_case() else {
+        return None;
+    };
+    map.extract::<&str, String>("kind").ok()
+}
+
+/// Turns a record `kind` tag into a `(kind column, summary)` pair. Drops the
+/// `rrn.` prefix and any trailing `.vN` version, names the row by its final
+/// segment, and reads the summary as a plain phrase — e.g.
+/// `rrn.marketplace.stock_consumed.v1` → (`stock_consumed`, "marketplace stock consumed").
+fn friendly_kind(kind: &str) -> (String, String) {
+    let trimmed = kind.strip_prefix("rrn.").unwrap_or(kind);
+    let mut parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.last().is_some_and(|s| is_version(s)) {
+        parts.pop();
+    }
+    let name = parts.last().copied().unwrap_or(kind);
+    let summary = parts.join(" ").replace('_', " ");
+    (name.to_string(), summary)
+}
+
+/// Whether a dotted segment is a version tag like `v1`, `v2`.
+fn is_version(s: &str) -> bool {
+    s.strip_prefix('v')
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Formats centicommons as `<int>.<2-digit> Commons`.
@@ -135,5 +176,40 @@ mod tests {
         assert_eq!(fmt_commons(1), "0.01 Commons");
         assert_eq!(fmt_commons(0), "0.00 Commons");
         assert_eq!(fmt_commons(-300), "-3.00 Commons");
+    }
+
+    #[test]
+    fn friendly_kind_names_records_from_their_tag() {
+        // A versioned marketplace record: prefix and `.v1` dropped, name is the
+        // final segment, summary reads as a plain phrase.
+        assert_eq!(
+            friendly_kind("rrn.marketplace.stock_consumed.v1"),
+            (
+                "stock_consumed".to_string(),
+                "marketplace stock consumed".to_string()
+            )
+        );
+        // An unversioned ledger record.
+        assert_eq!(
+            friendly_kind("rrn.tx.contract_charge"),
+            (
+                "contract_charge".to_string(),
+                "tx contract charge".to_string()
+            )
+        );
+        // A tag in no recognized shape still names itself rather than panicking.
+        assert_eq!(
+            friendly_kind("weird"),
+            ("weird".to_string(), "weird".to_string())
+        );
+    }
+
+    #[test]
+    fn only_real_version_segments_are_dropped() {
+        assert!(is_version("v1"));
+        assert!(is_version("v12"));
+        assert!(!is_version("v"));
+        assert!(!is_version("valve"));
+        assert!(!is_version("1"));
     }
 }
