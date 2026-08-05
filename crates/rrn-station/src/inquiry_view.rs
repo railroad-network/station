@@ -23,6 +23,8 @@ use serde::Serialize;
 use rrn_identity::address::Address;
 use rrn_marketplace::inquiry::{InquiryOutcome, InquiryRecords, InquiryState};
 
+use crate::marketplace_view::RecurringTermsView;
+
 /// One message in a thread, flattened for the wire.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InquiryMessageRow {
@@ -53,6 +55,12 @@ pub struct InquiryThreadView {
     /// Whether the listing invites offers. When false, the only close a party
     /// may agree to is at `listed_amount_centi`.
     pub negotiable: bool,
+    /// The listing's standing terms, when it is a recurring service (T1.7.7).
+    /// Present so an agreed thread carries everything the buyer's phone needs to
+    /// build the [`ServiceContract`](rrn_marketplace::contract::ServiceContract)
+    /// it signs — the cadence, alongside the `final_price_centi` already here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listing_recurring: Option<RecurringTermsView>,
     /// The buyer's `rrn1…` address.
     pub buyer: String,
     /// The provider's `rrn1…` address.
@@ -133,6 +141,11 @@ pub fn thread(records: &InquiryRecords, now: i64) -> InquiryThreadView {
         listing_title: records.listing.title.clone(),
         listed_amount_centi: records.listing.pricing.amount_centi,
         negotiable: records.listing.pricing.negotiable,
+        listing_recurring: records
+            .listing
+            .recurring
+            .as_ref()
+            .map(RecurringTermsView::of),
         buyer: records.buyer().to_string(),
         provider: records.provider().to_string(),
         initial_message: records.opened.initial_message.clone(),

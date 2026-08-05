@@ -98,6 +98,9 @@ pub struct ContractDetailView {
 pub struct ContractRow {
     /// The contract's content address, hex.
     pub contract_id: String,
+    /// The agreed inquiry this contract was born from, hex — the key a client uses
+    /// to tell whether an agreed inquiry already has a contract.
+    pub inquiry_id: String,
     /// The listing's title.
     pub listing_title: String,
     /// The viewer's role: `buyer` or `provider`.
@@ -204,6 +207,7 @@ where
             };
             Some(ContractRow {
                 contract_id: hex(&records.contract.contract_id.to_bytes()),
+                inquiry_id: hex(&records.contract.inquiry_id.to_bytes()),
                 listing_title: records.listing.title.clone(),
                 role,
                 counterparty: counterparty.to_string(),

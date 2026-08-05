@@ -2010,6 +2010,10 @@ impl Core {
             "submit_inquiry_close" => self.channel_submit_inquiry_close(envelope),
             "inquiry_thread" => self.channel_inquiry_thread(envelope),
             "my_inquiries" => self.channel_my_inquiries(envelope),
+            "submit_contract" => self.channel_submit_contract(envelope),
+            "submit_contract_termination" => self.channel_submit_contract_termination(envelope),
+            "marketplace_contracts" => self.channel_marketplace_contracts(envelope),
+            "marketplace_contract_show" => self.channel_marketplace_contract_show(envelope),
             "whoami" | "balance" | "transactions" | "next_nonce" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
@@ -2385,6 +2389,115 @@ impl Core {
     ) -> Result<serde_json::Value, (i32, String)> {
         let viewer = Address::from_public_key(envelope.signer);
         self.run_my_inquiries(viewer)
+            .map_err(|e| (e.code, e.message))
+    }
+
+    /// `submit_contract` — a mobile-signed [`SignedServiceContract`](rrn_marketplace::contract::SignedServiceContract),
+    /// the buyer's recurring mandate born from an agreed inquiry (T1.7.7 Stage 2).
+    ///
+    /// The phone snapshots the terms from the agreed inquiry thread and signs; the
+    /// append re-checks every one of them — that the contract is born from an
+    /// inquiry closed as agreed for exactly these parties and listing, and that the
+    /// terms match the listing's standing cadence and the agreed price — so a phone
+    /// cannot forge terms. The operator path signs the same record with the station
+    /// wallet; this one is buyer-signed, which is the only difference.
+    fn channel_submit_contract(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_contract")?;
+        let signed: rrn_marketplace::contract::SignedServiceContract =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed contract".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "buyer is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "contract signature does not verify".into(),
+            )
+        })?;
+
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let contract_id = signed.payload.contract_id;
+        let admits = self.inquiry_admits(now);
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::contract::append_service_contract(&mut log, signed, station_pk, &admits)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        // A fresh contract has charged nothing, so it stands `active` at `now`.
+        Ok(serde_json::json!({
+            "contract_id": hex(&contract_id.to_bytes()),
+            "state": "active",
+        }))
+    }
+
+    /// `submit_contract_termination` — a mobile-signed
+    /// [`SignedContractTermination`](rrn_marketplace::contract::SignedContractTermination)
+    /// ending a contract the member is a party to (T1.7.7 Stage 2). Either party
+    /// may; the notice window and any penalty are the charge sweep's to apply.
+    fn channel_submit_contract_termination(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_termination")?;
+        let signed: rrn_marketplace::contract::SignedContractTermination =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed termination".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "terminator is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "termination signature does not verify".into(),
+            )
+        })?;
+
+        let now = self.clock.now();
+        let station_pk = self.wallet.address.public_key();
+        let contract_id = signed.payload.contract_id;
+        let admits = self.inquiry_admits(now);
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::contract::append_contract_termination(
+            &mut log, signed, station_pk, &admits,
+        )
+        .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        Ok(serde_json::json!({ "contract_id": hex(&contract_id.to_bytes()) }))
+    }
+
+    /// `marketplace_contracts` — the authenticated mobile's own contracts (as
+    /// buyer or provider), newest first (T1.7.7 Stage 2).
+    fn channel_marketplace_contracts(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let viewer = Address::from_public_key(envelope.signer);
+        self.run_my_contracts(viewer)
+            .map_err(|e| (e.code, e.message))
+    }
+
+    /// `marketplace_contract_show` — one contract the authenticated mobile is a
+    /// party to (T1.7.7 Stage 2). Only a party may read it.
+    fn channel_marketplace_contract_show(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            contract_id: String,
+        }
+        let params: Params = serde_json::from_str(&envelope.params)
+            .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
+        let viewer = Address::from_public_key(envelope.signer);
+        self.run_contract_detail(&params.contract_id, viewer)
             .map_err(|e| (e.code, e.message))
     }
 
@@ -3949,13 +4062,20 @@ mod tests {
     /// Stands up a whole valid contract on the core's log — recurring listing,
     /// buyer's inquiry, provider's grant at the listed price, buyer's signed
     /// contract starting at `NOW` — and returns the contract's id and parties.
-    fn seed_contract(core: &Core, provider: &Keypair, buyer: &Keypair) -> ContractId {
-        let station = core.station_keypair();
-        let station_pk = station.public_key();
+    /// Seeds the chain a contract is born from — a recurring listing, the buyer's
+    /// inquiry, and the provider's agreed close — and returns the listing and the
+    /// inquiry's id. Both [`seed_contract`] and the channel test build a contract
+    /// on top of this, one appending it directly and one routing a buyer-signed
+    /// one through the mobile channel.
+    fn seed_agreed_inquiry(
+        core: &Core,
+        provider: &Keypair,
+        buyer: &Keypair,
+    ) -> (Listing, rrn_marketplace::inquiry::InquiryId) {
+        let station_pk = core.station_keypair().public_key();
         let admit_all = |_: &Listing, _: &Address| true;
         let listing = recurring_listing(provider);
         let buyer_addr = Address::from_public_key(buyer.public_key());
-        let provider_addr = Address::from_public_key(provider.public_key());
 
         let mut log = AppendLog::new(&core.db);
         append_listing_created(
@@ -3991,29 +4111,42 @@ mod tests {
             &admit_all,
         )
         .unwrap();
+        (listing, inquiry_id)
+    }
 
+    /// The terms every seeded contract commits to, matching [`recurring_listing`]'s
+    /// cadence and the agreed price.
+    fn seed_contract_terms() -> ContractTerms {
+        ContractTerms {
+            frequency: Frequency::Weekly,
+            duration_periods: CONTRACT_PERIODS,
+            commons_per_period_centi: CONTRACT_PRICE,
+            performance_metrics: std::collections::BTreeMap::new(),
+            notice_period_days: CONTRACT_NOTICE_DAYS,
+            early_termination_penalty_centi: CONTRACT_PENALTY,
+        }
+    }
+
+    fn seed_contract(core: &Core, provider: &Keypair, buyer: &Keypair) -> ContractId {
+        let (listing, inquiry_id) = seed_agreed_inquiry(core, provider, buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
         let contract = ServiceContract::new(
             inquiry_id,
             listing.id,
             buyer_addr,
             provider_addr,
-            ContractTerms {
-                frequency: Frequency::Weekly,
-                duration_periods: CONTRACT_PERIODS,
-                commons_per_period_centi: CONTRACT_PRICE,
-                performance_metrics: std::collections::BTreeMap::new(),
-                notice_period_days: CONTRACT_NOTICE_DAYS,
-                early_termination_penalty_centi: CONTRACT_PENALTY,
-            },
+            seed_contract_terms(),
             NOW,
         )
         .unwrap();
         let contract_id = contract.contract_id;
+        let mut log = AppendLog::new(&core.db);
         append_service_contract(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(contract, buyer),
-            &station_pk,
-            &admit_all,
+            &core.station_keypair().public_key(),
+            &|_: &Listing, _: &Address| true,
         )
         .unwrap();
         contract_id
@@ -4158,5 +4291,112 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    /// Frames a signed record into the hex a channel `submit_*` param carries —
+    /// the way a phone hands the station a whole `SignedPayload` (T1.3.4 framing).
+    fn record_hex<T>(payload: T, signer: &Keypair) -> String
+    where
+        T: Clone + Into<dcbor::prelude::CBOR>,
+    {
+        let bytes = to_canonical_bytes(payload);
+        let signature = signer.sign(&bytes);
+        hex(&rpc_envelope::frame_signed_record(
+            &bytes,
+            &signer.public_key(),
+            &signature,
+        ))
+    }
+
+    #[test]
+    fn a_paired_mobile_signs_reads_and_terminates_a_contract_over_the_channel() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+
+        // The buyer builds the mandate on-device from the agreed inquiry's terms
+        // and signs it; content-addressing makes the id independent of who relays.
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            buyer_addr,
+            provider_addr,
+            seed_contract_terms(),
+            NOW,
+        )
+        .unwrap();
+        let contract_id = contract.contract_id;
+        let cid = hex(&contract_id.to_bytes());
+
+        // A record whose signer is not the authenticated mobile is refused before
+        // it reaches the append: the station binds a submission to the pair.
+        let forged = envelope(
+            &provider,
+            "submit_contract",
+            serde_json::json!({ "signed_contract": record_hex(contract.clone(), &buyer) }),
+        );
+        let (code, message) = core.route_channel_method(&forged).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("authenticated mobile"), "{message}");
+
+        // The buyer submits their own signed contract: accepted, active.
+        let env = envelope(
+            &buyer,
+            "submit_contract",
+            serde_json::json!({ "signed_contract": record_hex(contract, &buyer) }),
+        );
+        let result = core.route_channel_method(&env).unwrap();
+        assert_eq!(result["contract_id"], cid);
+        assert_eq!(result["state"], "active");
+
+        // Both parties read it over the channel, each with their own role.
+        let rows = core
+            .route_channel_method(&envelope(
+                &provider,
+                "marketplace_contracts",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let rows = rows["contracts"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["role"], "provider");
+
+        let detail = core
+            .route_channel_method(&envelope(
+                &buyer,
+                "marketplace_contract_show",
+                serde_json::json!({ "contract_id": cid }),
+            ))
+            .unwrap();
+        assert_eq!(detail["state"], "active");
+        assert_eq!(detail["frequency"], "weekly");
+
+        // A stranger to the contract cannot read it over the channel.
+        let stranger = Keypair::generate();
+        assert!(core
+            .route_channel_method(&envelope(
+                &stranger,
+                "marketplace_contract_show",
+                serde_json::json!({ "contract_id": cid }),
+            ))
+            .is_err());
+
+        // The provider ends it over the channel — either party may — and the read
+        // no longer reports it active.
+        let termination = ContractTermination {
+            contract_id,
+            terminated_by: TerminatedBy::Provider,
+            requested_at: NOW,
+        };
+        let env = envelope(
+            &provider,
+            "submit_contract_termination",
+            serde_json::json!({ "signed_termination": record_hex(termination, &provider) }),
+        );
+        assert_eq!(core.route_channel_method(&env).unwrap()["contract_id"], cid);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_ne!(detail["state"], "active");
     }
 }

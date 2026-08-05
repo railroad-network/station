@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use rrn_identity::address::Address;
 use rrn_marketplace::lifecycle::{CloseReason, ListingState};
-use rrn_marketplace::listing::{Listing, ListingId, Surface};
+use rrn_marketplace::listing::{Frequency, Listing, ListingId, RecurringTerms, Surface};
 use rrn_marketplace::search::{SearchHit, SearchIndex, SearchQuery};
 use rrn_reputation::model::ReputationBand;
 use rrn_storage::db::Database;
@@ -64,6 +64,42 @@ pub struct AvailabilityRow {
     pub capacity: Option<u32>,
     /// Unix seconds of the next open slot, for Services.
     pub next_slot: Option<i64>,
+}
+
+/// A recurring service's standing terms, flattened for the wire (T1.7.7).
+///
+/// A [`Services`](Surface::Services) listing may be a standing order rather than
+/// a one-off: it carries the cadence, length, notice, and penalty a
+/// [`ServiceContract`](rrn_marketplace::contract::ServiceContract) snapshots. The
+/// phone reads this off the listing detail (to badge the offer) and off the
+/// agreed inquiry thread (to build the contract it signs), so the fields are the
+/// exact ones the contract commits to.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RecurringTermsView {
+    /// How often a period falls due: `daily`, `weekly`, `monthly`, or `custom`.
+    pub frequency: &'static str,
+    /// The period length in seconds — the only cadence detail a `custom`
+    /// frequency does not otherwise reveal.
+    pub period_secs: i64,
+    /// How many periods the commitment runs for.
+    pub duration_periods: u32,
+    /// Days of notice either side must give to end it early.
+    pub notice_period_days: u32,
+    /// The penalty in centicommons on whoever ends it before its natural end.
+    pub early_termination_penalty_centi: i64,
+}
+
+impl RecurringTermsView {
+    /// Shapes a listing's [`RecurringTerms`] into the wire view.
+    pub fn of(terms: &RecurringTerms) -> Self {
+        Self {
+            frequency: frequency_name(terms.frequency),
+            period_secs: terms.frequency.period_secs(),
+            duration_periods: terms.duration_periods,
+            notice_period_days: terms.notice_period_days,
+            early_termination_penalty_centi: terms.early_termination_penalty_centi,
+        }
+    }
 }
 
 /// One row in the browse list.
@@ -119,6 +155,11 @@ pub struct ListingDetailView {
     pub community_member_only: bool,
     /// The dispute tier a sale would run under (1 or 2 in Phase 1).
     pub oracle_tier: u8,
+    /// The standing terms, when this listing is a recurring service (T1.7.7).
+    /// Absent on a one-off offer. A client badges the offer as recurring and, on
+    /// an agreed inquiry, the phone snapshots these into the contract it signs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<RecurringTermsView>,
     /// `active`, `closed`, or `expired`. A client must treat anything but
     /// `active` as not for sale — including `expired`, which means the station's
     /// sweep has not yet written the close record (ADR-0010).
@@ -267,6 +308,7 @@ pub fn detail(
         min_reputation: listing.requirements.min_reputation,
         community_member_only: listing.requirements.community_member_only,
         oracle_tier: listing.oracle_tier,
+        recurring: listing.recurring.as_ref().map(RecurringTermsView::of),
         state: state_name(&state),
         close_reason: match &state {
             ListingState::Closed { reason, .. } => Some(close_reason_name(*reason)),
@@ -419,6 +461,16 @@ fn card_of(listing: &Listing, provider_composite: f32) -> ListingCard {
 /// filter on exactly the string the log records.
 fn surface_name(surface: Surface) -> &'static str {
     surface.tag()
+}
+
+/// The wire name of a frequency, matching the `unit` its CBOR encodes.
+fn frequency_name(f: Frequency) -> &'static str {
+    match f {
+        Frequency::Daily => "daily",
+        Frequency::Weekly => "weekly",
+        Frequency::Monthly => "monthly",
+        Frequency::Custom(_) => "custom",
+    }
 }
 
 /// The wire name of a lifecycle state.
