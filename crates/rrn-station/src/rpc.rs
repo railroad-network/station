@@ -578,6 +578,16 @@ pub struct InquiryThreadParams {
     pub inquiry_id: String,
 }
 
+/// `marketplace_settle_inquiry` params (operator socket) — pay for an agreed
+/// inquiry. The station wallet must be the inquiry's buyer; the payment is a
+/// listing-linked [`rrn_ledger::transaction::TransactionProposal`], the CLI
+/// counterpart of the mobile "Send payment" step. Reuses [`ProposeResult`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettleInquiryParams {
+    /// The hex id of the agreed inquiry to pay for.
+    pub inquiry_id: String,
+}
+
 /// `marketplace_contract` params (operator socket) — sign up to a recurring
 /// service, born from an agreed inquiry. The station wallet is the buyer; a mobile
 /// signs its own [`rrn_marketplace::contract::ServiceContract`] in Stage 2.

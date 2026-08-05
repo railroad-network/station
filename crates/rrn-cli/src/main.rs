@@ -329,6 +329,14 @@ enum Command {
         #[arg(long, allow_hyphen_values = true)]
         price: Option<String>,
     },
+    /// Pay for an inquiry the provider has agreed. Signs a listing-linked payment
+    /// at the agreed price, which the provider then confirms with `rrn confirm`.
+    /// Only the inquiry's buyer may settle it; a second run returns the existing
+    /// payment rather than paying twice.
+    SettleInquiry {
+        /// The hex id of the agreed inquiry.
+        inquiry_id: String,
+    },
     /// Sign up to a recurring service, from an inquiry the provider has agreed.
     Contract {
         /// The hex id of the agreed inquiry.
@@ -721,6 +729,18 @@ async fn run(cli: Cli) -> Result<()> {
             emit(fmt, &v, || {
                 let r: InquiryStateResult = parse(&v)?;
                 Ok(r.state)
+            })
+        }
+        Command::SettleInquiry { inquiry_id } => {
+            let v = client
+                .call(
+                    "marketplace_settle_inquiry",
+                    json!({ "inquiry_id": inquiry_id }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: ProposeResult = parse(&v)?;
+                Ok(r.tx_id)
             })
         }
         Command::Contract {

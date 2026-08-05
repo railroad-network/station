@@ -594,6 +594,7 @@ impl Core {
             "marketplace_inquiry_close" => self.m_marketplace_inquiry_close(req),
             "marketplace_inquiry_thread" => self.m_marketplace_inquiry_thread(req),
             "marketplace_my_inquiries" => self.m_marketplace_my_inquiries(),
+            "marketplace_settle_inquiry" => self.m_marketplace_settle_inquiry(req),
             "marketplace_contract" => self.m_marketplace_contract(req),
             "marketplace_contracts" => self.m_marketplace_contracts(),
             "marketplace_contract_show" => self.m_marketplace_contract_show(req),
@@ -1231,6 +1232,90 @@ impl Core {
     /// standing cadence and the price the two parties settled on — so the request
     /// chooses nothing but the free-form notes: everything binding was already
     /// agreed. [`append_service_contract`] re-checks all of it against the log.
+    /// `marketplace_settle_inquiry` — pay for an agreed inquiry (T1.7.6), the CLI
+    /// counterpart of the mobile "Send payment" step. The station wallet must be
+    /// the inquiry's buyer; the payment is a station-signed, listing-linked
+    /// proposal at the granted price, which the provider then confirms through the
+    /// ordinary M0.5 flow. Idempotent: a payment already on the log for this
+    /// agreement is returned rather than duplicated.
+    fn m_marketplace_settle_inquiry(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::SettleInquiryParams = parse_params(req)?;
+        let inquiry_id = parse_inquiry_id(&params.inquiry_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let admits = self.inquiry_admits(now);
+        let me = self.wallet.address;
+
+        // Resolve the agreed inquiry: only its buyer pays, only the price the
+        // provider granted, to the provider, linked to the listing.
+        let inquiry = {
+            let log = AppendLog::new(&self.db);
+            rrn_marketplace::inquiry::inquiry_records(&log, &inquiry_id, &station_pk, &admits)
+                .map_err(internal)?
+                .ok_or_else(|| invalid_params("no such inquiry on this station"))?
+        };
+        if inquiry.buyer() != me {
+            return Err(invalid_params("only the inquiry's buyer can settle it"));
+        }
+        let final_price_centi = match inquiry.closed.as_ref().map(|c| c.outcome) {
+            Some(rrn_marketplace::inquiry::InquiryOutcome::Agreed { final_price_centi }) => {
+                final_price_centi
+            }
+            _ => return Err(invalid_params("that inquiry is not agreed")),
+        };
+        let provider = inquiry.provider();
+        let listing_ref = ListingRef(inquiry.listing.id.to_bytes());
+        // Mirror the mobile memo so the two paths read alike in history and share
+        // one double-pay key: the listing title, then a short slice of the id.
+        let memo = format!(
+            "{} · #{}",
+            inquiry.listing.title,
+            &hex(&inquiry_id.to_bytes())[..8]
+        );
+
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+
+        // Idempotency: if a payment for this agreement is already on the log, return
+        // it instead of signing a second one — the station-side of the guard the
+        // mobile thread applies before offering the button. The memo is the key on
+        // both sides, so a re-run (or a mobile that already paid) can't double-pay.
+        if let Some((tx_id, state)) = snapshot.iter().find_map(|(id, state)| {
+            let p = proposal_of(state)?;
+            (p.memo.as_deref() == Some(memo.as_str()))
+                .then(|| (hex(&id.to_bytes()), state_name(state).to_string()))
+        }) {
+            return ok(&rpc::ProposeResult { tx_id, state });
+        }
+
+        let nonce = snapshot.next_nonce(&me.public_key().to_bytes());
+        let proposal = TransactionProposal::new(
+            me,
+            provider,
+            final_price_centi,
+            Some(memo),
+            nonce,
+            now,
+            now + PROPOSAL_TTL_SECS,
+        )
+        .with_listing(listing_ref);
+        let tx_id = proposal.id;
+        let signed: SignedProposal = SignedProposal::sign(proposal, &station);
+
+        let mut engine = Engine::new(&self.db, station);
+        engine.submit_proposal(signed, now).map_err(ledger_err)?;
+
+        ok(&rpc::ProposeResult {
+            tx_id: hex(&tx_id.to_bytes()),
+            state: "Proposed".into(),
+        })
+    }
+
     fn m_marketplace_contract(
         &mut self,
         req: &rpc::Request,
@@ -3296,18 +3381,23 @@ fn periods_charged_of(
         .unwrap_or(0)
 }
 
+/// The proposal a transaction carries, whatever state it has reached. `None` only
+/// for the disputed stub, which holds no proposal.
+fn proposal_of(state: &TransactionState) -> Option<&TransactionProposal> {
+    match state {
+        TransactionState::Proposed { proposal }
+        | TransactionState::Confirmed { proposal, .. }
+        | TransactionState::Settled { proposal, .. }
+        | TransactionState::Cancelled { proposal, .. } => Some(&proposal.payload),
+        TransactionState::DisputedStub => None,
+    }
+}
+
 /// The listing a transaction pays for, if it is a marketplace payment (T1.7.6):
 /// the `listing_id` the buyer signed into the proposal, named as a marketplace
 /// [`ListingId`]. `None` for a direct pay.
 fn linked_listing(state: &TransactionState) -> Option<ListingId> {
-    let proposal = match state {
-        TransactionState::Proposed { proposal }
-        | TransactionState::Confirmed { proposal, .. }
-        | TransactionState::Settled { proposal, .. }
-        | TransactionState::Cancelled { proposal, .. } => &proposal.payload,
-        TransactionState::DisputedStub => return None,
-    };
-    proposal
+    proposal_of(state)?
         .listing_id
         .map(|ListingRef(bytes)| ListingId(Hash::from_bytes(bytes)))
 }
@@ -4359,6 +4449,168 @@ mod tests {
         )
         .unwrap();
         contract_id
+    }
+
+    /// Seeds a one-off goods inquiry the *station wallet* opened — the buyer the
+    /// `marketplace_settle_inquiry` path settles as. `agreed` closes it at that
+    /// price (provider-granted); `None` leaves it open. Returns the listing and id.
+    fn seed_station_inquiry(
+        core: &Core,
+        provider: &Keypair,
+        agreed: Option<i64>,
+    ) -> (Listing, rrn_marketplace::inquiry::InquiryId) {
+        let station = core.station_keypair();
+        let station_pk = station.public_key();
+        let admit_all = |_: &Listing, _: &Address| true;
+        // Negotiable so the grant can settle on a price above the listed one,
+        // which lets the test prove the payment carries the *agreed* price.
+        let listing = Listing::new(
+            Address::from_public_key(provider.public_key()),
+            "blue_ridge_collective".into(),
+            Surface::Goods,
+            "food".into(),
+            "Seed potatoes".into(),
+            "Picked this week.".into(),
+            Pricing {
+                amount_centi: 250,
+                model: PricingModel::Negotiable,
+                negotiable: true,
+            },
+            Availability {
+                status: AvailabilityStatus::Available,
+                capacity: Some(12),
+                next_slot: None,
+            },
+            Requirements {
+                min_reputation: 0.0,
+                community_member_only: false,
+                federation_only: false,
+            },
+            1,
+            false,
+            NOW - 100,
+            Some(NOW + 10_000),
+        )
+        .unwrap();
+
+        let mut log = AppendLog::new(&core.db);
+        append_listing_created(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
+        )
+        .unwrap();
+
+        // The buyer's opening offer is the price the grant settles on — the
+        // provider may only agree at the buyer's standing offer.
+        let opened = InquiryOpened::new(
+            listing.id,
+            core.wallet.address,
+            "I'll take it.".into(),
+            agreed,
+            NOW,
+        )
+        .unwrap();
+        let inquiry_id = opened.inquiry_id;
+        append_inquiry_opened(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(opened, &station),
+            &listing,
+            0.0,
+            true,
+        )
+        .unwrap();
+        if let Some(final_price_centi) = agreed {
+            append_inquiry_closed(
+                &mut log,
+                rrn_crypto::signed::SignedPayload::sign(
+                    InquiryClosed {
+                        inquiry_id,
+                        outcome: InquiryOutcome::Agreed { final_price_centi },
+                        closed_at: NOW,
+                    },
+                    provider,
+                ),
+                &station_pk,
+                &admit_all,
+            )
+            .unwrap();
+        }
+        (listing, inquiry_id)
+    }
+
+    fn settle_req(inquiry_id: &rrn_marketplace::inquiry::InquiryId) -> rpc::Request {
+        rpc::Request {
+            id: "1".into(),
+            method: "marketplace_settle_inquiry".into(),
+            params: serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }),
+        }
+    }
+
+    #[test]
+    fn settling_an_agreed_inquiry_pays_the_provider_at_the_agreed_price() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, inquiry_id) = seed_station_inquiry(&core, &provider, Some(400));
+        let provider_addr = Address::from_public_key(provider.public_key());
+
+        let v = core.handle_call(&settle_req(&inquiry_id)).unwrap();
+        assert_eq!(v["state"], "Proposed");
+        let tx_id = v["tx_id"].as_str().unwrap().to_string();
+
+        // The proposal stands on the log: from the station, to the provider, at the
+        // granted price, and linked to the listing so settlement can attest the sale.
+        let snapshot =
+            rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+        let state = snapshot.get(&parse_tx_id(&tx_id).unwrap()).unwrap();
+        let proposal = proposal_of(state).unwrap();
+        assert_eq!(proposal.sender, core.wallet.address);
+        assert_eq!(proposal.receiver, provider_addr);
+        assert_eq!(proposal.amount_centi, 400);
+        assert_eq!(linked_listing(state), Some(listing.id));
+        assert!(proposal
+            .memo
+            .as_deref()
+            .unwrap()
+            .starts_with("Seed potatoes · #"));
+    }
+
+    #[test]
+    fn settling_the_same_agreement_twice_returns_the_one_payment() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (_listing, inquiry_id) = seed_station_inquiry(&core, &provider, Some(400));
+
+        let first = core.handle_call(&settle_req(&inquiry_id)).unwrap();
+        let second = core.handle_call(&settle_req(&inquiry_id)).unwrap();
+        assert_eq!(first["tx_id"], second["tx_id"]);
+
+        // Only one proposal was ever appended — the second call found the first.
+        let count = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+            .unwrap()
+            .iter()
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn an_inquiry_that_is_not_agreed_cannot_be_settled() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (_listing, inquiry_id) = seed_station_inquiry(&core, &provider, None);
+
+        let err = core.handle_call(&settle_req(&inquiry_id)).unwrap_err();
+        assert!(err.message.contains("not agreed"), "{}", err.message);
+    }
+
+    #[test]
+    fn only_the_inquirys_buyer_may_settle_it() {
+        let mut core = test_core();
+        // Here the buyer is a third party, not the station wallet.
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let (_listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &buyer);
+
+        let err = core.handle_call(&settle_req(&inquiry_id)).unwrap_err();
+        assert!(err.message.contains("buyer"), "{}", err.message);
     }
 
     #[test]
