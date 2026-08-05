@@ -439,6 +439,46 @@ pub struct CloseListingResult {
     pub reason: String,
 }
 
+/// `marketplace_edit_listing` params (T1.7.2 Phase B). Every field but the id is
+/// optional: an edit patches only what it names, and the current listing supplies
+/// the rest. A listing's identity — surface, category, title, requirements — is
+/// fixed at publication (ADR-0010) and has no field here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditListingParams {
+    /// The hex listing id to edit.
+    pub listing_id: String,
+    /// New price in centicommons. `None` leaves the price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_centi: Option<i64>,
+    /// New negotiable flag (also flips the pricing model). `None` leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiable: Option<bool>,
+    /// New description. `None` leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// New units available, for `goods`. `None` leaves capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
+    /// New next open slot, for `services`. `None` leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_slot: Option<i64>,
+    /// New expiry in Unix seconds. `None` leaves the expiry (see `clear_expiry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// Remove the expiry entirely, so the listing stands until closed. Takes
+    /// precedence over `expires_at` when both are given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_expiry: Option<bool>,
+}
+
+/// `marketplace_edit_listing` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditListingResult {
+    /// The listing that was edited, hex-encoded. Unchanged by the edit — a
+    /// listing's content address is fixed at publication.
+    pub listing_id: String,
+}
+
 /// `marketplace_announce_need` params.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnnounceNeedParams {

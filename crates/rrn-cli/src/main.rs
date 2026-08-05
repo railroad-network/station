@@ -20,8 +20,8 @@ use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    ContractStateResult, CreateListingResult, HistoryResult, InquireResult, InquiryStateResult,
-    ProposeResult, RecoverImportResult, VouchResult, WhoamiResult,
+    ContractStateResult, CreateListingResult, EditListingResult, HistoryResult, InquireResult,
+    InquiryStateResult, ProposeResult, RecoverImportResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -232,6 +232,36 @@ enum Command {
     },
     /// Show the listings you have published, in any state.
     MyListings,
+    /// Edit one of your own listings. Only price, description, availability, and
+    /// expiry can change; surface, category, title, and requirements are fixed at
+    /// publication. Each field left off is kept as it was.
+    EditListing {
+        /// The hex listing id.
+        listing_id: String,
+        /// New price in Commons, e.g. `3`, `3.5`, or `-3.50` (Commons subsidy).
+        #[arg(long, allow_hyphen_values = true)]
+        price: Option<String>,
+        /// Invite offers (`--negotiable true`) or fix the price
+        /// (`--negotiable false`). Omitted leaves the pricing model.
+        #[arg(long)]
+        negotiable: Option<bool>,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+        /// New units available (`goods` only).
+        #[arg(long)]
+        capacity: Option<u32>,
+        /// New next open slot, as a date or unix seconds (`services` only).
+        #[arg(long)]
+        next_slot: Option<String>,
+        /// New expiry, as a date or unix seconds.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Remove the expiry so the listing stands until closed. Wins over
+        /// `--expires` if both are given.
+        #[arg(long)]
+        clear_expiry: bool,
+    },
     /// Take one of your own listings off offer.
     CloseListing {
         /// The hex listing id.
@@ -550,6 +580,44 @@ async fn run(cli: Cli) -> Result<()> {
         Command::MyListings => {
             let v = client.call("marketplace_my_listings", json!({})).await?;
             emit(fmt, &v, || Ok(render_my_listings(&v["listings"], color)))
+        }
+        Command::EditListing {
+            listing_id,
+            price,
+            negotiable,
+            description,
+            capacity,
+            next_slot,
+            expires,
+            clear_expiry,
+        } => {
+            let mut params = json!({ "listing_id": listing_id });
+            if let Some(p) = price {
+                params["amount_centi"] = json!(parse_signed_amount(&p)?);
+            }
+            if let Some(n) = negotiable {
+                params["negotiable"] = json!(n);
+            }
+            if let Some(d) = description {
+                params["description"] = json!(d);
+            }
+            if let Some(c) = capacity {
+                params["capacity"] = json!(c);
+            }
+            if let Some(s) = next_slot {
+                params["next_slot"] = json!(parse_when(&s)?);
+            }
+            if let Some(e) = expires {
+                params["expires_at"] = json!(parse_when(&e)?);
+            }
+            if clear_expiry {
+                params["clear_expiry"] = json!(true);
+            }
+            let v = client.call("marketplace_edit_listing", params).await?;
+            emit(fmt, &v, || {
+                let r: EditListingResult = parse(&v)?;
+                Ok(r.listing_id)
+            })
         }
         Command::CloseListing { listing_id } => {
             let v = client

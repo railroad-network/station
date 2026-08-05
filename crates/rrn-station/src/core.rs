@@ -584,6 +584,7 @@ impl Core {
             "marketplace_search" => self.m_marketplace_search(req),
             "marketplace_listing" => self.m_marketplace_listing(req),
             "marketplace_create_listing" => self.m_marketplace_create_listing(req),
+            "marketplace_edit_listing" => self.m_marketplace_edit_listing(req),
             "marketplace_close_listing" => self.m_marketplace_close_listing(req),
             "marketplace_my_listings" => self.m_marketplace_my_listings(),
             "marketplace_announce_need" => self.m_marketplace_announce_need(req),
@@ -891,6 +892,93 @@ impl Core {
         ok(&rpc::CloseListingResult {
             listing_id: params.listing_id,
             reason: "provider_closed".into(),
+        })
+    }
+
+    /// `marketplace_edit_listing` — apply a provider patch to one of the station's
+    /// own listings (T1.7.2 Phase B). The listing's content id is fixed at
+    /// publication; an update references it and changes only what a
+    /// [`ListingPatch`](rrn_marketplace::lifecycle::ListingPatch) permits —
+    /// pricing, description, availability, expiry. The current listing is read
+    /// back so a partial edit (say, only `--price`) keeps every field the caller
+    /// did not mention. `append_listing_updated` re-runs signer-is-provider,
+    /// not-closed, non-empty-patch, and the patched listing's own validity.
+    fn m_marketplace_edit_listing(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        use rrn_marketplace::lifecycle::{ExpiryPatch, ListingPatch, ListingUpdated};
+        use rrn_marketplace::listing::{Pricing, PricingModel};
+        let params: rpc::EditListingParams = parse_params(req)?;
+        let listing_id = parse_listing_id(&params.listing_id)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+
+        let mut log = AppendLog::new(&self.db);
+        let records = rrn_marketplace::lifecycle::listing_records(&log, &listing_id, &station_pk)
+            .map_err(marketplace_err)?;
+        let current = records
+            .current()
+            .ok_or_else(|| invalid_params(format!("no such listing: {}", params.listing_id)))?;
+
+        // Pricing: patch only when a price or model override was given, carrying
+        // the untouched half from the current listing so `--price` alone keeps the
+        // model (and a model flip alone keeps the amount).
+        let pricing = if params.amount_centi.is_some() || params.negotiable.is_some() {
+            let negotiable = params.negotiable.unwrap_or(current.pricing.negotiable);
+            Some(Pricing {
+                amount_centi: params.amount_centi.unwrap_or(current.pricing.amount_centi),
+                model: if negotiable {
+                    PricingModel::Negotiable
+                } else {
+                    PricingModel::Fixed
+                },
+                negotiable,
+            })
+        } else {
+            None
+        };
+
+        // Availability: rebuild from the current values with the given override,
+        // clamped to what the surface allows (goods=capacity, services=next_slot).
+        let availability = if params.capacity.is_some() || params.next_slot.is_some() {
+            let capacity = params.capacity.or(current.availability.capacity);
+            let next_slot = params.next_slot.or(current.availability.next_slot);
+            Some(availability_for(current.surface, capacity, next_slot))
+        } else {
+            None
+        };
+
+        let expires_at = if params.clear_expiry.unwrap_or(false) {
+            ExpiryPatch::Clear
+        } else if let Some(t) = params.expires_at {
+            ExpiryPatch::Set(t)
+        } else {
+            ExpiryPatch::Unchanged
+        };
+
+        let patch = ListingPatch {
+            pricing,
+            description: params.description,
+            availability,
+            expires_at,
+        };
+        let update = ListingUpdated {
+            listing_id,
+            patch,
+            signed_by: self.wallet.address,
+        };
+        rrn_marketplace::lifecycle::append_listing_updated(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(update, &station),
+            &station_pk,
+        )
+        .map_err(marketplace_err)?;
+        self.reindex_listing(&listing_id);
+
+        ok(&rpc::EditListingResult {
+            listing_id: params.listing_id,
         })
     }
 
@@ -2003,6 +2091,7 @@ impl Core {
             "marketplace_search" => self.channel_marketplace_search(envelope),
             "marketplace_listing" => self.channel_marketplace_listing(envelope),
             "submit_listing" => self.channel_submit_listing(envelope),
+            "submit_listing_update" => self.channel_submit_listing_update(envelope),
             "submit_listing_close" => self.channel_submit_listing_close(envelope),
             "marketplace_my_listings" => self.channel_marketplace_my_listings(envelope),
             "submit_inquiry" => self.channel_submit_inquiry(envelope),
@@ -2206,6 +2295,48 @@ impl Core {
         Ok(serde_json::json!({
             "listing_id": hex(&listing_id.to_bytes()),
             "reason": "provider_closed",
+        }))
+    }
+
+    /// `submit_listing_update` — accept a mobile-signed [`SignedListingUpdate`]
+    /// and apply the provider's patch to their own listing (T1.7.2 Phase B). The
+    /// provider signs a [`ListingPatch`](rrn_marketplace::lifecycle::ListingPatch)
+    /// on the phone; the station verifies the signature and that the signer is
+    /// this paired mobile, then leaves signer-is-provider, listing-exists,
+    /// not-already-closed, non-empty-patch, and the patched listing's own validity
+    /// to [`append_listing_updated`] — so the write path and replay's `scan` agree
+    /// by construction. The listing's content id is fixed at publication and a
+    /// patch never changes it.
+    fn channel_submit_listing_update(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_listing_update")?;
+        let signed: rrn_marketplace::lifecycle::SignedListingUpdate =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed update".into()))?;
+        // A mobile submits only updates it signed: the provider must be the
+        // authenticated signer bound to this paired mobile.
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "editor is not the authenticated mobile".into(),
+            ));
+        }
+        signed.verify().map_err(|_| {
+            (
+                rpc::INVALID_PARAMS,
+                "update signature does not verify".into(),
+            )
+        })?;
+        let listing_id = signed.payload.listing_id;
+        let station_pk = self.station_keypair().public_key();
+        let mut log = AppendLog::new(&self.db);
+        rrn_marketplace::lifecycle::append_listing_updated(&mut log, signed, &station_pk)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        self.reindex_listing(&listing_id);
+        Ok(serde_json::json!({
+            "listing_id": hex(&listing_id.to_bytes()),
         }))
     }
 
@@ -3597,6 +3728,84 @@ mod tests {
         assert_eq!(detail["state"], "active");
         assert_eq!(detail["description"], "Picked this week.");
         assert_eq!(detail["availability"]["capacity"], 12);
+    }
+
+    #[test]
+    fn cli_edits_a_listing_and_the_id_holds_while_the_fields_change() {
+        let mut core = test_core();
+        let created = call(
+            &mut core,
+            "marketplace_create_listing",
+            create_params("Squash"),
+        );
+        let listing_id = created["listing_id"].as_str().unwrap().to_string();
+
+        // Patch price and description; leave capacity and everything else alone.
+        let edited = call(
+            &mut core,
+            "marketplace_edit_listing",
+            serde_json::json!({
+                "listing_id": listing_id,
+                "amount_centi": 999,
+                "description": "Now half price.",
+            }),
+        );
+        // A listing's content address is its identity — an edit never moves it.
+        assert_eq!(edited["listing_id"], listing_id);
+
+        let detail = call(
+            &mut core,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": listing_id }),
+        );
+        assert_eq!(detail["amount_centi"], 999);
+        assert_eq!(detail["description"], "Now half price.");
+        // A field the patch did not name is carried from the current listing.
+        assert_eq!(detail["availability"]["capacity"], 12);
+        assert_eq!(detail["state"], "active");
+
+        // An empty patch is refused rather than written as a no-op.
+        let err = call_err(
+            &mut core,
+            "marketplace_edit_listing",
+            serde_json::json!({ "listing_id": listing_id }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+
+        // So is editing a listing that does not exist.
+        let err = call_err(
+            &mut core,
+            "marketplace_edit_listing",
+            serde_json::json!({ "listing_id": "00".repeat(32), "amount_centi": 100 }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn editing_a_price_alone_keeps_the_pricing_model() {
+        let mut core = test_core();
+        // A negotiable listing, edited with only a new price, stays negotiable —
+        // the untouched half of pricing is carried from the current listing.
+        let mut params = create_params("Firewood, make an offer");
+        params["negotiable"] = serde_json::json!(true);
+        let listing_id = call(&mut core, "marketplace_create_listing", params)["listing_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        call(
+            &mut core,
+            "marketplace_edit_listing",
+            serde_json::json!({ "listing_id": listing_id, "amount_centi": 250 }),
+        );
+        let detail = call(
+            &mut core,
+            "marketplace_listing",
+            serde_json::json!({ "listing_id": listing_id }),
+        );
+        assert_eq!(detail["amount_centi"], 250);
+        assert_eq!(detail["pricing_model"], "negotiable");
+        assert_eq!(detail["negotiable"], true);
     }
 
     #[test]
