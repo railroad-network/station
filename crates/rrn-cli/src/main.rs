@@ -1584,6 +1584,7 @@ mod tests {
             listing_id: Some("3c3738c4".into()),
             listing_title: Some("Fresh eggs".into()),
             state: "settled".into(),
+            oracle_tier: 1,
             timestamp: 1_000,
             expires_at: None,
             confirmed_at: None,

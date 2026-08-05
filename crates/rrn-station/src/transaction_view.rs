@@ -127,6 +127,7 @@ pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<Tran
         listing_id: proposal.listing_id.map(|ListingRef(b)| hex(&b)),
         listing_title: None,
         state: state_str.to_string(),
+        oracle_tier: proposal.effective_tier(),
         timestamp: proposal.proposed_at,
         // Only a still-open proposal has a meaningful expiry.
         expires_at: matches!(state, TransactionState::Proposed { .. })

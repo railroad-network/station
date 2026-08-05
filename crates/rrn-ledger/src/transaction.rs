@@ -139,6 +139,20 @@ pub struct TransactionProposal {
     /// record**, so it is OMITTED from the CBOR when `None` (never `null`) — see
     /// the `From`/`TryFrom` impls below and ADR-0010.
     pub listing_id: Option<ListingRef>,
+    /// An **opt-up** on the oracle tier (Overview §4.3): a request that this
+    /// transaction be held to a higher tier than its amount alone requires, e.g.
+    /// a small-value medical consult a listing marks Tier 2. `None` — the common
+    /// case — means the transaction takes its amount's [`tier_floor`], so like
+    /// [`listing_id`](Self::listing_id) it is **OMITTED from the CBOR when
+    /// `None`** to keep every plain proposal byte-identical to before this field
+    /// existed (ADR-0010's additive-field rule). When present it must be a
+    /// genuine lift ([`tier::is_valid_opt_up`]); the tier that governs settlement
+    /// is [`tier::effective_tier`], never this raw value.
+    ///
+    /// [`tier_floor`]: crate::tier::tier_floor
+    /// [`tier::is_valid_opt_up`]: crate::tier::is_valid_opt_up
+    /// [`tier::effective_tier`]: crate::tier::effective_tier
+    pub oracle_tier: Option<u8>,
     /// Per-sender monotonic nonce; the engine rejects gaps and duplicates.
     pub nonce: u64,
     /// Unix seconds when the proposal was made.
@@ -171,6 +185,10 @@ impl TransactionProposal {
             // with `with_listing`. Absent-when-`None` keeps direct sends
             // byte-identical to before this field existed.
             listing_id: None,
+            // No opt-up by default: the transaction takes its amount's tier
+            // floor. `with_tier` records a genuine lift. Absent-when-`None`, same
+            // additive-field discipline as `listing_id`.
+            oracle_tier: None,
             nonce,
             proposed_at,
             expires_at,
@@ -186,6 +204,33 @@ impl TransactionProposal {
         self.listing_id = Some(listing);
         self.id = self.compute_id();
         self
+    }
+
+    /// Opts this transaction *up* the oracle ladder to `tier`, recomputing its
+    /// content [`id`](Self::id) with the opt-up included (T1.8.1).
+    ///
+    /// `tier` must be a genuine lift for this amount ([`crate::tier::is_valid_opt_up`]):
+    /// strictly above the amount's own floor and no higher than
+    /// [`crate::tier::MAX_PHASE1_TIER`]. A `tier` that is not a valid opt-up is
+    /// ignored (the proposal keeps its amount-derived floor), so a redundant or
+    /// out-of-range request can never produce a second encoding of the same
+    /// effective tier.
+    pub fn with_tier(mut self, tier: u8) -> Self {
+        if crate::tier::is_valid_opt_up(self.amount_centi, tier) {
+            self.oracle_tier = Some(tier);
+            self.id = self.compute_id();
+        }
+        self
+    }
+
+    /// The oracle tier that governs this transaction — the higher of its amount
+    /// floor and any recorded opt-up. This is what settlement, staking, and
+    /// disputes read; never the raw [`oracle_tier`](Self::oracle_tier) field. It
+    /// is *not* capped at the Phase-1 ceiling: a Tier-3 amount reports `3`, which
+    /// the engine rejects on submit ([`crate::Error::TierNotSupported`]) rather
+    /// than lowering.
+    pub fn effective_tier(&self) -> u8 {
+        crate::tier::effective_tier(self.amount_centi, self.oracle_tier)
     }
 
     /// Recomputes the content address from the current field values.
@@ -217,6 +262,13 @@ impl From<TransactionProposal> for CBOR {
         // byte-identical; only a linked proposal carries the key.
         if let Some(listing) = p.listing_id {
             m.insert("listing_id", listing);
+        }
+        // Same omit-when-`None` discipline as `listing_id` above: a plain
+        // proposal (no opt-up) carries no `oracle_tier` key, so it stays
+        // byte-identical to before this field existed. Only a genuine opt-up
+        // writes the key. Encoded as an unsigned integer (tier is 1..=2).
+        if let Some(tier) = p.oracle_tier {
+            m.insert("oracle_tier", tier);
         }
         m.insert("nonce", p.nonce);
         m.insert("proposed_at", p.proposed_at);
@@ -251,6 +303,14 @@ impl TryFrom<CBOR> for TransactionProposal {
         // after construction so the recomputed id matches the sender's.
         let proposal = match map.get::<&str, ListingRef>("listing_id") {
             Some(listing) => proposal.with_listing(listing),
+            None => proposal,
+        };
+        // Absent oracle_tier decodes to `None` (the amount's own floor governs);
+        // a present integer to an opt-up. `with_tier` re-validates it, so a
+        // forged or out-of-range tier in the bytes is dropped rather than
+        // trusted — the recomputed id then simply won't match a tampered record.
+        let proposal = match map.get::<&str, u8>("oracle_tier") {
+            Some(tier) => proposal.with_tier(tier),
             None => proposal,
         };
         Ok(proposal)
@@ -387,6 +447,62 @@ mod tests {
         assert_eq!(decoded.listing_id, Some(ListingRef([9u8; 32])));
         // The recomputed id agrees with the link included.
         assert_eq!(decoded.id, linked.id);
+    }
+
+    #[test]
+    fn tier_opt_up_is_absent_by_default_and_leaves_the_id_stable() {
+        let plain = sample_proposal(); // amount 300 → Tier 1 floor, no opt-up
+        assert_eq!(plain.oracle_tier, None);
+        assert_eq!(plain.effective_tier(), 1);
+        let bytes = to_canonical_bytes(plain.clone());
+        // Absent, never null — same ADR-0010 guard as listing_id: a proposal
+        // written before this field existed hashes identically.
+        assert!(!contains(&bytes, b"oracle_tier"));
+
+        // Opting a Tier-1 amount up to Tier 2 is additive content: the key
+        // appears, the id changes, and the effective tier follows.
+        let lifted = plain.clone().with_tier(2);
+        assert_eq!(lifted.oracle_tier, Some(2));
+        assert_eq!(lifted.effective_tier(), 2);
+        assert!(contains(
+            &to_canonical_bytes(lifted.clone()),
+            b"oracle_tier"
+        ));
+        assert_ne!(lifted.id, plain.id);
+    }
+
+    #[test]
+    fn a_tier_lifted_proposal_round_trips() {
+        let lifted = sample_proposal().with_tier(2);
+        let bytes = to_canonical_bytes(lifted.clone());
+        let decoded: TransactionProposal = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, lifted);
+        assert_eq!(decoded.oracle_tier, Some(2));
+        assert_eq!(decoded.id, lifted.id);
+    }
+
+    #[test]
+    fn a_redundant_or_out_of_range_opt_up_is_ignored() {
+        // Opting to the floor (Tier 1) is redundant: dropped, so there is one
+        // canonical encoding and the id is unchanged from plain.
+        let plain = sample_proposal();
+        let redundant = plain.clone().with_tier(1);
+        assert_eq!(redundant.oracle_tier, None);
+        assert_eq!(redundant.id, plain.id);
+
+        // Opting above the Phase-1 ceiling is dropped too.
+        let too_high = plain.clone().with_tier(3);
+        assert_eq!(too_high.oracle_tier, None);
+        assert_eq!(too_high.id, plain.id);
+    }
+
+    #[test]
+    fn effective_tier_follows_the_amount_floor_without_an_opt_up() {
+        // A 5-Common (500 centi) amount is Tier 2 from its floor alone.
+        let big =
+            TransactionProposal::new(addr(), addr(), 500, None, 0, 1_700_000_000, 1_700_086_400);
+        assert_eq!(big.oracle_tier, None);
+        assert_eq!(big.effective_tier(), 2);
     }
 
     #[test]

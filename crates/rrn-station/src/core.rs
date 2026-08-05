@@ -640,7 +640,7 @@ impl Core {
             .map_err(internal)?;
         let nonce = snapshot.next_nonce(&self.wallet.address.public_key().to_bytes());
 
-        let proposal = TransactionProposal::new(
+        let mut proposal = TransactionProposal::new(
             self.wallet.address,
             receiver,
             params.amount_centi,
@@ -649,6 +649,12 @@ impl Core {
             now,
             now + PROPOSAL_TTL_SECS,
         );
+        // Honor a sender's opt-up to a higher oracle tier (T1.8.1). `with_tier`
+        // drops a request that is not a genuine lift, so a plain pay stays at its
+        // amount-derived floor and its bytes are unchanged from before this field.
+        if let Some(tier) = params.oracle_tier {
+            proposal = proposal.with_tier(tier);
+        }
         let tx_id = proposal.id;
         let signed: SignedProposal = SignedProposal::sign(proposal, &station);
 
@@ -1303,7 +1309,13 @@ impl Core {
             now,
             now + PROPOSAL_TTL_SECS,
         )
-        .with_listing(listing_ref);
+        .with_listing(listing_ref)
+        // Carry the listing's declared oracle tier onto the payment as an opt-up
+        // (T1.8.1): a Tier-2 listing (e.g. a low-value medical consult) lifts an
+        // otherwise Tier-1 amount up to Tier 2. `with_tier` drops the request when
+        // it is not a genuine lift, so a Tier-1 listing or an amount already at
+        // the listing's tier leaves the proposal at its amount-derived floor.
+        .with_tier(inquiry.listing.oracle_tier);
         let tx_id = proposal.id;
         let signed: SignedProposal = SignedProposal::sign(proposal, &station);
 

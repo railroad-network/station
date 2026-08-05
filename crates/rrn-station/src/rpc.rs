@@ -115,6 +115,12 @@ pub struct ProposeParams {
     /// Optional human-readable memo, part of the signed proposal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
+    /// Optional oracle-tier **opt-up** (T1.8.1): the sender asking this payment
+    /// be held to a higher tier than its amount alone requires. `None` — the
+    /// common case — takes the amount's floor. Ignored unless it is a genuine
+    /// lift (see `TransactionProposal::with_tier`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_tier: Option<u8>,
 }
 
 /// `propose` result.
@@ -279,6 +285,11 @@ pub struct TransactionRow {
     pub listing_title: Option<String>,
     /// Lifecycle: `pending` | `confirmed` | `settled` | `cancelled`.
     pub state: String,
+    /// The oracle tier that governs this transaction (T1.8.1): `1` — settlement
+    /// window only — or `2` — reputation stake + dispute window. This is the
+    /// *effective* tier (amount floor lifted by any opt-up), what the UI shows
+    /// and what Tier-2 machinery keys on, not the proposal's raw opt-up field.
+    pub oracle_tier: u8,
     /// Unix seconds the proposal was made (the row's sort key).
     pub timestamp: i64,
     /// Unix seconds an unconfirmed proposal auto-cancels; present while pending.

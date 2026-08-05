@@ -67,6 +67,18 @@ impl<'db> Engine<'db> {
             return Err(Error::Expired);
         }
 
+        // Oracle tier: Phase 1 services Tiers 1 and 2 only. A transaction whose
+        // amount (or opt-up) reaches Tier 3+ is refused here, at the front door,
+        // so it never reaches the log — value sets the floor and is never lowered
+        // to fit what the phase can do (Overview §4.3).
+        let tier = p.effective_tier();
+        if !crate::tier::is_phase1_serviceable(tier) {
+            return Err(Error::TierNotSupported {
+                tier,
+                max: crate::tier::MAX_PHASE1_TIER,
+            });
+        }
+
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
 
         // Uniqueness: never process the same proposal twice.
@@ -218,6 +230,30 @@ mod tests {
             engine.submit_proposal(again, 100),
             Err(Error::DuplicateProposal)
         ));
+    }
+
+    #[test]
+    fn a_tier_three_amount_is_rejected_at_the_front_door() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // 50 Commons (5_000 centi) is Tier 3, which Phase 1 cannot service.
+        let p = TransactionProposal::new(addr(&alice), addr(&bob), 5_000, None, 0, 100, 100_000);
+        let signed = SignedProposal::sign(p, &alice);
+        assert!(matches!(
+            engine.submit_proposal(signed, 100),
+            Err(Error::TierNotSupported { tier: 3, max: 2 })
+        ));
+
+        // Nothing was written: the next nonce is still 0, so a valid Tier-1/2
+        // proposal can follow without a gap.
+        let ok = signed_proposal(&alice, &bob, 0, 100, 100_000);
+        assert!(engine.submit_proposal(ok, 100).is_ok());
     }
 
     #[test]

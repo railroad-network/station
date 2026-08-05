@@ -16,6 +16,9 @@
 //! - [`engine`] — the [`engine::Engine`] front door: submit a proposal, submit a
 //!   confirmation, cancel, or query state, with nonce + timestamp replay
 //!   protection.
+//! - [`tier`] — the oracle tier ladder (Overview §4.3): a pure function from a
+//!   transaction's amount to the scrutiny it needs (Tier 1 settlement-window
+//!   only vs. Tier 2 reputation stake + dispute window), plus the opt-up rules.
 //! - [`contract`] — the [`contract::ContractCharge`], a second station-signed
 //!   balance record: the per-period direct debit a recurring service contract
 //!   executes (T1.7.7), a sibling of the settlement record.
@@ -54,6 +57,7 @@ pub mod contract;
 pub mod engine;
 pub mod settlement;
 pub mod state;
+pub mod tier;
 pub mod transaction;
 
 /// Errors from the ledger and transaction engine.
@@ -96,6 +100,18 @@ pub enum Error {
     /// The proposal's window is degenerate: `proposed_at` is after `expires_at`.
     #[error("proposal window is invalid: proposed_at is after expires_at")]
     InvalidWindow,
+    /// The transaction's amount (or opt-up) puts it at an oracle tier Phase 1
+    /// cannot service — Tier 3+ needs artifact evidence, community witnesses, or
+    /// cross-community validation, none of which exist yet. Rejected rather than
+    /// serviced at a lower tier, so a large transaction is never quietly stripped
+    /// of the scrutiny its value demands (Overview §4.3; see [`tier`]).
+    #[error("oracle tier {tier} is not supported in Phase 1 (max {max}); transaction too large")]
+    TierNotSupported {
+        /// The effective tier the transaction required.
+        tier: u8,
+        /// The highest tier Phase 1 can service ([`tier::MAX_PHASE1_TIER`]).
+        max: u8,
+    },
     /// No transaction with the given id exists in the log.
     #[error("transaction not found")]
     UnknownTransaction,
