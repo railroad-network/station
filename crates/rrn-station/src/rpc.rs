@@ -242,6 +242,21 @@ pub struct WhoamiResult {
     /// reads this rather than hardcoding the string so it cannot drift.
     #[serde(default)]
     pub community: String,
+    /// Whether the community is still in Tier-2 **bootstrap grace** (T1.8.6):
+    /// fewer than [`grace_threshold`](Self::grace_threshold) members have reached
+    /// the Member band, so *any* member may confirm a Tier-2 payment without
+    /// meeting the standing floor. The mobile shows a persistent banner while this
+    /// is true, so members know the oracle is running under weaker assumptions.
+    #[serde(default)]
+    pub bootstrap_in_grace: bool,
+    /// How many members are currently *established* (effective composite over the
+    /// Member band) — the count that decides `bootstrap_in_grace`.
+    #[serde(default)]
+    pub established_members: u64,
+    /// The number of established members at which bootstrap grace ends
+    /// (`rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD`).
+    #[serde(default)]
+    pub grace_threshold: u64,
 }
 
 /// `transactions` params — the mobile-facing, member-relative view of the
@@ -298,6 +313,12 @@ pub struct TransactionRow {
     /// Unix seconds the receiver confirmed; present once confirmed/settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<i64>,
+    /// Unix seconds the settlement window closes — `confirmed_at` plus this tier's
+    /// window (Tier 1 = 24h, Tier 2 = 48h; T1.8.4/T1.8.6). Present once confirmed,
+    /// so the wallet can count down to settlement without hardcoding the window or
+    /// re-deriving it from the tier. Absent while a proposal is still pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_by: Option<i64>,
     /// Unix seconds the transaction settled; present once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<i64>,

@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
+use rrn_ledger::settlement::SettlementConfig;
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::ListingRef;
 use rrn_marketplace::lifecycle::listing_records;
@@ -35,6 +36,7 @@ pub fn member_transactions(
     limit: Option<u64>,
     log: &AppendLog,
     station: &PublicKey,
+    settlement: &SettlementConfig,
 ) -> Vec<TransactionRow> {
     let mut rows: Vec<TransactionRow> = snapshot
         .iter()
@@ -53,6 +55,12 @@ pub fn member_transactions(
                 .entry(listing_hex.clone())
                 .or_insert_with(|| listing_title(log, station, listing_hex))
                 .clone();
+        }
+        // Once confirmed, the settlement window is `confirmed_at` + the tier's
+        // window; the phone counts down to this instant. Derived here, not stored,
+        // exactly like the tier and the window itself (ADR-0011).
+        if let Some(confirmed_at) = row.confirmed_at {
+            row.settle_by = Some(confirmed_at + settlement.window_for(row.oracle_tier) as i64);
         }
     }
     rows
@@ -133,6 +141,9 @@ pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<Tran
         expires_at: matches!(state, TransactionState::Proposed { .. })
             .then_some(proposal.expires_at),
         confirmed_at,
+        // Filled by `member_transactions`, which has the settlement config; a push
+        // event (events.rs) leaves it `None` and the phone's refetch supplies it.
+        settle_by: None,
         settled_at,
         nonce: proposal.nonce,
     })
@@ -230,5 +241,71 @@ mod tests {
         let log = AppendLog::new(&db);
         let station_pk = Keypair::generate().public_key();
         assert_eq!(listing_title(&log, &station_pk, &"aa".repeat(32)), None);
+    }
+
+    #[test]
+    fn a_confirmed_row_carries_its_tier_window_as_settle_by() {
+        use rrn_ledger::settlement::{
+            SettlementConfig, DEFAULT_TIER1_WINDOW_SECONDS, DEFAULT_TIER2_WINDOW_SECONDS,
+        };
+        use rrn_ledger::transaction::{SignedConfirmation, TransactionConfirmation};
+
+        let db = rrn_storage::db::Database::open_in_memory().unwrap();
+        rrn_storage::migrations::run(&db).unwrap();
+        let station_pk = Keypair::generate().public_key();
+        let config = SettlementConfig::default();
+
+        let sender = Keypair::generate();
+        let receiver = Keypair::generate();
+        let sender_addr = Address::from_public_key(sender.public_key());
+        let receiver_addr = Address::from_public_key(receiver.public_key());
+
+        // A sub-5-Common payment is Tier 1 (24h window); a 5.00-Common payment is
+        // Tier 2 (48h). Confirm each so it has a settlement window to derive.
+        let confirmed_at = 1_100;
+        for (nonce, amount) in [300i64, 500].into_iter().enumerate() {
+            let proposal = TransactionProposal::new(
+                sender_addr,
+                receiver_addr,
+                amount,
+                None,
+                nonce as u64,
+                1_000,
+                1_000 + 86_400,
+            );
+            let id = proposal.id;
+            AppendLog::new(&db)
+                .append(SignedProposal::sign(proposal, &sender))
+                .unwrap();
+            let confirmation = TransactionConfirmation {
+                proposal_id: id,
+                confirmer: receiver_addr,
+                confirmed_at,
+            };
+            AppendLog::new(&db)
+                .append(SignedConfirmation::sign(confirmation, &receiver))
+                .unwrap();
+        }
+
+        let log = AppendLog::new(&db);
+        let snapshot = LedgerSnapshot::derive(&log).unwrap();
+        let rows = member_transactions(&snapshot, &receiver_addr, None, &log, &station_pk, &config);
+
+        let tier1 = rows
+            .iter()
+            .find(|r| r.oracle_tier == 1)
+            .expect("a tier-1 row");
+        let tier2 = rows
+            .iter()
+            .find(|r| r.oracle_tier == 2)
+            .expect("a tier-2 row");
+        assert_eq!(
+            tier1.settle_by,
+            Some(confirmed_at + DEFAULT_TIER1_WINDOW_SECONDS as i64)
+        );
+        assert_eq!(
+            tier2.settle_by,
+            Some(confirmed_at + DEFAULT_TIER2_WINDOW_SECONDS as i64)
+        );
     }
 }

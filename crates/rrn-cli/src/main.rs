@@ -1588,6 +1588,7 @@ mod tests {
             timestamp: 1_000,
             expires_at: None,
             confirmed_at: None,
+            settle_by: None,
             settled_at: Some(1_010),
             nonce: 0,
         };

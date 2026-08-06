@@ -613,9 +613,20 @@ impl Core {
     }
 
     fn m_whoami(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        // Bootstrap-grace status (T1.8.6): while fewer than the threshold of
+        // members are established, any member may confirm a Tier-2 payment. The
+        // count is derived from the log, so it always reflects the current standing
+        // and the phone can render its grace banner without recomputing it.
+        let established =
+            rrn_reputation::staking::established_member_count(&self.db, self.clock.now())
+                .map_err(internal)?;
+        let threshold = rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD;
         ok(&rpc::WhoamiResult {
             address: self.wallet.address.to_string(),
             community: VOUCH_COMMUNITY.to_string(),
+            bootstrap_in_grace: established < threshold,
+            established_members: established as u64,
+            grace_threshold: threshold as u64,
         })
     }
 
@@ -759,6 +770,7 @@ impl Core {
             params.limit,
             &log,
             &station_pk,
+            &self.settlement,
         );
         ok(&rpc::TransactionsResult { transactions })
     }
@@ -3731,6 +3743,20 @@ mod tests {
         assert_eq!(
             result["listings"].as_array().unwrap().len(),
             marketplace_view::MAX_SEARCH_LIMIT
+        );
+    }
+
+    #[test]
+    fn whoami_reports_bootstrap_grace_for_a_fresh_community() {
+        let mut core = test_core();
+        let who = call(&mut core, "whoami", serde_json::json!({}));
+        // A brand-new station has no established members, so the community is in
+        // bootstrap grace and the phone will show its "new community" banner.
+        assert_eq!(who["bootstrap_in_grace"], true);
+        assert_eq!(who["established_members"], 0);
+        assert_eq!(
+            who["grace_threshold"],
+            rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD as u64
         );
     }
 
