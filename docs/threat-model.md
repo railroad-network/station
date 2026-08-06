@@ -630,6 +630,56 @@ transition; the derivability of all state from the log.
   debt in Phase 0 (Phase 1). The ±5 minute drift window is a deliberate
   usability/security trade-off recorded here.
 
+#### Oracle tiering and the reputation stake
+
+The scrutiny a transaction receives scales with its value across two Phase-1
+tiers (ADR-0011). The tier is derived from the absolute amount and cannot be
+lowered; the settlement window it serves (24h Tier 1, 48h Tier 2) follows from
+it.
+
+- *Threat: escaping scrutiny by shrinking, flipping, or clamping the amount.* A
+  party structures a large payment to dodge Tier-2's longer window and stake, or
+  flips its sign hoping a refund is classified more leniently, or relies on a
+  large transfer being silently *clamped* down to the highest serviceable tier.
+- *Mitigation:* the tier is a pure function of the **absolute** amount, so sign
+  never lowers it, and a transaction whose effective tier exceeds the Phase-1
+  ceiling (Tier 3, ≥ 50 Commons) is **rejected outright** (`Error::TierNotSupported`)
+  rather than clamped — the network never records a high-value transfer under
+  thin protection. Structuring one payment into several smaller ones is possible,
+  but each piece still serves its own window and (for Tier 2) its own stake, and
+  the pieces are individually visible on the log.
+- *Residual risk:* a determined party can split a large purchase into many
+  sub-5-Common transfers to stay in Tier 1, trading the longer window for
+  bookkeeping. This is the accepted micro-scale-fraud posture below.
+
+- *Threat: a Tier-2 confirmation by a member with nothing at stake.* A throwaway
+  or freshly-minted identity confirms a deliberate purchase to lend it
+  legitimacy it has not earned.
+- *Mitigation:* confirming a Tier-2 transaction requires clearing a hard
+  Member-band reputation floor (composite ≥ 2.0). The staked value is the
+  confirmer's raw composite at confirmation time, reconstructible from the log by
+  replay (`score_raw_at`) rather than stored, so it cannot be forged after the
+  fact. While a community is bootstrapping (< 3 established members) the floor is
+  relaxed to *any* member so the community is not deadlocked; that grace sunsets
+  automatically by condition.
+- *Residual risk:* in Phase 1 the stake is **consequence-free** — there is no
+  dispute-resolution or forfeiture path yet (Phase 2), so the stake functions as
+  an eligibility filter and an audit anchor, not a live financial deterrent. The
+  bootstrap grace is a genuine window in which a small colluding founding group
+  can attest to each other's Tier-2 transactions; it is bounded by the
+  three-established-member sunset and accepted for bootstrap usability.
+
+- *Threat: bilateral collusion.* The two counterparties (Tier 1 or Tier 2) simply
+  agree to a fraudulent transaction; both "confirm" honestly from the protocol's
+  point of view.
+- *Mitigation:* none at these tiers by design — bilateral confirmation cannot
+  detect a two-party conspiracy. Tier 1 tolerates this as acceptable micro-scale
+  loss (the value at risk is small by construction); Tier 2 raises the cost by
+  putting the confirmer's reputation on record. Detecting collusion requires
+  independent witnesses, which is precisely what Tier 3+ adds in Phase 2.
+- *Residual risk:* Tier-1 and Tier-2 collusion is a known, accepted risk for the
+  value bands they cover. It is not mitigated in Phase 1.
+
 ### `rrn-protocol`
 
 **Intentionally unpopulated in Phase 0.** This crate contains only stubs — there
