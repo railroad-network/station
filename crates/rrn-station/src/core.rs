@@ -2322,6 +2322,57 @@ impl Core {
             ));
         }
         let now = self.clock.now();
+
+        // A Tier-2 confirmation stakes reputation (T1.8.2): gate it here, on the
+        // path a phone actually confirms through, keyed on the **authenticated
+        // mobile** (`signed.signer`) — the confirmer must clear the Member band, or
+        // the community must still be in bootstrap grace. `m_confirm` gates the
+        // operator's own CLI confirm; without this a mobile Tier-2 confirm would
+        // slip past the gate entirely.
+        let confirmer = Address::from_public_key(signed.signer);
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        let tier = snapshot
+            .get(&signed.payload.proposal_id)
+            .and_then(proposal_of)
+            .map(|p| p.effective_tier())
+            // An unknown proposal falls through as Tier 1; the engine below is what
+            // rejects it authoritatively with `UnknownTransaction`.
+            .unwrap_or(rrn_ledger::tier::MIN_TIER);
+        if tier >= 2 {
+            use rrn_reputation::staking::Tier2Eligibility;
+            match rrn_reputation::staking::evaluate_tier2_confirmation(&self.db, &confirmer, now)
+                .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+            {
+                Tier2Eligibility::Allowed {
+                    stake_centi,
+                    via_grace,
+                } => {
+                    tracing::info!(
+                        tx = %hex(&signed.payload.proposal_id.to_bytes()),
+                        stake_centi,
+                        via_grace,
+                        "tier-2 confirmation (mobile): reputation staked"
+                    );
+                }
+                Tier2Eligibility::Refused {
+                    composite,
+                    established,
+                } => {
+                    let member_floor = rrn_reputation::model::BAND_MEMBER_MIN;
+                    return Err((
+                        rpc::INVALID_PARAMS,
+                        format!(
+                            "cannot confirm a Tier-2 payment: your standing is {composite:.2}, \
+                             below the Member band ({member_floor:.1}) the community now \
+                             requires ({established} members are established, so the bootstrap \
+                             grace has ended)"
+                        ),
+                    ));
+                }
+            }
+        }
+
         let mut engine = Engine::new(&self.db, self.station_keypair());
         engine
             .submit_confirmation(signed, now)
@@ -3758,6 +3809,52 @@ mod tests {
             who["grace_threshold"],
             rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD as u64
         );
+    }
+
+    #[test]
+    fn a_mobile_confirming_a_tier2_payment_runs_the_stake_gate_and_grace_allows_it() {
+        let mut core = test_core();
+        let sender = Keypair::generate();
+        let receiver = Keypair::generate(); // the confirming mobile
+        let receiver_addr = Address::from_public_key(receiver.public_key());
+
+        // A Tier-2 proposal — 25 Commons = 2500 centi, above the 5-Common floor —
+        // submitted over the channel by its sender.
+        let proposal = TransactionProposal::new(
+            Address::from_public_key(sender.public_key()),
+            receiver_addr,
+            2500,
+            Some("t2".into()),
+            0,
+            NOW,
+            NOW + 86_400,
+        );
+        let tx_id = proposal.id;
+        let env = envelope(
+            &sender,
+            "submit_proposal",
+            serde_json::json!({ "signed_proposal": record_hex(proposal, &sender) }),
+        );
+        core.route_channel_method(&env).expect("proposal accepted");
+
+        // The receiver confirms over the channel — the path the gate must cover
+        // (the operator `m_confirm` gate does not run here). A brand-new station
+        // has no established members, so bootstrap grace lets any member confirm a
+        // Tier-2 payment: the gate runs and allows rather than being bypassed.
+        let confirmation = TransactionConfirmation {
+            proposal_id: tx_id,
+            confirmer: receiver_addr,
+            confirmed_at: NOW + 10,
+        };
+        let env = envelope(
+            &receiver,
+            "submit_confirmation",
+            serde_json::json!({ "signed_confirmation": record_hex(confirmation, &receiver) }),
+        );
+        let result = core
+            .route_channel_method(&env)
+            .expect("tier-2 confirm allowed in grace");
+        assert_eq!(result["state"], "Confirmed");
     }
 
     #[test]
