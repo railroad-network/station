@@ -673,6 +673,54 @@ impl Core {
         let now = self.clock.now();
         let station = self.station_keypair();
 
+        // A Tier-2 transaction is confirmed by staking reputation on it (T1.8.2):
+        // the confirmer must be an established member, or the community must still
+        // be inside its bootstrap grace. The stake itself is their raw composite at
+        // `now`, recomputable later, so nothing is frozen onto the confirmation.
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+        let tier = snapshot
+            .get(&tx_id)
+            .and_then(proposal_of)
+            .map(|p| p.effective_tier())
+            // An unknown/absent proposal falls through as Tier 1; the engine below
+            // is what rejects it authoritatively with `UnknownTransaction`.
+            .unwrap_or(rrn_ledger::tier::MIN_TIER);
+        if tier >= 2 {
+            use rrn_reputation::staking::Tier2Eligibility;
+            match rrn_reputation::staking::evaluate_tier2_confirmation(
+                &self.db,
+                &self.wallet.address,
+                now,
+            )
+            .map_err(internal)?
+            {
+                Tier2Eligibility::Allowed {
+                    stake_centi,
+                    via_grace,
+                } => {
+                    tracing::info!(
+                        tx = %params.tx_id,
+                        stake_centi,
+                        via_grace,
+                        "tier-2 confirmation: reputation staked"
+                    );
+                }
+                Tier2Eligibility::Refused {
+                    composite,
+                    established,
+                } => {
+                    let member_floor = rrn_reputation::model::BAND_MEMBER_MIN;
+                    return Err(invalid_params(format!(
+                        "cannot confirm a Tier-2 payment: your standing is {composite:.2}, \
+                         below the Member band ({member_floor:.1}) the community now \
+                         requires ({established} members are established, so the bootstrap \
+                         grace has ended)"
+                    )));
+                }
+            }
+        }
+
         let confirmation = TransactionConfirmation {
             proposal_id: tx_id,
             confirmer: self.wallet.address,

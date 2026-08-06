@@ -22,8 +22,9 @@
 //! [`scoring`] replays the log into a profile, [`decay`] applies the time
 //! weighting, [`portability`] makes a profile signed and replayable off its
 //! home station, and [`sybil`] holds the velocity and identity-anchoring
-//! defenses. Each module is a placeholder here (T1.5.2) and is filled in by its
-//! own later M1.5 task.
+//! defenses. The M1.5 modules began as placeholders (T1.5.2), each filled in by
+//! its own later M1.5 task. [`staking`] is the M1.8 addition: the Tier-2 oracle's
+//! reputation stake and its bootstrap grace.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -33,6 +34,7 @@ pub mod model;
 pub mod portability;
 pub mod scoring;
 pub mod snapshot;
+pub mod staking;
 pub mod sybil;
 
 /// Something went wrong reading the evidence a reputation score is derived from.

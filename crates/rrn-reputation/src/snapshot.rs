@@ -109,7 +109,7 @@ pub fn refresh_all_snapshots(db: &Database, now: i64) -> Result<usize> {
 /// party or on either side of a vouch. These are exactly the identities that can
 /// have a non-empty profile, and the set is derived from the canonical log so it
 /// is identical on every replica.
-fn known_addresses(db: &Database) -> Result<Vec<Address>> {
+pub(crate) fn known_addresses(db: &Database) -> Result<Vec<Address>> {
     let log = AppendLog::new(db);
     let mut addresses: HashSet<Address> = HashSet::new();
 
