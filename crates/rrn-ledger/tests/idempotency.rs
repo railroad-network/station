@@ -40,13 +40,7 @@ fn run_once() -> (i64, i64, u64) {
     let station = Keypair::generate();
 
     let mut engine = Engine::new(&db, station.clone());
-    let mut settler = Settler::new(
-        &db,
-        station.clone(),
-        SettlementConfig {
-            window_seconds: WINDOW,
-        },
-    );
+    let mut settler = Settler::new(&db, station.clone(), SettlementConfig::uniform(WINDOW));
     let balances = BalanceView::new(&db);
 
     // --- propose ---

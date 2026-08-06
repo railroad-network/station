@@ -78,13 +78,7 @@ fn full_transaction_lifecycle() {
     migrations::run(&db).unwrap();
 
     let mut engine = Engine::new(&db, station.clone());
-    let mut settler = Settler::new(
-        &db,
-        station.clone(),
-        SettlementConfig {
-            window_seconds: WINDOW,
-        },
-    );
+    let mut settler = Settler::new(&db, station.clone(), SettlementConfig::uniform(WINDOW));
     let balances = BalanceView::new(&db);
 
     // 3. Alice proposes a 3-Common (300 centi) payment to Bob, nonce 0, 24h

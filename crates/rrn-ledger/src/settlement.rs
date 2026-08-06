@@ -1,9 +1,13 @@
 //! The settlement window, and the balance changes that close it.
 //!
-//! After a transaction is confirmed it sits in the **settlement window** (48h by
-//! default; shorter for demos/tests). While it waits, *no balances change* —
-//! that delay is the whole point: it is also the dispute window for the Phase 1
-//! oracle. When the window elapses the [`Settler`] moves the transaction to
+//! After a transaction is confirmed it sits in the **settlement window** — 24h
+//! for Tier 1, 48h for Tier 2 by default (a demo/test can collapse both to a few
+//! seconds; see [`SettlementConfig::uniform`]). The window that governs a given
+//! transaction follows its [oracle tier](crate::tier): a lower-value Tier-1
+//! transfer clears sooner than the deliberate Tier-2 purchase it stakes
+//! reputation on. While it waits, *no balances change* — that delay is the whole
+//! point: it is also the dispute window for the Phase 1 oracle. When the window
+//! elapses the [`Settler`] moves the transaction to
 //! [`Settled`](crate::state::TransactionState::Settled) and applies the balance
 //! change, exactly once.
 //!
@@ -40,21 +44,53 @@ use crate::{Error, Result};
 /// Discriminant string for a settlement record's canonical CBOR.
 pub(crate) const SETTLEMENT_KIND: &str = "rrn.tx.settlement";
 
-/// The default Phase 0 settlement window: 48 hours.
-pub const DEFAULT_WINDOW_SECONDS: u64 = 48 * 3600;
+/// The default Tier-1 settlement window: 24 hours. Lower value, shorter scrutiny
+/// (ADR-0011).
+pub const DEFAULT_TIER1_WINDOW_SECONDS: u64 = 24 * 3600;
 
-/// Tunable settlement parameters.
+/// The default Tier-2 settlement window: 48 hours — the standard dispute window
+/// a staked confirmation is exposed to (ADR-0011).
+pub const DEFAULT_TIER2_WINDOW_SECONDS: u64 = 48 * 3600;
+
+/// Tunable settlement parameters: the wait a confirmed transaction serves before
+/// it settles, per [oracle tier](crate::tier).
 #[derive(Clone, Copy, Debug)]
 pub struct SettlementConfig {
-    /// How long after confirmation a transaction must wait before settling.
-    /// Defaults to [`DEFAULT_WINDOW_SECONDS`]; demos/tests shorten it.
-    pub window_seconds: u64,
+    /// How long a confirmed **Tier-1** transaction waits before settling.
+    /// Defaults to [`DEFAULT_TIER1_WINDOW_SECONDS`].
+    pub tier1_window_seconds: u64,
+    /// How long a confirmed **Tier-2** transaction waits before settling.
+    /// Defaults to [`DEFAULT_TIER2_WINDOW_SECONDS`].
+    pub tier2_window_seconds: u64,
 }
 
 impl Default for SettlementConfig {
     fn default() -> Self {
         Self {
-            window_seconds: DEFAULT_WINDOW_SECONDS,
+            tier1_window_seconds: DEFAULT_TIER1_WINDOW_SECONDS,
+            tier2_window_seconds: DEFAULT_TIER2_WINDOW_SECONDS,
+        }
+    }
+}
+
+impl SettlementConfig {
+    /// A config that applies the same `window_seconds` to every tier — the
+    /// demo/test knob that collapses both windows so settlement fires promptly.
+    pub fn uniform(window_seconds: u64) -> Self {
+        Self {
+            tier1_window_seconds: window_seconds,
+            tier2_window_seconds: window_seconds,
+        }
+    }
+
+    /// The settlement window, in seconds, that governs a transaction of the given
+    /// `tier`. Tier 1 gets the shorter window; Tier 2 — and, defensively, any
+    /// higher tier that somehow reached settlement — gets the standard one.
+    pub fn window_for(&self, tier: u8) -> u64 {
+        if tier <= crate::tier::MIN_TIER {
+            self.tier1_window_seconds
+        } else {
+            self.tier2_window_seconds
         }
     }
 }
@@ -143,10 +179,17 @@ impl<'db> Settler<'db> {
     /// elapsed (`confirmed_at + window_seconds <= now`).
     pub fn find_eligible(&self, now: i64) -> Result<Vec<TransactionId>> {
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
-        let window = self.config.window_seconds as i64;
         let mut eligible = Vec::new();
         for (id, state) in snapshot.iter() {
-            if let TransactionState::Confirmed { confirmation, .. } = state {
+            if let TransactionState::Confirmed {
+                proposal,
+                confirmation,
+            } = state
+            {
+                // The window is a pure function of the transaction's tier, which
+                // is itself derived from the immutable signed proposal — nothing
+                // extra is recorded per transaction.
+                let window = self.config.window_for(proposal.payload.effective_tier()) as i64;
                 if confirmation.payload.confirmed_at.saturating_add(window) <= now {
                     eligible.push(*id);
                 }
@@ -307,13 +350,7 @@ mod tests {
     }
 
     fn settler<'a>(db: &'a Database, station: &Keypair, window: u64) -> Settler<'a> {
-        Settler::new(
-            db,
-            station.clone(),
-            SettlementConfig {
-                window_seconds: window,
-            },
-        )
+        Settler::new(db, station.clone(), SettlementConfig::uniform(window))
     }
 
     #[test]
@@ -329,6 +366,36 @@ mod tests {
 
         assert_eq!(s.find_eligible(1_100).unwrap(), vec![id]);
         assert!(s.find_eligible(1_099).unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_follows_the_transactions_tier() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        // A 3-Common transfer is Tier 1; a 25-Common transfer is Tier 2.
+        let low = confirmed_tx(&db, &alice, &bob, 300, 1_000);
+        let high = confirmed_tx(&db, &alice, &bob, 2_500, 1_000);
+        let s = Settler::new(
+            &db,
+            station.clone(),
+            SettlementConfig {
+                tier1_window_seconds: 100,
+                tier2_window_seconds: 200,
+            },
+        );
+
+        // Between the two windows: the Tier-1 transfer is eligible, the Tier-2
+        // one still waits.
+        let mid = s.find_eligible(1_150).unwrap();
+        assert_eq!(mid, vec![low]);
+
+        // Once the Tier-2 window also elapses, both are eligible.
+        let done = s.find_eligible(1_200).unwrap();
+        assert!(done.contains(&low) && done.contains(&high));
     }
 
     #[test]

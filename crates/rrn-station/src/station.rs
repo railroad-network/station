@@ -109,8 +109,14 @@ impl Station {
                 .context("open wallet (wrong passphrase, or run `station init` first)")?;
         let address = wallet.address.to_string();
 
-        let settlement = SettlementConfig {
-            window_seconds: config.settlement.window_seconds,
+        // A `window_seconds` override collapses every tier to one window (the
+        // demo/test knob); otherwise each tier keeps its own configured window.
+        let settlement = match config.settlement.window_seconds {
+            Some(window) => SettlementConfig::uniform(window),
+            None => SettlementConfig {
+                tier1_window_seconds: config.settlement.tier1_window_seconds,
+                tier2_window_seconds: config.settlement.tier2_window_seconds,
+            },
         };
         let paired = paired::PairedMobiles::load(&data_dir).context("load paired mobiles")?;
 

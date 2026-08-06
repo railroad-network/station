@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use rrn_ledger::settlement::DEFAULT_WINDOW_SECONDS;
+use rrn_ledger::settlement::{DEFAULT_TIER1_WINDOW_SECONDS, DEFAULT_TIER2_WINDOW_SECONDS};
 
 /// The parsed `config.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,13 +115,22 @@ impl Default for MobileConfig {
     }
 }
 
-/// `[settlement]` — the dispute/settlement window.
+/// `[settlement]` — the dispute/settlement window, per oracle tier.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SettlementSection {
-    /// Seconds a confirmed transaction waits before it settles. The demo sets
-    /// this to a handful of seconds; production is [`DEFAULT_WINDOW_SECONDS`].
-    #[serde(default = "default_window_seconds")]
-    pub window_seconds: u64,
+    /// A uniform override applied to *every* tier — the demo/test knob. When set
+    /// (a handful of seconds), it wins over the per-tier keys so settlement fires
+    /// promptly; leave it unset in production to use the per-tier windows below.
+    #[serde(default)]
+    pub window_seconds: Option<u64>,
+    /// Seconds a confirmed **Tier-1** transaction waits before settling. Defaults
+    /// to [`DEFAULT_TIER1_WINDOW_SECONDS`] (24h).
+    #[serde(default = "default_tier1_window_seconds")]
+    pub tier1_window_seconds: u64,
+    /// Seconds a confirmed **Tier-2** transaction waits before settling. Defaults
+    /// to [`DEFAULT_TIER2_WINDOW_SECONDS`] (48h).
+    #[serde(default = "default_tier2_window_seconds")]
+    pub tier2_window_seconds: u64,
 }
 
 /// `[timers]` — how often the background loops fire.
@@ -165,8 +174,11 @@ pub struct TimersSection {
     pub contract_charge_interval_secs: u64,
 }
 
-fn default_window_seconds() -> u64 {
-    DEFAULT_WINDOW_SECONDS
+fn default_tier1_window_seconds() -> u64 {
+    DEFAULT_TIER1_WINDOW_SECONDS
+}
+fn default_tier2_window_seconds() -> u64 {
+    DEFAULT_TIER2_WINDOW_SECONDS
 }
 fn default_sweep_interval() -> u64 {
     30
@@ -190,7 +202,9 @@ fn default_contract_charge_interval() -> u64 {
 impl Default for SettlementSection {
     fn default() -> Self {
         Self {
-            window_seconds: default_window_seconds(),
+            window_seconds: None,
+            tier1_window_seconds: default_tier1_window_seconds(),
+            tier2_window_seconds: default_tier2_window_seconds(),
         }
     }
 }
@@ -316,7 +330,15 @@ mod tests {
         assert_eq!(cfg.peers.list, vec!["127.0.0.1:7412"]);
         assert_eq!(cfg.network.listen, "127.0.0.1:7411");
         // Optional sections fall back to defaults.
-        assert_eq!(cfg.settlement.window_seconds, DEFAULT_WINDOW_SECONDS);
+        assert_eq!(cfg.settlement.window_seconds, None);
+        assert_eq!(
+            cfg.settlement.tier1_window_seconds,
+            DEFAULT_TIER1_WINDOW_SECONDS
+        );
+        assert_eq!(
+            cfg.settlement.tier2_window_seconds,
+            DEFAULT_TIER2_WINDOW_SECONDS
+        );
         assert_eq!(cfg.timers.sweep_interval_secs, 30);
         assert_eq!(cfg.timers.gossip_interval_secs, 5);
         // A config written before [mobile] existed still parses, and advertises
