@@ -41,7 +41,8 @@ pub struct StationConfig {
     /// interfaces).
     #[serde(default)]
     pub mobile: MobileConfig,
-    /// Settlement tuning (optional; defaults to the 48h production window).
+    /// Settlement tuning (optional; defaults to the per-tier windows —
+    /// Tier 1 = 24h, Tier 2 = 48h, T1.8.4).
     #[serde(default)]
     pub settlement: SettlementSection,
     /// Background-loop intervals (optional; defaults to the daemon cadence).
