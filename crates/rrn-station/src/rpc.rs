@@ -681,3 +681,101 @@ pub struct NextNonceResult {
     /// The next expected per-sender nonce (0 if the member has never proposed).
     pub nonce: u64,
 }
+
+// --- Governance (T1.9.7b) ---------------------------------------------------
+
+/// `governance_init_charter` params — publish a community's genesis Charter.
+///
+/// With no `founder_secrets_hex`, the daemon signs it with the station wallet as
+/// the sole founder (threshold `ceil(1×0.75) = 1`), the one-command solo bootstrap.
+/// Supplying founder secret keys assembles a multi-founder genesis instead: the
+/// keys are hex-encoded 32-byte secrets, and travel the local socket to the daemon,
+/// which signs the Charter with all of them. (A distributed founder-signing
+/// ceremony that never gathers the secrets in one place is Phase 2.)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovInitCharterParams {
+    /// A stable identifier for the community.
+    pub community_id: String,
+    /// The founding principles, free text.
+    #[serde(default)]
+    pub founding_principles: Vec<String>,
+    /// Rights guaranteed above the federation floor.
+    #[serde(default)]
+    pub rights_floor: Vec<String>,
+    /// Hex-encoded 32-byte founder secret keys. Empty means the station wallet is
+    /// the sole founder.
+    #[serde(default)]
+    pub founder_secrets_hex: Vec<String>,
+}
+
+/// `governance_init_charter` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovCharterResult {
+    /// The published Charter's hash, hex-encoded.
+    pub charter_hash: String,
+    /// Its version (1 at genesis).
+    pub version: u32,
+}
+
+/// `governance_propose` params — author a proposal (daemon-signed by the station
+/// wallet). `kind` is `statute` (default), `administrative_rule` (with `scope`),
+/// or `emergency` (with `expires_at`). Charter amendments carry a full replacement
+/// Charter and are authored on the mobile, not through this convenience method.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovProposeParams {
+    /// The short title (≤200 bytes).
+    pub title: String,
+    /// The full text, markdown allowed (≤16 KiB).
+    pub body: String,
+    /// `statute`, `administrative_rule`, or `emergency`.
+    #[serde(default = "default_proposal_kind")]
+    pub kind: String,
+    /// The scope label, required when `kind` is `administrative_rule`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Unix seconds an emergency measure expires, required when `kind` is
+    /// `emergency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+fn default_proposal_kind() -> String {
+    "statute".to_string()
+}
+
+/// `governance_propose` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovProposeResult {
+    /// The proposal's content address, hex-encoded.
+    pub proposal_id: String,
+}
+
+/// `governance_proposal` params — one proposal in full, by content address.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovProposalParams {
+    /// The hex proposal id.
+    pub proposal_id: String,
+}
+
+/// `governance_cosign` params — endorse a proposal (daemon-signed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovCosignParams {
+    /// The hex proposal id to endorse.
+    pub proposal_id: String,
+}
+
+/// `governance_cosign` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovCosignResult {
+    /// Distinct established co-signers now gathered.
+    pub cosigner_count: u32,
+}
+
+/// `governance_vote` params — cast a ballot (daemon-signed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovVoteParams {
+    /// The hex proposal id being voted on.
+    pub proposal_id: String,
+    /// `yes`, `no`, or `abstain`.
+    pub choice: String,
+}

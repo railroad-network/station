@@ -16,13 +16,14 @@ use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
+use rrn_station::governance_view::{CharterView, ProposalDetail, ProposalSummary, StatuteSummary};
 use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    ContractStateResult, CreateListingResult, EditListingResult, HistoryResult, InquireResult,
-    InquiryStateResult, ProposeResult, RecoverImportResult, TransactionRow, TransactionsResult,
-    VouchResult, WhoamiResult,
+    ContractStateResult, CreateListingResult, EditListingResult, GovCharterResult, GovCosignResult,
+    GovProposeResult, HistoryResult, InquireResult, InquiryStateResult, ProposeResult,
+    RecoverImportResult, TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -368,6 +369,73 @@ enum Command {
         /// The hex contract id.
         contract_id: String,
     },
+    /// Community governance: the Charter, proposals, voting, and statutes (M1.9).
+    Governance {
+        #[command(subcommand)]
+        cmd: GovernanceCmd,
+    },
+}
+
+/// The `rrn governance …` subcommands (T1.9.7b).
+#[derive(Subcommand)]
+enum GovernanceCmd {
+    /// Publish the community's genesis Charter. With no `--founder-key`, the
+    /// station wallet is the sole founder (the one-command solo bootstrap);
+    /// pass a founder key file per founder for a multi-founder genesis.
+    CharterInit {
+        /// A stable identifier for the community.
+        #[arg(long)]
+        community_id: String,
+        /// A founding principle; repeatable.
+        #[arg(long = "principle")]
+        principles: Vec<String>,
+        /// A guaranteed right; repeatable.
+        #[arg(long = "right")]
+        rights: Vec<String>,
+        /// A file holding a founder's hex-encoded 32-byte secret key; repeatable.
+        /// Omit entirely to sign with the station wallet as the sole founder.
+        #[arg(long = "founder-key")]
+        founder_keys: Vec<PathBuf>,
+    },
+    /// Show the community's current (effective) Charter.
+    Charter,
+    /// List proposals with their phase and vote so far.
+    List,
+    /// Show one proposal in full.
+    Show {
+        /// The hex proposal id.
+        proposal_id: String,
+    },
+    /// Author a proposal (signed by the station wallet).
+    Propose {
+        /// The short title.
+        title: String,
+        /// The full body, markdown allowed.
+        body: String,
+        /// Kind: `statute` (default), `administrative_rule`, or `emergency`.
+        #[arg(long, default_value = "statute")]
+        kind: String,
+        /// The scope, required for `administrative_rule`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Unix seconds an `emergency` measure expires.
+        #[arg(long)]
+        expires_at: Option<i64>,
+    },
+    /// Endorse a proposal, carrying it toward the co-sign threshold.
+    Cosign {
+        /// The hex proposal id.
+        proposal_id: String,
+    },
+    /// Cast a ballot on a published proposal.
+    Vote {
+        /// The hex proposal id.
+        proposal_id: String,
+        /// `yes`, `no`, or `abstain`.
+        choice: String,
+    },
+    /// List the statutes in force.
+    Statutes,
 }
 
 fn main() -> ExitCode {
@@ -825,6 +893,101 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(r.restored_address)
             })
         }
+        Command::Governance { cmd } => cmd_governance(&client, fmt, color, cmd).await,
+    }
+}
+
+/// Dispatches `rrn governance …` to the daemon's `governance_*` methods.
+async fn cmd_governance(
+    client: &UnixClient,
+    fmt: Format,
+    color: ColorMode,
+    cmd: GovernanceCmd,
+) -> Result<()> {
+    match cmd {
+        GovernanceCmd::CharterInit {
+            community_id,
+            principles,
+            rights,
+            founder_keys,
+        } => {
+            let mut founder_secrets_hex = Vec::with_capacity(founder_keys.len());
+            for path in &founder_keys {
+                let raw = std::fs::read_to_string(path)
+                    .with_context(|| format!("read founder key {}", path.display()))?;
+                founder_secrets_hex.push(raw.trim().to_string());
+            }
+            let params = json!({
+                "community_id": community_id,
+                "founding_principles": principles,
+                "rights_floor": rights,
+                "founder_secrets_hex": founder_secrets_hex,
+            });
+            let v = client.call("governance_init_charter", params).await?;
+            emit(fmt, &v, || {
+                let r: GovCharterResult = parse(&v)?;
+                Ok(format!("charter v{} {}", r.version, r.charter_hash))
+            })
+        }
+        GovernanceCmd::Charter => {
+            let v = client.call("governance_charter", json!({})).await?;
+            emit(fmt, &v, || Ok(render_charter(&v)))
+        }
+        GovernanceCmd::List => {
+            let v = client.call("governance_proposals", json!({})).await?;
+            emit(fmt, &v, || Ok(render_proposals(&v["proposals"], color)))
+        }
+        GovernanceCmd::Show { proposal_id } => {
+            let v = client
+                .call("governance_proposal", json!({ "proposal_id": proposal_id }))
+                .await?;
+            emit(fmt, &v, || Ok(render_proposal_detail(&v)))
+        }
+        GovernanceCmd::Propose {
+            title,
+            body,
+            kind,
+            scope,
+            expires_at,
+        } => {
+            let mut params = json!({ "title": title, "body": body, "kind": kind });
+            if let Some(scope) = scope {
+                params["scope"] = json!(scope);
+            }
+            if let Some(expires_at) = expires_at {
+                params["expires_at"] = json!(expires_at);
+            }
+            let v = client.call("governance_propose", params).await?;
+            emit(fmt, &v, || {
+                let r: GovProposeResult = parse(&v)?;
+                Ok(r.proposal_id)
+            })
+        }
+        GovernanceCmd::Cosign { proposal_id } => {
+            let v = client
+                .call("governance_cosign", json!({ "proposal_id": proposal_id }))
+                .await?;
+            emit(fmt, &v, || {
+                let r: GovCosignResult = parse(&v)?;
+                Ok(format!("{} co-signers", r.cosigner_count))
+            })
+        }
+        GovernanceCmd::Vote {
+            proposal_id,
+            choice,
+        } => {
+            let v = client
+                .call(
+                    "governance_vote",
+                    json!({ "proposal_id": proposal_id, "choice": choice }),
+                )
+                .await?;
+            emit(fmt, &v, || Ok("voted".to_string()))
+        }
+        GovernanceCmd::Statutes => {
+            let v = client.call("governance_statutes", json!({})).await?;
+            emit(fmt, &v, || Ok(render_statutes(&v["statutes"])))
+        }
     }
 }
 
@@ -893,6 +1056,135 @@ fn s(v: &serde_json::Value, key: &str) -> String {
 /// A JSON integer field, or `None` when absent or null.
 fn i(v: &serde_json::Value, key: &str) -> Option<i64> {
     v.get(key).and_then(|x| x.as_i64())
+}
+
+// --- governance text rendering (T1.9.7b) ------------------------------------
+
+/// The effective Charter and its governing thresholds.
+fn render_charter(v: &serde_json::Value) -> String {
+    let c: CharterView = match serde_json::from_value(v.clone()) {
+        Ok(c) => c,
+        Err(_) => return "—".to_string(),
+    };
+    if !c.published {
+        return "no charter published yet (the community is bootstrapping)".to_string();
+    }
+    let mut out = format!(
+        "{} — charter v{}\n  hash:      {}\n  statute:   {}% quorum / {}% approval, {}d window, {}d delay\n  amendment: {}% quorum / {}% approval, {}d window\n  emergency: {}% approval\n  cosign:    {} established co-signers to publish",
+        c.community_id,
+        c.version,
+        c.charter_hash.as_deref().unwrap_or("—"),
+        c.statute_quorum_pct,
+        c.statute_approval_pct,
+        c.deliberation_window_days,
+        c.implementation_delay_days,
+        c.charter_quorum_pct,
+        c.charter_approval_pct,
+        c.charter_deliberation_window_days,
+        c.emergency_threshold_pct,
+        c.cosign_threshold,
+    );
+    if !c.founders.is_empty() {
+        out.push_str(&format!("\n  founders:  {}", c.founders.join(", ")));
+    }
+    out
+}
+
+/// One proposal per line: id, kind, phase, running tally, title.
+fn render_proposals(proposals: &serde_json::Value, color: ColorMode) -> String {
+    let rows: Vec<ProposalSummary> = serde_json::from_value(proposals.clone()).unwrap_or_default();
+    if rows.is_empty() {
+        return "no proposals".to_string();
+    }
+    rows.iter()
+        .map(|p| proposal_line(p, color))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn proposal_line(p: &ProposalSummary, color: ColorMode) -> String {
+    let short: String = p.proposal_id.chars().take(12).collect();
+    let t = &p.tally;
+    let status = t.outcome.as_deref().unwrap_or(&p.phase);
+    let enacted = if p.enacted { "  (enacted)" } else { "" };
+    format!(
+        "{}  {:<18}  {:<12}  {} y/{} n/{} a  {}{}",
+        paint(color, DIM, &short),
+        p.kind,
+        status,
+        t.yes,
+        t.no,
+        t.abstain,
+        paint(color, BOLD, &p.title),
+        enacted,
+    )
+}
+
+/// One proposal in full: header, windows, tally, co-signers, body.
+fn render_proposal_detail(v: &serde_json::Value) -> String {
+    let d: ProposalDetail = match serde_json::from_value(v.clone()) {
+        Ok(d) => d,
+        Err(_) => return "—".to_string(),
+    };
+    let p = &d.summary;
+    let t = &p.tally;
+    let mut out = format!(
+        "{}\n  id:         {}\n  author:     {}\n  kind:       {}{}\n  phase:      {}{}\n  window:     created {} → closes {}\n  effect:     {}\n  co-signers: {}\n  tally:      {} yes / {} no / {} abstain  (eligible {}, quorum {}, approval {})",
+        p.title,
+        p.proposal_id,
+        p.author,
+        p.kind,
+        p.scope
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default(),
+        p.phase,
+        if p.enacted { " — enacted" } else { "" },
+        p.created_at,
+        p.voting_ends_at,
+        p.implementation_at,
+        p.cosigner_count,
+        t.yes,
+        t.no,
+        t.abstain,
+        t.eligible_voters,
+        yesno(t.quorum_met),
+        yesno(t.approval_met),
+    );
+    if let Some(outcome) = &t.outcome {
+        out.push_str(&format!("\n  outcome:   {outcome}"));
+    }
+    if !d.cosigners.is_empty() {
+        out.push_str(&format!("\n  endorsed by: {}", d.cosigners.join(", ")));
+    }
+    out.push_str(&format!("\n\n{}", d.body));
+    out
+}
+
+/// The statutes in force.
+fn render_statutes(statutes: &serde_json::Value) -> String {
+    let rows: Vec<StatuteSummary> = serde_json::from_value(statutes.clone()).unwrap_or_default();
+    if rows.is_empty() {
+        return "no statutes in force".to_string();
+    }
+    rows.iter()
+        .map(|s| {
+            let short: String = s.proposal_id.chars().take(12).collect();
+            format!(
+                "{}  {:<18}  enacted {}  {}",
+                short, s.kind, s.implemented_at, s.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn yesno(b: bool) -> &'static str {
+    if b {
+        "met"
+    } else {
+        "unmet"
+    }
 }
 
 /// One browse row: id, price, surface, category, band, title.

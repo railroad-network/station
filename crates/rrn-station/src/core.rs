@@ -20,6 +20,12 @@ use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
 use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_governance::charter::{create_charter, store_charter, CharterParams};
+use rrn_governance::proposal::{
+    append_cosign, append_proposal, Proposal, ProposalCosign, ProposalId, ProposalKind,
+};
+use rrn_governance::tally::effective_charter;
+use rrn_governance::vote::{append_vote, Vote, VoteChoice};
 use rrn_identity::address::Address;
 use rrn_identity::recovery::flow::{reconstruct_wallet, RecoveryPackage};
 use rrn_identity::recovery::shamir::{RawShard, ShardIndex};
@@ -55,6 +61,7 @@ use crate::clock::Clock;
 use crate::contract_view;
 use crate::events::{self, Event};
 use crate::gossip::WireEntry;
+use crate::governance_view;
 use crate::inquiry_view;
 use crate::ledger_view;
 use crate::marketplace_view;
@@ -619,6 +626,17 @@ impl Core {
             "marketplace_contracts" => self.m_marketplace_contracts(),
             "marketplace_contract_show" => self.m_marketplace_contract_show(req),
             "marketplace_contract_terminate" => self.m_marketplace_contract_terminate(req),
+            // Operator-facing governance (T1.9.7b). Reads answer with the same
+            // views the mobile channel serves; the writes are signed by this
+            // station's own wallet, as `propose` and `vouch` are.
+            "governance_charter" => self.m_governance_charter(),
+            "governance_proposals" => self.m_governance_proposals(),
+            "governance_proposal" => self.m_governance_proposal(req),
+            "governance_statutes" => self.m_governance_statutes(),
+            "governance_init_charter" => self.m_governance_init_charter(req),
+            "governance_propose" => self.m_governance_propose(req),
+            "governance_cosign" => self.m_governance_cosign(req),
+            "governance_vote" => self.m_governance_vote(req),
             // Operator-facing pairing management (T1.3.3), invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
@@ -2046,6 +2064,247 @@ impl Core {
         appended
     }
 
+    // --- governance (T1.9.7b) ----------------------------------------------
+
+    fn m_governance_charter(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        ok(&governance_view::charter_view(&self.db).map_err(internal)?)
+    }
+
+    fn m_governance_proposals(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let proposals =
+            governance_view::proposals_view(&self.db, self.clock.now()).map_err(internal)?;
+        Ok(serde_json::json!({ "proposals": proposals }))
+    }
+
+    fn m_governance_proposal(
+        &self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovProposalParams = parse_params(req)?;
+        let id = parse_proposal_id(&params.proposal_id)?;
+        match governance_view::proposal_view(&self.db, &id, self.clock.now()).map_err(internal)? {
+            Some(detail) => ok(&detail),
+            None => Err(invalid_params(format!(
+                "no proposal {}",
+                params.proposal_id
+            ))),
+        }
+    }
+
+    fn m_governance_statutes(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let statutes = governance_view::statutes_view(&self.db).map_err(internal)?;
+        Ok(serde_json::json!({ "statutes": statutes }))
+    }
+
+    /// `governance_init_charter` — create and publish the genesis Charter. With no
+    /// founder keys the station wallet is the sole founder (the solo bootstrap);
+    /// otherwise the supplied secret keys are the founding set (T1.9.7b).
+    fn m_governance_init_charter(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovInitCharterParams = parse_params(req)?;
+        let station = self.station_keypair();
+        let now = self.clock.now();
+
+        let founders: Vec<Keypair> = if params.founder_secrets_hex.is_empty() {
+            vec![station.clone()]
+        } else {
+            let mut keys = Vec::with_capacity(params.founder_secrets_hex.len());
+            for h in &params.founder_secrets_hex {
+                keys.push(parse_secret_keypair(h)?);
+            }
+            keys
+        };
+
+        let charter_params = CharterParams {
+            version: 1,
+            community_id: params.community_id,
+            founding_principles: params.founding_principles,
+            rights_floor: params.rights_floor,
+            governance_structure: rrn_governance::charter::GovernanceStructure::default(),
+            amendment_rules: rrn_governance::charter::AmendmentRules::default(),
+            founders: founders
+                .iter()
+                .map(|k| Address::from_public_key(k.public_key()))
+                .collect(),
+            created_at: now,
+            previous_hash: None,
+        };
+        let signed =
+            create_charter(charter_params, &founders).map_err(|e| invalid_params(e.to_string()))?;
+        let charter_hash = signed.charter_hash().to_string();
+        let version = signed.charter().version;
+
+        let mut log = AppendLog::new(&self.db);
+        store_charter(&mut log, &station, signed).map_err(|e| invalid_params(e.to_string()))?;
+        ok(&rpc::GovCharterResult {
+            charter_hash,
+            version,
+        })
+    }
+
+    /// `governance_propose` — author a proposal signed by the station wallet. The
+    /// author must be an established member, as the governance guard enforces.
+    fn m_governance_propose(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovProposeParams = parse_params(req)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let charter = effective_charter(&self.db)
+            .map_err(internal)?
+            .ok_or_else(|| invalid_params("no charter published; run governance charter-init"))?;
+        let kind = parse_proposal_kind(&params)?;
+        let proposal = Proposal::new(
+            self.wallet.address,
+            params.title,
+            params.body,
+            kind,
+            now,
+            &charter,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let proposal_id = proposal.proposal_id.to_string();
+
+        let mut log = AppendLog::new(&self.db);
+        append_proposal(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(proposal, &station),
+            &self.db,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        ok(&rpc::GovProposeResult { proposal_id })
+    }
+
+    /// `governance_cosign` — endorse a proposal, signed by the station wallet.
+    fn m_governance_cosign(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovCosignParams = parse_params(req)?;
+        let id = parse_proposal_id(&params.proposal_id)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let cosign = ProposalCosign {
+            proposal_id: id,
+            cosigner: self.wallet.address,
+            cosigned_at: now,
+        };
+        let mut log = AppendLog::new(&self.db);
+        append_cosign(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(cosign, &station),
+            &self.db,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let records =
+            rrn_governance::proposal::proposal_records(&AppendLog::new(&self.db), &id, &self.db)
+                .map_err(internal)?;
+        ok(&rpc::GovCosignResult {
+            cosigner_count: records.cosigner_count(),
+        })
+    }
+
+    /// `governance_vote` — cast a ballot, signed by the station wallet.
+    fn m_governance_vote(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovVoteParams = parse_params(req)?;
+        let id = parse_proposal_id(&params.proposal_id)?;
+        let choice = parse_vote_choice(&params.choice)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let vote = Vote {
+            proposal_id: id,
+            voter: self.wallet.address,
+            choice,
+            cast_at: now,
+        };
+        let mut log = AppendLog::new(&self.db);
+        append_vote(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(vote, &station),
+            &self.db,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
+    // --- governance mobile writes (T1.9.7b) --------------------------------
+
+    /// `governance_submit_proposal` — accept a mobile-signed governance
+    /// [`Proposal`] and append it. The author signs it on the phone; the station
+    /// only validates and records. `params` carries the canonical dCBOR of the
+    /// signed proposal, hex-encoded.
+    fn channel_governance_submit_proposal(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_proposal")?;
+        let signed: rrn_governance::proposal::SignedProposal =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed proposal".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "proposal author is not the authenticated mobile".into(),
+            ));
+        }
+        let proposal_id = signed.payload.proposal_id.to_string();
+        let mut log = AppendLog::new(&self.db);
+        append_proposal(&mut log, signed, &self.db)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        Ok(serde_json::json!({ "proposal_id": proposal_id }))
+    }
+
+    /// `governance_submit_cosign` — accept a mobile-signed [`ProposalCosign`].
+    fn channel_governance_submit_cosign(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_cosign")?;
+        let signed: rrn_governance::proposal::SignedCosign =
+            rpc_envelope::parse_signed_record(&bytes)
+                .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed cosign".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "co-signer is not the authenticated mobile".into(),
+            ));
+        }
+        let id = signed.payload.proposal_id;
+        let mut log = AppendLog::new(&self.db);
+        append_cosign(&mut log, signed, &self.db)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        let records =
+            rrn_governance::proposal::proposal_records(&AppendLog::new(&self.db), &id, &self.db)
+                .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({ "cosigner_count": records.cosigner_count() }))
+    }
+
+    /// `governance_submit_vote` — accept a mobile-signed [`Vote`].
+    fn channel_governance_submit_vote(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_vote")?;
+        let signed: rrn_governance::vote::SignedVote = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed vote".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "voter is not the authenticated mobile".into(),
+            ));
+        }
+        let mut log = AppendLog::new(&self.db);
+        append_vote(&mut log, signed, &self.db)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
     /// Puts every passed proposal whose implementation delay has run into force,
     /// appending a station-signed enactment record for each (T1.9.7). Returns the
     /// number enacted. Emergencies, whose delay is zero, are enacted the first
@@ -2296,7 +2555,20 @@ impl Core {
             "submit_contract_termination" => self.channel_submit_contract_termination(envelope),
             "marketplace_contracts" => self.channel_marketplace_contracts(envelope),
             "marketplace_contract_show" => self.channel_marketplace_contract_show(envelope),
-            "whoami" | "balance" | "transactions" | "next_nonce" => {
+            // Governance writes (T1.9.7b): each carries a mobile-signed record, and
+            // the signer must be the authenticated mobile. Reads fall through to the
+            // shared, signer-less dispatch below.
+            "governance_submit_proposal" => self.channel_governance_submit_proposal(envelope),
+            "governance_submit_cosign" => self.channel_governance_submit_cosign(envelope),
+            "governance_submit_vote" => self.channel_governance_submit_vote(envelope),
+            "whoami"
+            | "balance"
+            | "transactions"
+            | "next_nonce"
+            | "governance_charter"
+            | "governance_proposals"
+            | "governance_proposal"
+            | "governance_statutes" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
                 let req = rpc::Request {
@@ -3304,6 +3576,59 @@ fn parse_tx_id(s: &str) -> Result<TransactionId, rpc::RpcError> {
         .try_into()
         .map_err(|_| invalid_params("tx id must be 32 bytes"))?;
     Ok(TransactionId(Hash::from_bytes(arr)))
+}
+
+fn parse_proposal_id(s: &str) -> Result<ProposalId, rpc::RpcError> {
+    let bytes = unhex(s).ok_or_else(|| invalid_params(format!("invalid proposal id {s:?}")))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_params("proposal id must be 32 bytes"))?;
+    Ok(ProposalId(Hash::from_bytes(arr)))
+}
+
+fn parse_secret_keypair(hex_secret: &str) -> Result<Keypair, rpc::RpcError> {
+    let bytes = unhex(hex_secret).ok_or_else(|| invalid_params("founder key is not valid hex"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_params("founder key must be 32 bytes"))?;
+    Ok(Keypair::from_secret(
+        rrn_crypto::keypair::SecretKey::from_bytes(arr),
+    ))
+}
+
+fn parse_proposal_kind(p: &rpc::GovProposeParams) -> Result<ProposalKind, rpc::RpcError> {
+    match p.kind.as_str() {
+        "statute" => Ok(ProposalKind::Statute),
+        "administrative_rule" | "admin_rule" | "admin-rule" => {
+            let scope = p
+                .scope
+                .clone()
+                .ok_or_else(|| invalid_params("an administrative_rule proposal needs a --scope"))?;
+            Ok(ProposalKind::AdministrativeRule { scope })
+        }
+        "emergency" => {
+            let expires_at = p
+                .expires_at
+                .ok_or_else(|| invalid_params("an emergency proposal needs --expires-at"))?;
+            Ok(ProposalKind::Emergency { expires_at })
+        }
+        other => Err(invalid_params(format!(
+            "unknown proposal kind {other:?} (statute, administrative_rule, emergency)"
+        ))),
+    }
+}
+
+fn parse_vote_choice(s: &str) -> Result<VoteChoice, rpc::RpcError> {
+    match s {
+        "yes" => Ok(VoteChoice::Yes),
+        "no" => Ok(VoteChoice::No),
+        "abstain" => Ok(VoteChoice::Abstain),
+        other => Err(invalid_params(format!(
+            "vote choice must be yes, no, or abstain, got {other:?}"
+        ))),
+    }
 }
 
 fn read_raw_shard(path: &str) -> Result<RawShard, rpc::RpcError> {
@@ -5078,5 +5403,247 @@ mod tests {
         assert_eq!(core.route_channel_method(&env).unwrap()["contract_id"], cid);
         let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
         assert_ne!(detail["state"], "active");
+    }
+
+    // --- governance wiring (T1.9.7b) ----------------------------------------
+
+    const TEN_MONTHS: i64 = 10 * 30 * 86_400;
+
+    fn gaddr(kp: &Keypair) -> Address {
+        Address::from_public_key(kp.public_key())
+    }
+
+    /// Appends a full proposal → confirmation → settlement chain, mirroring the
+    /// reputation crate's own fixture, so the parties earn trade standing.
+    fn gov_settled(
+        db: &Database,
+        sender: &Keypair,
+        receiver: &Keypair,
+        settler: &Keypair,
+        nonce: u64,
+        at: i64,
+    ) {
+        let mut log = AppendLog::new(db);
+        let proposal = TransactionProposal::new(
+            gaddr(sender),
+            gaddr(receiver),
+            300,
+            None,
+            nonce,
+            1,
+            i64::MAX / 2,
+        );
+        let pid = proposal.id;
+        log.append(rrn_crypto::signed::SignedPayload::sign(proposal, sender))
+            .unwrap();
+        log.append(rrn_crypto::signed::SignedPayload::sign(
+            TransactionConfirmation {
+                proposal_id: pid,
+                confirmer: gaddr(receiver),
+                confirmed_at: at,
+            },
+            receiver,
+        ))
+        .unwrap();
+        log.append(rrn_crypto::signed::SignedPayload::sign(
+            rrn_ledger::settlement::SettlementRecord {
+                proposal_id: pid,
+                sender: gaddr(sender),
+                receiver: gaddr(receiver),
+                amount_centi: 300,
+                settled_at: at,
+            },
+            settler,
+        ))
+        .unwrap();
+    }
+
+    /// Appends a vouch, mirroring the reputation crate's fixture (raw
+    /// [`Attestation`] with a zero stake) so the issuer earns attestation standing.
+    fn gov_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
+        use rrn_identity::attestation::Attestation;
+        use rrn_identity::vouch::{VouchBody, VouchKind};
+        let vouch = Attestation {
+            kind: VouchKind,
+            body: VouchBody {
+                community: "commons".into(),
+                statement: "trustworthy".into(),
+                reputation_stake_centi: 0,
+            },
+            subject: *subject,
+            issued_at: at,
+            expires_at: None,
+        };
+        AppendLog::new(db).append(vouch.sign(voucher)).unwrap();
+    }
+
+    /// Builds `n` established members anchored in a ring — the electorate the
+    /// governance guards require.
+    fn gov_established_members(db: &Database, n: usize, at: i64) -> Vec<Keypair> {
+        let settler = Keypair::generate();
+        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
+        for m in &members {
+            for nonce in 0..10 {
+                gov_settled(db, m, &Keypair::generate(), &settler, nonce, at);
+            }
+            for _ in 0..10 {
+                gov_vouch(db, m, &gaddr(&Keypair::generate()), at);
+            }
+        }
+        for i in 0..n {
+            gov_vouch(db, &members[(i + 1) % n], &gaddr(&members[i]), at);
+        }
+        members
+    }
+
+    /// A core whose clock sits at a realistic time, so seeded reputation scores as
+    /// it would in production.
+    fn established_core() -> Core {
+        let db = Database::open_in_memory().unwrap();
+        migrations::run(&db).unwrap();
+        Core::new(
+            db,
+            WalletContents::create_new(),
+            SettlementConfig::default(),
+            Clock::manual(TEN_MONTHS),
+            PairedMobiles::default(),
+            SearchIndex::in_memory(),
+        )
+    }
+
+    #[test]
+    fn governance_charter_is_unpublished_before_init() {
+        let mut core = test_core();
+        let v = call(&mut core, "governance_charter", serde_json::json!({}));
+        assert_eq!(v["published"], false);
+    }
+
+    #[test]
+    fn governance_charter_init_solo_publishes_and_reads_back() {
+        let mut core = test_core();
+        let r = call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({ "community_id": "commons" }),
+        );
+        assert_eq!(r["version"], 1);
+        assert_eq!(r["charter_hash"].as_str().unwrap().len(), 64);
+
+        let c = call(&mut core, "governance_charter", serde_json::json!({}));
+        assert_eq!(c["published"], true);
+        assert_eq!(c["version"], 1);
+        assert_eq!(c["community_id"], "commons");
+        assert_eq!(c["statute_quorum_pct"], 30);
+        assert_eq!(c["cosign_threshold"], 3);
+        // The station wallet is the sole founder of a solo bootstrap.
+        assert_eq!(c["founders"].as_array().unwrap().len(), 1);
+        assert_eq!(c["founders"][0], core.wallet.address.to_string());
+    }
+
+    #[test]
+    fn governance_charter_init_accepts_a_multi_founder_set() {
+        let mut core = test_core();
+        let founders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        let secrets: Vec<String> = founders
+            .iter()
+            .map(|k| hex(&k.secret_key().to_bytes()))
+            .collect();
+        let r = call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({ "community_id": "commons", "founder_secrets_hex": secrets }),
+        );
+        assert_eq!(r["version"], 1);
+        let c = call(&mut core, "governance_charter", serde_json::json!({}));
+        assert_eq!(c["founders"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn governance_propose_without_a_charter_is_refused() {
+        let mut core = test_core();
+        let err = call_err(
+            &mut core,
+            "governance_propose",
+            serde_json::json!({ "title": "t", "body": "b" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn governance_channel_lifecycle_publishes_and_counts_votes() {
+        let mut core = established_core();
+        let members = gov_established_members(&core.db, 4, TEN_MONTHS);
+
+        // The station publishes the genesis charter (sole founder).
+        call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({ "community_id": "commons" }),
+        );
+        let charter = effective_charter(&core.db).unwrap().unwrap();
+
+        // member[0] authors a statute over the mobile channel.
+        let proposal = Proposal::new(
+            gaddr(&members[0]),
+            "Quiet hours".into(),
+            "No power tools after 9pm.".into(),
+            ProposalKind::Statute,
+            TEN_MONTHS,
+            &charter,
+        )
+        .unwrap();
+        let pid = proposal.proposal_id.to_string();
+        let env = envelope(
+            &members[0],
+            "governance_submit_proposal",
+            serde_json::json!({ "signed_proposal": record_hex(proposal.clone(), &members[0]) }),
+        );
+        assert_eq!(core.route_channel_method(&env).unwrap()["proposal_id"], pid);
+
+        // Three others co-sign, carrying it over the threshold.
+        for m in &members[1..4] {
+            let cosign = ProposalCosign {
+                proposal_id: proposal.proposal_id,
+                cosigner: gaddr(m),
+                cosigned_at: TEN_MONTHS,
+            };
+            let env = envelope(
+                m,
+                "governance_submit_cosign",
+                serde_json::json!({ "signed_cosign": record_hex(cosign, m) }),
+            );
+            core.route_channel_method(&env).unwrap();
+        }
+
+        // All four vote yes.
+        for m in &members {
+            let vote = Vote {
+                proposal_id: proposal.proposal_id,
+                voter: gaddr(m),
+                choice: VoteChoice::Yes,
+                cast_at: TEN_MONTHS,
+            };
+            let env = envelope(
+                m,
+                "governance_submit_vote",
+                serde_json::json!({ "signed_vote": record_hex(vote, m) }),
+            );
+            core.route_channel_method(&env).unwrap();
+        }
+
+        // The detail read shows it published, in voting, with four yes ballots.
+        let detail = call(
+            &mut core,
+            "governance_proposal",
+            serde_json::json!({ "proposal_id": pid }),
+        );
+        assert_eq!(detail["phase"], "voting");
+        assert_eq!(detail["published"], true);
+        assert_eq!(detail["cosigner_count"], 3);
+        assert_eq!(detail["tally"]["yes"], 4);
+        assert_eq!(detail["tally"]["eligible_voters"], 4);
+        assert_eq!(detail["tally"]["quorum_met"], true);
+        assert_eq!(detail["tally"]["approval_met"], true);
+        assert_eq!(detail["body"], "No power tools after 9pm.");
     }
 }

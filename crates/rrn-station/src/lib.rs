@@ -37,6 +37,7 @@ pub mod contract_view;
 pub mod core;
 pub mod events;
 pub mod gossip;
+pub mod governance_view;
 pub mod history;
 pub mod inquiry_view;
 pub mod ledger_view;
