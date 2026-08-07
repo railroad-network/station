@@ -392,13 +392,23 @@ pub fn phase(records: &ProposalRecords, cosign_threshold: u32, now: i64) -> Opti
 
 /// Whether `address` is an established member as of `at_time`: effective
 /// (anchored) composite reputation at or above the Member band.
-fn is_established(db: &Database, address: &Address, at_time: i64) -> Result<bool, ProposalError> {
+///
+/// Shared with [`vote`](crate::vote), which gates ballots on the same standing.
+pub(crate) fn is_established(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+) -> Result<bool, ProposalError> {
     Ok(composite_at(db, address, at_time)? >= BAND_MEMBER_MIN)
 }
 
 /// The composite reputation `address` holds as of `at_time`, also used for the
 /// rich error the write path reports when the established-member gate refuses.
-fn composite_at(db: &Database, address: &Address, at_time: i64) -> Result<f32, ProposalError> {
+pub(crate) fn composite_at(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+) -> Result<f32, ProposalError> {
     Ok(ReputationScorer::new(db)
         .score(address, at_time)?
         .composite())
