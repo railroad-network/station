@@ -28,3 +28,11 @@ dcbor = "0.25"
 # Typed governance errors, and diagnostics for the lifecycle task.
 thiserror = "1"
 tracing = "0.1"
+
+[dev-dependencies]
+# Tests seed established-member reputation the way `rrn-reputation`'s own tests
+# do — settled transactions plus vouches — which needs the ledger record types.
+# This is a test-only dependency: the crate itself does not depend on
+# `rrn-ledger` (ADR-0012), since governance decides policy, it does not move
+# credit.
+rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
