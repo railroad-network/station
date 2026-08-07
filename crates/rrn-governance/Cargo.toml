@@ -5,12 +5,26 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Governance for Railroad Network: proposals, one-member-one-vote balloting, and tallying."
+description = "Governance for Railroad Network: the Charter, proposals, one-member-one-vote balloting, and tallying."
 
 [dependencies]
-# Ballots are signed and canonically encoded so a tally is verifiable.
+# The Charter is a multisig-signed, canonically encoded document; proposals and
+# ballots are signed and canonically encoded so a tally is verifiable.
 rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
-# Proposals and votes are recorded in the append-only log.
+# The Charter, proposals, and votes are recorded in the append-only log.
 rrn-storage = { path = "../rrn-storage", version = "0.1" }
-# One member, one vote: eligibility and vote weight are identity properties.
+# Governance acts on identities: founders sign the Charter, members author and
+# ballot on proposals.
 rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# Voting eligibility and the quorum denominator are the established-member set
+# (effective composite reputation >= 2.0) — the Sybil-resistant electorate
+# (ADR-0012). Governance reads reputation but does not depend on `rrn-ledger`:
+# it decides policy, it does not move credit.
+rrn-reputation = { path = "../rrn-reputation", version = "0.1" }
+# The Charter and proposals serialize to canonical CBOR so their hashes are
+# stable and their signatures verifiable across machines.
+serde = { version = "1", features = ["derive"] }
+dcbor = "0.25"
+# Typed governance errors, and diagnostics for the lifecycle task.
+thiserror = "1"
+tracing = "0.1"
