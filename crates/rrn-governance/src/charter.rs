@@ -28,14 +28,18 @@
 //! the outer signature is log attribution; the inner multisig is the authority.
 //! Its canonical form carries `kind = "rrn.gov.charter"` so replay can tell it
 //! apart. The newest published, founder-authorized Charter (highest `version`)
-//! supersedes any earlier one; see [`current_charter`].
+//! is the community's genesis root; see [`founder_charter`]. The *effective*
+//! Charter — that root plus any amendments the community has since enacted through
+//! the vote lifecycle — is resolved a layer up, in [`crate::tally::effective_charter`]
+//! (ADR-0012 § 4). Founder authorization lives here; amendment authority is a
+//! tally, so it lives with the tally.
 
 use std::collections::HashSet;
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::{MultiSignedPayload, MultiVerifyError, SignedPayload};
 use rrn_identity::address::Address;
 use rrn_storage::db::Database;
@@ -134,6 +138,16 @@ pub struct Charter {
     /// The prior Charter's `charter_hash`, chaining the lineage; `None` at
     /// genesis.
     pub previous_hash: Option<Hash>,
+}
+
+impl Charter {
+    /// The Blake3 hash of this body's canonical bytes — the same content address
+    /// [`SignedCharter::charter_hash`] pins, computed from the body alone so a
+    /// bare amended Charter (which carries no signatures of its own) can still be
+    /// chained by `previous_hash` and matched against a prior Charter's hash.
+    pub fn hash(&self) -> Hash {
+        Hash::of(&to_canonical_bytes(self.clone()))
+    }
 }
 
 /// The inputs to [`create_charter`]. Mirrors [`Charter`] minus the parts the
@@ -299,13 +313,18 @@ pub fn store_charter(
     Ok(log.append(SignedPayload::sign(charter, publisher))?)
 }
 
-/// The community's current Charter: the highest-`version`, founder-authorized
+/// The community's genesis root Charter: the highest-`version`, founder-authorized
 /// Charter on the log, or `None` if none has been published yet. Ties on version
 /// break toward the later log entry.
 ///
+/// This is the *founder* charter only — it does not fold in amendments enacted
+/// through the vote lifecycle (those carry no founder authority). The effective,
+/// possibly-amended Charter is [`crate::tally::effective_charter`], which builds
+/// on this root.
+///
 /// Deviation from the task sketch's non-optional return: a community may legally
 /// have no Charter yet (it is bootstrapping), which is an absence, not an error.
-pub fn current_charter(db: &Database) -> Result<Option<SignedCharter>, CharterError> {
+pub fn founder_charter(db: &Database) -> Result<Option<SignedCharter>, CharterError> {
     let log = AppendLog::new(db);
     let mut best: Option<(u32, u64, SignedCharter)> = None;
     for entry in log.iter_from(1) {
@@ -328,9 +347,9 @@ pub fn current_charter(db: &Database) -> Result<Option<SignedCharter>, CharterEr
     Ok(best.map(|(_, _, signed)| signed))
 }
 
-/// The `charter_hash` of the [`current_charter`], or `None` if none is published.
-pub fn current_charter_hash(db: &Database) -> Result<Option<Hash>, CharterError> {
-    Ok(current_charter(db)?.map(|signed| signed.charter_hash()))
+/// The `charter_hash` of the [`founder_charter`], or `None` if none is published.
+pub fn founder_charter_hash(db: &Database) -> Result<Option<Hash>, CharterError> {
+    Ok(founder_charter(db)?.map(|signed| signed.charter_hash()))
 }
 
 // --- Canonical CBOR ---------------------------------------------------------
@@ -716,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn store_then_read_current_charter() {
+    fn store_then_read_founder_charter() {
         let db = fresh_db();
         let founders = founder_keys(4);
         let signed = create_charter(params_for(&founders), &founders[..3]).unwrap();
@@ -725,11 +744,11 @@ mod tests {
             let mut log = AppendLog::new(&db);
             store_charter(&mut log, &founders[0], signed).unwrap();
         }
-        let current = current_charter(&db)
+        let current = founder_charter(&db)
             .unwrap()
             .expect("a charter is published");
         assert_eq!(current.charter_hash(), want_hash);
-        assert_eq!(current_charter_hash(&db).unwrap(), Some(want_hash));
+        assert_eq!(founder_charter_hash(&db).unwrap(), Some(want_hash));
     }
 
     #[test]
@@ -748,7 +767,7 @@ mod tests {
         store_charter(&mut log, &founders[0], v1).unwrap();
         store_charter(&mut log, &founders[1], v2).unwrap();
 
-        let current = current_charter(&db).unwrap().unwrap();
+        let current = founder_charter(&db).unwrap().unwrap();
         assert_eq!(current.charter().version, 2);
         assert_eq!(current.charter_hash(), v2_hash);
     }
@@ -764,13 +783,13 @@ mod tests {
             Err(CharterError::BelowThreshold { .. })
         ));
         // Nothing was written.
-        assert!(current_charter(&db).unwrap().is_none());
+        assert!(founder_charter(&db).unwrap().is_none());
     }
 
     #[test]
     fn no_charter_yet_reads_as_none() {
         let db = fresh_db();
-        assert!(current_charter(&db).unwrap().is_none());
-        assert!(current_charter_hash(&db).unwrap().is_none());
+        assert!(founder_charter(&db).unwrap().is_none());
+        assert!(founder_charter_hash(&db).unwrap().is_none());
     }
 }

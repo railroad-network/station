@@ -120,6 +120,12 @@ pub enum Command {
         /// Count of charge records appended.
         reply: oneshot::Sender<usize>,
     },
+    /// Put every passed proposal whose implementation delay has run into force with
+    /// a station-signed `ProposalImplemented`; reply with the number enacted (T1.9.7).
+    EnactGovernance {
+        /// Count of proposals enacted.
+        reply: oneshot::Sender<usize>,
+    },
     /// Report this station's own address and current log tail seq (for the peer
     /// handshake).
     Handshake {
@@ -282,6 +288,16 @@ impl CoreHandle {
     pub async fn charge_contracts(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::ChargeContracts { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Triggers the governance-enactment sweep; returns the number of proposals
+    /// put into force.
+    pub async fn enact_governance(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::EnactGovernance { reply }).is_err() {
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -499,6 +515,10 @@ impl Core {
                 }
                 Command::ChargeContracts { reply } => {
                     let n = self.do_charge_contracts();
+                    let _ = reply.send(n);
+                }
+                Command::EnactGovernance { reply } => {
+                    let n = self.do_enact_governance();
                     let _ = reply.send(n);
                 }
                 Command::Handshake { reply } => {
@@ -2024,6 +2044,22 @@ impl Core {
             self.reindex_listing(listing_id);
         }
         appended
+    }
+
+    /// Puts every passed proposal whose implementation delay has run into force,
+    /// appending a station-signed enactment record for each (T1.9.7). Returns the
+    /// number enacted. Emergencies, whose delay is zero, are enacted the first
+    /// sweep after their vote closes.
+    fn do_enact_governance(&mut self) -> usize {
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        match rrn_governance::lifecycle::enact_due(&self.db, &station, now) {
+            Ok(enacted) => enacted.len(),
+            Err(e) => {
+                tracing::warn!(error = %e, "governance enactment sweep failed");
+                0
+            }
+        }
     }
 
     fn station_keypair(&self) -> Keypair {

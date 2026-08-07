@@ -267,6 +267,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // Governance-enactment sweep timer (T1.9.7).
+        tasks.push(tokio::spawn(governance_implementation_timer(
+            Duration::from_secs(config.timers.governance_implementation_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -328,6 +335,14 @@ impl Station {
     /// see the direct debit taken without waiting on the timer.
     pub async fn charge_contracts(&self) -> usize {
         self.core.charge_contracts().await
+    }
+
+    /// Forces an immediate governance-enactment sweep; returns the number of
+    /// proposals put into force. Lets a driver advance the clock past an
+    /// implementation delay and see the enactment recorded without waiting on the
+    /// hourly timer.
+    pub async fn enact_governance(&self) -> usize {
+        self.core.enact_governance().await
     }
 
     /// Signals all tasks to stop, stops the core thread, awaits the tasks, and
@@ -474,6 +489,38 @@ async fn reputation_refresh_timer(
                 let n = core.refresh_reputation().await;
                 if n > 0 {
                     tracing::info!(refreshed = n, "reputation snapshot refresh");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically asks the core to enact passed proposals whose implementation delay
+/// has run (T1.9.7).
+///
+/// Like the contract charge sweep, this is the only thing that turns a decided
+/// proposal into a recorded fact — the community's vote authorized it, and the
+/// delay only defers *writing it down*. A missed tick is caught up on the next:
+/// the sweep enacts every proposal now due, not just the newest, and an already-
+/// enacted proposal is skipped.
+async fn governance_implementation_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick, as the other timers do.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.enact_governance().await;
+                if n > 0 {
+                    tracing::info!(enacted = n, "governance enactment sweep");
                 }
             }
             _ = shutdown.changed() => {

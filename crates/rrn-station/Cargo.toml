@@ -27,6 +27,8 @@ rrn-reputation = { path = "../rrn-reputation", version = "0.1" }
 # while M1.6 was crate-only work — which is what brings tantivy and its ~60
 # transitive crates into the daemon's build.
 rrn-marketplace = { path = "../rrn-marketplace", version = "0.1" }
+# Governance (M1.9): the enactment sweep that puts passed proposals into force.
+rrn-governance = { path = "../rrn-governance", version = "0.1" }
 
 tokio = { version = "1", features = ["full"] }
 # The mobile-facing HTTP surface (ADR-0008 / T1.3.3+): plain HTTP over local

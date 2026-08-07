@@ -49,7 +49,10 @@ use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
 use crate::charter::{Charter, CharterError};
-use crate::proposal::{proposal_records, ProposalError, ProposalId, ProposalKind};
+use crate::proposal::{
+    all_proposals, proposal_records, Proposal, ProposalError, ProposalId, ProposalKind,
+};
+use crate::statute::is_implemented;
 use crate::vote::{votes, VoteChoice, VoteError};
 
 /// Whether a concluded proposal carried or fell.
@@ -83,15 +86,96 @@ pub struct VoteTally {
     pub outcome: Option<ProposalOutcome>,
 }
 
-/// Tallies a proposal's ballots as of `now`.
+/// Tallies a proposal's ballots as of `now`, against the community's effective
+/// Charter.
 ///
-/// Reads the governing thresholds from the [current Charter](crate::charter::current_charter),
-/// counts the valid ballots, sizes the electorate at the proposal's close, and —
-/// if `now` is past that close — settles an outcome. Returns
+/// Resolves the governing thresholds from the [effective Charter](effective_charter)
+/// — the founder root plus any enacted amendments — so a proposal answers to the
+/// numbers actually in force when it is counted. Returns
 /// [`TallyError::UnknownProposal`] if the log has no authorized record of the
 /// proposal, and [`TallyError::NoCharter`] if no Charter has been published to
 /// supply the thresholds.
 pub fn tally(db: &Database, proposal_id: &ProposalId, now: i64) -> Result<VoteTally, TallyError> {
+    let charter = effective_charter(db)?.ok_or(TallyError::NoCharter)?;
+    count_against(db, proposal_id, now, &charter)
+}
+
+/// The community's effective Charter: the [founder root](crate::charter::founder_charter)
+/// with every enacted amendment folded on top in lineage order, or `None` if no
+/// Charter has been published yet.
+///
+/// An amendment folds in only when it has been enacted — a [`ProposalImplemented`](crate::statute::ProposalImplemented)
+/// record for it exists ([`is_implemented`]) — *and* re-derives as passed when
+/// tallied against the Charter it amends, chaining by `version + 1` and
+/// `previous_hash`. The authority for an amendment is the vote, not a founder
+/// signature, so its passage is re-verified here rather than trusted (ADR-0012 § 4).
+/// Each fold strictly raises the version, so the walk terminates.
+///
+/// The amendment is judged against the *prior* Charter — the one already in hand —
+/// never against [`tally`] (which would resolve the effective Charter again), so
+/// there is no recursion.
+pub fn effective_charter(db: &Database) -> Result<Option<Charter>, TallyError> {
+    let Some(root) = crate::charter::founder_charter(db)? else {
+        return Ok(None);
+    };
+    let mut current = root.charter().clone();
+    let mut current_hash = root.charter_hash();
+
+    let log = AppendLog::new(db);
+    let amendments: Vec<Proposal> = all_proposals(&log, db)?
+        .into_iter()
+        .filter(|p| matches!(p.kind, ProposalKind::CharterAmendment { .. }))
+        .collect();
+
+    loop {
+        let mut advanced = false;
+        for p in &amendments {
+            let ProposalKind::CharterAmendment { new_charter } = &p.kind else {
+                continue;
+            };
+            if new_charter.version != current.version + 1
+                || new_charter.previous_hash != Some(current_hash)
+                || !is_implemented(&log, &p.proposal_id)
+            {
+                continue;
+            }
+            // Re-derive passage against the Charter this amendment supersedes.
+            let passed = count_against(db, &p.proposal_id, p.implementation_at, &current)?.outcome
+                == Some(ProposalOutcome::Passed);
+            if !passed {
+                continue;
+            }
+            current_hash = new_charter.hash();
+            current = new_charter.clone();
+            advanced = true;
+            break;
+        }
+        if !advanced {
+            break;
+        }
+    }
+    Ok(Some(current))
+}
+
+/// The `charter_hash` of the [effective Charter](effective_charter), or `None` if
+/// none is published. The content address the community profile and treaty
+/// partners pin, reflecting any enacted amendment.
+pub fn effective_charter_hash(db: &Database) -> Result<Option<rrn_crypto::hash::Hash>, TallyError> {
+    Ok(effective_charter(db)?.map(|c| c.hash()))
+}
+
+/// Counts a proposal's ballots as of `now` against an explicit `governing`
+/// Charter, without resolving which Charter governs.
+///
+/// The counting core behind [`tally`]; kept separate so [`effective_charter`] can
+/// judge an amendment against the Charter it amends without re-entering charter
+/// resolution.
+fn count_against(
+    db: &Database,
+    proposal_id: &ProposalId,
+    now: i64,
+    governing: &Charter,
+) -> Result<VoteTally, TallyError> {
     let log = AppendLog::new(db);
 
     let records = proposal_records(&log, proposal_id, db)?;
@@ -99,8 +183,7 @@ pub fn tally(db: &Database, proposal_id: &ProposalId, now: i64) -> Result<VoteTa
         return Err(TallyError::UnknownProposal(*proposal_id));
     };
 
-    let signed_charter = crate::charter::current_charter(db)?.ok_or(TallyError::NoCharter)?;
-    let (quorum_pct, approval_pct) = thresholds(&proposal.kind, signed_charter.charter());
+    let (quorum_pct, approval_pct) = thresholds(&proposal.kind, governing);
 
     let (mut yes, mut no, mut abstain) = (0u32, 0u32, 0u32);
     for choice in votes(&log, proposal_id, db)?.into_values() {

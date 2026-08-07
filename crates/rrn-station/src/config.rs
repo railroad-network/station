@@ -173,6 +173,14 @@ pub struct TimersSection {
     /// [`charge_contracts`](crate::core::CoreHandle::charge_contracts).
     #[serde(default = "default_contract_charge_interval")]
     pub contract_charge_interval_secs: u64,
+    /// Governance-enactment sweep interval in seconds (default: 3600 — hourly).
+    ///
+    /// Puts every passed proposal whose implementation delay has run into force
+    /// (T1.9.7). Coarse on purpose: the delay is measured in days, so an hour of
+    /// latency writing the enactment down changes nothing a member would notice,
+    /// and the sweep catches up every proposal due since the last tick.
+    #[serde(default = "default_governance_implementation_interval")]
+    pub governance_implementation_interval_secs: u64,
 }
 
 fn default_tier1_window_seconds() -> u64 {
@@ -199,6 +207,9 @@ fn default_inquiry_expiry_interval() -> u64 {
 fn default_contract_charge_interval() -> u64 {
     300
 }
+fn default_governance_implementation_interval() -> u64 {
+    3600
+}
 
 impl Default for SettlementSection {
     fn default() -> Self {
@@ -219,6 +230,7 @@ impl Default for TimersSection {
             listing_expiry_interval_secs: default_listing_expiry_interval(),
             inquiry_expiry_interval_secs: default_inquiry_expiry_interval(),
             contract_charge_interval_secs: default_contract_charge_interval(),
+            governance_implementation_interval_secs: default_governance_implementation_interval(),
         }
     }
 }

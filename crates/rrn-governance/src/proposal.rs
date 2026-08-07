@@ -491,6 +491,38 @@ pub fn proposal_records(
     })
 }
 
+/// Every authorized proposal on the log, most-recent-first by log order, each
+/// appearing once.
+///
+/// Applies the same authorization the [`find_proposal`] read path does — self-
+/// signed by its author, valid by its own rules, author established as of
+/// `created_at` — so a gossiped entry that dodged the guards is not returned. The
+/// enactment sweep ([`crate::lifecycle::enact_due`]) walks this to find the passed
+/// proposals it is due to put into force.
+pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, ProposalError> {
+    let mut seen = HashSet::new();
+    let mut proposals = Vec::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(proposal) = from_canonical_bytes::<Proposal>(&entry.payload.bytes) else {
+            continue;
+        };
+        if Address::from_public_key(entry.payload.signer) != proposal.author {
+            continue;
+        }
+        if proposal.validate().is_err() {
+            continue;
+        }
+        if !is_established(db, &proposal.author, proposal.created_at)? {
+            continue;
+        }
+        if seen.insert(proposal.proposal_id) {
+            proposals.push(proposal);
+        }
+    }
+    Ok(proposals)
+}
+
 /// Publishes an author's proposal: appends the author-signed [`Proposal`].
 ///
 /// Rejects a proposal whose signer is not its author, one that breaks its own

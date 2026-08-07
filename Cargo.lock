@@ -1955,6 +1955,7 @@ dependencies = [
  "mdns-sd",
  "rpassword",
  "rrn-crypto",
+ "rrn-governance",
  "rrn-identity",
  "rrn-ledger",
  "rrn-marketplace",
