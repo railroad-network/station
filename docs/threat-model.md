@@ -57,7 +57,8 @@ Phase 1 (from M1.0) extends the scope with:
   (`rrn-marketplace`)
 - **Reputation** — transaction- and attestation-derived scores with time decay
   (`rrn-reputation`)
-- **Governance** — proposals and one-member-one-vote balloting (`rrn-governance`)
+- **Governance** — a signed Charter, proposals, and one-established-member-one-vote
+  balloting (`rrn-governance`)
 
 ## Out of Scope
 
@@ -69,9 +70,11 @@ Deferred to Phase 1 and beyond:
   cross-community validation / governance approval (Tier 4); see design
   overview Section 4.3, "The Tiered Oracle Model". Phase 0 only needs Tier
   1/2 (bilateral confirmation + settlement window + reputation stake)
-- **Governance beyond direct balloting** — charters and dispute tribunals;
-  Phase 1's `rrn-governance` covers proposals and one-member-one-vote voting,
-  not tribunal adjudication or oracle escalation above Tier 2
+- **Governance beyond direct balloting** — dispute tribunals, non-direct voting
+  (liquid/sortition/quadratic/consent), and a statute→config rule engine; Phase
+  1's `rrn-governance` covers a signed Charter, proposals, and
+  one-established-member-one-vote direct voting, not tribunal adjudication,
+  alternative voting mechanisms, or oracle escalation above Tier 2
 - **Radio (LoRa) and mesh transport-specific threats** — Phase 0 runs over
   local network/loopback only; Phase 1's mobile↔station transport section
   covers the *local-network* case, not radio/mesh links
@@ -1262,46 +1265,172 @@ inherited standing.
 
 ### `rrn-governance`
 
-Binding collective decisions: signed proposals, one-member-one-vote balloting,
-and a verifiable tally. The defining control — vote weight is a property of a
-vouched identity, not of stake or reputation — is what most of these threats
-push against.
+A community's constitutional layer: a signed immutable Charter, member-authored
+proposals and statutes, one-established-member-one-vote balloting, and a
+replay-derived tally. Every binding artifact — Charter, proposal, co-signature,
+ballot, enactment — is a signed record appended to the same hash-chained log as
+everything else, and every piece of governance state (a proposal's phase, a
+tally, the effective Charter) is *derived* from that log rather than stored, so
+the threats here are attempts to forge a record, manufacture the standing the
+gates require, or bend the derivation, not to tamper with a stored verdict.
 
-**Assets:** the one-member-one-vote invariant; the integrity of a tally
-(re-derivable from signed ballots); the availability of the proposal channel.
+The defining control is who counts as a voter: the electorate is the community's
+**established members** — effective (anchored) composite reputation at or above
+the Member band ([`BAND_MEMBER_MIN`](#rrn-reputation) = 2.0), the same standing
+`rrn-reputation` gates a Tier-2 confirmation on. One established member, one
+vote. This is a deliberate ADR-0012 refinement of the M1.0 scaffold's original
+"vote weight is a vouched identity, not reputation" framing: vote *weight* is
+still flat (never scaled by score), but vote *eligibility* is reputation-gated,
+which means governance inherits `rrn-reputation`'s Sybil posture wholesale.
 
-> Phase 1 scaffold (M1.0). Mitigations below are **planned**.
+**Assets:** the one-established-member-one-vote invariant; the re-derivability of
+a tally and of the effective Charter from signed records; the legitimacy of a
+Charter's founding and amendment lineage; the availability of the proposal
+channel.
 
-#### Proposal flooding
+> Implemented in M1.9 (T1.9.3–T1.9.8, RPC/CLI surface T1.9.7b) against
+> [ADR-0012](adr/0012-charter-format-and-amendments.md), which fixes the Charter
+> schema, the founder/amendment rules, and the established-member electorate at
+> the design level. Mitigations below are **shipped** unless marked otherwise.
+> Only **direct** voting exists in Phase 1; liquid/sortition/quadratic/consent
+> and a statute→config rule engine are Phase 2. Vote records carry the voter's
+> address in clear — there is **no ballot secrecy** in Phase 1, a tradeoff called
+> out under vote buying.
 
-- *Threat:* an identity submits a flood of proposals to bury real ones or force
-  the community into constant voting (a governance DoS).
-- *Planned mitigation (M1 governance task):* proposals are signed and
-  rate-limitable per identity, and a proposal must clear a sponsorship/second
-  threshold before it reaches a ballot; identity is Sybil-bounded by vouching.
-- *Residual risk:* rate limiting is not yet implemented; a coordinated group of
-  real members can still consume community attention.
+#### Ballot stuffing (Sybil voting) and a captured electorate
 
-#### Vote buying
+- *Threat:* one person casts many votes by controlling many identities, or stands
+  up enough fake "members" to swing or manufacture a quorum.
+- *Mitigation (shipped, T1.9.5/T1.9.6):* only an established member may vote —
+  `append_vote` and the `votes` replay both gate each ballot on `is_established`
+  (composite ≥ 2.0) *as of the ballot's own `cast_at`* — and a second ballot from
+  the same voter on the same proposal is dropped (first ballot wins, `votes`
+  keys by address). The tally's denominator is the established-member count, not
+  the raw identity count, so unanchored Sybils inflate neither numerator nor
+  denominator.
+- *Residual risk:* **governance is exactly as Sybil-resistant as
+  `rrn-reputation`, no more.** Establishing an identity means clearing the
+  anchoring cap, and that section's central residual risk — a patient collusion
+  *pair* can manufacture established standing in roughly ten weeks and then anchor
+  any number of further identities — carries straight through to votes: each such
+  identity is one established member and gets one vote. Governance adds no
+  independent defence against it.
+- *Residual risk (bootstrap electorate):* ADR-0012 accepts that a community with
+  only one or two established members has a one- or two-person electorate, in
+  which a lone member trivially meets quorum and approval and can pass statutes
+  binding everyone (verified in live testing: a two-member electorate passed a
+  statute on a single Yes). The stated position is that communities that small do
+  not need formal governance yet; there is no floor on electorate size before
+  proposals may pass, and adding one is a Phase 2 question.
 
-- *Threat:* an actor pays members (in Commons or off-system) to vote a chosen
-  way.
-- *Planned mitigation (M1 governance task):* one-member-one-vote caps the value
-  of any single vote, which lowers the return on buying it; social accountability
-  around signed votes raises the cost.
-- *Residual risk:* off-system bribery and coercion are fundamentally hard to
-  prevent technically; deferred to community norms and to keeping each vote
-  low-value. Ballot-secrecy tradeoffs (which would reduce buyability) are a
-  Phase 2 design question.
+#### Proposal flooding / governance DoS
 
-#### Ballot stuffing (Sybil voting)
+- *Threat:* an identity floods the community with proposals to bury real ones or
+  force constant voting.
+- *Mitigation (shipped, T1.9.4):* authorship itself requires established standing
+  (`append_proposal` gates the author on `is_established` at `created_at`), and a
+  proposal does not reach a ballot until at least `DEFAULT_COSIGN_THRESHOLD` (3)
+  *distinct established* members other than the author co-sign it (`append_cosign`
+  + `proposal_records`). A motion nobody else with standing will endorse never
+  opens for voting, so the flood a lone attacker can create is un-cosigned noise
+  that `phase` leaves in Deliberation.
+- *Residual risk:* there is **no per-identity rate limit** on proposal or
+  co-signature submission yet, so an established member (or a colluding cosigned
+  group of them) can still author many proposals and consume community attention;
+  un-cosigned proposals also still occupy the log and the derived list even though
+  they cannot pass. The cosign threshold is a fixed constant, not Charter-tunable
+  in Phase 1, so a community cannot raise its own spam bar.
 
-- *Threat:* one person casts multiple votes by controlling multiple identities.
-- *Planned mitigation (M1 governance task):* one-member-one-vote is enforced at
-  eligibility — only vouched identities may vote (`rrn-identity`) — and duplicate
-  ballots from the same identity on the same proposal are rejected at tally.
-- *Residual risk:* Sybil resistance is only as strong as the vouching graph; a
-  compromised or careless voucher chain admits fake members who each get a vote.
+#### Vote buying and coercion
+
+- *Threat:* an actor pays members to vote a chosen way, or coerces/retaliates
+  against them for how they voted.
+- *Mitigation (shipped, T1.9.5/T1.9.6):* one-established-member-one-vote caps the
+  value of any single vote, lowering the return on buying it, and every ballot is
+  a signed record, so a vote is socially accountable.
+- *Residual risk:* that same signing means **votes are attributable, not secret**
+  — the voter's address is in clear on the record — which cuts both ways: it
+  raises the cost of buying an undetectable vote but *enables* coercion and
+  retaliation, since anyone replaying the log can see how a member voted.
+  Off-system bribery is fundamentally hard to prevent technically and is left to
+  community norms plus keeping each vote low-value. Ballot secrecy (which would
+  blunt both buying and coercion) is a Phase 2 design question, in tension with
+  the replay-verifiability the tally depends on.
+
+#### Tally forgery / fabricated ballots
+
+- *Threat:* an attacker gossips forged ballots, or a station reports a tally its
+  ballots do not support, to fake an outcome.
+- *Mitigation (shipped, T1.9.6):* a tally is never stored — `tally` recomputes it
+  from the signed ballots in the log every time, counting only votes that
+  `votes` admits (self-signed by the voter, on a published proposal, inside the
+  voting window, from an established member). Quorum and approval are decided by
+  integer cross-multiplication (`participation·100 ≥ quorum_pct·eligible`;
+  `yes·100 ≥ approval_pct·decisive`, with `decisive > 0` required), so every
+  replica reaches a bit-identical verdict with no float drift, and the outcome is
+  only `Some` once the window has closed. A forged ballot that never had a valid
+  signature simply is not counted; there is no number to tamper with.
+- *Residual risk:* correctness rests on log integrity — a fork or rollback that
+  hid real ballots or resurrected withdrawn ones would change a tally (see
+  [Log fork / rollback](#log-fork--rollback)). The eligible-voter denominator is
+  pinned at `voting_ends_at` so a concluded outcome stays stable as the community
+  grows, but the per-kind thresholds are read from the *current* effective Charter
+  at tally time rather than snapshotted at proposal creation, so an amendment that
+  lands mid-flight can shift the bar a proposal is judged against (a known
+  Phase-1 simplification).
+
+#### Illegitimate Charter founding and amendment capture
+
+- *Threat:* someone publishes a Charter naming themselves the founders, or pushes
+  through an amendment that captures the community's rules.
+- *Mitigation (shipped, T1.9.3/T1.9.7):* a Charter is a `MultiSignedPayload`
+  whose `verify_founders` requires valid signatures from at least
+  `ceil(founders × 0.75)` of the addresses the Charter itself names as founders —
+  signatures from non-founders are verified but **ignored**, so padding the signer
+  list does not help — and its `charter_hash` is the Blake3 of the body,
+  independent of the signatures. Amendments do not get a second ratification path:
+  a `CharterAmendment` proposal runs through the ordinary vote lifecycle at the
+  Charter thresholds (default 50% quorum / 75% approval), and `effective_charter`
+  folds an amendment into force only if it was actually enacted *and* re-derives
+  as Passed against the **prior** Charter, chaining `previous_hash` and
+  `version + 1`; strictly increasing versions make the fold terminate.
+- *Residual risk (TOFU):* founding is **trust-on-first-use** — the first Charter
+  that clears its own founder threshold defines who the founders are, with no
+  prior authority to check it against. Whoever publishes the genesis Charter for a
+  community effectively names its founders; this is by design (a community has no
+  root of trust before its Charter) but means Charter legitimacy rests on
+  first-writer honesty plus out-of-band social agreement. Two competing enacted
+  amendments to the same version resolve first-found-wins; principled conflict
+  resolution is Phase 2.
+
+#### Founder key disclosure at multi-founder genesis
+
+- *Threat:* the multi-founder `charter-init` path exposes founder secret keys.
+- *Mitigation (shipped, T1.9.7b):* it is a bootstrap-time, operator-run path over
+  the station's **local Unix socket** — the CLI reads each founder's hex secret
+  from a file and hands it to the daemon, which does all signing; nothing crosses
+  the network.
+- *Residual risk (disclosure):* the founder secrets nonetheless transit the local
+  socket and live briefly in daemon memory, so this assumes the operator legitimately
+  holds (or is trusted to marshal) those keys at founding. A distributed
+  founder-signing ceremony, where each founder signs on their own device and only
+  signatures are collected, is Phase 2. The solo-bootstrap default (station wallet
+  as sole founder, threshold 1) avoids the issue entirely.
+
+#### Enactment forgery
+
+- *Threat:* a gossiped "this proposal is now in force" record makes the community
+  treat an un-passed or premature proposal as enacted.
+- *Mitigation (shipped, T1.9.7):* enactment is a guarded, replay-checked record.
+  `record_implementation` refuses to write one for a proposal that has not passed,
+  is not yet past its `implementation_at`, or is already implemented, and
+  `enacted_statutes` re-derives passage and due-time when it builds the
+  statutes-in-force list — so a forged `ProposalImplemented` that skipped the
+  guards is not believed on read. The hourly `enact_due` sweep is idempotent.
+- *Residual risk:* enactment merely *records* that a statute is in force; Phase 1
+  has no engine that turns a passed statute into an enforced configuration change,
+  so compliance is still a matter of members and operators honoring it (the
+  statute→config rule engine is Phase 2).
 
 ## Mobile client (Phase 1)
 
@@ -1979,6 +2108,18 @@ edges of that scope.
   expiry sweep wired; **writes** are not yet, so admission control is still owed by
   the T1.7.2/T1.7.3 publishing path, and nothing rate-limits reads. See
   [`rrn-marketplace`](#rrn-marketplace).
+- **Governance has no spam bound, no ballot secrecy, and a capturable bootstrap
+  electorate.** Authorship and voting are gated on established standing and a
+  three-cosigner publication threshold, but nothing rate-limits how many
+  proposals a standing member may submit onto the permanently replicated log, and
+  the cosign threshold is a fixed constant a community cannot raise. Ballots are
+  signed records carrying the voter's address in clear, so votes are attributable
+  — enabling coercion as much as accountability; ballot secrecy is Phase 2. A
+  community with only one or two established members has a one- or two-person
+  electorate that trivially passes statutes, an accepted ADR-0012 tradeoff with no
+  minimum-electorate floor. And an enacted statute is only *recorded* as in force —
+  there is no engine that turns it into an enforced configuration change. See
+  [`rrn-governance`](#rrn-governance).
 - **Unclamped wallet KDF parameters.** A hostile `.rrnwallet` can specify a very
   large argon2 `m_cost`, forcing a large allocation on `decrypt` (accepted: you
   only decrypt your own wallet; clamping is a noted future hardening). This is
