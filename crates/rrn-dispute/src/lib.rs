@@ -29,10 +29,12 @@
 //!   [`resolve`](resolution::resolve) sweep that enacts a terminal outcome, or
 //!   lets an unresolved dispute lapse to the confirmed status quo.
 //!
-//! The optional governance escalation/appeal (ADR-0014 §5) reuses
-//! `rrn-governance` and is not part of this first cut; the resolution seam is
-//! shaped to accept it.
+//! The optional escalation/appeal path (ADR-0014 §5) layers on top: when the jury
+//! cannot seat a panel, or a party contests its ruling, [`escalation`] puts the
+//! question to the whole established-member electorate on a bounded sub-window that
+//! also fails open.
 
+pub mod escalation;
 pub mod panel;
 pub mod resolution;
 pub mod sortition;
@@ -49,18 +51,46 @@ pub const PANEL_SIZE: usize = 3;
 /// overall resolution window so several redraws can happen inside it.
 pub const DEFAULT_JUROR_RESPONSE_SECONDS: i64 = 3 * 24 * 3600;
 
+/// How long a jury ruling's enactment is held so a party may appeal it to the
+/// electorate (ADR-0014 §5). A dispute nobody appeals waits this out, then enacts.
+pub const DEFAULT_APPEAL_WINDOW_SECONDS: i64 = 2 * 24 * 3600;
+
+/// How long an escalation vote runs before it fails open. A sub-window inside the
+/// overall resolution window, which remains the hard outer bound.
+pub const DEFAULT_ESCALATION_WINDOW_SECONDS: i64 = 5 * 24 * 3600;
+
+/// Default share of the electorate that must turn out for an escalation to reach
+/// quorum, mirroring the governance statute quorum.
+pub const DEFAULT_ESCALATION_QUORUM_PCT: u8 = 30;
+
+/// Default share of decisive escalation ballots that must uphold for the dispute to
+/// be upheld; below it, the dispute is rejected and the transaction settles.
+pub const DEFAULT_ESCALATION_APPROVAL_PCT: u8 = 50;
+
 /// Tunable dispute-resolution parameters. Fixed for uniform Phase-1 behavior
 /// (ADR-0014 says panel size and windows are not governance-tunable yet); a
 /// demo/test collapses the windows so a resolution fires promptly.
 #[derive(Clone, Copy, Debug)]
 pub struct DisputeParams {
     /// The overall window a dispute freezes settlement for. Past it, an
-    /// unresolved dispute lapses and the transaction settles as confirmed.
+    /// unresolved dispute lapses and the transaction settles as confirmed. This is
+    /// the hard outer bound: every appeal and escalation deadline is clamped to it.
     pub window_seconds: i64,
     /// A single juror's response deadline, measured from when they were seated.
     pub juror_response_seconds: i64,
     /// The number of jurors on a panel.
     pub panel_size: usize,
+    /// How long a jury ruling's enactment is held so a party may appeal it. Zero
+    /// enacts a ruling immediately (the single-round test/demo behaviour).
+    pub appeal_window_seconds: i64,
+    /// How long an escalation vote runs before it fails open, clamped to the
+    /// overall window.
+    pub escalation_window_seconds: i64,
+    /// Share of the electorate that must turn out for an escalation quorum.
+    pub escalation_quorum_pct: u8,
+    /// Share of decisive escalation ballots that must uphold for the dispute to be
+    /// upheld.
+    pub escalation_approval_pct: u8,
 }
 
 impl Default for DisputeParams {
@@ -69,19 +99,27 @@ impl Default for DisputeParams {
             window_seconds: DEFAULT_DISPUTE_WINDOW_SECONDS,
             juror_response_seconds: DEFAULT_JUROR_RESPONSE_SECONDS,
             panel_size: PANEL_SIZE,
+            appeal_window_seconds: DEFAULT_APPEAL_WINDOW_SECONDS,
+            escalation_window_seconds: DEFAULT_ESCALATION_WINDOW_SECONDS,
+            escalation_quorum_pct: DEFAULT_ESCALATION_QUORUM_PCT,
+            escalation_approval_pct: DEFAULT_ESCALATION_APPROVAL_PCT,
         }
     }
 }
 
 impl DisputeParams {
-    /// A config whose juror deadline equals its overall window `secs` and whose
-    /// panel size is the default — the test/demo knob for a single-round jury with
-    /// no redraw.
+    /// A config whose juror deadline equals its overall window `secs`, panel size is
+    /// the default, and appeal/escalation windows are zero — the test/demo knob for
+    /// a single-round jury with no redraw and no appeal delay.
     pub fn uniform(secs: i64) -> Self {
         Self {
             window_seconds: secs,
             juror_response_seconds: secs,
             panel_size: PANEL_SIZE,
+            appeal_window_seconds: 0,
+            escalation_window_seconds: secs,
+            escalation_quorum_pct: DEFAULT_ESCALATION_QUORUM_PCT,
+            escalation_approval_pct: DEFAULT_ESCALATION_APPROVAL_PCT,
         }
     }
 }
@@ -113,6 +151,29 @@ pub enum Error {
     /// The juror has already cast a verdict on this dispute; a verdict is final.
     #[error("juror has already voted on this dispute")]
     AlreadyVoted,
+    /// An escalation record's signature did not verify, its signer is not the named
+    /// initiator, or the initiator is not a party to the disputed transaction.
+    #[error("escalation signature is invalid, or the initiator is not a party")]
+    BadEscalation,
+    /// An escalation ballot's signature did not verify, or its signer is not the
+    /// named voter.
+    #[error("escalation ballot signature is invalid or does not match the named voter")]
+    BadBallot,
+    /// The escalation's reason does not match the dispute's state — an appeal with
+    /// no jury ruling or outside the appeal window, or a cannot-seat escalation
+    /// when the pool can in fact seat a panel.
+    #[error("the dispute cannot be escalated for the stated reason right now")]
+    NotEscalatable,
+    /// The dispute has already been escalated; a dispute escalates at most once.
+    #[error("this dispute has already been escalated")]
+    AlreadyEscalated,
+    /// The voter is not an established, non-party member of the escalation
+    /// electorate as of the escalation's open time.
+    #[error("voter is not eligible to vote in this escalation")]
+    NotEligible,
+    /// There is no open escalation on this dispute to vote in.
+    #[error("this dispute has not been escalated")]
+    NotEscalated,
 }
 
 /// Convenience alias for dispute results.

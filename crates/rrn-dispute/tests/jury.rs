@@ -17,8 +17,13 @@ use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
 
+use rrn_dispute::escalation::{
+    EscalationBallot, EscalationReason, EscalationRecord, SignedEscalation, SignedEscalationBallot,
+};
 use rrn_dispute::panel::resolve_panel;
-use rrn_dispute::resolution::{append_verdict, find_disputed, resolve, Resolution};
+use rrn_dispute::resolution::{
+    append_escalation_ballot, append_verdict, find_disputed, open_escalation, resolve, Resolution,
+};
 use rrn_dispute::sortition::{disputed_info, draw_sequence, eligible_pool, sortition_seed};
 use rrn_dispute::verdict::{verdicts, JurorVerdict, SignedVerdict};
 use rrn_dispute::DisputeParams;
@@ -160,6 +165,11 @@ fn params() -> DisputeParams {
         window_seconds: 1000,
         juror_response_seconds: 500,
         panel_size: 3,
+        // No appeal delay: these jury-only tests enact a ruling immediately.
+        appeal_window_seconds: 0,
+        escalation_window_seconds: 500,
+        escalation_quorum_pct: 30,
+        escalation_approval_pct: 50,
     }
 }
 
@@ -192,6 +202,66 @@ fn signed_verdict(
         },
         juror,
     )
+}
+
+// --- Escalation setup ---------------------------------------------------------
+
+/// Params with a real appeal window and escalation sub-window, both comfortably
+/// inside a long overall window.
+fn esc_params() -> DisputeParams {
+    DisputeParams {
+        window_seconds: 100_000,
+        juror_response_seconds: 500,
+        panel_size: 3,
+        appeal_window_seconds: 1000,
+        escalation_window_seconds: 5000,
+        escalation_quorum_pct: 30,
+        escalation_approval_pct: 50,
+    }
+}
+
+fn signed_escalation(
+    tx_id: &TransactionId,
+    initiator: &Keypair,
+    reason: EscalationReason,
+    opened_at: i64,
+) -> SignedEscalation {
+    SignedEscalation::sign(
+        EscalationRecord {
+            proposal_id: *tx_id,
+            initiator: addr(initiator),
+            reason,
+            opened_at,
+        },
+        initiator,
+    )
+}
+
+fn signed_ballot(
+    tx_id: &TransactionId,
+    voter: &Keypair,
+    uphold: bool,
+    cast_at: i64,
+) -> SignedEscalationBallot {
+    SignedEscalationBallot::sign(
+        EscalationBallot {
+            proposal_id: *tx_id,
+            voter: addr(voter),
+            uphold,
+            cast_at,
+        },
+        voter,
+    )
+}
+
+/// A dispute whose jury pool is too small to seat a panel: three established
+/// members, two of whom are the parties, leaving a single eligible member. Returns
+/// the parties, the lone eligible member, and the disputed transaction id.
+fn cannot_seat_setup(db: &Database) -> (Keypair, Keypair, Keypair, TransactionId) {
+    let members = established_members(db, 3, T);
+    let [alice, bob, lone] = <[Keypair; 3]>::try_from(members).ok().unwrap();
+    let tx = append_disputed(db, &alice, &bob, 300, T);
+    (alice, bob, lone, tx)
 }
 
 // --- Tests --------------------------------------------------------------------
@@ -352,6 +422,10 @@ fn a_silent_juror_is_redrawn_around() {
         window_seconds: 1000,
         juror_response_seconds: 10,
         panel_size: 3,
+        appeal_window_seconds: 0,
+        escalation_window_seconds: 500,
+        escalation_quorum_pct: 30,
+        escalation_approval_pct: 50,
     };
     let seq = sequence(&db, &tx, &p);
 
@@ -467,6 +541,310 @@ fn a_second_verdict_from_a_juror_is_refused() {
         T + 6,
     );
     assert!(matches!(err, Err(rrn_dispute::Error::AlreadyVoted)));
+}
+
+// --- Escalation & appeal (ADR-0014 §5) ----------------------------------------
+
+#[test]
+fn cannot_seat_escalation_upheld_by_the_electorate_voids_the_transfer() {
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+    let station = Keypair::generate();
+
+    // A party escalates because the jury cannot seat a panel, then the lone
+    // eligible member (the whole electorate here) upholds.
+    open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    )
+    .unwrap();
+    append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, true, T + 10), T + 10).unwrap();
+
+    // While the escalation window is open, it is pending.
+    assert_eq!(
+        resolve(&db, &station, &tx, &p, ANCHOR, T + 100).unwrap(),
+        Resolution::EscalationPending
+    );
+    // Once the window closes, the electorate's ruling enacts.
+    let outcome = resolve(&db, &station, &tx, &p, ANCHOR, T + 6000).unwrap();
+    assert_eq!(outcome, Resolution::EscalationUpheld);
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    assert!(matches!(
+        snapshot.get(&tx),
+        Some(TransactionState::Cancelled {
+            reason: CancelReason::DisputeUpheld,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn cannot_seat_escalation_rejected_by_the_electorate_settles() {
+    let db = fresh_db();
+    let (alice, bob, lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+    let station = Keypair::generate();
+
+    open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    )
+    .unwrap();
+    append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, false, T + 10), T + 10).unwrap();
+
+    let outcome = resolve(&db, &station, &tx, &p, ANCHOR, T + 6000).unwrap();
+    assert_eq!(outcome, Resolution::EscalationRejected);
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    assert!(matches!(
+        snapshot.get(&tx),
+        Some(TransactionState::Settled { .. })
+    ));
+    let balances = BalanceView::new(&db);
+    assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
+    assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
+}
+
+#[test]
+fn an_escalation_without_quorum_lapses_open_and_settles() {
+    let db = fresh_db();
+    let (alice, _bob, _lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+    let station = Keypair::generate();
+
+    // Escalated, but nobody votes.
+    open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    )
+    .unwrap();
+
+    let outcome = resolve(&db, &station, &tx, &p, ANCHOR, T + 6000).unwrap();
+    assert_eq!(outcome, Resolution::EscalationLapsed);
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    assert!(matches!(
+        snapshot.get(&tx),
+        Some(TransactionState::Settled { .. })
+    ));
+}
+
+#[test]
+fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
+    let db = fresh_db();
+    let members = established_members(&db, 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let p = esc_params();
+    let seq = sequence(&db, &tx, &p);
+    let station = Keypair::generate();
+
+    // The jury upholds the dispute (2 of 3).
+    append_verdict(
+        &db,
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 10),
+        T + 10,
+    )
+    .unwrap();
+    append_verdict(
+        &db,
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 10),
+        T + 10,
+    )
+    .unwrap();
+
+    // Before enactment, the ruling sits in its appeal window.
+    assert_eq!(
+        resolve(&db, &station, &tx, &p, ANCHOR, T + 20).unwrap(),
+        Resolution::AwaitingAppeal
+    );
+
+    // The losing party (sender) appeals; the electorate rejects the dispute,
+    // overturning the jury.
+    open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::Appeal, T + 20),
+        T + 20,
+    )
+    .unwrap();
+    for m in &members[0..3] {
+        append_escalation_ballot(&db, &p, signed_ballot(&tx, m, false, T + 30), T + 30).unwrap();
+    }
+
+    let outcome = resolve(&db, &station, &tx, &p, ANCHOR, T + 6000).unwrap();
+    assert_eq!(outcome, Resolution::EscalationRejected);
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    assert!(
+        matches!(snapshot.get(&tx), Some(TransactionState::Settled { .. })),
+        "the electorate overturned the jury's uphold, so the transfer settles"
+    );
+}
+
+#[test]
+fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
+    let db = fresh_db();
+    let members = established_members(&db, 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let p = esc_params();
+    let seq = sequence(&db, &tx, &p);
+    let station = Keypair::generate();
+
+    append_verdict(
+        &db,
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 10),
+        T + 10,
+    )
+    .unwrap();
+    append_verdict(
+        &db,
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 10),
+        T + 10,
+    )
+    .unwrap();
+
+    // Ruling at T+10; appeal window is 1000. Inside it: held. Past it: enacted.
+    assert_eq!(
+        resolve(&db, &station, &tx, &p, ANCHOR, T + 500).unwrap(),
+        Resolution::AwaitingAppeal
+    );
+    let outcome = resolve(&db, &station, &tx, &p, ANCHOR, T + 2000).unwrap();
+    assert_eq!(outcome, Resolution::Upheld);
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    assert!(matches!(
+        snapshot.get(&tx),
+        Some(TransactionState::Cancelled {
+            reason: CancelReason::DisputeUpheld,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn escalation_and_ballot_gates_refuse_the_illegitimate() {
+    let db = fresh_db();
+    // Five established members: the pool can seat a panel, so CannotSeat is invalid.
+    let _members = established_members(&db, 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let p = esc_params();
+
+    // Escalate CannotSeat when the pool (5) can seat a panel: refused.
+    let err = open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEscalatable)));
+
+    // Appeal with no jury ruling yet: refused.
+    let err = open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::Appeal, T + 5),
+        T + 5,
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEscalatable)));
+
+    // A non-party cannot open an escalation.
+    let stranger = Keypair::generate();
+    let err = open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &stranger, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::BadEscalation)));
+}
+
+#[test]
+fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+
+    open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    )
+    .unwrap();
+
+    // A non-established stranger is not in the electorate.
+    let stranger = Keypair::generate();
+    let err =
+        append_escalation_ballot(&db, &p, signed_ballot(&tx, &stranger, true, T + 10), T + 10);
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
+
+    // A ballot before the escalation opened is out of window.
+    let err = append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, true, T + 1), T + 10);
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
+
+    // The lone member votes once, then a second ballot is refused.
+    append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, true, T + 10), T + 10).unwrap();
+    let err = append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, false, T + 11), T + 11);
+    assert!(matches!(err, Err(rrn_dispute::Error::AlreadyVoted)));
+
+    // A second escalation on the same dispute is refused.
+    let err = open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 12),
+        T + 12,
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::AlreadyEscalated)));
+}
+
+#[test]
+fn the_escalation_window_is_clamped_to_the_main_window() {
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    // Main window closes at T+100, well before the 5000s escalation window would.
+    let p = DisputeParams {
+        window_seconds: 100,
+        escalation_window_seconds: 5000,
+        ..esc_params()
+    };
+
+    open_escalation(
+        &db,
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 50),
+        T + 50,
+    )
+    .unwrap();
+
+    // A ballot at T+90 (before the clamped close at T+100) is accepted...
+    append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, true, T + 90), T + 90).unwrap();
+    // ...but one at T+150 — inside the raw 5000s window, past the clamped close — is not.
+    let err = append_escalation_ballot(&db, &p, signed_ballot(&tx, &lone, true, T + 150), T + 150);
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
 }
 
 #[test]

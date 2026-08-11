@@ -19,7 +19,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use rrn_dispute::panel::{resolve_panel, tally, DisputeOutcome};
+use rrn_dispute::escalation::{
+    count_escalation, escalation_ballots, escalation_electorate, escalation_of, EscalationReason,
+};
+use rrn_dispute::panel::resolve_panel;
+use rrn_dispute::resolution::{preview, Resolution};
 use rrn_dispute::sortition::{draw_sequence, eligible_pool, sortition_seed, DisputedInfo};
 use rrn_dispute::verdict::verdicts;
 use rrn_dispute::DisputeParams;
@@ -53,9 +57,10 @@ pub struct DisputeSummary {
     pub window_ends_at: i64,
     /// The seated jury's counts so far and the outcome a resolve pass would enact.
     pub tally: DisputeTallyView,
-    /// The outcome a resolve pass would enact right now: `pending` (jury still
-    /// out, window open), `upheld`, `rejected`, or `lapsed` (window closed, no
-    /// majority).
+    /// The outcome a resolve pass would enact right now: `pending` (jury out, window
+    /// open), `awaiting_appeal` (jury ruled, appeal window open), `upheld`,
+    /// `rejected`, `lapsed` (window closed, no majority), or the `escalation_*`
+    /// variants once a party has put the dispute to the electorate.
     pub resolution: String,
 }
 
@@ -73,6 +78,35 @@ pub struct DisputeDetail {
     /// How many members were eligible for the draw (the pool the jury was seated
     /// from). A pool short of the panel size is why a jury may sit unfilled.
     pub eligible_pool_size: u32,
+    /// The escalation to the electorate, if a party has opened one (ADR-0014 §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<EscalationView>,
+}
+
+/// An open escalation vote: why it was opened, its window, and the electorate's
+/// ballots so far.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EscalationView {
+    /// Why it was opened: `appeal` (of a jury ruling) or `cannot_seat` (the jury
+    /// could not seat a panel).
+    pub reason: String,
+    /// The party who opened it, `rrn1…`.
+    pub initiator: String,
+    /// Unix seconds it was opened — the electorate is snapshotted here.
+    pub opened_at: i64,
+    /// Unix seconds its window closes (clamped to the dispute's overall window);
+    /// past it, a quorum-less escalation fails open and the transaction settles.
+    pub closes_at: i64,
+    /// Ballots to uphold the dispute from eligible voters inside the window.
+    pub uphold: u32,
+    /// Ballots to reject the dispute from eligible voters inside the window.
+    pub reject: u32,
+    /// Established, non-party members eligible to vote.
+    pub eligible: u32,
+    /// Whether turnout has reached the escalation quorum.
+    pub quorum_met: bool,
+    /// Whether the uphold share of decisive ballots has cleared the approval bar.
+    pub approval_met: bool,
 }
 
 /// A party's filed response to the dispute.
@@ -189,11 +223,40 @@ pub fn dispute_view(
         })
         .collect();
 
+    // An open, applicable escalation, with its live electorate tally.
+    let escalation = escalation_of(db, tx_id)?
+        .map(|esc| -> rrn_dispute::Result<EscalationView> {
+            let closes_at = esc
+                .opened_at
+                .saturating_add(params.escalation_window_seconds)
+                .min(info.opened_at.saturating_add(params.window_seconds));
+            let electorate = escalation_electorate(db, &info, esc.opened_at)?;
+            let ballots = escalation_ballots(db, tx_id)?;
+            let t = count_escalation(&ballots, &electorate, params, esc.opened_at, closes_at);
+            Ok(EscalationView {
+                reason: match esc.reason {
+                    EscalationReason::Appeal => "appeal",
+                    EscalationReason::CannotSeat => "cannot_seat",
+                }
+                .to_string(),
+                initiator: esc.initiator.to_string(),
+                opened_at: esc.opened_at,
+                closes_at,
+                uphold: t.uphold,
+                reject: t.reject,
+                eligible: t.eligible,
+                quorum_met: t.quorum_met,
+                approval_met: t.approval_met,
+            })
+        })
+        .transpose()?;
+
     Ok(Some(DisputeDetail {
         summary,
         responses,
         panel,
         eligible_pool_size: pool.len() as u32,
+        escalation,
     }))
 }
 
@@ -239,13 +302,9 @@ fn summarize(
     let awaiting = panel.seats.iter().filter(|s| s.verdict.is_none()).count() as u32;
 
     let window_ends_at = info.opened_at.saturating_add(params.window_seconds);
-    let resolution = match tally(&panel, params) {
-        Some(DisputeOutcome::Upheld) => "upheld",
-        Some(DisputeOutcome::Rejected) => "rejected",
-        None if now >= window_ends_at => "lapsed",
-        None => "pending",
-    }
-    .to_string();
+    // The full layered outcome — jury, appeal window, and any escalation — exactly
+    // as a resolve pass would decide it, without enacting.
+    let resolution = resolution_str(preview(db, tx_id, params, anchor, now)?).to_string();
 
     Ok(DisputeSummary {
         tx_id: tx_id.0.to_string(),
@@ -264,4 +323,19 @@ fn summarize(
         },
         resolution,
     })
+}
+
+/// The wire string for a [`Resolution`] — the outcome a resolve pass would enact.
+fn resolution_str(r: Resolution) -> &'static str {
+    match r {
+        Resolution::Pending => "pending",
+        Resolution::AwaitingAppeal => "awaiting_appeal",
+        Resolution::Upheld => "upheld",
+        Resolution::Rejected => "rejected",
+        Resolution::Lapsed => "lapsed",
+        Resolution::EscalationPending => "escalation_pending",
+        Resolution::EscalationUpheld => "escalation_upheld",
+        Resolution::EscalationRejected => "escalation_rejected",
+        Resolution::EscalationLapsed => "escalation_lapsed",
+    }
 }

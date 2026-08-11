@@ -20,7 +20,12 @@ use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
 use rrn_crypto::serialize::from_canonical_bytes;
-use rrn_dispute::resolution::{append_verdict, find_disputed, resolve, Resolution};
+use rrn_dispute::escalation::{
+    EscalationBallot, EscalationReason, EscalationRecord, SignedEscalation, SignedEscalationBallot,
+};
+use rrn_dispute::resolution::{
+    append_escalation_ballot, append_verdict, find_disputed, open_escalation, resolve, Resolution,
+};
 use rrn_dispute::verdict::{JurorVerdict, SignedVerdict};
 use rrn_dispute::DisputeParams;
 use rrn_governance::charter::{create_charter, store_charter, CharterParams};
@@ -672,6 +677,8 @@ impl Core {
             "dispute_respond" => self.m_dispute_respond(req),
             "dispute_rule" => self.m_dispute_rule(req),
             "dispute_resolve" => self.m_dispute_resolve(req),
+            "dispute_escalate" => self.m_dispute_escalate(req),
+            "dispute_escalation_vote" => self.m_dispute_escalation_vote(req),
             // Operator-facing pairing management (T1.3.3), invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
@@ -2425,6 +2432,65 @@ impl Core {
         ok(&rpc::DisputeResolveResult { resolved })
     }
 
+    /// `dispute_escalate` — open an escalation to the established-member electorate,
+    /// signed by the station wallet (which must be a party). Used when the jury
+    /// cannot seat a panel, or to appeal its ruling (ADR-0014 §5).
+    fn m_dispute_escalate(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeEscalateParams = parse_params(req)?;
+        let tx_id = parse_tx_id(&params.tx_id)?;
+        let reason = parse_escalation_reason(&params.reason)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let record = EscalationRecord {
+            proposal_id: tx_id,
+            initiator: self.wallet.address,
+            reason,
+            opened_at: now,
+        };
+        let signed = SignedEscalation::sign(record, &station);
+        open_escalation(
+            &self.db,
+            &self.dispute_params(),
+            &self.dispute_anchor(),
+            signed,
+            now,
+        )
+        .map_err(dispute_err)?;
+        ok(&rpc::DisputeEscalateResult {
+            tx_id: params.tx_id,
+            reason: params.reason,
+        })
+    }
+
+    /// `dispute_escalation_vote` — cast the station wallet's ballot in an open
+    /// escalation. The wallet must be an eligible, non-party established member,
+    /// which [`append_escalation_ballot`] enforces.
+    fn m_dispute_escalation_vote(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeEscalationVoteParams = parse_params(req)?;
+        let tx_id = parse_tx_id(&params.tx_id)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let ballot = EscalationBallot {
+            proposal_id: tx_id,
+            voter: self.wallet.address,
+            uphold: params.uphold,
+            cast_at: now,
+        };
+        let signed = SignedEscalationBallot::sign(ballot, &station);
+        append_escalation_ballot(&self.db, &self.dispute_params(), signed, now)
+            .map_err(dispute_err)?;
+        ok(&rpc::DisputeEscalationVoteResult {
+            tx_id: params.tx_id,
+            uphold: params.uphold,
+        })
+    }
+
     // --- governance mobile writes (T1.9.7b) --------------------------------
 
     /// `governance_submit_proposal` — accept a mobile-signed governance
@@ -2582,6 +2648,71 @@ impl Core {
             now,
         )
         .map_err(dispute_err_pair)?;
+        Ok(serde_json::json!({ "tx_id": tx_id, "uphold": uphold }))
+    }
+
+    /// `submit_escalation` — accept a mobile-signed [`SignedEscalation`] and open
+    /// it. The party signs it on the phone; the station validates the reason against
+    /// the dispute's state and records it (ADR-0014 §5).
+    fn channel_submit_escalation(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_escalation")?;
+        let signed: SignedEscalation = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed escalation".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "escalation initiator is not the authenticated mobile".into(),
+            ));
+        }
+        let tx_id = signed.payload.proposal_id.0.to_string();
+        let reason = match signed.payload.reason {
+            EscalationReason::Appeal => "appeal",
+            EscalationReason::CannotSeat => "cannot_seat",
+        }
+        .to_string();
+        let now = self.clock.now();
+        open_escalation(
+            &self.db,
+            &self.dispute_params(),
+            &self.dispute_anchor(),
+            signed,
+            now,
+        )
+        .map_err(dispute_err_pair)?;
+        Ok(serde_json::json!({ "tx_id": tx_id, "reason": reason }))
+    }
+
+    /// `submit_escalation_ballot` — accept a mobile-signed [`SignedEscalationBallot`]
+    /// from an eligible voter. The signer must be the authenticated mobile, and an
+    /// eligible non-party established member ([`append_escalation_ballot`] enforces).
+    fn channel_submit_escalation_ballot(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_ballot")?;
+        let signed: SignedEscalationBallot =
+            rpc_envelope::parse_signed_record(&bytes).map_err(|_| {
+                (
+                    rpc::INVALID_PARAMS,
+                    "malformed signed escalation ballot".into(),
+                )
+            })?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "voter is not the authenticated mobile".into(),
+            ));
+        }
+        let (tx_id, uphold) = (
+            signed.payload.proposal_id.0.to_string(),
+            signed.payload.uphold,
+        );
+        let now = self.clock.now();
+        append_escalation_ballot(&self.db, &self.dispute_params(), signed, now)
+            .map_err(dispute_err_pair)?;
         Ok(serde_json::json!({ "tx_id": tx_id, "uphold": uphold }))
     }
 
@@ -2877,6 +3008,8 @@ impl Core {
             "submit_dispute" => self.channel_submit_dispute(envelope),
             "submit_dispute_response" => self.channel_submit_dispute_response(envelope),
             "submit_verdict" => self.channel_submit_verdict(envelope),
+            "submit_escalation" => self.channel_submit_escalation(envelope),
+            "submit_escalation_ballot" => self.channel_submit_escalation_ballot(envelope),
             "whoami"
             | "balance"
             | "transactions"
@@ -4111,7 +4244,10 @@ fn dispute_err(e: rrn_dispute::Error) -> rpc::RpcError {
     match e {
         Storage(_) | Reputation(_) => internal(e),
         Ledger(l) => ledger_err(l),
-        NotDisputed | BadVerdict | NotSeated | AlreadyVoted => invalid_params(e.to_string()),
+        NotDisputed | BadVerdict | NotSeated | AlreadyVoted | BadEscalation | BadBallot
+        | NotEscalatable | AlreadyEscalated | NotEligible | NotEscalated => {
+            invalid_params(e.to_string())
+        }
     }
 }
 
@@ -4127,9 +4263,26 @@ fn dispute_err_pair(e: rrn_dispute::Error) -> (i32, String) {
 fn resolution_name(r: Resolution) -> &'static str {
     match r {
         Resolution::Pending => "pending",
+        Resolution::AwaitingAppeal => "awaiting_appeal",
         Resolution::Upheld => "upheld",
         Resolution::Rejected => "rejected",
         Resolution::Lapsed => "lapsed",
+        Resolution::EscalationPending => "escalation_pending",
+        Resolution::EscalationUpheld => "escalation_upheld",
+        Resolution::EscalationRejected => "escalation_rejected",
+        Resolution::EscalationLapsed => "escalation_lapsed",
+    }
+}
+
+/// Parses the wire reason string for a `dispute_escalate` call into the typed
+/// [`EscalationReason`].
+fn parse_escalation_reason(s: &str) -> Result<EscalationReason, rpc::RpcError> {
+    match s {
+        "appeal" => Ok(EscalationReason::Appeal),
+        "cannot_seat" => Ok(EscalationReason::CannotSeat),
+        other => Err(invalid_params(format!(
+            "unknown escalation reason: {other}"
+        ))),
     }
 }
 
@@ -4470,6 +4623,83 @@ mod tests {
             serde_json::json!({ "tx_id": "00".repeat(32) }),
         );
         assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    /// Drives the escalation surface (T1.10.4b) over RPC. This bare core seats no
+    /// jury (no established members), so a raised dispute is a genuine cannot-seat
+    /// case: the station (a party) escalates it to the electorate, and with no
+    /// electorate to reach quorum it fails open — the transaction settles. The
+    /// electorate-vote paths need reputation seeding and are covered in
+    /// `rrn-dispute`'s tests.
+    #[test]
+    fn escalation_lifecycle_over_rpc_cannot_seat_then_lapses() {
+        let mut core = test_core();
+        let station = core.station_keypair();
+        let bob = Keypair::generate();
+        let bob_addr = Address::from_public_key(bob.public_key());
+
+        // Station→bob payment, confirmed, then disputed by the station.
+        let proposed = call(
+            &mut core,
+            "propose",
+            serde_json::json!({ "receiver": bob_addr.to_string(), "amount_centi": 100 }),
+        );
+        let tx_id = proposed["tx_id"].as_str().unwrap().to_string();
+        let now = core.clock.now();
+        let confirmation = TransactionConfirmation {
+            proposal_id: parse_tx_id(&tx_id).unwrap(),
+            confirmer: bob_addr,
+            confirmed_at: now,
+        };
+        Engine::new(&core.db, station.clone())
+            .submit_confirmation(SignedConfirmation::sign(confirmation, &bob), now)
+            .unwrap();
+        call(
+            &mut core,
+            "dispute_raise",
+            serde_json::json!({ "tx_id": tx_id, "reason": "never delivered" }),
+        );
+
+        // Appealing a ruling that does not exist is refused.
+        let err = call_err(
+            &mut core,
+            "dispute_escalate",
+            serde_json::json!({ "tx_id": tx_id, "reason": "appeal" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+
+        // With no eligible jurors, a cannot-seat escalation is valid.
+        let escalated = call(
+            &mut core,
+            "dispute_escalate",
+            serde_json::json!({ "tx_id": tx_id, "reason": "cannot_seat" }),
+        );
+        assert_eq!(escalated["reason"], "cannot_seat");
+
+        // The dispute now reads as an open escalation.
+        let detail = call(&mut core, "dispute", serde_json::json!({ "tx_id": tx_id }));
+        assert_eq!(detail["resolution"], "escalation_pending");
+        assert_eq!(detail["escalation"]["reason"], "cannot_seat");
+
+        // A second escalation on the same dispute is refused.
+        let err = call_err(
+            &mut core,
+            "dispute_escalate",
+            serde_json::json!({ "tx_id": tx_id, "reason": "cannot_seat" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+
+        // Nobody votes; past the sub-window it fails open and settles.
+        core.clock
+            .advance(rrn_dispute::DEFAULT_ESCALATION_WINDOW_SECONDS + 1);
+        let resolved = call(&mut core, "dispute_resolve", serde_json::json!({}));
+        assert_eq!(resolved["resolved"][0]["resolution"], "escalation_lapsed");
+        assert!(matches!(
+            Engine::new(&core.db, station)
+                .get_state(&parse_tx_id(&tx_id).unwrap())
+                .unwrap(),
+            Some(TransactionState::Settled { .. })
+        ));
     }
 
     // --- marketplace wiring (T1.7.0) ----------------------------------------

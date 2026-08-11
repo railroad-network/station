@@ -22,10 +22,11 @@ use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    ContractStateResult, CreateListingResult, DisputeRaiseResult, DisputeResolveResult,
-    DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult, GovProposeResult,
-    HistoryResult, InquireResult, InquiryStateResult, ProposeResult, RecoverImportResult,
-    TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
+    ContractStateResult, CreateListingResult, DisputeEscalateResult, DisputeEscalationVoteResult,
+    DisputeRaiseResult, DisputeResolveResult, DisputeRuleResult, EditListingResult,
+    GovCharterResult, GovCosignResult, GovProposeResult, HistoryResult, InquireResult,
+    InquiryStateResult, ProposeResult, RecoverImportResult, TransactionRow, TransactionsResult,
+    VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -426,6 +427,26 @@ enum DisputeCmd {
     Resolve {
         /// The hex id of a single disputed transaction to resolve.
         tx_id: Option<String>,
+    },
+    /// Escalate to the electorate because the jury cannot seat a panel
+    /// (station-signed; the wallet must be a party). ADR-0014 §5.
+    Escalate {
+        /// The hex id of the disputed transaction.
+        tx_id: String,
+    },
+    /// Appeal a jury ruling to the electorate (station-signed; the wallet must be a
+    /// party), suspending the ruling's enactment. ADR-0014 §5.
+    Appeal {
+        /// The hex id of the disputed transaction.
+        tx_id: String,
+    },
+    /// Cast the station wallet's ballot in an open escalation (must be an eligible,
+    /// non-party established member).
+    Vote {
+        /// The hex id of the escalated transaction.
+        tx_id: String,
+        /// `uphold` (void the transfer) or `reject` (let it settle).
+        ruling: String,
     },
 }
 
@@ -1126,6 +1147,50 @@ async fn cmd_dispute(
                     .join("\n"))
             })
         }
+        DisputeCmd::Escalate { tx_id } => {
+            let v = client
+                .call(
+                    "dispute_escalate",
+                    json!({ "tx_id": tx_id, "reason": "cannot_seat" }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: DisputeEscalateResult = parse(&v)?;
+                Ok(format!("escalation opened ({})", r.reason))
+            })
+        }
+        DisputeCmd::Appeal { tx_id } => {
+            let v = client
+                .call(
+                    "dispute_escalate",
+                    json!({ "tx_id": tx_id, "reason": "appeal" }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: DisputeEscalateResult = parse(&v)?;
+                Ok(format!("escalation opened ({})", r.reason))
+            })
+        }
+        DisputeCmd::Vote { tx_id, ruling } => {
+            let uphold = match ruling.as_str() {
+                "uphold" => true,
+                "reject" => false,
+                other => anyhow::bail!("ruling must be `uphold` or `reject`, got {other:?}"),
+            };
+            let v = client
+                .call(
+                    "dispute_escalation_vote",
+                    json!({ "tx_id": tx_id, "uphold": uphold }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: DisputeEscalationVoteResult = parse(&v)?;
+                Ok(format!(
+                    "escalation ballot recorded: {}",
+                    if r.uphold { "uphold" } else { "reject" }
+                ))
+            })
+        }
     }
 }
 
@@ -1387,6 +1452,19 @@ fn render_dispute_detail(v: &serde_json::Value) -> String {
     for r in &d.responses {
         let short: String = r.responder.chars().take(16).collect();
         out.push_str(&format!("\n  response: {}…  {}", short, r.statement));
+    }
+    if let Some(e) = &d.escalation {
+        out.push_str(&format!(
+            "\n  escalation: {} by {}…  {} uphold / {} reject (of {})  quorum {} / approval {}  closes {}",
+            e.reason,
+            e.initiator.chars().take(16).collect::<String>(),
+            e.uphold,
+            e.reject,
+            e.eligible,
+            if e.quorum_met { "met" } else { "unmet" },
+            if e.approval_met { "met" } else { "unmet" },
+            e.closes_at,
+        ));
     }
     out
 }

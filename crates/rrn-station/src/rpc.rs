@@ -882,3 +882,42 @@ pub struct DisputeShowParams {
     /// The hex id of the disputed transaction.
     pub tx_id: String,
 }
+
+/// `dispute_escalate` params — put a dispute to the established-member electorate
+/// (daemon-signed). Used when the jury cannot seat a panel (`cannot_seat`) or to
+/// appeal its ruling (`appeal`); ADR-0014 §5.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeEscalateParams {
+    /// The hex id of the disputed transaction to escalate.
+    pub tx_id: String,
+    /// Why: `appeal` (of a jury ruling) or `cannot_seat` (jury could not seat).
+    pub reason: String,
+}
+
+/// `dispute_escalate` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeEscalateResult {
+    /// The disputed transaction's id, hex-encoded.
+    pub tx_id: String,
+    /// The escalation reason recorded.
+    pub reason: String,
+}
+
+/// `dispute_escalation_vote` params — cast the station wallet's escalation ballot
+/// (daemon-signed). The wallet must be an eligible, non-party established member.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeEscalationVoteParams {
+    /// The hex id of the escalated transaction being voted on.
+    pub tx_id: String,
+    /// `true` upholds the dispute (voids the transfer), `false` rejects it.
+    pub uphold: bool,
+}
+
+/// `dispute_escalation_vote` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeEscalationVoteResult {
+    /// The escalated transaction's id, hex-encoded.
+    pub tx_id: String,
+    /// The ballot recorded: `true` upheld, `false` rejected.
+    pub uphold: bool,
+}

@@ -143,6 +143,30 @@ pub fn resolve_panel(
     }
 }
 
+/// The instant a terminal majority was reached: the cast time of the
+/// majority-th concurring verdict, ordered earliest-first. `None` if the panel has
+/// not reached a majority. This is when a jury ruling becomes appealable and when
+/// its appeal window starts (ADR-0014 §5).
+pub fn ruling_reached_at(
+    panel: &Panel,
+    verdicts: &HashMap<Address, (bool, i64)>,
+    params: &DisputeParams,
+) -> Option<i64> {
+    let want = match tally(panel, params)? {
+        DisputeOutcome::Upheld => true,
+        DisputeOutcome::Rejected => false,
+    };
+    let mut times: Vec<i64> = panel
+        .seats
+        .iter()
+        .filter(|s| s.verdict == Some(want))
+        .filter_map(|s| verdicts.get(&s.juror).map(|(_, cast_at)| *cast_at))
+        .collect();
+    times.sort_unstable();
+    // A terminal tally guarantees at least `majority` concurring verdicts.
+    times.get(params.panel_size / 2).copied()
+}
+
 /// The panel's ruling, if a majority of the full panel size has been reached.
 /// `None` while the jury is still short of a majority — waiting on verdicts, or
 /// hung.
