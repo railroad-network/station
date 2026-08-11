@@ -84,15 +84,15 @@ pub(crate) fn listing_title(
 }
 
 /// Maps one correlated state to a row for `member`, or `None` if the member is
-/// not a party to it (or it is the never-constructed dispute stub). Shared with
-/// [`crate::events`], which builds the same member-relative row for a push event.
+/// not a party to it. Shared with [`crate::events`], which builds the same
+/// member-relative row for a push event.
 pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<TransactionRow> {
     let proposal = match state {
         TransactionState::Proposed { proposal }
         | TransactionState::Confirmed { proposal, .. }
         | TransactionState::Settled { proposal, .. }
-        | TransactionState::Cancelled { proposal, .. } => &proposal.payload,
-        TransactionState::DisputedStub => return None,
+        | TransactionState::Cancelled { proposal, .. }
+        | TransactionState::Disputed { proposal, .. } => &proposal.payload,
     };
 
     // Direction, counterparty, and the sign of the amount are all relative to
@@ -120,7 +120,11 @@ pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<Tran
             Some(*settled_at),
         ),
         TransactionState::Cancelled { .. } => ("cancelled", None, None),
-        TransactionState::DisputedStub => unreachable!("filtered above"),
+        // A disputed transaction was confirmed, then frozen; surface the
+        // confirmation time so the row still shows when it was agreed.
+        TransactionState::Disputed { confirmation, .. } => {
+            ("disputed", Some(confirmation.payload.confirmed_at), None)
+        }
     };
 
     Some(TransactionRow {

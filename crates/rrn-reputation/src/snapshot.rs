@@ -132,18 +132,18 @@ pub(crate) fn known_addresses(db: &Database) -> Result<Vec<Address>> {
     Ok(addresses.into_iter().collect())
 }
 
-/// The (sender, receiver) of a transaction state, or `None` for the disputed stub
-/// that carries no proposal.
+/// The (sender, receiver) of a transaction state. Every lifecycle state carries
+/// the proposal, so this is always `Some`.
 fn proposal_of(state: &TransactionState) -> Option<Parties> {
     match state {
         TransactionState::Proposed { proposal }
         | TransactionState::Confirmed { proposal, .. }
         | TransactionState::Settled { proposal, .. }
-        | TransactionState::Cancelled { proposal, .. } => Some(Parties {
+        | TransactionState::Cancelled { proposal, .. }
+        | TransactionState::Disputed { proposal, .. } => Some(Parties {
             sender: proposal.payload.sender,
             receiver: proposal.payload.receiver,
         }),
-        TransactionState::DisputedStub => None,
     }
 }
 

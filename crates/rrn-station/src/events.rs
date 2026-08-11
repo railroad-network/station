@@ -175,7 +175,11 @@ fn classify(
         let targets_member = match cancellation.reason {
             CancelReason::WithdrawnBySender => member == &receiver,
             CancelReason::RejectedByReceiver => member == &sender,
-            CancelReason::Expired => member == &sender || member == &receiver,
+            // Expiry and an upheld dispute both void the transfer for both
+            // parties. (A richer dispute-specific event is a later, mobile task.)
+            CancelReason::Expired | CancelReason::DisputeUpheld => {
+                member == &sender || member == &receiver
+            }
         };
         return targets_member.then_some((EventKind::Cancellation, cancellation.proposal_id));
     }
@@ -209,8 +213,8 @@ fn parties(snapshot: &LedgerSnapshot, id: &TransactionId) -> Option<(Address, Ad
         TransactionState::Proposed { proposal }
         | TransactionState::Confirmed { proposal, .. }
         | TransactionState::Settled { proposal, .. }
-        | TransactionState::Cancelled { proposal, .. } => &proposal.payload,
-        TransactionState::DisputedStub => return None,
+        | TransactionState::Cancelled { proposal, .. }
+        | TransactionState::Disputed { proposal, .. } => &proposal.payload,
     };
     Some((proposal.sender, proposal.receiver))
 }

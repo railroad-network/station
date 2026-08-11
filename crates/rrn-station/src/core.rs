@@ -3865,15 +3865,15 @@ fn periods_charged_of(
         .unwrap_or(0)
 }
 
-/// The proposal a transaction carries, whatever state it has reached. `None` only
-/// for the disputed stub, which holds no proposal.
+/// The proposal a transaction carries, whatever state it has reached. Every
+/// lifecycle state carries the proposal, so this is always `Some`.
 fn proposal_of(state: &TransactionState) -> Option<&TransactionProposal> {
     match state {
         TransactionState::Proposed { proposal }
         | TransactionState::Confirmed { proposal, .. }
         | TransactionState::Settled { proposal, .. }
-        | TransactionState::Cancelled { proposal, .. } => Some(&proposal.payload),
-        TransactionState::DisputedStub => None,
+        | TransactionState::Cancelled { proposal, .. }
+        | TransactionState::Disputed { proposal, .. } => Some(&proposal.payload),
     }
 }
 
@@ -3930,7 +3930,7 @@ pub fn state_name(state: &TransactionState) -> &'static str {
         TransactionState::Confirmed { .. } => "Confirmed",
         TransactionState::Settled { .. } => "Settled",
         TransactionState::Cancelled { .. } => "Cancelled",
-        TransactionState::DisputedStub => "Disputed",
+        TransactionState::Disputed { .. } => "Disputed",
     }
 }
 

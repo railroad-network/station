@@ -54,6 +54,7 @@
 #![warn(missing_docs)]
 
 pub mod contract;
+pub mod dispute;
 pub mod engine;
 pub mod settlement;
 pub mod state;
@@ -122,6 +123,22 @@ pub enum Error {
     /// The transaction is not in `Confirmed` state, so it cannot be settled.
     #[error("transaction is not in the Confirmed state")]
     NotConfirmed,
+    /// The transaction is not in `Disputed` state, so a dispute resolution
+    /// cannot be applied to it.
+    #[error("transaction is not in the Disputed state")]
+    NotDisputed,
+    /// The dispute raiser is neither the sender nor the receiver of the disputed
+    /// transaction; only a party may contest it.
+    #[error("dispute raiser is not a party to the transaction")]
+    NotAParty,
+    /// The dispute was opened outside the transaction's settlement window — too
+    /// early (before it confirmed) or too late (after it should have settled).
+    #[error("dispute opened outside the transaction's settlement window")]
+    DisputeWindowClosed,
+    /// The dispute's free-text reason exceeds
+    /// [`MAX_DISPUTE_REASON_BYTES`](dispute::MAX_DISPUTE_REASON_BYTES).
+    #[error("dispute reason exceeds the maximum length")]
+    DisputeReasonTooLong,
     /// A derived [`state::TransactionState`] failed its internal integrity check
     /// (e.g. an embedded signature did not verify).
     #[error("invalid transaction state: {0}")]

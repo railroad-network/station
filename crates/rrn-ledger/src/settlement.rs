@@ -214,6 +214,12 @@ impl<'db> Settler<'db> {
                 return Ok(());
             }
             TransactionState::Confirmed { proposal, .. } => proposal.clone(),
+            // A dispute that was rejected or lapsed settles as originally
+            // confirmed (ADR-0014 §6). The automatic sweep never reaches this arm
+            // — `find_eligible` returns only `Confirmed` transactions, so a live
+            // dispute stays frozen — but the dispute layer calls `settle`
+            // explicitly to enact a rejection.
+            TransactionState::Disputed { proposal, .. } => proposal.clone(),
             _ => return Err(Error::NotConfirmed),
         };
 
@@ -304,6 +310,7 @@ mod tests {
     use rrn_crypto::keypair::Keypair;
     use rrn_storage::migrations;
 
+    use crate::dispute::{DisputeRecord, SignedDispute};
     use crate::transaction::{
         SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionProposal,
     };
@@ -464,6 +471,80 @@ mod tests {
         assert!(matches!(
             s.settle(&missing, 1_000),
             Err(Error::UnknownTransaction)
+        ));
+    }
+
+    /// Appends proposal + confirmation + a party-raised dispute, leaving the
+    /// transaction in the `Disputed` (frozen) state. Returns its id.
+    fn disputed_tx(
+        db: &Database,
+        sender: &Keypair,
+        receiver: &Keypair,
+        amount_centi: i64,
+        confirmed_at: i64,
+        opened_at: i64,
+    ) -> TransactionId {
+        let id = confirmed_tx(db, sender, receiver, amount_centi, confirmed_at);
+        let dispute = DisputeRecord {
+            proposal_id: id,
+            raiser: addr(sender),
+            reason: "contested".into(),
+            evidence_hash: None,
+            opened_at,
+        };
+        AppendLog::new(db)
+            .append(SignedDispute::sign(dispute, sender))
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn disputed_transaction_is_frozen_from_the_sweep() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let id = disputed_tx(&db, &alice, &bob, 300, 1_000, 1_050);
+        let mut s = settler(&db, &station, 100);
+
+        // The settlement window elapsed long ago, but the dispute freezes it:
+        // nothing is eligible and a sweep settles nothing.
+        assert!(s.find_eligible(10_000).unwrap().is_empty());
+        assert_eq!(s.sweep(10_000).unwrap(), 0);
+
+        let balances = BalanceView::new(&db);
+        assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 0);
+        assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 0);
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        assert!(matches!(
+            snap.get(&id),
+            Some(TransactionState::Disputed { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_settle_enacts_a_rejected_dispute() {
+        // Rejection/lapse enactment: the dispute layer calls `settle` directly on
+        // a frozen transaction, which settles it and moves balances as confirmed.
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let id = disputed_tx(&db, &alice, &bob, 300, 1_000, 1_050);
+        let mut s = settler(&db, &station, 100);
+
+        s.settle(&id, 20_000).unwrap();
+        let balances = BalanceView::new(&db);
+        assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
+        assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        assert!(matches!(
+            snap.get(&id),
+            Some(TransactionState::Settled { .. })
         ));
     }
 

@@ -5,11 +5,11 @@
 //! ```text
 //!                 confirm                 window elapses
 //!   Proposed  ─────────────▶  Confirmed  ───────────────▶  Settled
-//!      │                          │
-//!      │ withdraw / reject /      │ dispute (Phase 1)
-//!      │ expire                   ▼
-//!      ▼                      DisputedStub
-//!   Cancelled
+//!      │                          │                          ▲
+//!      │ withdraw / reject /      │ dispute (ADR-0014)       │ dispute
+//!      │ expire                   ▼                          │ rejected /
+//!      ▼                      Disputed  ────────────────────┘ lapsed
+//!   Cancelled  ◀──────────────────┘  dispute upheld
 //! ```
 //!
 //! [`TransactionState::can_transition_to`] encodes exactly these edges; every
@@ -24,6 +24,7 @@ use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_storage::log::{AppendLog, StoredPayload};
 use serde::{Deserialize, Serialize};
 
+use crate::dispute::{DisputeRecord, SignedDispute};
 use crate::settlement::SettlementRecord;
 use crate::transaction::{
     SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId, TransactionProposal,
@@ -42,6 +43,10 @@ pub enum CancelReason {
     WithdrawnBySender,
     /// The receiver declined to confirm.
     RejectedByReceiver,
+    /// A dispute was upheld against the confirmation: the pending transfer is
+    /// voided (not reversed — the freeze caught it before settlement, so no
+    /// balance ever moved). See ADR-0014 §6.
+    DisputeUpheld,
 }
 
 impl CancelReason {
@@ -50,6 +55,7 @@ impl CancelReason {
             CancelReason::Expired => "expired",
             CancelReason::WithdrawnBySender => "withdrawn_by_sender",
             CancelReason::RejectedByReceiver => "rejected_by_receiver",
+            CancelReason::DisputeUpheld => "dispute_upheld",
         }
     }
 }
@@ -68,6 +74,7 @@ impl TryFrom<CBOR> for CancelReason {
             "expired" => Ok(CancelReason::Expired),
             "withdrawn_by_sender" => Ok(CancelReason::WithdrawnBySender),
             "rejected_by_receiver" => Ok(CancelReason::RejectedByReceiver),
+            "dispute_upheld" => Ok(CancelReason::DisputeUpheld),
             _ => Err(dcbor::Error::WrongType),
         }
     }
@@ -152,9 +159,20 @@ pub enum TransactionState {
         /// Why it was cancelled.
         reason: CancelReason,
     },
-    /// Placeholder for the Phase 1 dispute path. Never constructed in Phase 0;
-    /// the `Confirmed → DisputedStub` edge is accepted but does nothing.
-    DisputedStub,
+    /// A confirmed transaction that a party has contested. Settlement is frozen
+    /// (the sweep skips it) until the dispute resolves — rejected/lapsed, moving
+    /// on to `Settled`, or upheld, moving to `Cancelled` with
+    /// [`CancelReason::DisputeUpheld`]. See ADR-0014.
+    Disputed {
+        /// The sender-signed proposal.
+        proposal: SignedProposal,
+        /// The receiver-signed confirmation now under contest.
+        confirmation: SignedConfirmation,
+        /// The party-signed record that opened the dispute. Boxed so this
+        /// variant does not enlarge every `TransactionState` (it carries a third
+        /// signed record where the others carry at most two).
+        dispute: Box<SignedDispute>,
+    },
 }
 
 /// The coarse lifecycle stage of a state, ignoring the carried records. Used to
@@ -170,18 +188,13 @@ enum Stage {
 
 impl TransactionState {
     /// The transaction this state belongs to.
-    ///
-    /// [`TransactionState::DisputedStub`] carries no proposal (it is an
-    /// unconstructed Phase 0 placeholder) and returns the all-zero id.
     pub fn id(&self) -> TransactionId {
         match self {
             TransactionState::Proposed { proposal }
             | TransactionState::Confirmed { proposal, .. }
             | TransactionState::Settled { proposal, .. }
-            | TransactionState::Cancelled { proposal, .. } => proposal.payload.id,
-            TransactionState::DisputedStub => {
-                TransactionId(rrn_crypto::hash::Hash::from_bytes([0u8; 32]))
-            }
+            | TransactionState::Cancelled { proposal, .. }
+            | TransactionState::Disputed { proposal, .. } => proposal.payload.id,
         }
     }
 
@@ -191,15 +204,17 @@ impl TransactionState {
             TransactionState::Confirmed { .. } => Stage::Confirmed,
             TransactionState::Settled { .. } => Stage::Settled,
             TransactionState::Cancelled { .. } => Stage::Cancelled,
-            TransactionState::DisputedStub => Stage::Disputed,
+            TransactionState::Disputed { .. } => Stage::Disputed,
         }
     }
 
     /// Whether moving from `self` to `target` is a legal lifecycle transition.
     ///
     /// The only legal edges are `Proposed → Confirmed`, `Proposed → Cancelled`,
-    /// `Confirmed → Settled`, and `Confirmed → DisputedStub`. Everything else —
-    /// including staying in the same state or moving backwards — is illegal.
+    /// `Confirmed → Settled`, `Confirmed → Disputed`, `Disputed → Settled`
+    /// (dispute rejected or lapsed), and `Disputed → Cancelled` (dispute upheld).
+    /// Everything else — including staying in the same state or moving backwards —
+    /// is illegal.
     pub fn can_transition_to(&self, target: &TransactionState) -> bool {
         matches!(
             (self.stage(), target.stage()),
@@ -207,6 +222,8 @@ impl TransactionState {
                 | (Stage::Proposed, Stage::Cancelled)
                 | (Stage::Confirmed, Stage::Settled)
                 | (Stage::Confirmed, Stage::Disputed)
+                | (Stage::Disputed, Stage::Settled)
+                | (Stage::Disputed, Stage::Cancelled)
         )
     }
 
@@ -239,6 +256,24 @@ impl TransactionState {
                 Ok(())
             };
 
+        let check_dispute = |proposal: &SignedProposal, dispute: &SignedDispute| -> Result<()> {
+            dispute.verify().map_err(|_| Error::BadSignature)?;
+            if dispute.payload.proposal_id != proposal.payload.id {
+                return Err(Error::Invalid(
+                    "dispute references a different proposal".into(),
+                ));
+            }
+            let p = &proposal.payload;
+            // Only a party may contest, and they must have signed it.
+            let raiser = dispute.payload.raiser;
+            if (raiser != p.sender && raiser != p.receiver)
+                || &dispute.signer != raiser.public_key()
+            {
+                return Err(Error::NotAParty);
+            }
+            Ok(())
+        };
+
         match self {
             TransactionState::Proposed { proposal }
             | TransactionState::Cancelled { proposal, .. } => check_proposal(proposal),
@@ -254,7 +289,15 @@ impl TransactionState {
                 check_proposal(proposal)?;
                 check_confirmation(proposal, confirmation)
             }
-            TransactionState::DisputedStub => Ok(()),
+            TransactionState::Disputed {
+                proposal,
+                confirmation,
+                dispute,
+            } => {
+                check_proposal(proposal)?;
+                check_confirmation(proposal, confirmation)?;
+                check_dispute(proposal, dispute)
+            }
         }
     }
 }
@@ -323,12 +366,53 @@ impl LedgerSnapshot {
             return;
         }
 
-        if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
+        if let Ok(dispute) = from_canonical_bytes::<DisputeRecord>(bytes) {
+            // A dispute freezes a `Confirmed` transaction. Replay re-checks the
+            // one structural invariant that matters for the freeze — the raiser
+            // is a party — so a stranger's gossiped dispute can never freeze a
+            // transaction it has no standing in.
             if let Some(TransactionState::Confirmed {
                 proposal,
                 confirmation,
-            }) = self.states.get(&settlement.proposal_id).cloned()
+            }) = self.states.get(&dispute.proposal_id).cloned()
             {
+                let p = &proposal.payload;
+                if dispute.raiser == p.sender || dispute.raiser == p.receiver {
+                    let signed = SignedDispute {
+                        payload: dispute.clone(),
+                        signer: stored.signer,
+                        signature: stored.signature,
+                    };
+                    self.states.insert(
+                        dispute.proposal_id,
+                        TransactionState::Disputed {
+                            proposal,
+                            confirmation,
+                            dispute: Box::new(signed),
+                        },
+                    );
+                }
+            }
+            return;
+        }
+
+        if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
+            // A settlement closes either a `Confirmed` transaction (the normal
+            // path) or a `Disputed` one whose dispute was rejected or lapsed
+            // (ADR-0014 §6) — both carry the proposal and confirmation it needs.
+            let prior = match self.states.get(&settlement.proposal_id).cloned() {
+                Some(TransactionState::Confirmed {
+                    proposal,
+                    confirmation,
+                })
+                | Some(TransactionState::Disputed {
+                    proposal,
+                    confirmation,
+                    ..
+                }) => Some((proposal, confirmation)),
+                _ => None,
+            };
+            if let Some((proposal, confirmation)) = prior {
                 self.states.insert(
                     settlement.proposal_id,
                     TransactionState::Settled {
@@ -342,9 +426,23 @@ impl LedgerSnapshot {
         }
 
         if let Ok(cancellation) = from_canonical_bytes::<CancellationRecord>(bytes) {
-            if let Some(TransactionState::Proposed { proposal }) =
-                self.states.get(&cancellation.proposal_id).cloned()
-            {
+            // A cancellation retires a `Proposed` transaction (withdraw / reject /
+            // expire) or voids a `Disputed` one whose dispute was upheld
+            // (`DisputeUpheld` — ADR-0014 §6). The reason and the prior stage must
+            // agree, so a stray upheld-cancellation cannot void a mere proposal
+            // and an ordinary reason cannot void a dispute.
+            let target = self.states.get(&cancellation.proposal_id).cloned();
+            let proposal = match (&target, cancellation.reason) {
+                // An upheld dispute cannot apply to a still-unconfirmed proposal.
+                (Some(TransactionState::Proposed { .. }), CancelReason::DisputeUpheld) => None,
+                (Some(TransactionState::Proposed { proposal }), _) => Some(proposal.clone()),
+                (
+                    Some(TransactionState::Disputed { proposal, .. }),
+                    CancelReason::DisputeUpheld,
+                ) => Some(proposal.clone()),
+                _ => None,
+            };
+            if let Some(proposal) = proposal {
                 self.states.insert(
                     cancellation.proposal_id,
                     TransactionState::Cancelled {
@@ -406,12 +504,25 @@ mod tests {
         SignedConfirmation::sign(c, receiver)
     }
 
+    fn dispute(proposal: &SignedProposal, raiser: &Keypair) -> SignedDispute {
+        let d = DisputeRecord {
+            proposal_id: proposal.payload.id,
+            raiser: Address::from_public_key(raiser.public_key()),
+            reason: "contested".into(),
+            evidence_hash: None,
+            opened_at: 1_600,
+        };
+        SignedDispute::sign(d, raiser)
+    }
+
     /// One representative instance of each lifecycle stage.
     fn all_stages() -> Vec<TransactionState> {
         let sender = Keypair::generate();
         let receiver = Keypair::generate();
         let p = proposal(&sender, &receiver);
         let c = confirmation(&p, &receiver);
+        // A party (the sender here) raises the dispute in the Disputed instance.
+        let d = dispute(&p, &sender);
         vec![
             TransactionState::Proposed {
                 proposal: p.clone(),
@@ -422,15 +533,19 @@ mod tests {
             },
             TransactionState::Settled {
                 proposal: p.clone(),
-                confirmation: c,
+                confirmation: c.clone(),
                 settled_at: 9_000,
             },
             TransactionState::Cancelled {
-                proposal: p,
+                proposal: p.clone(),
                 cancelled_at: 9_000,
                 reason: CancelReason::Expired,
             },
-            TransactionState::DisputedStub,
+            TransactionState::Disputed {
+                proposal: p,
+                confirmation: c,
+                dispute: Box::new(d),
+            },
         ]
     }
 
@@ -441,6 +556,8 @@ mod tests {
                 | (Stage::Proposed, Stage::Cancelled)
                 | (Stage::Confirmed, Stage::Settled)
                 | (Stage::Confirmed, Stage::Disputed)
+                | (Stage::Disputed, Stage::Settled)
+                | (Stage::Disputed, Stage::Cancelled)
         )
     }
 

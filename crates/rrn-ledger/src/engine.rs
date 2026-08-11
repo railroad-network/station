@@ -18,6 +18,8 @@ use rrn_crypto::keypair::Keypair;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
+use crate::dispute::SignedDispute;
+use crate::settlement::SettlementConfig;
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
 use crate::transaction::{SignedConfirmation, SignedProposal, TransactionId};
 use crate::{Error, Result};
@@ -163,6 +165,99 @@ impl<'db> Engine<'db> {
             &self.station,
         ))?;
         tracing::info!(tx = ?tx_id, ?reason, "proposal cancelled");
+        Ok(())
+    }
+
+    /// Raises a party-signed dispute against a `Confirmed` transaction, freezing
+    /// its settlement (ADR-0014). Appends the [`SignedDispute`] after validating,
+    /// without writing on failure.
+    ///
+    /// Errors on a bad signature, an over-long reason, an unknown or
+    /// non-`Confirmed` transaction, a raiser who is not a party (or did not sign
+    /// it), or a dispute opened outside the transaction's settlement window — the
+    /// same window a settlement would otherwise fire at, so a dispute must land
+    /// before the transfer settles. `settlement` supplies that window per tier.
+    pub fn raise_dispute(
+        &mut self,
+        dispute: SignedDispute,
+        settlement: &SettlementConfig,
+        now: i64,
+    ) -> Result<()> {
+        dispute.verify().map_err(|_| Error::BadSignature)?;
+        let d = &dispute.payload;
+        if !d.reason_within_bound() {
+            return Err(Error::DisputeReasonTooLong);
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let (proposal, confirmation) = match snapshot.get(&d.proposal_id) {
+            Some(TransactionState::Confirmed {
+                proposal,
+                confirmation,
+            }) => (proposal, confirmation),
+            Some(_) => return Err(Error::NotConfirmed),
+            None => return Err(Error::UnknownTransaction),
+        };
+        let p = &proposal.payload;
+
+        // Only a party may contest, and they must have signed the dispute.
+        if (d.raiser != p.sender && d.raiser != p.receiver)
+            || &dispute.signer != d.raiser.public_key()
+        {
+            return Err(Error::NotAParty);
+        }
+
+        // The dispute must fall inside the settlement window: no earlier than the
+        // confirmation it contests, and no later than the moment the sweep would
+        // have settled it (with clock-skew tolerance, as elsewhere). A dispute
+        // that arrives after settlement finds the transaction already `Settled`
+        // and fails the `Confirmed` check above; this bounds the honest case.
+        let window = settlement.window_for(p.effective_tier()) as i64;
+        let confirmed_at = confirmation.payload.confirmed_at;
+        let deadline = confirmed_at
+            .saturating_add(window)
+            .saturating_add(CLOCK_SKEW_TOLERANCE_SECS);
+        if d.opened_at < confirmed_at.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS)
+            || d.opened_at > deadline
+            || d.opened_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS)
+        {
+            return Err(Error::DisputeWindowClosed);
+        }
+
+        let proposal_id = d.proposal_id;
+        let raiser = d.raiser;
+        AppendLog::new(self.db).append(dispute)?;
+        tracing::info!(tx = ?proposal_id, ?raiser, "dispute raised");
+        Ok(())
+    }
+
+    /// Upholds a dispute against a `Disputed` transaction: voids the pending
+    /// transfer by appending a station-signed cancellation with
+    /// [`CancelReason::DisputeUpheld`] (ADR-0014 §6). No balance moved (the freeze
+    /// preceded settlement), so there is nothing to reverse.
+    ///
+    /// The complementary "dispute rejected / lapsed" outcome settles the frozen
+    /// transaction instead — see [`Settler::settle`](crate::settlement::Settler::settle).
+    /// Deciding *which* outcome applies is the dispute layer's job; this method is
+    /// the ledger primitive that enacts an upheld ruling.
+    pub fn uphold_dispute(&mut self, tx_id: &TransactionId, now: i64) -> Result<()> {
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        match snapshot.get(tx_id) {
+            Some(TransactionState::Disputed { .. }) => {}
+            Some(_) => return Err(Error::NotDisputed),
+            None => return Err(Error::UnknownTransaction),
+        }
+
+        let record = CancellationRecord {
+            proposal_id: *tx_id,
+            reason: CancelReason::DisputeUpheld,
+            cancelled_at: now,
+        };
+        AppendLog::new(self.db).append(rrn_crypto::signed::SignedPayload::sign(
+            record,
+            &self.station,
+        ))?;
+        tracing::info!(tx = ?tx_id, "dispute upheld: transfer voided");
         Ok(())
     }
 
@@ -452,5 +547,167 @@ mod tests {
         let engine = Engine::new(&db, station);
         let missing = TransactionId(rrn_crypto::hash::Hash::of(b"missing"));
         assert!(engine.get_state(&missing).unwrap().is_none());
+    }
+
+    /// Proposes and confirms a transaction through the engine, returning its id
+    /// in the `Confirmed` state.
+    fn confirmed(
+        engine: &mut Engine,
+        alice: &Keypair,
+        bob: &Keypair,
+        confirmed_at: i64,
+    ) -> TransactionId {
+        let p = signed_proposal(alice, bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(bob),
+            confirmed_at,
+        };
+        engine
+            .submit_confirmation(SignedConfirmation::sign(c, bob), confirmed_at)
+            .unwrap();
+        id
+    }
+
+    fn signed_dispute(id: TransactionId, raiser: &Keypair, opened_at: i64) -> SignedDispute {
+        let d = crate::dispute::DisputeRecord {
+            proposal_id: id,
+            raiser: addr(raiser),
+            reason: "goods never arrived".into(),
+            evidence_hash: None,
+            opened_at,
+        };
+        SignedDispute::sign(d, raiser)
+    }
+
+    #[test]
+    fn raise_dispute_freezes_a_confirmed_transaction() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        // The sender contests it inside the window.
+        engine
+            .raise_dispute(signed_dispute(id, &alice, 300), &cfg, 300)
+            .unwrap();
+        assert!(matches!(
+            engine.get_state(&id).unwrap(),
+            Some(TransactionState::Disputed { .. })
+        ));
+    }
+
+    #[test]
+    fn dispute_by_a_stranger_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, mallory, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        assert!(matches!(
+            engine.raise_dispute(signed_dispute(id, &mallory, 300), &cfg, 300),
+            Err(Error::NotAParty)
+        ));
+        // Nothing was frozen.
+        assert!(matches!(
+            engine.get_state(&id).unwrap(),
+            Some(TransactionState::Confirmed { .. })
+        ));
+    }
+
+    #[test]
+    fn dispute_after_the_window_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        // Opened well past confirmed_at + window (+ skew).
+        assert!(matches!(
+            engine.raise_dispute(signed_dispute(id, &bob, 50_000), &cfg, 50_000),
+            Err(Error::DisputeWindowClosed)
+        ));
+    }
+
+    #[test]
+    fn disputing_an_unconfirmed_transaction_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        // Proposed but not confirmed.
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+        assert!(matches!(
+            engine.raise_dispute(signed_dispute(id, &alice, 300), &cfg, 300),
+            Err(Error::NotConfirmed)
+        ));
+    }
+
+    #[test]
+    fn upholding_a_dispute_voids_the_transfer() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        engine
+            .raise_dispute(signed_dispute(id, &bob, 300), &cfg, 300)
+            .unwrap();
+        engine.uphold_dispute(&id, 400).unwrap();
+        assert!(matches!(
+            engine.get_state(&id).unwrap(),
+            Some(TransactionState::Cancelled {
+                reason: CancelReason::DisputeUpheld,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn upholding_requires_a_disputed_transaction() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // Confirmed but never disputed.
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        assert!(matches!(
+            engine.uphold_dispute(&id, 400),
+            Err(Error::NotDisputed)
+        ));
     }
 }
