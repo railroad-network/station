@@ -17,9 +17,11 @@
 //!   populated in Phase 1.
 //! - **Attestation accuracy** — each signed statement the address made about a
 //!   transaction or another member: the vouches it signed, plus the transaction
-//!   confirmations it signed as a receiver. No fraud-finding mechanism exists in
-//!   Phase 1, so every attestation counts as accurate and the dimension is driven
-//!   by volume.
+//!   confirmations it signed as a receiver. Each counts as accurate *unless later
+//!   proven wrong*: a dispute upheld against a confirmation (ADR-0014) both strips
+//!   its positive credit and levies a penalty, dragging the dimension below
+//!   neutral — the "proven wrong" negative event ADR-0009 always reserved for this
+//!   dimension, and the forfeiture the Tier-2 stake finally pays.
 //!
 //! # The count-to-score mapping
 //!
@@ -34,7 +36,7 @@
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
-use rrn_ledger::state::{LedgerSnapshot, TransactionState};
+use rrn_ledger::state::{CancelReason, LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionConfirmation;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
@@ -127,6 +129,27 @@ impl<'db> ReputationScorer<'db> {
                     attestation.record(confirmation.confirmed_at);
                 }
             }
+            // A dispute upheld against a confirmation is the "proven wrong" event
+            // ADR-0009's attestation-accuracy dimension was documented to hold and
+            // ADR-0014 §6 delivers: the transaction is now
+            // `Cancelled { DisputeUpheld }`, which already strips the confirmer's
+            // positive credit (a cancelled state carries no confirmation), and this
+            // penalty drags the dimension *below* neutral so the Tier-2 stake
+            // actually costs them. The confirmer is always the proposal's receiver
+            // (a confirmation can only come from the receiver), so it is derivable
+            // even though the cancelled state no longer carries the confirmation.
+            // Gated on `cancelled_at` so a profile scored before the ruling is not
+            // dented — the attestation was not yet proven wrong then.
+            if let TransactionState::Cancelled {
+                proposal,
+                reason: CancelReason::DisputeUpheld,
+                cancelled_at,
+            } = state
+            {
+                if proposal.payload.receiver == *address && *cancelled_at <= at_time {
+                    attestation.penalize();
+                }
+            }
         }
 
         // Vouches are written by `rrn-identity` and ignored by the ledger replay,
@@ -161,16 +184,18 @@ fn confirmation_of(state: &TransactionState) -> Option<&TransactionConfirmation>
     }
 }
 
-/// Running tally for one dimension: how many qualifying events, and when the most
-/// recent one happened (for decay).
+/// Running tally for one dimension: how many qualifying events, how many
+/// penalties counted against it, and when the most recent positive event
+/// happened (for decay).
 #[derive(Default)]
 struct DimensionTally {
     count: u32,
+    penalties: u32,
     last_activity: Option<i64>,
 }
 
 impl DimensionTally {
-    /// Folds in one event that occurred at `event_time`.
+    /// Folds in one positive event that occurred at `event_time`.
     fn record(&mut self, event_time: i64) {
         self.count += 1;
         self.last_activity = Some(match self.last_activity {
@@ -179,14 +204,30 @@ impl DimensionTally {
         });
     }
 
-    /// The dimension's score as of `at_time`: capped linear accrual, then decayed
-    /// from the most recent event, floored at zero. Zero when there is no evidence.
+    /// Counts one penalty against the dimension — a positive contribution that
+    /// was later proven wrong (currently only an upheld dispute against a
+    /// confirmation). It subtracts a full [`EVENT_INCREMENT`], pulling the score
+    /// below where the member's clean events left it. Deliberately does *not*
+    /// touch `last_activity`: a penalty must not reset the decay clock and thereby
+    /// preserve more of the positive score it is meant to erode. A dimension with
+    /// no positive events stays at zero regardless — a dimension floors at zero,
+    /// so there is nothing below neutral to reach.
+    fn penalize(&mut self) {
+        self.penalties += 1;
+    }
+
+    /// The dimension's score as of `at_time`: capped linear accrual less its
+    /// penalties, then decayed from the most recent positive event, floored at
+    /// zero. Zero when there is no positive evidence.
     fn score(&self, at_time: i64) -> f32 {
         let Some(last) = self.last_activity else {
             return 0.0;
         };
-        let raw = (EVENT_INCREMENT * self.count as f32).min(DIMENSION_MAX);
-        decayed(raw, last, at_time)
+        let earned = (EVENT_INCREMENT * self.count as f32).min(DIMENSION_MAX);
+        let net = earned - EVENT_INCREMENT * self.penalties as f32;
+        // `decayed` floors at zero, so a net driven negative by penalties reads as
+        // a bottomed-out dimension rather than an impossible negative one.
+        decayed(net, last, at_time)
     }
 }
 
@@ -197,6 +238,7 @@ mod tests {
     use rrn_crypto::signed::SignedPayload;
     use rrn_identity::attestation::Attestation;
     use rrn_identity::vouch::{VouchBody, VouchKind};
+    use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
     use rrn_ledger::settlement::SettlementRecord;
     use rrn_ledger::state::{CancelReason, CancellationRecord};
     use rrn_ledger::transaction::TransactionProposal;
@@ -287,6 +329,55 @@ mod tests {
             .unwrap();
     }
 
+    /// Appends a proposal → confirmation → dispute → upheld-cancellation chain,
+    /// leaving the transaction `Cancelled { DisputeUpheld }`. The receiver is the
+    /// confirmer whose attestation is thereby proven wrong; `sender` raises the
+    /// dispute (a party).
+    fn append_disputed_upheld(
+        db: &Database,
+        sender: &Keypair,
+        receiver: &Keypair,
+        station: &Keypair,
+        nonce: u64,
+        confirmed_at: i64,
+        resolved_at: i64,
+    ) {
+        let mut log = AppendLog::new(db);
+        let proposal = TransactionProposal::new(
+            addr(sender),
+            addr(receiver),
+            300,
+            None,
+            nonce,
+            1,
+            i64::MAX / 2,
+        );
+        let pid = proposal.id;
+        log.append(SignedPayload::sign(proposal, sender)).unwrap();
+        let confirmation = TransactionConfirmation {
+            proposal_id: pid,
+            confirmer: addr(receiver),
+            confirmed_at,
+        };
+        log.append(SignedPayload::sign(confirmation, receiver))
+            .unwrap();
+        let dispute = DisputeRecord {
+            proposal_id: pid,
+            raiser: addr(sender),
+            reason: "goods never arrived".into(),
+            evidence_hash: None,
+            opened_at: confirmed_at,
+        };
+        log.append(SignedDispute::sign(dispute, sender)).unwrap();
+        let cancellation = CancellationRecord {
+            proposal_id: pid,
+            reason: CancelReason::DisputeUpheld,
+            cancelled_at: resolved_at,
+        };
+        log.append(SignedPayload::sign(cancellation, station))
+            .unwrap();
+    }
+
     /// Appends a vouch from `voucher` for `subject`, issued at `at`.
     fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
         let mut log = AppendLog::new(db);
@@ -357,6 +448,89 @@ mod tests {
         let p = ReputationScorer::new(&db).score(&addr(&alice), t).unwrap();
         assert!(approx(p.trade_reliability, 0.0));
         assert!(approx(p.attestation_accuracy, 0.0));
+    }
+
+    #[test]
+    fn an_upheld_dispute_dents_the_confirmers_attestation_accuracy() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let t = 10 * MONTH;
+
+        // Bob confirms two clean settled trades → 2 attestations, raw 1.0.
+        append_settled(&db, &alice, &bob, &station, 0, t);
+        append_settled(&db, &alice, &bob, &station, 1, t);
+        let base = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&bob), t)
+            .unwrap();
+        assert!(
+            approx(base.attestation_accuracy, 1.0),
+            "baseline attn = {}",
+            base.attestation_accuracy
+        );
+
+        // A third trade Bob confirmed is disputed and upheld against him. It earns
+        // no attestation credit (a cancelled state carries no confirmation) *and*
+        // levies a 0.5 penalty: 1.0 − 0.5 = 0.5, below the clean baseline.
+        append_disputed_upheld(&db, &alice, &bob, &station, 2, t, t);
+        let after = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&bob), t)
+            .unwrap();
+        assert!(
+            approx(after.attestation_accuracy, 0.5),
+            "dented attn = {}",
+            after.attestation_accuracy
+        );
+        // The raiser (alice) is untouched — the dent lands only on the confirmer.
+        let alice_p = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&alice), t)
+            .unwrap();
+        assert!(approx(alice_p.attestation_accuracy, 0.0));
+    }
+
+    #[test]
+    fn the_attestation_dent_applies_only_from_the_ruling_onward() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let t = 10 * MONTH;
+
+        // One clean confirmation by Bob at `t` (raw 0.5), plus a trade he
+        // confirmed at `t` that is upheld-disputed a month later.
+        let ruling = t + MONTH;
+        append_settled(&db, &alice, &bob, &station, 0, t);
+        append_disputed_upheld(&db, &alice, &bob, &station, 1, t, ruling);
+
+        // Scored at `t`, before the ruling: the disputed confirmation is not yet
+        // proven wrong, so no penalty — only the clean 0.5 remains (the disputed
+        // one already carries no confirmation credit). Scored at its own instant,
+        // so no decay either.
+        let before = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&bob), t)
+            .unwrap();
+        assert!(
+            approx(before.attestation_accuracy, 0.5),
+            "pre-ruling attn = {}",
+            before.attestation_accuracy
+        );
+
+        // Scored at the ruling: the 0.5 penalty applies, bottoming the dimension
+        // out at zero (a dimension floors at zero, not below) — 0.5 earned − 0.5
+        // penalty, then a month of decay, all floored.
+        let at_ruling = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&bob), ruling)
+            .unwrap();
+        assert!(
+            approx(at_ruling.attestation_accuracy, 0.0),
+            "at-ruling attn = {}",
+            at_ruling.attestation_accuracy
+        );
     }
 
     #[test]
