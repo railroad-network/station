@@ -1836,6 +1836,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrn-dispute"
+version = "0.1.0"
+dependencies = [
+ "dcbor",
+ "rrn-crypto",
+ "rrn-identity",
+ "rrn-ledger",
+ "rrn-reputation",
+ "rrn-storage",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "rrn-governance"
 version = "0.1.0"
 dependencies = [

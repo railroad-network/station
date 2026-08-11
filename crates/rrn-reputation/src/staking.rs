@@ -70,21 +70,32 @@ pub fn tier2_stake_centi(db: &Database, address: &Address, at_time: i64) -> Resu
     Ok(composite_to_centi(raw))
 }
 
-/// How many known members hold an **effective** (anchored) composite at or above
-/// the Member band as of `at_time` — the count the bootstrap grace turns on.
+/// Every known member holding an **effective** (anchored) composite at or above
+/// the Member band as of `at_time` — the community's established-member set. This
+/// is the same electorate governance ballots on ([ADR-0012]) and the pool a
+/// dispute jury is drawn from (ADR-0014).
 ///
-/// Scores every identity that appears on the log; `O(members)` full scorings, run
-/// only when a below-floor member attempts a Tier-2 confirmation, never on a hot
-/// path.
-pub fn established_member_count(db: &Database, at_time: i64) -> Result<usize> {
+/// Scores every identity that appears on the log; `O(members)` full scorings, so
+/// it is called off hot paths (grace checks, governance tallies, dispute draws),
+/// not per transaction. The *set* is derived from the canonical log and so is
+/// identical on every replica, but the returned **order is not** deterministic (it
+/// follows a hash-set iteration): a caller that needs a stable order — a dispute
+/// draw, say — must sort the result itself.
+pub fn established_members(db: &Database, at_time: i64) -> Result<Vec<Address>> {
     let scorer = ReputationScorer::new(db);
-    let mut count = 0;
+    let mut members = Vec::new();
     for address in known_addresses(db)? {
         if scorer.score(&address, at_time)?.composite() >= BAND_MEMBER_MIN {
-            count += 1;
+            members.push(address);
         }
     }
-    Ok(count)
+    Ok(members)
+}
+
+/// How many known members hold an **effective** (anchored) composite at or above
+/// the Member band as of `at_time` — the count the bootstrap grace turns on.
+pub fn established_member_count(db: &Database, at_time: i64) -> Result<usize> {
+    Ok(established_members(db, at_time)?.len())
 }
 
 /// The outcome of checking whether `confirmer` may confirm a Tier-2 transaction.

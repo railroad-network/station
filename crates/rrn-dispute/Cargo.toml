@@ -1,0 +1,31 @@
+[package]
+name = "rrn-dispute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dispute resolution for Railroad Network: a standing-weighted sortition jury over the ledger's frozen Disputed state (ADR-0014)."
+
+[dependencies]
+# Verdicts are signed and canonically encoded, and the sortition seed is a Blake3
+# hash — the same crypto surface the rest of the protocol uses.
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+# Verdicts append to, and the panel derives from, the append-only log.
+rrn-storage = { path = "../rrn-storage", version = "0.1" }
+# Jurors, parties, and vouchers are identities; a party's direct vouchers are
+# recused, read from the vouch graph on the log.
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# A dispute freezes and resolves a ledger transaction: this crate reads the
+# Disputed state and enacts an outcome through the ledger's uphold/settle
+# primitives (ADR-0014 §6).
+rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
+# The eligible jury pool is the established-member electorate, weighted by raw
+# standing — both read from `rrn-reputation`.
+rrn-reputation = { path = "../rrn-reputation", version = "0.1" }
+# Verdicts serialize to canonical CBOR so a tally is verifiable across machines.
+serde = { version = "1", features = ["derive"] }
+dcbor = "0.25"
+# Typed dispute errors, and diagnostics for the resolution sweep.
+thiserror = "1"
+tracing = "0.1"
