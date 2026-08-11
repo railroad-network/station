@@ -51,6 +51,7 @@ Decision Records) convention, using the structure in
 - [0011 — Oracle tier model for Phase 1](0011-oracle-tier-model-phase-1.md)
 - [0012 — Charter format and amendments](0012-charter-format-and-amendments.md)
 - [0013 — Federation/collapse transport is pluggable; Reticulum is the adopted backend, run as an external sidecar](0013-federation-transport-reticulum.md)
+- [0014 — Phase-1 dispute resolution: a sortition jury with a governance backstop, and the Tier-2 stake that finally bites](0014-phase-1-dispute-resolution.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.
