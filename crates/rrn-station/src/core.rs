@@ -20,6 +20,9 @@ use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
 use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_dispute::resolution::{append_verdict, find_disputed, resolve, Resolution};
+use rrn_dispute::verdict::{JurorVerdict, SignedVerdict};
+use rrn_dispute::DisputeParams;
 use rrn_governance::charter::{create_charter, store_charter, CharterParams};
 use rrn_governance::proposal::{
     append_cosign, append_proposal, Proposal, ProposalCosign, ProposalId, ProposalKind,
@@ -32,6 +35,7 @@ use rrn_identity::recovery::shamir::{RawShard, ShardIndex};
 use rrn_identity::vouch::{append_vouch, create_vouch, SignedVouch};
 use rrn_identity::wallet::WalletContents;
 use rrn_ledger::contract::{ContractCharge, ContractRef};
+use rrn_ledger::dispute::{DisputeRecord, DisputeResponse, SignedDispute, SignedDisputeResponse};
 use rrn_ledger::engine::Engine;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::TransactionState;
@@ -59,6 +63,7 @@ use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
 
 use crate::clock::Clock;
 use crate::contract_view;
+use crate::dispute_view;
 use crate::events::{self, Event};
 use crate::gossip::WireEntry;
 use crate::governance_view;
@@ -131,6 +136,13 @@ pub enum Command {
     /// a station-signed `ProposalImplemented`; reply with the number enacted (T1.9.7).
     EnactGovernance {
         /// Count of proposals enacted.
+        reply: oneshot::Sender<usize>,
+    },
+    /// Resolve every disputed transaction whose jury has reached a majority, and
+    /// lapse (settle as confirmed) any whose window has closed unresolved; reply
+    /// with the number of disputes given a terminal outcome (T1.10.5).
+    ResolveDisputes {
+        /// Count of disputes resolved (upheld, rejected, or lapsed) this pass.
         reply: oneshot::Sender<usize>,
     },
     /// Report this station's own address and current log tail seq (for the peer
@@ -305,6 +317,16 @@ impl CoreHandle {
     pub async fn enact_governance(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::EnactGovernance { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Triggers the dispute-resolution sweep; returns the number of disputes given
+    /// a terminal outcome (upheld, rejected, or lapsed).
+    pub async fn resolve_disputes(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::ResolveDisputes { reply }).is_err() {
             return 0;
         }
         rx.await.unwrap_or(0)
@@ -528,6 +550,10 @@ impl Core {
                     let n = self.do_enact_governance();
                     let _ = reply.send(n);
                 }
+                Command::ResolveDisputes { reply } => {
+                    let n = self.do_resolve_disputes();
+                    let _ = reply.send(n);
+                }
                 Command::Handshake { reply } => {
                     let tail = self.tail_seq();
                     let _ = reply.send((self.wallet.address.to_string(), tail));
@@ -637,6 +663,15 @@ impl Core {
             "governance_propose" => self.m_governance_propose(req),
             "governance_cosign" => self.m_governance_cosign(req),
             "governance_vote" => self.m_governance_vote(req),
+            // Operator-facing disputes (T1.10.5). Reads answer with the same
+            // views the mobile channel serves; the writes are signed by this
+            // station's own wallet, as `propose` and `vouch` are.
+            "disputes" => self.m_disputes(),
+            "dispute" => self.m_dispute(req),
+            "dispute_raise" => self.m_dispute_raise(req),
+            "dispute_respond" => self.m_dispute_respond(req),
+            "dispute_rule" => self.m_dispute_rule(req),
+            "dispute_resolve" => self.m_dispute_resolve(req),
             // Operator-facing pairing management (T1.3.3), invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
@@ -2233,6 +2268,163 @@ impl Core {
         Ok(serde_json::json!({ "ok": true }))
     }
 
+    // --- disputes (T1.10.5) ------------------------------------------------
+
+    /// The dispute-resolution parameters this station runs: the freeze window, a
+    /// juror's response deadline, and the panel size. Fixed at the Phase-1 defaults
+    /// (ADR-0014 says these are not governance-tunable yet); every dispute call
+    /// reads them from here so the draw, the seating, and the resolution all agree.
+    fn dispute_params(&self) -> DisputeParams {
+        DisputeParams::default()
+    }
+
+    /// The community value mixed into a dispute's sortition seed. In Phase 1 —
+    /// single community, no federation — an empty anchor is correct (ADR-0014 §2);
+    /// a stable per-community anchor drops in here when federation arrives, and
+    /// every dispute call routes through this one helper so they never disagree.
+    fn dispute_anchor(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn m_disputes(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let disputes = dispute_view::disputes_view(
+            &self.db,
+            &self.dispute_params(),
+            &self.dispute_anchor(),
+            self.clock.now(),
+        )
+        .map_err(dispute_err)?;
+        Ok(serde_json::json!({ "disputes": disputes }))
+    }
+
+    fn m_dispute(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeShowParams = parse_params(req)?;
+        let tx_id = parse_tx_id(&params.tx_id)?;
+        match dispute_view::dispute_view(
+            &self.db,
+            &tx_id,
+            &self.dispute_params(),
+            &self.dispute_anchor(),
+            self.clock.now(),
+        )
+        .map_err(dispute_err)?
+        {
+            Some(detail) => ok(&detail),
+            None => Err(invalid_params(format!(
+                "no live dispute for transaction {}",
+                params.tx_id
+            ))),
+        }
+    }
+
+    /// `dispute_raise` — contest a `Confirmed` transaction, signed by the station
+    /// wallet. Freezes settlement across the `Confirmed → Disputed` edge.
+    fn m_dispute_raise(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeRaiseParams = parse_params(req)?;
+        let tx_id = parse_tx_id(&params.tx_id)?;
+        let evidence_hash = parse_evidence_hash(&params.evidence_hash)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let record = DisputeRecord {
+            proposal_id: tx_id,
+            raiser: self.wallet.address,
+            reason: params.reason,
+            evidence_hash,
+            opened_at: now,
+        };
+        let signed = SignedDispute::sign(record, &station);
+        let mut engine = Engine::new(&self.db, station);
+        engine
+            .raise_dispute(signed, &self.settlement, now)
+            .map_err(ledger_err)?;
+        ok(&rpc::DisputeRaiseResult {
+            tx_id: params.tx_id,
+            state: "Disputed".into(),
+        })
+    }
+
+    /// `dispute_respond` — file the station wallet's side of a live dispute.
+    fn m_dispute_respond(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeRespondParams = parse_params(req)?;
+        let tx_id = parse_tx_id(&params.tx_id)?;
+        let evidence_hash = parse_evidence_hash(&params.evidence_hash)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let record = DisputeResponse {
+            proposal_id: tx_id,
+            responder: self.wallet.address,
+            statement: params.statement,
+            evidence_hash,
+            responded_at: now,
+        };
+        let signed = SignedDisputeResponse::sign(record, &station);
+        let mut engine = Engine::new(&self.db, station);
+        engine.respond_to_dispute(signed, now).map_err(ledger_err)?;
+        ok(&rpc::DisputeRespondResult {
+            tx_id: params.tx_id,
+        })
+    }
+
+    /// `dispute_rule` — cast the station wallet's juror verdict on a dispute. The
+    /// wallet must hold a live seat on the derived panel, which
+    /// [`append_verdict`] enforces.
+    fn m_dispute_rule(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeRuleParams = parse_params(req)?;
+        let tx_id = parse_tx_id(&params.tx_id)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let verdict = JurorVerdict {
+            proposal_id: tx_id,
+            juror: self.wallet.address,
+            uphold: params.uphold,
+            cast_at: now,
+        };
+        let signed = SignedVerdict::sign(verdict, &station);
+        append_verdict(
+            &self.db,
+            &self.dispute_params(),
+            &self.dispute_anchor(),
+            signed,
+            now,
+        )
+        .map_err(dispute_err)?;
+        ok(&rpc::DisputeRuleResult {
+            tx_id: params.tx_id,
+            uphold: params.uphold,
+        })
+    }
+
+    /// `dispute_resolve` — enact a terminal outcome, or lapse a dispute whose
+    /// window has closed. With a `tx_id`, resolves just that one; without,
+    /// sweeps every disputed transaction (the same work the resolution timer does).
+    fn m_dispute_resolve(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DisputeResolveParams = parse_params(req)?;
+        let ids = match &params.tx_id {
+            Some(hex) => vec![parse_tx_id(hex)?],
+            None => find_disputed(&self.db).map_err(dispute_err)?,
+        };
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let disp_params = self.dispute_params();
+        let anchor = self.dispute_anchor();
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            let outcome = resolve(&self.db, &station, &id, &disp_params, &anchor, now)
+                .map_err(dispute_err)?;
+            resolved.push(rpc::DisputeResolvedRow {
+                tx_id: id.0.to_string(),
+                resolution: resolution_name(outcome).to_string(),
+            });
+        }
+        ok(&rpc::DisputeResolveResult { resolved })
+    }
+
     // --- governance mobile writes (T1.9.7b) --------------------------------
 
     /// `governance_submit_proposal` — accept a mobile-signed governance
@@ -2305,6 +2497,94 @@ impl Core {
         Ok(serde_json::json!({ "ok": true }))
     }
 
+    // --- dispute mobile writes (T1.10.5) -----------------------------------
+
+    /// `submit_dispute` — accept a mobile-signed [`SignedDispute`] and raise it.
+    /// The party signs it on the phone; the station validates and records, freezing
+    /// the contested transaction. `params` carries the canonical dCBOR of the
+    /// signed dispute, hex-encoded.
+    fn channel_submit_dispute(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_dispute")?;
+        let signed: SignedDispute = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed dispute".into()))?;
+        // A mobile raises only its own dispute: the raiser must be the
+        // authenticated signer. (The engine independently checks the raiser is a
+        // party; this binds it to *this* paired mobile.)
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "dispute raiser is not the authenticated mobile".into(),
+            ));
+        }
+        let tx_id = signed.payload.proposal_id.0.to_string();
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let mut engine = Engine::new(&self.db, station);
+        engine
+            .raise_dispute(signed, &self.settlement, now)
+            .map_err(ledger_err_pair)?;
+        Ok(serde_json::json!({ "tx_id": tx_id, "state": "Disputed" }))
+    }
+
+    /// `submit_dispute_response` — accept a mobile-signed [`SignedDisputeResponse`].
+    fn channel_submit_dispute_response(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_response")?;
+        let signed: SignedDisputeResponse = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed response".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "responder is not the authenticated mobile".into(),
+            ));
+        }
+        let tx_id = signed.payload.proposal_id.0.to_string();
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let mut engine = Engine::new(&self.db, station);
+        engine
+            .respond_to_dispute(signed, now)
+            .map_err(ledger_err_pair)?;
+        Ok(serde_json::json!({ "tx_id": tx_id }))
+    }
+
+    /// `submit_verdict` — accept a mobile-signed [`SignedVerdict`] from a seated
+    /// juror. The signer must be the authenticated mobile, and hold a live seat on
+    /// the derived panel (which [`append_verdict`] enforces).
+    fn channel_submit_verdict(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_verdict")?;
+        let signed: SignedVerdict = rpc_envelope::parse_signed_record(&bytes)
+            .map_err(|_| (rpc::INVALID_PARAMS, "malformed signed verdict".into()))?;
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "juror is not the authenticated mobile".into(),
+            ));
+        }
+        let (tx_id, uphold) = (
+            signed.payload.proposal_id.0.to_string(),
+            signed.payload.uphold,
+        );
+        let now = self.clock.now();
+        append_verdict(
+            &self.db,
+            &self.dispute_params(),
+            &self.dispute_anchor(),
+            signed,
+            now,
+        )
+        .map_err(dispute_err_pair)?;
+        Ok(serde_json::json!({ "tx_id": tx_id, "uphold": uphold }))
+    }
+
     /// Puts every passed proposal whose implementation delay has run into force,
     /// appending a station-signed enactment record for each (T1.9.7). Returns the
     /// number enacted. Emergencies, whose delay is zero, are enacted the first
@@ -2319,6 +2599,36 @@ impl Core {
                 0
             }
         }
+    }
+
+    /// Resolves every disputed transaction whose jury has reached a majority, and
+    /// lapses (settles as confirmed) any whose window has closed with no ruling
+    /// (T1.10.5). Returns the number given a terminal outcome. A dispute still
+    /// inside its window with no majority is left `Pending` and untouched; a failing
+    /// resolution is logged and skipped so one bad dispute cannot stall the sweep.
+    fn do_resolve_disputes(&mut self) -> usize {
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let params = self.dispute_params();
+        let anchor = self.dispute_anchor();
+        let ids = match find_disputed(&self.db) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "dispute resolution sweep: listing disputes failed");
+                return 0;
+            }
+        };
+        let mut resolved = 0;
+        for id in ids {
+            match resolve(&self.db, &station, &id, &params, &anchor, now) {
+                Ok(Resolution::Pending) => {}
+                Ok(_) => resolved += 1,
+                Err(e) => {
+                    tracing::warn!(tx = ?id, error = %e, "dispute resolution failed");
+                }
+            }
+        }
+        resolved
     }
 
     fn station_keypair(&self) -> Keypair {
@@ -2561,6 +2871,12 @@ impl Core {
             "governance_submit_proposal" => self.channel_governance_submit_proposal(envelope),
             "governance_submit_cosign" => self.channel_governance_submit_cosign(envelope),
             "governance_submit_vote" => self.channel_governance_submit_vote(envelope),
+            // Dispute writes (T1.10.5): each carries a mobile-signed record whose
+            // signer must be the authenticated mobile. Reads fall through to the
+            // shared, signer-less dispatch below.
+            "submit_dispute" => self.channel_submit_dispute(envelope),
+            "submit_dispute_response" => self.channel_submit_dispute_response(envelope),
+            "submit_verdict" => self.channel_submit_verdict(envelope),
             "whoami"
             | "balance"
             | "transactions"
@@ -2568,7 +2884,9 @@ impl Core {
             | "governance_charter"
             | "governance_proposals"
             | "governance_proposal"
-            | "governance_statutes" => {
+            | "governance_statutes"
+            | "disputes"
+            | "dispute" => {
                 let params = serde_json::from_str(&envelope.params)
                     .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
                 let req = rpc::Request {
@@ -3578,6 +3896,15 @@ fn parse_tx_id(s: &str) -> Result<TransactionId, rpc::RpcError> {
     Ok(TransactionId(Hash::from_bytes(arr)))
 }
 
+/// Decodes an optional hex evidence hash from a dispute raise/response. An absent
+/// field means "no evidence attached"; a present one must be a valid 32-byte hash.
+fn parse_evidence_hash(s: &Option<String>) -> Result<Option<Hash>, rpc::RpcError> {
+    let Some(s) = s else { return Ok(None) };
+    Ok(Some(Hash::from_hex(s).map_err(|e| {
+        invalid_params(format!("invalid evidence hash: {e}"))
+    })?))
+}
+
 fn parse_proposal_id(s: &str) -> Result<ProposalId, rpc::RpcError> {
     let bytes = unhex(s).ok_or_else(|| invalid_params(format!("invalid proposal id {s:?}")))?;
     let arr: [u8; 32] = bytes
@@ -3773,6 +4100,37 @@ fn ledger_err(e: rrn_ledger::Error) -> rpc::RpcError {
 fn ledger_err_pair(e: rrn_ledger::Error) -> (i32, String) {
     let r = ledger_err(e);
     (r.code, r.message)
+}
+
+/// Maps a dispute-layer error to an RPC error, distinguishing caller mistakes
+/// (an unseated juror, a duplicate verdict, a transaction that is not disputed)
+/// from internal failures (storage, reputation). A nested ledger error routes
+/// through [`ledger_err`] so its own caller-vs-infra split is preserved.
+fn dispute_err(e: rrn_dispute::Error) -> rpc::RpcError {
+    use rrn_dispute::Error::*;
+    match e {
+        Storage(_) | Reputation(_) => internal(e),
+        Ledger(l) => ledger_err(l),
+        NotDisputed | BadVerdict | NotSeated | AlreadyVoted => invalid_params(e.to_string()),
+    }
+}
+
+/// The channel's `(code, message)` form of a dispute error, for the mobile
+/// write-path handlers that build a response envelope.
+fn dispute_err_pair(e: rrn_dispute::Error) -> (i32, String) {
+    let r = dispute_err(e);
+    (r.code, r.message)
+}
+
+/// The wire name for a resolution outcome — a stable string owned here, not a
+/// serde derive on the dispute layer's enum.
+fn resolution_name(r: Resolution) -> &'static str {
+    match r {
+        Resolution::Pending => "pending",
+        Resolution::Upheld => "upheld",
+        Resolution::Rejected => "rejected",
+        Resolution::Lapsed => "lapsed",
+    }
 }
 
 /// Pulls a hex-string field out of a JSON `params` object and decodes it to
@@ -4011,6 +4369,107 @@ mod tests {
         };
         let v = core.handle_call(&req).unwrap();
         assert_eq!(v["balance_centi"], 0);
+    }
+
+    // --- disputes (T1.10.5) -------------------------------------------------
+
+    /// Drives the operator dispute surface end to end without a jury: raise a
+    /// dispute over a confirmed transaction, read it back, respond, and let it
+    /// lapse to settled once its window closes (the fail-open default). A full
+    /// rule→resolve with a seated jury is covered in `rrn-dispute`'s tests, which
+    /// need the reputation seeding this unit core lacks.
+    #[test]
+    fn dispute_lifecycle_over_rpc_raise_read_respond_and_lapse() {
+        let mut core = test_core();
+        let station_addr = core.wallet.address.to_string();
+        let station = core.station_keypair();
+        let bob = Keypair::generate();
+        let bob_addr = Address::from_public_key(bob.public_key());
+
+        // Station proposes a small (Tier-1) payment to bob; bob confirms it. Bob's
+        // confirmation is signed directly — the RPC `confirm` is station-as-receiver
+        // only, and here the station is the sender.
+        let proposed = call(
+            &mut core,
+            "propose",
+            serde_json::json!({ "receiver": bob_addr.to_string(), "amount_centi": 100 }),
+        );
+        let tx_id = proposed["tx_id"].as_str().unwrap().to_string();
+        let now = core.clock.now();
+        let confirmation = TransactionConfirmation {
+            proposal_id: parse_tx_id(&tx_id).unwrap(),
+            confirmer: bob_addr,
+            confirmed_at: now,
+        };
+        Engine::new(&core.db, station.clone())
+            .submit_confirmation(SignedConfirmation::sign(confirmation, &bob), now)
+            .unwrap();
+
+        // Raise a dispute over RPC (station-signed; the station is the sender, a party).
+        let raised = call(
+            &mut core,
+            "dispute_raise",
+            serde_json::json!({ "tx_id": tx_id, "reason": "never delivered" }),
+        );
+        assert_eq!(raised["state"], "Disputed");
+
+        // It shows in the browse list and the detail read, pending (no jury seated).
+        let list = call(&mut core, "disputes", serde_json::json!({}));
+        assert_eq!(list["disputes"].as_array().unwrap().len(), 1);
+        let detail = call(&mut core, "dispute", serde_json::json!({ "tx_id": tx_id }));
+        assert_eq!(detail["resolution"], "pending");
+        assert_eq!(detail["raiser"], station_addr);
+
+        // The station files a response; it appears on the dispute.
+        call(
+            &mut core,
+            "dispute_respond",
+            serde_json::json!({ "tx_id": tx_id, "statement": "it was delivered on time" }),
+        );
+        let detail = call(&mut core, "dispute", serde_json::json!({ "tx_id": tx_id }));
+        assert_eq!(detail["responses"].as_array().unwrap().len(), 1);
+
+        // Advance past the freeze window; a resolve sweep lapses it to settled.
+        core.clock
+            .advance(rrn_dispute::DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+        let resolved = call(&mut core, "dispute_resolve", serde_json::json!({}));
+        assert_eq!(resolved["resolved"][0]["resolution"], "lapsed");
+
+        // No longer disputed; it is settled and off the disputes list.
+        assert!(
+            call(&mut core, "disputes", serde_json::json!({}))["disputes"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            Engine::new(&core.db, station)
+                .get_state(&parse_tx_id(&tx_id).unwrap())
+                .unwrap(),
+            Some(TransactionState::Settled { .. })
+        ));
+    }
+
+    #[test]
+    fn raising_a_dispute_on_an_unknown_transaction_is_rejected() {
+        let mut core = test_core();
+        let err = call_err(
+            &mut core,
+            "dispute_raise",
+            serde_json::json!({ "tx_id": "00".repeat(32), "reason": "x" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn reading_a_dispute_that_does_not_exist_is_rejected() {
+        let mut core = test_core();
+        let err = call_err(
+            &mut core,
+            "dispute",
+            serde_json::json!({ "tx_id": "00".repeat(32) }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
     }
 
     // --- marketplace wiring (T1.7.0) ----------------------------------------

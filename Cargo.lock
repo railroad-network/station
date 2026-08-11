@@ -1970,6 +1970,7 @@ dependencies = [
  "mdns-sd",
  "rpassword",
  "rrn-crypto",
+ "rrn-dispute",
  "rrn-governance",
  "rrn-identity",
  "rrn-ledger",

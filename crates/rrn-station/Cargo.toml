@@ -29,6 +29,7 @@ rrn-reputation = { path = "../rrn-reputation", version = "0.1" }
 rrn-marketplace = { path = "../rrn-marketplace", version = "0.1" }
 # Governance (M1.9): the enactment sweep that puts passed proposals into force.
 rrn-governance = { path = "../rrn-governance", version = "0.1" }
+rrn-dispute = { path = "../rrn-dispute", version = "0.1" }
 
 tokio = { version = "1", features = ["full"] }
 # The mobile-facing HTTP surface (ADR-0008 / T1.3.3+): plain HTTP over local

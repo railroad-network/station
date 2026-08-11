@@ -274,6 +274,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // Dispute-resolution sweep timer (T1.10.5).
+        tasks.push(tokio::spawn(dispute_resolution_timer(
+            Duration::from_secs(config.timers.dispute_resolution_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -343,6 +350,14 @@ impl Station {
     /// hourly timer.
     pub async fn enact_governance(&self) -> usize {
         self.core.enact_governance().await
+    }
+
+    /// Forces an immediate dispute-resolution sweep; returns the number of
+    /// disputes given a terminal outcome. Lets a driver advance the clock past a
+    /// jury's majority (or a window's close) and see the outcome enacted without
+    /// waiting on the hourly timer.
+    pub async fn resolve_disputes(&self) -> usize {
+        self.core.resolve_disputes().await
     }
 
     /// Signals all tasks to stop, stops the core thread, awaits the tasks, and
@@ -521,6 +536,38 @@ async fn governance_implementation_timer(
                 let n = core.enact_governance().await;
                 if n > 0 {
                     tracing::info!(enacted = n, "governance enactment sweep");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically asks the core to resolve disputes: enact the outcome of any whose
+/// jury has reached a majority, and lapse (settle as confirmed) any whose window
+/// has closed unresolved (T1.10.5).
+///
+/// Like the governance-enactment sweep, this is what turns a decided dispute into
+/// a recorded fact. A missed tick is caught up on the next — the sweep resolves
+/// every dispute now terminal, not just the newest — and a dispute already moved
+/// out of `Disputed` is skipped.
+async fn dispute_resolution_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick, as the other timers do.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.resolve_disputes().await;
+                if n > 0 {
+                    tracing::info!(resolved = n, "dispute resolution sweep");
                 }
             }
             _ = shutdown.changed() => {

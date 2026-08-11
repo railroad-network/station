@@ -779,3 +779,106 @@ pub struct GovVoteParams {
     /// `yes`, `no`, or `abstain`.
     pub choice: String,
 }
+
+// --- Disputes (T1.10.5) -----------------------------------------------------
+//
+// The operator-facing half of the dispute layer. The writes (`dispute_raise`,
+// `dispute_respond`, `dispute_rule`) are signed by the **station's own wallet**,
+// as `propose`/`vouch`/`governance_*` are; a mobile signs its own record and
+// submits it over the channel (`submit_dispute` / `submit_dispute_response` /
+// `submit_verdict`). `dispute_resolve` is operator-only — it enacts a terminal
+// outcome or lets a dispute lapse, the same sweep the resolution timer runs.
+// Reads answer with the [`crate::dispute_view`] shapes, so a dispute means one
+// thing whoever asks for it.
+
+/// `dispute_raise` params — contest a `Confirmed` transaction (daemon-signed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeRaiseParams {
+    /// The hex id of the confirmed transaction to contest.
+    pub tx_id: String,
+    /// A bounded free-text statement of the grievance.
+    pub reason: String,
+    /// Optional hex content hash of out-of-band evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_hash: Option<String>,
+}
+
+/// `dispute_raise` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeRaiseResult {
+    /// The disputed transaction's id, hex-encoded.
+    pub tx_id: String,
+    /// The transaction's state after raising (`"Disputed"`).
+    pub state: String,
+}
+
+/// `dispute_respond` params — a party's reply to a live dispute (daemon-signed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeRespondParams {
+    /// The hex id of the disputed transaction to respond to.
+    pub tx_id: String,
+    /// A bounded free-text statement of the responder's side.
+    pub statement: String,
+    /// Optional hex content hash of out-of-band evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_hash: Option<String>,
+}
+
+/// `dispute_respond` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeRespondResult {
+    /// The disputed transaction's id, hex-encoded.
+    pub tx_id: String,
+}
+
+/// `dispute_rule` params — a seated juror's verdict (daemon-signed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeRuleParams {
+    /// The hex id of the disputed transaction being ruled on.
+    pub tx_id: String,
+    /// `true` upholds the dispute (voids the transfer), `false` rejects it.
+    pub uphold: bool,
+}
+
+/// `dispute_rule` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeRuleResult {
+    /// The disputed transaction's id, hex-encoded.
+    pub tx_id: String,
+    /// The ruling recorded: `true` upheld, `false` rejected.
+    pub uphold: bool,
+}
+
+/// `dispute_resolve` params — enact a terminal outcome or lapse. With no
+/// `tx_id`, sweeps every disputed transaction; with one, resolves just that one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DisputeResolveParams {
+    /// The hex id of a single disputed transaction to resolve, or `None` to
+    /// sweep them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<String>,
+}
+
+/// One transaction's resolution outcome in a `dispute_resolve` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeResolvedRow {
+    /// The disputed transaction's id, hex-encoded.
+    pub tx_id: String,
+    /// The outcome this pass: `pending`, `upheld`, `rejected`, or `lapsed`.
+    pub resolution: String,
+}
+
+/// `dispute_resolve` result — the outcome of each transaction the pass touched.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeResolveResult {
+    /// One row per disputed transaction the sweep resolved (or a single row when
+    /// a `tx_id` was given).
+    pub resolved: Vec<DisputeResolvedRow>,
+}
+
+/// `dispute` params — one dispute in full, by disputed-transaction id.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisputeShowParams {
+    /// The hex id of the disputed transaction.
+    pub tx_id: String,
+}

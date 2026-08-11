@@ -181,6 +181,16 @@ pub struct TimersSection {
     /// and the sweep catches up every proposal due since the last tick.
     #[serde(default = "default_governance_implementation_interval")]
     pub governance_implementation_interval_secs: u64,
+    /// Dispute-resolution sweep interval in seconds (default: 3600 — hourly).
+    ///
+    /// Enacts a dispute whose jury has reached a majority, and lapses one whose
+    /// window has closed unresolved (T1.10.5). Coarse on purpose: the freeze window
+    /// is measured in days, so an hour of latency writing the outcome down changes
+    /// nothing a party would notice, and the sweep catches up every dispute due
+    /// since the last tick. A test drives it directly through
+    /// [`resolve_disputes`](crate::core::CoreHandle::resolve_disputes).
+    #[serde(default = "default_dispute_resolution_interval")]
+    pub dispute_resolution_interval_secs: u64,
 }
 
 fn default_tier1_window_seconds() -> u64 {
@@ -210,6 +220,9 @@ fn default_contract_charge_interval() -> u64 {
 fn default_governance_implementation_interval() -> u64 {
     3600
 }
+fn default_dispute_resolution_interval() -> u64 {
+    3600
+}
 
 impl Default for SettlementSection {
     fn default() -> Self {
@@ -231,6 +244,7 @@ impl Default for TimersSection {
             inquiry_expiry_interval_secs: default_inquiry_expiry_interval(),
             contract_charge_interval_secs: default_contract_charge_interval(),
             governance_implementation_interval_secs: default_governance_implementation_interval(),
+            dispute_resolution_interval_secs: default_dispute_resolution_interval(),
         }
     }
 }

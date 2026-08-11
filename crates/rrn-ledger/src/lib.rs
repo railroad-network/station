@@ -135,10 +135,14 @@ pub enum Error {
     /// early (before it confirmed) or too late (after it should have settled).
     #[error("dispute opened outside the transaction's settlement window")]
     DisputeWindowClosed,
-    /// The dispute's free-text reason exceeds
+    /// The dispute's free-text reason (or a response's statement) exceeds
     /// [`MAX_DISPUTE_REASON_BYTES`](dispute::MAX_DISPUTE_REASON_BYTES).
     #[error("dispute reason exceeds the maximum length")]
     DisputeReasonTooLong,
+    /// The responder has already filed a response to this dispute; a party may
+    /// respond at most once (bounds log growth from a frozen transaction).
+    #[error("this party has already responded to the dispute")]
+    AlreadyResponded,
     /// A derived [`state::TransactionState`] failed its internal integrity check
     /// (e.g. an embedded signature did not verify).
     #[error("invalid transaction state: {0}")]

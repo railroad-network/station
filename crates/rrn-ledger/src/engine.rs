@@ -18,7 +18,7 @@ use rrn_crypto::keypair::Keypair;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
-use crate::dispute::SignedDispute;
+use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
 use crate::settlement::SettlementConfig;
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
 use crate::transaction::{SignedConfirmation, SignedProposal, TransactionId};
@@ -258,6 +258,55 @@ impl<'db> Engine<'db> {
             &self.station,
         ))?;
         tracing::info!(tx = ?tx_id, "dispute upheld: transfer voided");
+        Ok(())
+    }
+
+    /// Records a party's signed response to a live dispute — their side of the
+    /// story for the jury (ADR-0014 §1). Appends the [`SignedDisputeResponse`]
+    /// after validating, without writing on failure. Unlike raising a dispute,
+    /// this changes no ledger state; the transaction stays `Disputed`.
+    ///
+    /// Errors on a bad signature, an over-long statement, an unknown or
+    /// non-`Disputed` transaction, a responder who is not a party (or did not sign
+    /// it), a response dated implausibly into the future, or a party who has
+    /// already responded (one response per party — [`Error::AlreadyResponded`]).
+    pub fn respond_to_dispute(&mut self, response: SignedDisputeResponse, now: i64) -> Result<()> {
+        response.verify().map_err(|_| Error::BadSignature)?;
+        let r = &response.payload;
+        if !r.statement_within_bound() {
+            return Err(Error::DisputeReasonTooLong);
+        }
+        if r.responded_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::FutureDated);
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let proposal = match snapshot.get(&r.proposal_id) {
+            Some(TransactionState::Disputed { proposal, .. }) => proposal,
+            Some(_) => return Err(Error::NotDisputed),
+            None => return Err(Error::UnknownTransaction),
+        };
+        let p = &proposal.payload;
+
+        // Only a party may respond, and they must have signed the response.
+        if (r.responder != p.sender && r.responder != p.receiver)
+            || &response.signer != r.responder.public_key()
+        {
+            return Err(Error::NotAParty);
+        }
+
+        // One response per party: the record is a bounded statement, but an
+        // unbounded stream of them would let a frozen transaction bloat the log.
+        if dispute_responses(self.db, &r.proposal_id)?
+            .iter()
+            .any(|existing| existing.responder == r.responder)
+        {
+            return Err(Error::AlreadyResponded);
+        }
+
+        let (proposal_id, responder) = (r.proposal_id, r.responder);
+        AppendLog::new(self.db).append(response)?;
+        tracing::info!(tx = ?proposal_id, ?responder, "dispute response recorded");
         Ok(())
     }
 
@@ -707,6 +756,131 @@ mod tests {
         let id = confirmed(&mut engine, &alice, &bob, 200);
         assert!(matches!(
             engine.uphold_dispute(&id, 400),
+            Err(Error::NotDisputed)
+        ));
+    }
+
+    fn signed_response(
+        id: TransactionId,
+        responder: &Keypair,
+        responded_at: i64,
+    ) -> SignedDisputeResponse {
+        let r = crate::dispute::DisputeResponse {
+            proposal_id: id,
+            responder: addr(responder),
+            statement: "the goods were delivered on time".into(),
+            evidence_hash: None,
+            responded_at,
+        };
+        SignedDisputeResponse::sign(r, responder)
+    }
+
+    /// Confirms a transaction and freezes it with a dispute the sender raised,
+    /// returning its id in the `Disputed` state.
+    fn disputed(
+        engine: &mut Engine,
+        alice: &Keypair,
+        bob: &Keypair,
+        cfg: &SettlementConfig,
+    ) -> TransactionId {
+        let id = confirmed(engine, alice, bob, 200);
+        engine
+            .raise_dispute(signed_dispute(id, alice, 300), cfg, 300)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn counterparty_can_respond_to_a_dispute() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = disputed(&mut engine, &alice, &bob, &cfg);
+        // The receiver (the confirmer under contest) states their side.
+        engine
+            .respond_to_dispute(signed_response(id, &bob, 400), 400)
+            .unwrap();
+        // A response changes no state — the transaction stays frozen.
+        assert!(matches!(
+            engine.get_state(&id).unwrap(),
+            Some(TransactionState::Disputed { .. })
+        ));
+        let responses = crate::dispute::dispute_responses(&db, &id).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].responder, addr(&bob));
+    }
+
+    #[test]
+    fn a_stranger_cannot_respond() {
+        let db = fresh_db();
+        let (alice, bob, mallory, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = disputed(&mut engine, &alice, &bob, &cfg);
+        assert!(matches!(
+            engine.respond_to_dispute(signed_response(id, &mallory, 400), 400),
+            Err(Error::NotAParty)
+        ));
+        assert!(crate::dispute::dispute_responses(&db, &id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_party_responds_only_once() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = SettlementConfig::uniform(10_000);
+
+        let id = disputed(&mut engine, &alice, &bob, &cfg);
+        engine
+            .respond_to_dispute(signed_response(id, &bob, 400), 400)
+            .unwrap();
+        assert!(matches!(
+            engine.respond_to_dispute(signed_response(id, &bob, 500), 500),
+            Err(Error::AlreadyResponded)
+        ));
+        // Both parties may respond, so the raiser adding their own is fine.
+        engine
+            .respond_to_dispute(signed_response(id, &alice, 500), 500)
+            .unwrap();
+        assert_eq!(
+            crate::dispute::dispute_responses(&db, &id).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn responding_requires_a_disputed_transaction() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // Confirmed but never disputed.
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        assert!(matches!(
+            engine.respond_to_dispute(signed_response(id, &bob, 400), 400),
             Err(Error::NotDisputed)
         ));
     }

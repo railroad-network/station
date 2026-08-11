@@ -16,14 +16,16 @@ use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
+use rrn_station::dispute_view::{DisputeDetail, DisputeSummary};
 use rrn_station::governance_view::{CharterView, ProposalDetail, ProposalSummary, StatuteSummary};
 use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    ContractStateResult, CreateListingResult, EditListingResult, GovCharterResult, GovCosignResult,
-    GovProposeResult, HistoryResult, InquireResult, InquiryStateResult, ProposeResult,
-    RecoverImportResult, TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
+    ContractStateResult, CreateListingResult, DisputeRaiseResult, DisputeResolveResult,
+    DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult, GovProposeResult,
+    HistoryResult, InquireResult, InquiryStateResult, ProposeResult, RecoverImportResult,
+    TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -373,6 +375,57 @@ enum Command {
     Governance {
         #[command(subcommand)]
         cmd: GovernanceCmd,
+    },
+    /// Disputes: contest a confirmed payment, respond, rule as a juror, resolve
+    /// (M1.10).
+    Dispute {
+        #[command(subcommand)]
+        cmd: DisputeCmd,
+    },
+}
+
+/// The `rrn dispute …` subcommands (T1.10.5).
+#[derive(Subcommand)]
+enum DisputeCmd {
+    /// List the disputes currently frozen, with their live jury tally.
+    List,
+    /// Show one dispute in full: grievance, responses, and the seated jury.
+    Show {
+        /// The hex id of the disputed transaction.
+        tx_id: String,
+    },
+    /// Contest a confirmed transaction, freezing its settlement (station-signed).
+    Raise {
+        /// The hex id of the confirmed transaction to contest.
+        tx_id: String,
+        /// A bounded statement of the grievance.
+        reason: String,
+        /// Optional hex content hash of out-of-band evidence.
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// File the station wallet's side of a live dispute (station-signed).
+    Respond {
+        /// The hex id of the disputed transaction.
+        tx_id: String,
+        /// A bounded statement of your side.
+        statement: String,
+        /// Optional hex content hash of out-of-band evidence.
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// Cast the station wallet's juror verdict (must hold a live seat).
+    Rule {
+        /// The hex id of the disputed transaction.
+        tx_id: String,
+        /// `uphold` (void the transfer) or `reject` (let it settle).
+        ruling: String,
+    },
+    /// Enact terminal outcomes and lapse expired disputes. With no `tx_id`,
+    /// sweeps them all; with one, resolves just that dispute.
+    Resolve {
+        /// The hex id of a single disputed transaction to resolve.
+        tx_id: Option<String>,
     },
 }
 
@@ -894,6 +947,7 @@ async fn run(cli: Cli) -> Result<()> {
             })
         }
         Command::Governance { cmd } => cmd_governance(&client, fmt, color, cmd).await,
+        Command::Dispute { cmd } => cmd_dispute(&client, fmt, color, cmd).await,
     }
 }
 
@@ -987,6 +1041,90 @@ async fn cmd_governance(
         GovernanceCmd::Statutes => {
             let v = client.call("governance_statutes", json!({})).await?;
             emit(fmt, &v, || Ok(render_statutes(&v["statutes"])))
+        }
+    }
+}
+
+/// Dispatches `rrn dispute …` to the daemon's `dispute*` methods.
+async fn cmd_dispute(
+    client: &UnixClient,
+    fmt: Format,
+    color: ColorMode,
+    cmd: DisputeCmd,
+) -> Result<()> {
+    match cmd {
+        DisputeCmd::List => {
+            let v = client.call("disputes", json!({})).await?;
+            emit(fmt, &v, || Ok(render_disputes(&v["disputes"], color)))
+        }
+        DisputeCmd::Show { tx_id } => {
+            let v = client.call("dispute", json!({ "tx_id": tx_id })).await?;
+            emit(fmt, &v, || Ok(render_dispute_detail(&v)))
+        }
+        DisputeCmd::Raise {
+            tx_id,
+            reason,
+            evidence,
+        } => {
+            let mut params = json!({ "tx_id": tx_id, "reason": reason });
+            if let Some(evidence) = evidence {
+                params["evidence_hash"] = json!(evidence);
+            }
+            let v = client.call("dispute_raise", params).await?;
+            emit(fmt, &v, || {
+                let r: DisputeRaiseResult = parse(&v)?;
+                Ok(format!("{} {}", r.state, r.tx_id))
+            })
+        }
+        DisputeCmd::Respond {
+            tx_id,
+            statement,
+            evidence,
+        } => {
+            let mut params = json!({ "tx_id": tx_id, "statement": statement });
+            if let Some(evidence) = evidence {
+                params["evidence_hash"] = json!(evidence);
+            }
+            let v = client.call("dispute_respond", params).await?;
+            emit(fmt, &v, || Ok("response recorded".to_string()))
+        }
+        DisputeCmd::Rule { tx_id, ruling } => {
+            let uphold = match ruling.as_str() {
+                "uphold" => true,
+                "reject" => false,
+                other => anyhow::bail!("ruling must be `uphold` or `reject`, got {other:?}"),
+            };
+            let v = client
+                .call("dispute_rule", json!({ "tx_id": tx_id, "uphold": uphold }))
+                .await?;
+            emit(fmt, &v, || {
+                let r: DisputeRuleResult = parse(&v)?;
+                Ok(format!(
+                    "verdict recorded: {}",
+                    if r.uphold { "uphold" } else { "reject" }
+                ))
+            })
+        }
+        DisputeCmd::Resolve { tx_id } => {
+            let params = match tx_id {
+                Some(tx_id) => json!({ "tx_id": tx_id }),
+                None => json!({}),
+            };
+            let v = client.call("dispute_resolve", params).await?;
+            emit(fmt, &v, || {
+                let r: DisputeResolveResult = parse(&v)?;
+                if r.resolved.is_empty() {
+                    return Ok("no disputes to resolve".to_string());
+                }
+                Ok(r.resolved
+                    .iter()
+                    .map(|row| {
+                        let short: String = row.tx_id.chars().take(12).collect();
+                        format!("{}  {}", short, row.resolution)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            })
         }
     }
 }
@@ -1177,6 +1315,80 @@ fn render_statutes(statutes: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// --- dispute text rendering (T1.10.5) ---------------------------------------
+
+/// One dispute per line: id, resolution status, jury tally, grievance.
+fn render_disputes(disputes: &serde_json::Value, color: ColorMode) -> String {
+    let rows: Vec<DisputeSummary> = serde_json::from_value(disputes.clone()).unwrap_or_default();
+    if rows.is_empty() {
+        return "no open disputes".to_string();
+    }
+    rows.iter()
+        .map(|d| dispute_line(d, color))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn dispute_line(d: &DisputeSummary, color: ColorMode) -> String {
+    let short: String = d.tx_id.chars().take(12).collect();
+    let t = &d.tally;
+    format!(
+        "{}  {:<9}  {} up/{} rej/{} wait (of {})  {}",
+        paint(color, DIM, &short),
+        d.resolution,
+        t.uphold,
+        t.reject,
+        t.awaiting,
+        t.panel_size,
+        paint(color, BOLD, &d.reason),
+    )
+}
+
+/// One dispute in full: header, window, parties, jury, responses.
+fn render_dispute_detail(v: &serde_json::Value) -> String {
+    let d: DisputeDetail = match serde_json::from_value(v.clone()) {
+        Ok(d) => d,
+        Err(_) => return "—".to_string(),
+    };
+    let s = &d.summary;
+    let t = &s.tally;
+    let mut out = format!(
+        "dispute on {}\n  status:   {}\n  raiser:   {}\n  sender:   {}\n  receiver: {}\n  window:   opened {} → closes {}\n  reason:   {}\n  jury:     {} uphold / {} reject / {} awaiting  (panel {}, pool {})",
+        s.tx_id,
+        s.resolution,
+        s.raiser,
+        s.sender,
+        s.receiver,
+        s.opened_at,
+        s.window_ends_at,
+        s.reason,
+        t.uphold,
+        t.reject,
+        t.awaiting,
+        t.panel_size,
+        d.eligible_pool_size,
+    );
+    if let Some(hash) = &s.evidence_hash {
+        out.push_str(&format!("\n  evidence: {hash}"));
+    }
+    if d.panel.is_empty() {
+        out.push_str("\n  seats:    (no jury seated — pool too small)");
+    } else {
+        for seat in &d.panel {
+            let short: String = seat.juror.chars().take(16).collect();
+            out.push_str(&format!(
+                "\n  seat:     {}…  {}  (seated {})",
+                short, seat.verdict, seat.seated_at
+            ));
+        }
+    }
+    for r in &d.responses {
+        let short: String = r.responder.chars().take(16).collect();
+        out.push_str(&format!("\n  response: {}…  {}", short, r.statement));
+    }
+    out
 }
 
 fn yesno(b: bool) -> &'static str {

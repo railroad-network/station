@@ -19,8 +19,11 @@
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
+use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
+use rrn_storage::db::Database;
+use rrn_storage::log::AppendLog;
 use serde::{Deserialize, Serialize};
 
 use crate::transaction::TransactionId;
@@ -164,6 +167,110 @@ impl TryFrom<CBOR> for DisputeRecord {
     }
 }
 
+/// Discriminant string carried in a dispute-response record's canonical CBOR.
+pub(crate) const DISPUTE_RESPONSE_KIND: &str = "rrn.tx.dispute.response";
+
+/// A party's signed reply to a dispute raised against a transaction they are a
+/// party to — the counterparty's side of the story for the jury to weigh.
+///
+/// Where a [`DisputeRecord`] *opens* a dispute and drives the `Confirmed →
+/// Disputed` edge, a response changes no ledger state: it records argument and
+/// evidence onto the log while the transaction is frozen. Either party may
+/// respond, at most once each — [`respond_to_dispute`](crate::engine::Engine::respond_to_dispute)
+/// enforces the one-per-party cap so the record cannot be used to bloat the log —
+/// and jurors read the responses alongside the opening reason. Mirrors
+/// [`DisputeRecord`] in shape (bounded statement plus an optional evidence hash)
+/// and in serde/CBOR handling so it embeds and travels the same way.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DisputeResponse {
+    /// The disputed transaction this responds to.
+    pub proposal_id: TransactionId,
+    /// The party responding (must be the transaction's sender or receiver).
+    pub responder: Address,
+    /// A bounded free-text statement of their side
+    /// (≤ [`MAX_DISPUTE_REASON_BYTES`]).
+    pub statement: String,
+    /// Optional content hash of out-of-band evidence. `None` for a
+    /// statement-only response.
+    pub evidence_hash: Option<Hash>,
+    /// Unix seconds when the response was made.
+    pub responded_at: i64,
+}
+
+impl DisputeResponse {
+    /// Whether `statement` is within the Phase-1 bound. A response with an
+    /// over-long statement is rejected at append time (`DisputeReasonTooLong`).
+    pub fn statement_within_bound(&self) -> bool {
+        self.statement.len() <= MAX_DISPUTE_REASON_BYTES
+    }
+}
+
+/// A [`DisputeResponse`] signed by the party who made it.
+pub type SignedDisputeResponse = SignedPayload<DisputeResponse>;
+
+impl From<DisputeResponse> for CBOR {
+    fn from(r: DisputeResponse) -> Self {
+        let mut m = Map::new();
+        m.insert("kind", DISPUTE_RESPONSE_KIND);
+        m.insert("proposal_id", r.proposal_id);
+        m.insert("responder", r.responder);
+        m.insert("statement", r.statement);
+        // Omit-when-`None`, matching `DisputeRecord`'s evidence handling.
+        if let Some(hash) = r.evidence_hash {
+            m.insert("evidence_hash", EvidenceHash(hash));
+        }
+        m.insert("responded_at", r.responded_at);
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for DisputeResponse {
+    type Error = dcbor::Error;
+
+    fn try_from(cbor: CBOR) -> std::result::Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        if map.extract::<&str, String>("kind")? != DISPUTE_RESPONSE_KIND {
+            return Err(dcbor::Error::WrongType);
+        }
+        Ok(DisputeResponse {
+            proposal_id: map.extract::<&str, TransactionId>("proposal_id")?,
+            responder: map.extract::<&str, Address>("responder")?,
+            statement: map.extract::<&str, String>("statement")?,
+            evidence_hash: map.get::<&str, EvidenceHash>("evidence_hash").map(|e| e.0),
+            responded_at: map.extract::<&str, i64>("responded_at")?,
+        })
+    }
+}
+
+/// Every response appended against `tx_id`, in log (chronological) order.
+///
+/// A thin replay read, like the dispute layer's verdict scan: whether a response
+/// *counts* — its signer is a party who had not already responded — was decided
+/// when it was appended (see
+/// [`respond_to_dispute`](crate::engine::Engine::respond_to_dispute)), so a reader
+/// can take the log at face value here. A non-response log entry fails the CBOR
+/// decode and is skipped.
+pub fn dispute_responses(
+    db: &Database,
+    tx_id: &TransactionId,
+) -> crate::Result<Vec<DisputeResponse>> {
+    let log = AppendLog::new(db);
+    let mut out = Vec::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(response) = from_canonical_bytes::<DisputeResponse>(&entry.payload.bytes) else {
+            continue;
+        };
+        if response.proposal_id == *tx_id {
+            out.push(response);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +334,56 @@ mod tests {
         };
         assert!(!cfg.has_lapsed(1_000, 1_099));
         assert!(cfg.has_lapsed(1_000, 1_100));
+    }
+
+    fn sample_response(evidence: Option<Hash>) -> DisputeResponse {
+        let responder = Keypair::generate();
+        DisputeResponse {
+            proposal_id: TransactionId(Hash::of(b"tx")),
+            responder: Address::from_public_key(responder.public_key()),
+            statement: "the goods were delivered on time".into(),
+            evidence_hash: evidence,
+            responded_at: 1_800,
+        }
+    }
+
+    #[test]
+    fn response_roundtrip_without_evidence() {
+        let rec = sample_response(None);
+        let bytes = to_canonical_bytes(rec.clone());
+        // A statement-only response must not carry the evidence key at all.
+        assert!(!bytes
+            .windows(b"evidence_hash".len())
+            .any(|w| w == b"evidence_hash"));
+        let decoded: DisputeResponse = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(rec, decoded);
+    }
+
+    #[test]
+    fn response_roundtrip_with_evidence() {
+        let rec = sample_response(Some(Hash::of(b"proof.jpg")));
+        let bytes = to_canonical_bytes(rec.clone());
+        let decoded: DisputeResponse = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(rec, decoded);
+        assert_eq!(decoded.evidence_hash, Some(Hash::of(b"proof.jpg")));
+    }
+
+    #[test]
+    fn response_and_dispute_do_not_cross_decode() {
+        // The two records share fields but carry distinct kind tags, so neither
+        // decodes as the other (the `dispute_responses` scan relies on this).
+        let dispute_bytes = to_canonical_bytes(sample(None));
+        assert!(from_canonical_bytes::<DisputeResponse>(&dispute_bytes).is_err());
+        let response_bytes = to_canonical_bytes(sample_response(None));
+        assert!(from_canonical_bytes::<DisputeRecord>(&response_bytes).is_err());
+    }
+
+    #[test]
+    fn statement_bound() {
+        let mut rec = sample_response(None);
+        rec.statement = "x".repeat(MAX_DISPUTE_REASON_BYTES);
+        assert!(rec.statement_within_bound());
+        rec.statement = "x".repeat(MAX_DISPUTE_REASON_BYTES + 1);
+        assert!(!rec.statement_within_bound());
     }
 }
