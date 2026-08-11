@@ -48,6 +48,9 @@ Decision Records) convention, using the structure in
 - [0008 — The mobile↔station envelope is the security boundary; the transport is a dumb carrier](0008-mobile-station-transport.md)
 - [0009 — One reputation formula runs on every station and no community can tune it](0009-universal-reputation-algorithm.md)
 - [0010 — A listing is a signed record on the log; the search index is a view that can be thrown away](0010-marketplace-data-model.md)
+- [0011 — Oracle tier model for Phase 1](0011-oracle-tier-model-phase-1.md)
+- [0012 — Charter format and amendments](0012-charter-format-and-amendments.md)
+- [0013 — Federation/collapse transport is pluggable; Reticulum is the adopted backend, run as an external sidecar](0013-federation-transport-reticulum.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.
