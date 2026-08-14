@@ -98,6 +98,49 @@ pub fn established_member_count(db: &Database, at_time: i64) -> Result<usize> {
     Ok(established_members(db, at_time)?.len())
 }
 
+/// Whether the community is still in **bootstrap grace** as of `at_time`: fewer
+/// than [`BOOTSTRAP_GRACE_THRESHOLD`] members hold an effective composite at or
+/// above the Member band (ADR-0015).
+///
+/// This is the single shared predicate the oracle ladder (T1.8), governance
+/// (ADR-0012), and disputes (ADR-0014) all key their bootstrap relaxations off,
+/// so a community is either bootstrapping or it is not — uniformly across all
+/// three. Like [`established_member_count`] it is a pure function of the log.
+pub fn in_grace(db: &Database, at_time: i64) -> Result<bool> {
+    Ok(established_member_count(db, at_time)? < BOOTSTRAP_GRACE_THRESHOLD)
+}
+
+/// The community's governing electorate as of `at_time` (ADR-0015): the body that
+/// may co-sign proposals, vote, be counted toward a quorum, and be drawn for a
+/// dispute jury.
+///
+/// In steady state this is exactly [`established_members`]. **While the community
+/// is [`in_grace`]** it is the union of the established set with the genesis
+/// `founders` — the one pre-vetted body — so a young community can govern and
+/// adjudicate before anyone has earned their standing. The instant a
+/// [`BOOTSTRAP_GRACE_THRESHOLD`]-th member establishes, grace ends and the union
+/// collapses back to the established set on its own; nothing is stored. Founders
+/// count during grace regardless of their own standing or anchoring, because
+/// their eligibility is their genesis membership, not a score.
+///
+/// Founders are supplied by the caller: they live in the effective Charter, which
+/// this crate deliberately does not depend on. As with [`established_members`] the
+/// returned order is **not** deterministic; a caller needing a stable order (a
+/// dispute draw, say) must sort it.
+pub fn grace_electorate(db: &Database, founders: &[Address], at_time: i64) -> Result<Vec<Address>> {
+    // `established_members().len()` is the grace predicate, so reuse the set we
+    // just computed rather than scoring the community a second time.
+    let mut electorate = established_members(db, at_time)?;
+    if electorate.len() < BOOTSTRAP_GRACE_THRESHOLD {
+        for founder in founders {
+            if !electorate.contains(founder) {
+                electorate.push(*founder);
+            }
+        }
+    }
+    Ok(electorate)
+}
+
 /// The outcome of checking whether `confirmer` may confirm a Tier-2 transaction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tier2Eligibility {
@@ -402,5 +445,112 @@ mod tests {
             }
             other => panic!("expected an established allowance, got {other:?}"),
         }
+    }
+
+    /// Anchors `n` members over the Member band by minting raw standing for each
+    /// and cross-vouching them, the recipe the two-member test above uses,
+    /// generalized. Returns the established keypairs.
+    fn establish_members(db: &Database, station: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
+        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
+        for m in &members {
+            earn_raw_standing(db, m, station, at);
+        }
+        // Every member vouches for every other, so each is anchored by a peer.
+        for voucher in &members {
+            for subject in &members {
+                if addr(voucher) != addr(subject) {
+                    append_vouch(db, voucher, &addr(subject), at);
+                }
+            }
+        }
+        members
+    }
+
+    #[test]
+    fn in_grace_until_the_threshold_is_reached() {
+        let station = Keypair::generate();
+        let t = 10 * MONTH;
+
+        // A fresh log has no established members — squarely in grace.
+        let db0 = fresh_db();
+        assert!(in_grace(&db0, t).unwrap());
+
+        // Two established is still short of the threshold of three.
+        let db2 = fresh_db();
+        establish_members(&db2, &station, 2, t);
+        assert_eq!(established_member_count(&db2, t).unwrap(), 2);
+        assert!(in_grace(&db2, t).unwrap());
+
+        // Three established tips the community out of grace.
+        let db3 = fresh_db();
+        establish_members(&db3, &station, 3, t);
+        assert_eq!(established_member_count(&db3, t).unwrap(), 3);
+        assert!(!in_grace(&db3, t).unwrap());
+    }
+
+    #[test]
+    fn grace_electorate_unions_founders_while_bootstrapping() {
+        let db = fresh_db();
+        let t = 10 * MONTH;
+        let (f1, f2) = (Keypair::generate(), Keypair::generate());
+        let founders = [addr(&f1), addr(&f2)];
+
+        // No established members yet: the electorate is exactly the founders.
+        let electorate = grace_electorate(&db, &founders, t).unwrap();
+        assert_eq!(electorate.len(), 2);
+        assert!(electorate.contains(&addr(&f1)));
+        assert!(electorate.contains(&addr(&f2)));
+    }
+
+    #[test]
+    fn grace_electorate_adds_early_established_non_founders() {
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let t = 10 * MONTH;
+        let founder = Keypair::generate();
+
+        // Two members establish (still in grace); neither is the founder.
+        let established = establish_members(&db, &station, 2, t);
+        let electorate = grace_electorate(&db, &[addr(&founder)], t).unwrap();
+
+        // The union is the two established members plus the founder.
+        assert_eq!(electorate.len(), 3);
+        assert!(electorate.contains(&addr(&founder)));
+        for m in &established {
+            assert!(electorate.contains(&addr(m)));
+        }
+    }
+
+    #[test]
+    fn grace_electorate_does_not_double_count_an_established_founder() {
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let t = 10 * MONTH;
+
+        // Two members establish, and one of them is also named a founder.
+        let established = establish_members(&db, &station, 2, t);
+        let founder_addr = addr(&established[0]);
+        let electorate = grace_electorate(&db, &[founder_addr], t).unwrap();
+
+        // The overlapping founder is not added twice.
+        assert_eq!(electorate.len(), 2);
+    }
+
+    #[test]
+    fn grace_electorate_is_established_only_once_grace_ends() {
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let t = 10 * MONTH;
+
+        // Three members establish → grace is over.
+        establish_members(&db, &station, 3, t);
+        assert!(!in_grace(&db, t).unwrap());
+
+        // A founder who never established is now excluded: the electorate is the
+        // established set alone.
+        let outsider = Keypair::generate();
+        let electorate = grace_electorate(&db, &[addr(&outsider)], t).unwrap();
+        assert_eq!(electorate.len(), 3);
+        assert!(!electorate.contains(&addr(&outsider)));
     }
 }
