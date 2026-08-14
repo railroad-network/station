@@ -58,8 +58,8 @@ use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::proposal::{
-    composite_at, founder_set, is_eligible, proposal_records, ProposalError, ProposalId,
-    DEFAULT_COSIGN_THRESHOLD,
+    composite_at, effective_cosign_threshold, founder_set, is_eligible, proposal_records,
+    ProposalError, ProposalId,
 };
 
 /// Discriminant carried in the `kind` field of a [`Vote`]'s canonical CBOR, so
@@ -116,7 +116,7 @@ pub fn votes(
     let Some(proposal) = records.proposal.as_ref() else {
         return Ok(HashMap::new());
     };
-    if !records.is_published(DEFAULT_COSIGN_THRESHOLD) {
+    if !records.is_published(effective_cosign_threshold(db, proposal)?) {
         return Ok(HashMap::new());
     }
 
@@ -169,7 +169,7 @@ pub fn append_vote(
     let Some(proposal) = records.proposal.as_ref() else {
         return Err(VoteError::UnknownProposal(vote.proposal_id));
     };
-    if !records.is_published(DEFAULT_COSIGN_THRESHOLD) {
+    if !records.is_published(effective_cosign_threshold(db, proposal)?) {
         return Err(VoteError::ProposalNotPublished(vote.proposal_id));
     }
     if vote.cast_at < proposal.created_at || vote.cast_at > proposal.voting_ends_at {

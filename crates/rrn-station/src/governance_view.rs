@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use rrn_governance::proposal::{
-    all_proposals, phase, proposal_records, Proposal, ProposalId, ProposalKind, ProposalPhase,
-    DEFAULT_COSIGN_THRESHOLD,
+    all_proposals, effective_cosign_threshold, phase, proposal_records, Proposal, ProposalId,
+    ProposalKind, ProposalPhase, DEFAULT_COSIGN_THRESHOLD,
 };
 use rrn_governance::statute::enacted_statutes;
 use rrn_governance::tally::{effective_charter, tally, ProposalOutcome, VoteTally};
@@ -259,8 +259,11 @@ fn summarize(
     enacted: &HashSet<ProposalId>,
 ) -> Result<ProposalSummary, GovernanceViewError> {
     let records = proposal_records(log, &proposal.proposal_id, db)?;
-    let published = records.is_published(DEFAULT_COSIGN_THRESHOLD);
-    let phase = phase(&records, DEFAULT_COSIGN_THRESHOLD, now)
+    // The publish bar clamps down during bootstrap grace (ADR-0015 § 3), so a
+    // small founder set is not shown as forever un-published.
+    let threshold = effective_cosign_threshold(db, proposal)?;
+    let published = records.is_published(threshold);
+    let phase = phase(&records, threshold, now)
         .map(phase_name)
         .unwrap_or("concluded")
         .to_string();

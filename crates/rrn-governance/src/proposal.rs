@@ -61,7 +61,7 @@ use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_reputation::model::BAND_MEMBER_MIN;
 use rrn_reputation::scoring::ReputationScorer;
-use rrn_reputation::staking::in_grace;
+use rrn_reputation::staking::{grace_electorate, in_grace};
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
@@ -432,6 +432,26 @@ pub(crate) fn is_eligible(
         return Ok(true);
     }
     Ok(in_grace(db, at_time)? && founders.contains(address))
+}
+
+/// The co-sign threshold in force for `proposal` (ADR-0015 § 3).
+///
+/// Outside bootstrap grace this is the configured [`DEFAULT_COSIGN_THRESHOLD`].
+/// **During grace** it clamps down to the number of *other* eligible members —
+/// the grace electorate at the proposal's `created_at`, minus one for the author,
+/// who cannot co-sign their own motion — so a founder set too small to field the
+/// full threshold (a solo- or two-founder genesis) is not deadlocked by a bar it
+/// can never clear. A one-member community publishes with zero co-signers; the
+/// threshold only relaxes downward, never above the configured value.
+pub fn effective_cosign_threshold(
+    db: &Database,
+    proposal: &Proposal,
+) -> Result<u32, ProposalError> {
+    if !in_grace(db, proposal.created_at)? {
+        return Ok(DEFAULT_COSIGN_THRESHOLD);
+    }
+    let electorate = grace_electorate(db, &founder_set(db)?, proposal.created_at)?.len() as u32;
+    Ok(DEFAULT_COSIGN_THRESHOLD.min(electorate.saturating_sub(1)))
 }
 
 /// The composite reputation `address` holds as of `at_time`, also used for the

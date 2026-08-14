@@ -108,9 +108,12 @@ During grace, "established member" is read as "member of the grace electorate"
 everywhere ADR-0012 uses it:
 
 - **Co-signing a proposal.** Founders may co-sign. The Charter's co-sign
-  threshold clamps to `min(threshold, |grace electorate|)`, so a two-founder
-  community is not deadlocked by a rule asking for three co-signers it can never
-  field. Outside grace the configured threshold applies unchanged.
+  threshold clamps to `min(threshold, |grace electorate| − 1)` — the number of
+  *other* eligible members, since the author cannot endorse their own motion — so
+  a two-founder community publishes on its one other founder's co-signature and a
+  lone founder publishes with none, rather than being deadlocked by a rule asking
+  for three co-signers it can never field. Outside grace the configured threshold
+  applies unchanged.
 
 - **Voting.** A ballot is accepted from any member of the grace electorate as of
   when it was cast, replacing the bare `is_established` gate for the duration.

@@ -799,6 +799,75 @@ mod tests {
         assert_eq!(t.yes_count, 0);
     }
 
+    #[test]
+    fn grace_clamps_the_cosign_bar_for_a_two_founder_community() {
+        let db = fresh_db();
+        // Two founders — short of the default three co-signers, so without the
+        // clamp a proposal could never publish.
+        let founders: Vec<Keypair> = (0..2).map(|_| Keypair::generate()).collect();
+        publish_charter(&db, &founders);
+
+        let author = founders[0].clone();
+        let mut log = AppendLog::new(&db);
+        let proposal = statute(&author, NOW);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(proposal.clone(), &author),
+            &db,
+        )
+        .unwrap();
+
+        // Before any co-sign, the clamped bar is min(3, 2−1) = 1, so a ballot does
+        // not yet count — the proposal has not published.
+        append_vote(
+            &mut log,
+            vote(&author, &proposal, VoteChoice::Yes, NOW),
+            &db,
+        )
+        .unwrap_err();
+
+        // The one other founder co-signs, meeting the clamped bar.
+        append_cosign(&mut log, cosign(&founders[1], &proposal, NOW), &db).unwrap();
+        for m in &founders {
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db).unwrap();
+        }
+
+        let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
+        assert_eq!(t.eligible_voters, 2);
+        assert!(t.quorum_met);
+        assert!(t.approval_met);
+        assert_eq!(t.outcome, Some(ProposalOutcome::Passed));
+    }
+
+    #[test]
+    fn grace_lets_a_solo_founder_publish_without_cosigners() {
+        let db = fresh_db();
+        let founder = Keypair::generate();
+        publish_charter(&db, std::slice::from_ref(&founder));
+
+        let mut log = AppendLog::new(&db);
+        let proposal = statute(&founder, NOW);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(proposal.clone(), &founder),
+            &db,
+        )
+        .unwrap();
+
+        // The clamp is min(3, 1−1) = 0: a lone founder publishes with no co-signers
+        // and can carry a statute alone.
+        append_vote(
+            &mut log,
+            vote(&founder, &proposal, VoteChoice::Yes, NOW),
+            &db,
+        )
+        .unwrap();
+
+        let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
+        assert_eq!(t.eligible_voters, 1);
+        assert_eq!(t.outcome, Some(ProposalOutcome::Passed));
+    }
+
     // --- Errors --------------------------------------------------------------
 
     #[test]
