@@ -693,10 +693,14 @@ impl Core {
     }
 
     fn m_whoami(&self) -> Result<serde_json::Value, rpc::RpcError> {
-        // Bootstrap-grace status (T1.8.6): while fewer than the threshold of
-        // members are established, any member may confirm a Tier-2 payment. The
-        // count is derived from the log, so it always reflects the current standing
-        // and the phone can render its grace banner without recomputing it.
+        // Bootstrap-grace status (T1.8.6, widened in T1.11.2/ADR-0015): while fewer
+        // than the threshold of members are established, the community runs under
+        // grace across all three subsystems at once — any member may confirm a
+        // Tier-2 payment, and the genesis founders stand in as the electorate for
+        // governance and dispute juries. `bootstrap_in_grace` is exactly the shared
+        // `in_grace` predicate; the count is derived from the log, so it always
+        // reflects current standing and the phone can render its grace banner
+        // without recomputing it.
         let established =
             rrn_reputation::staking::established_member_count(&self.db, self.clock.now())
                 .map_err(internal)?;
