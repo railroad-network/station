@@ -30,8 +30,10 @@
 //! # Who is eligible, and why the count is pinned
 //!
 //! The eligible electorate is the community's **established members** — the same
-//! effective-composite ≥ Member-band set that authors, co-signs, and votes — as of
-//! the proposal's `voting_ends_at`. Pinning eligibility to the close (rather than
+//! effective-composite ≥ Member-band set that authors, co-signs, and votes —
+//! plus, while the community is in bootstrap grace, its genesis founders
+//! (ADR-0015). It is measured as of the proposal's `voting_ends_at`. Pinning
+//! eligibility to the close (rather than
 //! to wall-clock `now`) is what makes a concluded outcome **stable**: members who
 //! join or lapse after voting ends cannot move a settled quorum. Before the close,
 //! evaluating at `voting_ends_at` reads the same current membership (nothing on the
@@ -44,7 +46,7 @@
 //! when the ballots and the electorate are both frozen. A proposal that never
 //! published has no counting ballots and concludes [`Failed`](ProposalOutcome::Failed).
 
-use rrn_reputation::staking::established_member_count;
+use rrn_reputation::staking::grace_electorate;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -194,7 +196,10 @@ fn count_against(
         }
     }
 
-    let eligible = established_member_count(db, proposal.voting_ends_at)? as u32;
+    // The electorate as of the close: established members, plus the genesis
+    // founders while the community is in bootstrap grace (ADR-0015). Pinned at
+    // `voting_ends_at`, like the ballots, so a concluded quorum stays stable.
+    let eligible = grace_electorate(db, &governing.founders, proposal.voting_ends_at)?.len() as u32;
     let participation = yes + no + abstain;
     let decisive = yes + no;
 
@@ -709,6 +714,89 @@ mod tests {
         let t = tally(&db, &amendment.proposal_id, amendment.voting_ends_at + 1).unwrap();
         assert!(t.approval_met); // 3/4 = 75% ≥ 75%
         assert_eq!(t.outcome, Some(ProposalOutcome::Passed));
+    }
+
+    // --- Bootstrap grace (ADR-0015) ------------------------------------------
+
+    #[test]
+    fn grace_lets_founders_govern_before_anyone_is_established() {
+        let db = fresh_db();
+        // Four founders, none with any earned standing — a brand-new community
+        // squarely in bootstrap grace.
+        let founders: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
+        publish_charter(&db, &founders);
+        assert_eq!(
+            rrn_reputation::staking::established_member_count(&db, NOW).unwrap(),
+            0
+        );
+
+        // A founder authors a statute and three others co-sign it to publication —
+        // all below the Member band, allowed only because grace seats the founders.
+        let author = founders[0].clone();
+        let mut log = AppendLog::new(&db);
+        let proposal = statute(&author, NOW);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(proposal.clone(), &author),
+            &db,
+        )
+        .unwrap();
+        for c in &founders[1..4] {
+            append_cosign(&mut log, cosign(c, &proposal, NOW), &db).unwrap();
+        }
+
+        // The founders vote: 3 yes, 1 no.
+        for m in &founders[0..3] {
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db).unwrap();
+        }
+        append_vote(
+            &mut log,
+            vote(&founders[3], &proposal, VoteChoice::No, NOW),
+            &db,
+        )
+        .unwrap();
+
+        let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
+        // The electorate is the four founders, and the statute carries.
+        assert_eq!(t.eligible_voters, 4);
+        assert!(t.quorum_met);
+        assert!(t.approval_met); // 3/4 = 75% ≥ 50%
+        assert_eq!(t.outcome, Some(ProposalOutcome::Passed));
+    }
+
+    #[test]
+    fn grace_does_not_seat_a_non_founder_below_the_band() {
+        let db = fresh_db();
+        let founders: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
+        publish_charter(&db, &founders);
+
+        let author = founders[0].clone();
+        let mut log = AppendLog::new(&db);
+        let proposal = statute(&author, NOW);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(proposal.clone(), &author),
+            &db,
+        )
+        .unwrap();
+        for c in &founders[1..4] {
+            append_cosign(&mut log, cosign(c, &proposal, NOW), &db).unwrap();
+        }
+
+        // An outsider — paired, perhaps, but neither established nor a founder —
+        // is refused even during grace: pairing is not membership.
+        let outsider = Keypair::generate();
+        let err = append_vote(
+            &mut log,
+            vote(&outsider, &proposal, VoteChoice::Yes, NOW),
+            &db,
+        )
+        .unwrap_err();
+        assert!(matches!(err, VoteError::VoterNotEstablished { .. }));
+
+        // Their ballot is not believed on replay either.
+        let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
+        assert_eq!(t.yes_count, 0);
     }
 
     // --- Errors --------------------------------------------------------------

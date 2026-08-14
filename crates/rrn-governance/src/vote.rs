@@ -54,12 +54,11 @@ use dcbor::prelude::*;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
-use rrn_reputation::model::BAND_MEMBER_MIN;
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::proposal::{
-    composite_at, is_established, proposal_records, ProposalError, ProposalId,
+    composite_at, founder_set, is_eligible, proposal_records, ProposalError, ProposalId,
     DEFAULT_COSIGN_THRESHOLD,
 };
 
@@ -121,6 +120,7 @@ pub fn votes(
         return Ok(HashMap::new());
     }
 
+    let founders = founder_set(db)?;
     let mut ballots: HashMap<Address, VoteChoice> = HashMap::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
@@ -136,7 +136,7 @@ pub fn votes(
         if vote.cast_at < proposal.created_at || vote.cast_at > proposal.voting_ends_at {
             continue;
         }
-        if !is_established(db, &vote.voter, vote.cast_at)? {
+        if !is_eligible(db, &founders, &vote.voter, vote.cast_at)? {
             continue;
         }
         // First ballot wins; a later one from the same voter is ignored.
@@ -181,11 +181,10 @@ pub fn append_vote(
         });
     }
 
-    let composite = composite_at(db, &vote.voter, vote.cast_at)?;
-    if composite < BAND_MEMBER_MIN {
+    if !is_eligible(db, &founder_set(db)?, &vote.voter, vote.cast_at)? {
         return Err(VoteError::VoterNotEstablished {
             voter: vote.voter,
-            composite,
+            composite: composite_at(db, &vote.voter, vote.cast_at)?,
         });
     }
 

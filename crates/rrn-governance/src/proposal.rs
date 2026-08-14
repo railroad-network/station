@@ -61,10 +61,11 @@ use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_reputation::model::BAND_MEMBER_MIN;
 use rrn_reputation::scoring::ReputationScorer;
+use rrn_reputation::staking::in_grace;
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
-use crate::charter::{Charter, VotingMechanism};
+use crate::charter::{founder_charter, Charter, CharterError, VotingMechanism};
 
 /// Discriminant carried in the `kind` field of a [`Proposal`]'s canonical CBOR,
 /// so log replay can tell a proposal apart from other records.
@@ -392,14 +393,45 @@ pub fn phase(records: &ProposalRecords, cosign_threshold: u32, now: i64) -> Opti
 
 /// Whether `address` is an established member as of `at_time`: effective
 /// (anchored) composite reputation at or above the Member band.
-///
-/// Shared with [`vote`](crate::vote), which gates ballots on the same standing.
 pub(crate) fn is_established(
     db: &Database,
     address: &Address,
     at_time: i64,
 ) -> Result<bool, ProposalError> {
     Ok(composite_at(db, address, at_time)? >= BAND_MEMBER_MIN)
+}
+
+/// The genesis founders named in the published founder Charter, or empty if no
+/// Charter has been published yet. Resolved once per replay and threaded into
+/// [`is_eligible`] so a below-band check does not re-scan the log per entry.
+pub(crate) fn founder_set(db: &Database) -> Result<Vec<Address>, ProposalError> {
+    Ok(founder_charter(db)?
+        .map(|c| c.charter().founders.clone())
+        .unwrap_or_default())
+}
+
+/// Whether `address` may act in governance as of `at_time` (ADR-0015): the
+/// grace-aware electorate test that replaces the bare established-member gate for
+/// authoring, co-signing, and voting.
+///
+/// An established member always qualifies. While the community is in bootstrap
+/// grace ([`in_grace`]), a genesis `founder` also qualifies even below the Member
+/// band — the union `rrn_reputation::staking::grace_electorate` materializes,
+/// evaluated one address at a time. Once grace ends, only the established test
+/// remains, so founders who never earned standing drop out on their own.
+///
+/// `founders` is supplied by the caller (from [`founder_set`]); `is_established`
+/// is checked first so the steady-state path never pays for the grace lookup.
+pub(crate) fn is_eligible(
+    db: &Database,
+    founders: &[Address],
+    address: &Address,
+    at_time: i64,
+) -> Result<bool, ProposalError> {
+    if is_established(db, address, at_time)? {
+        return Ok(true);
+    }
+    Ok(in_grace(db, at_time)? && founders.contains(address))
 }
 
 /// The composite reputation `address` holds as of `at_time`, also used for the
@@ -425,6 +457,7 @@ fn find_proposal(
     proposal_id: &ProposalId,
     db: &Database,
 ) -> Result<Option<Proposal>, ProposalError> {
+    let founders = founder_set(db)?;
     for entry in log.iter_from(1) {
         let entry = entry?;
         let Ok(proposal) = from_canonical_bytes::<Proposal>(&entry.payload.bytes) else {
@@ -439,7 +472,7 @@ fn find_proposal(
         if proposal.validate().is_err() {
             continue;
         }
-        if !is_established(db, &proposal.author, proposal.created_at)? {
+        if !is_eligible(db, &founders, &proposal.author, proposal.created_at)? {
             continue;
         }
         return Ok(Some(proposal));
@@ -463,6 +496,7 @@ pub fn proposal_records(
         return Ok(ProposalRecords::default());
     };
     let author = proposal.author;
+    let founders = founder_set(db)?;
 
     let mut cosigners = HashSet::new();
     for entry in log.iter_from(1) {
@@ -479,7 +513,7 @@ pub fn proposal_records(
         if cosign.cosigner == author {
             continue;
         }
-        if !is_established(db, &cosign.cosigner, cosign.cosigned_at)? {
+        if !is_eligible(db, &founders, &cosign.cosigner, cosign.cosigned_at)? {
             continue;
         }
         cosigners.insert(cosign.cosigner);
@@ -500,6 +534,7 @@ pub fn proposal_records(
 /// enactment sweep ([`crate::lifecycle::enact_due`]) walks this to find the passed
 /// proposals it is due to put into force.
 pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, ProposalError> {
+    let founders = founder_set(db)?;
     let mut seen = HashSet::new();
     let mut proposals = Vec::new();
     for entry in log.iter_from(1) {
@@ -513,7 +548,7 @@ pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, Pr
         if proposal.validate().is_err() {
             continue;
         }
-        if !is_established(db, &proposal.author, proposal.created_at)? {
+        if !is_eligible(db, &founders, &proposal.author, proposal.created_at)? {
             continue;
         }
         if seen.insert(proposal.proposal_id) {
@@ -542,11 +577,10 @@ pub fn append_proposal(
         });
     }
     proposal.validate()?;
-    let composite = composite_at(db, &proposal.author, proposal.created_at)?;
-    if composite < BAND_MEMBER_MIN {
+    if !is_eligible(db, &founder_set(db)?, &proposal.author, proposal.created_at)? {
         return Err(ProposalError::AuthorNotEstablished {
             author: proposal.author,
-            composite,
+            composite: composite_at(db, &proposal.author, proposal.created_at)?,
         });
     }
     if find_proposal(log, &proposal.proposal_id, db)?.is_some() {
@@ -582,11 +616,10 @@ pub fn append_cosign(
     if cosign.cosigner == proposal.author {
         return Err(ProposalError::AuthorCannotCosign);
     }
-    let composite = composite_at(db, &cosign.cosigner, cosign.cosigned_at)?;
-    if composite < BAND_MEMBER_MIN {
+    if !is_eligible(db, &founder_set(db)?, &cosign.cosigner, cosign.cosigned_at)? {
         return Err(ProposalError::CosignerNotEstablished {
             cosigner: cosign.cosigner,
-            composite,
+            composite: composite_at(db, &cosign.cosigner, cosign.cosigned_at)?,
         });
     }
     if records.cosigners.contains(&cosign.cosigner) {
@@ -682,6 +715,10 @@ pub enum ProposalError {
     /// A reputation-scoring error while evaluating the established-member gate.
     #[error("reputation: {0}")]
     Reputation(#[from] rrn_reputation::Error),
+    /// Reading the founder Charter to resolve the genesis founders for the
+    /// bootstrap-grace electorate failed (ADR-0015).
+    #[error("charter: {0}")]
+    Charter(#[from] CharterError),
     /// A storage/log error while reading or appending.
     #[error("storage: {0}")]
     Storage(#[from] rrn_storage::Error),
