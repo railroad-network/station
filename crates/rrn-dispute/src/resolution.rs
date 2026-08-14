@@ -14,6 +14,7 @@
 //! unresolved dispute **lapses** and settles as confirmed (ADR-0014 §5).
 
 use rrn_crypto::keypair::Keypair;
+use rrn_identity::address::Address;
 use rrn_ledger::engine::Engine;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
@@ -75,6 +76,7 @@ pub fn find_disputed(db: &Database) -> Result<Vec<TransactionId>> {
 /// their own response deadline).
 pub fn append_verdict(
     db: &Database,
+    founders: &[Address],
     params: &DisputeParams,
     anchor: &[u8],
     verdict: SignedVerdict,
@@ -111,7 +113,7 @@ pub fn append_verdict(
     // Re-derive the panel as of the verdict's own instant. The juror must occupy a
     // seat that is still awaiting a verdict then — which also proves they are
     // within their response window (a lapsed occupant would have been redrawn).
-    let pool = eligible_pool(db, &info, info.opened_at, params)?;
+    let pool = eligible_pool(db, founders, &info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(&proposal_id, anchor));
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, cast_at);
     match panel.seat_of(&juror) {
@@ -137,6 +139,7 @@ pub fn append_verdict(
 /// ([`Error::NotEscalatable`]).
 pub fn open_escalation(
     db: &Database,
+    founders: &[Address],
     params: &DisputeParams,
     anchor: &[u8],
     escalation: SignedEscalation,
@@ -161,8 +164,15 @@ pub fn open_escalation(
         return Err(Error::NotEscalatable);
     }
 
-    let (jury, jury_at, pool_len, majority) =
-        jury_view(db, &record.proposal_id, &info, params, anchor, now)?;
+    let (jury, jury_at, pool_len, majority) = jury_view(
+        db,
+        founders,
+        &record.proposal_id,
+        &info,
+        params,
+        anchor,
+        now,
+    )?;
     if !escalation_applies(&record, &info, pool_len, majority, jury, jury_at, params) {
         return Err(Error::NotEscalatable);
     }
@@ -182,6 +192,7 @@ pub fn open_escalation(
 /// ([`Error::AlreadyVoted`]).
 pub fn append_escalation_ballot(
     db: &Database,
+    founders: &[Address],
     params: &DisputeParams,
     ballot: SignedEscalationBallot,
     now: i64,
@@ -200,7 +211,7 @@ pub fn append_escalation_ballot(
     let escalation = escalation_of(db, &proposal_id)?.ok_or(Error::NotEscalated)?;
     let close = escalation_close(&escalation, &info, params);
 
-    let electorate = escalation_electorate(db, &info, escalation.opened_at)?;
+    let electorate = escalation_electorate(db, founders, &info, escalation.opened_at)?;
     if !electorate.contains(&voter)
         || cast_at < escalation.opened_at
         || cast_at > close
@@ -227,13 +238,14 @@ pub fn append_escalation_ballot(
 /// mixed into the sortition seed (see [`sortition_seed`]).
 pub fn resolve(
     db: &Database,
+    founders: &[Address],
     station: &Keypair,
     tx_id: &TransactionId,
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
 ) -> Result<Resolution> {
-    let outcome = decide(db, tx_id, params, anchor, now)?;
+    let outcome = decide(db, founders, tx_id, params, anchor, now)?;
     enact_resolution(db, station, tx_id, outcome, now)?;
     Ok(outcome)
 }
@@ -242,12 +254,13 @@ pub fn resolve(
 /// the read-only twin the dispute views render. Same derivation, no enactment.
 pub fn preview(
     db: &Database,
+    founders: &[Address],
     tx_id: &TransactionId,
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
 ) -> Result<Resolution> {
-    decide(db, tx_id, params, anchor, now)
+    decide(db, founders, tx_id, params, anchor, now)
 }
 
 /// The pure decision: derives the jury and any escalation and reduces them to the
@@ -255,6 +268,7 @@ pub fn preview(
 /// terminal ones, [`preview`] just reports them.
 fn decide(
     db: &Database,
+    founders: &[Address],
     tx_id: &TransactionId,
     params: &DisputeParams,
     anchor: &[u8],
@@ -262,7 +276,8 @@ fn decide(
 ) -> Result<Resolution> {
     let info = disputed_info(db, tx_id)?;
     let main_close = info.opened_at.saturating_add(params.window_seconds);
-    let (jury, jury_at, pool_len, majority) = jury_view(db, tx_id, &info, params, anchor, now)?;
+    let (jury, jury_at, pool_len, majority) =
+        jury_view(db, founders, tx_id, &info, params, anchor, now)?;
 
     // A validly-opened escalation governs the outcome; a bogus or inapplicable one
     // is ignored, and the jury path resumes.
@@ -279,7 +294,7 @@ fn decide(
                 params,
             )
         {
-            return decide_escalation(db, tx_id, &info, &escalation, params, now);
+            return decide_escalation(db, founders, tx_id, &info, &escalation, params, now);
         }
     }
 
@@ -311,13 +326,14 @@ fn decide(
 /// off.
 fn jury_view(
     db: &Database,
+    founders: &[Address],
     tx_id: &TransactionId,
     info: &DisputedInfo,
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
 ) -> Result<(Option<DisputeOutcome>, Option<i64>, usize, usize)> {
-    let pool = eligible_pool(db, info, info.opened_at, params)?;
+    let pool = eligible_pool(db, founders, info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let existing = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, now);
@@ -365,6 +381,7 @@ fn escalation_applies(
 /// (fail open) once the window closes without one. Writes nothing.
 fn decide_escalation(
     db: &Database,
+    founders: &[Address],
     tx_id: &TransactionId,
     info: &DisputedInfo,
     escalation: &EscalationRecord,
@@ -375,7 +392,7 @@ fn decide_escalation(
     if now < close {
         return Ok(Resolution::EscalationPending);
     }
-    let electorate = escalation_electorate(db, info, escalation.opened_at)?;
+    let electorate = escalation_electorate(db, founders, info, escalation.opened_at)?;
     let ballots = escalation_ballots(db, tx_id)?;
     let tallied = count_escalation(&ballots, &electorate, params, escalation.opened_at, close);
     Ok(match tallied.terminal_outcome() {

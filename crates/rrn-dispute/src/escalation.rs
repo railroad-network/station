@@ -28,7 +28,7 @@ use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::transaction::TransactionId;
-use rrn_reputation::staking::established_members;
+use rrn_reputation::staking::grace_electorate;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -215,17 +215,19 @@ pub fn escalation_ballots(
     Ok(out)
 }
 
-/// The established-member electorate eligible to vote in an escalation, snapshotted
-/// as of `at` (the escalation's open time) — established members minus the two
-/// parties, who never vote on their own dispute. Vouchers are *not* recused: unlike
-/// the jury, this is the whole community ruling.
+/// The electorate eligible to vote in an escalation, snapshotted as of `at` (the
+/// escalation's open time) — the governance electorate (established members, plus
+/// the genesis `founders` while the community is in bootstrap grace, per
+/// ADR-0015) minus the two parties, who never vote on their own dispute. Vouchers
+/// are *not* recused: unlike the jury, this is the whole community ruling.
 pub fn escalation_electorate(
     db: &Database,
+    founders: &[Address],
     info: &DisputedInfo,
     at: i64,
 ) -> Result<HashSet<Address>> {
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
-    Ok(established_members(db, at)?
+    Ok(grace_electorate(db, founders, at)?
         .into_iter()
         .filter(|a| !parties.contains(a))
         .collect())

@@ -27,6 +27,7 @@ use rrn_dispute::resolution::{preview, Resolution};
 use rrn_dispute::sortition::{draw_sequence, eligible_pool, sortition_seed, DisputedInfo};
 use rrn_dispute::verdict::verdicts;
 use rrn_dispute::DisputeParams;
+use rrn_identity::address::Address;
 use rrn_ledger::dispute::dispute_responses;
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionId;
@@ -152,6 +153,7 @@ pub struct DisputeTallyView {
 /// reversed), each with its live panel and the outcome a resolve pass would enact.
 pub fn disputes_view(
     db: &Database,
+    founders: &[Address],
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
@@ -160,7 +162,7 @@ pub fn disputes_view(
     let mut rows = Vec::new();
     for (id, state) in snapshot.iter() {
         if let TransactionState::Disputed { .. } = state {
-            rows.push(summarize(db, id, state, params, anchor, now)?);
+            rows.push(summarize(db, founders, id, state, params, anchor, now)?);
         }
     }
     // Newest first, by open time.
@@ -171,6 +173,7 @@ pub fn disputes_view(
 /// One dispute in full, or `None` if the transaction is not currently disputed.
 pub fn dispute_view(
     db: &Database,
+    founders: &[Address],
     tx_id: &TransactionId,
     params: &DisputeParams,
     anchor: &[u8],
@@ -186,7 +189,7 @@ pub fn dispute_view(
     else {
         return Ok(None);
     };
-    let summary = summarize(db, tx_id, state, params, anchor, now)?;
+    let summary = summarize(db, founders, tx_id, state, params, anchor, now)?;
 
     let responses = dispute_responses(db, tx_id)?
         .into_iter()
@@ -204,7 +207,7 @@ pub fn dispute_view(
         receiver: proposal.payload.receiver,
         opened_at: dispute.payload.opened_at,
     };
-    let pool = eligible_pool(db, &info, info.opened_at, params)?;
+    let pool = eligible_pool(db, founders, &info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let cast = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &cast, info.opened_at, params, now);
@@ -230,7 +233,7 @@ pub fn dispute_view(
                 .opened_at
                 .saturating_add(params.escalation_window_seconds)
                 .min(info.opened_at.saturating_add(params.window_seconds));
-            let electorate = escalation_electorate(db, &info, esc.opened_at)?;
+            let electorate = escalation_electorate(db, founders, &info, esc.opened_at)?;
             let ballots = escalation_ballots(db, tx_id)?;
             let t = count_escalation(&ballots, &electorate, params, esc.opened_at, closes_at);
             Ok(EscalationView {
@@ -264,6 +267,7 @@ pub fn dispute_view(
 /// jury tally, and the outcome a resolve pass would enact right now.
 fn summarize(
     db: &Database,
+    founders: &[Address],
     tx_id: &TransactionId,
     state: &TransactionState,
     params: &DisputeParams,
@@ -284,7 +288,7 @@ fn summarize(
         receiver: p.receiver,
         opened_at: d.opened_at,
     };
-    let pool = eligible_pool(db, &info, info.opened_at, params)?;
+    let pool = eligible_pool(db, founders, &info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let cast = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &cast, info.opened_at, params, now);
@@ -304,7 +308,7 @@ fn summarize(
     let window_ends_at = info.opened_at.saturating_add(params.window_seconds);
     // The full layered outcome — jury, appeal window, and any escalation — exactly
     // as a resolve pass would decide it, without enacting.
-    let resolution = resolution_str(preview(db, tx_id, params, anchor, now)?).to_string();
+    let resolution = resolution_str(preview(db, founders, tx_id, params, anchor, now)?).to_string();
 
     Ok(DisputeSummary {
         tx_id: tx_id.0.to_string(),

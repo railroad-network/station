@@ -2293,9 +2293,30 @@ impl Core {
         Vec::new()
     }
 
+    /// The genesis founders of the effective Charter, or an empty set if none is
+    /// published. Threaded into every dispute call so the jury pool and escalation
+    /// electorate seat founders while the community is in bootstrap grace
+    /// (ADR-0015); once three members establish, the set is ignored.
+    fn dispute_founders(&self) -> Result<Vec<Address>, rpc::RpcError> {
+        Ok(effective_charter(&self.db)
+            .map_err(internal)?
+            .map(|c| c.founders)
+            .unwrap_or_default())
+    }
+
+    /// [`dispute_founders`] for the channel write path, whose errors are the
+    /// `(code, message)` pair the mobile handlers return.
+    fn dispute_founders_pair(&self) -> Result<Vec<Address>, (i32, String)> {
+        Ok(effective_charter(&self.db)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+            .map(|c| c.founders)
+            .unwrap_or_default())
+    }
+
     fn m_disputes(&self) -> Result<serde_json::Value, rpc::RpcError> {
         let disputes = dispute_view::disputes_view(
             &self.db,
+            &self.dispute_founders()?,
             &self.dispute_params(),
             &self.dispute_anchor(),
             self.clock.now(),
@@ -2309,6 +2330,7 @@ impl Core {
         let tx_id = parse_tx_id(&params.tx_id)?;
         match dispute_view::dispute_view(
             &self.db,
+            &self.dispute_founders()?,
             &tx_id,
             &self.dispute_params(),
             &self.dispute_anchor(),
@@ -2392,6 +2414,7 @@ impl Core {
         let signed = SignedVerdict::sign(verdict, &station);
         append_verdict(
             &self.db,
+            &self.dispute_founders()?,
             &self.dispute_params(),
             &self.dispute_anchor(),
             signed,
@@ -2420,10 +2443,19 @@ impl Core {
         let station = self.station_keypair();
         let disp_params = self.dispute_params();
         let anchor = self.dispute_anchor();
+        let founders = self.dispute_founders()?;
         let mut resolved = Vec::with_capacity(ids.len());
         for id in ids {
-            let outcome = resolve(&self.db, &station, &id, &disp_params, &anchor, now)
-                .map_err(dispute_err)?;
+            let outcome = resolve(
+                &self.db,
+                &founders,
+                &station,
+                &id,
+                &disp_params,
+                &anchor,
+                now,
+            )
+            .map_err(dispute_err)?;
             resolved.push(rpc::DisputeResolvedRow {
                 tx_id: id.0.to_string(),
                 resolution: resolution_name(outcome).to_string(),
@@ -2453,6 +2485,7 @@ impl Core {
         let signed = SignedEscalation::sign(record, &station);
         open_escalation(
             &self.db,
+            &self.dispute_founders()?,
             &self.dispute_params(),
             &self.dispute_anchor(),
             signed,
@@ -2483,8 +2516,14 @@ impl Core {
             cast_at: now,
         };
         let signed = SignedEscalationBallot::sign(ballot, &station);
-        append_escalation_ballot(&self.db, &self.dispute_params(), signed, now)
-            .map_err(dispute_err)?;
+        append_escalation_ballot(
+            &self.db,
+            &self.dispute_founders()?,
+            &self.dispute_params(),
+            signed,
+            now,
+        )
+        .map_err(dispute_err)?;
         ok(&rpc::DisputeEscalationVoteResult {
             tx_id: params.tx_id,
             uphold: params.uphold,
@@ -2642,6 +2681,7 @@ impl Core {
         let now = self.clock.now();
         append_verdict(
             &self.db,
+            &self.dispute_founders_pair()?,
             &self.dispute_params(),
             &self.dispute_anchor(),
             signed,
@@ -2676,6 +2716,7 @@ impl Core {
         let now = self.clock.now();
         open_escalation(
             &self.db,
+            &self.dispute_founders_pair()?,
             &self.dispute_params(),
             &self.dispute_anchor(),
             signed,
@@ -2711,8 +2752,14 @@ impl Core {
             signed.payload.uphold,
         );
         let now = self.clock.now();
-        append_escalation_ballot(&self.db, &self.dispute_params(), signed, now)
-            .map_err(dispute_err_pair)?;
+        append_escalation_ballot(
+            &self.db,
+            &self.dispute_founders_pair()?,
+            &self.dispute_params(),
+            signed,
+            now,
+        )
+        .map_err(dispute_err_pair)?;
         Ok(serde_json::json!({ "tx_id": tx_id, "uphold": uphold }))
     }
 
@@ -2742,6 +2789,15 @@ impl Core {
         let station = self.station_keypair();
         let params = self.dispute_params();
         let anchor = self.dispute_anchor();
+        // Founders seat the grace electorate; if the charter cannot be read the
+        // sweep still runs on the established set alone rather than stalling.
+        let founders = match effective_charter(&self.db) {
+            Ok(charter) => charter.map(|c| c.founders).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "dispute resolution sweep: reading founders failed");
+                Vec::new()
+            }
+        };
         let ids = match find_disputed(&self.db) {
             Ok(ids) => ids,
             Err(e) => {
@@ -2751,7 +2807,7 @@ impl Core {
         };
         let mut resolved = 0;
         for id in ids {
-            match resolve(&self.db, &station, &id, &params, &anchor, now) {
+            match resolve(&self.db, &founders, &station, &id, &params, &anchor, now) {
                 Ok(Resolution::Pending) => {}
                 Ok(_) => resolved += 1,
                 Err(e) => {

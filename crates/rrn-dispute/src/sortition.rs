@@ -17,7 +17,7 @@ use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionId;
-use rrn_reputation::staking::{established_members, tier2_stake_centi};
+use rrn_reputation::staking::{grace_electorate, tier2_stake_centi};
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -89,19 +89,25 @@ pub fn vouchers_of(db: &Database, subject: &Address) -> Result<HashSet<Address>>
 /// raw-standing weight the draw uses, as of `at_time` (the dispute's open time).
 ///
 /// Eligibility is the governance electorate — established members (effective
-/// composite ≥ the Member band) — **minus both parties** (recusal) and **minus
-/// each party's direct vouchers**. Per ADR-0014 §5 the voucher-recusal relaxes
-/// before the panel goes unseated: if the strict pool cannot fill a panel, the
-/// voucher exclusion is dropped (the two parties are still never eligible). The
-/// returned pool may still be smaller than the panel — the caller treats an
-/// unseatable jury as a dispute that will lapse.
+/// composite ≥ the Member band), plus the genesis `founders` while the community
+/// is in bootstrap grace (ADR-0015) — **minus both parties** (recusal) and
+/// **minus each party's direct vouchers**. Per ADR-0014 §5 the voucher-recusal
+/// relaxes before the panel goes unseated: if the strict pool cannot fill a
+/// panel, the voucher exclusion is dropped (the two parties are still never
+/// eligible). The returned pool may still be smaller than the panel — the caller
+/// treats an unseatable jury as a dispute that will lapse.
+///
+/// `founders` is supplied by the caller (from the effective Charter); it is only
+/// consulted while the community is bootstrapping, matching
+/// [`rrn_reputation::staking::grace_electorate`].
 pub fn eligible_pool(
     db: &Database,
+    founders: &[Address],
     info: &DisputedInfo,
     at_time: i64,
     params: &DisputeParams,
 ) -> Result<Vec<(Address, u64)>> {
-    let established = established_members(db, at_time)?;
+    let electorate = grace_electorate(db, founders, at_time)?;
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
 
     let mut vouchers = vouchers_of(db, &info.sender)?;
@@ -110,13 +116,14 @@ pub fn eligible_pool(
     // The strict pool recuses parties and their vouchers.
     let weigh = |db: &Database, addr: &Address| -> Result<(Address, u64)> {
         // Established members hold composite ≥ the Member band, so their raw
-        // standing is positive; `max(1)` is a defensive floor so a zero weight can
-        // never make the running total unable to select.
+        // standing is positive; a founder seated during grace may have none, so the
+        // `max(1)` floor — defensive against a zero weight stalling the draw — is
+        // what keeps such a founder selectable.
         Ok((*addr, tier2_stake_centi(db, addr, at_time)?.max(1)))
     };
 
     let mut strict = Vec::new();
-    for addr in &established {
+    for addr in &electorate {
         if !parties.contains(addr) && !vouchers.contains(addr) {
             strict.push(weigh(db, addr)?);
         }
@@ -127,7 +134,7 @@ pub fn eligible_pool(
 
     // Relax: drop voucher-recusal, keep party-recusal, and try again.
     let mut relaxed = Vec::new();
-    for addr in &established {
+    for addr in &electorate {
         if !parties.contains(addr) {
             relaxed.push(weigh(db, addr)?);
         }
