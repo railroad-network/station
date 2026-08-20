@@ -28,6 +28,7 @@
 
 pub mod address;
 pub mod attestation;
+pub mod envelope;
 pub mod recovery;
 pub mod sealed;
 pub mod vouch;
