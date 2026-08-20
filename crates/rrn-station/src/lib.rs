@@ -48,6 +48,7 @@ pub mod mdns;
 pub mod mobile_server;
 pub mod paired;
 pub mod pairing;
+pub mod recovery;
 pub mod reputation_view;
 pub mod rpc;
 pub mod rpc_client;
