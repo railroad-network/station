@@ -77,6 +77,31 @@ impl Database {
     }
 }
 
+/// Writes a consistent snapshot of the database at `src` to a fresh file at
+/// `dest`, using SQLite's `VACUUM INTO`.
+///
+/// This is safe to run against a *live* database — including one a running
+/// station holds open — because the database is in WAL mode: `VACUUM INTO`
+/// reads from a separate connection at a single consistent point and never
+/// takes the writer's lock, so no daemon downtime is required. The snapshot it
+/// produces is a single defragmented file with no `-wal`/`-shm` sidecars, which
+/// is exactly what a backup wants to carry.
+///
+/// `dest` must not already exist (`VACUUM INTO` refuses to overwrite).
+pub fn snapshot_to(src: &Path, dest: &Path) -> Result<()> {
+    tracing::trace!(
+        src = %src.display(),
+        dest = %dest.display(),
+        "snapshotting database via VACUUM INTO"
+    );
+    // A plain connection, not `Database::open`: opening through `from_conn`
+    // would re-assert `journal_mode = WAL`, a write against a file another
+    // process may hold. All we need here is to read and copy.
+    let conn = Connection::open(src)?;
+    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +129,38 @@ mod tests {
         assert!(db.foreign_keys().unwrap());
         drop(db);
         // WAL leaves -wal/-shm sidecar files; clean the whole dir.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_copies_data_to_a_standalone_file() {
+        let dir = std::env::temp_dir().join(format!("rrn-storage-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("live.db");
+
+        // Seed the source with a row, keeping the connection open so the
+        // snapshot is taken against a still-live WAL database.
+        let db = Database::open(&src).unwrap();
+        db.conn()
+            .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept');")
+            .unwrap();
+
+        let dest = dir.join("snapshot.db");
+        snapshot_to(&src, &dest).unwrap();
+        assert!(dest.exists(), "snapshot file must be written");
+
+        // The snapshot is a standalone file: no WAL sidecars, and it carries the
+        // committed row when reopened on its own.
+        assert!(!dir.join("snapshot.db-wal").exists());
+        let copy = Database::open(&dest).unwrap();
+        let v: String = copy
+            .conn()
+            .query_row("SELECT v FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(v, "kept");
+
+        drop(db);
+        drop(copy);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

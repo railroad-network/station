@@ -60,6 +60,28 @@ enum Command {
         /// The mobile's bech32 address.
         address: String,
     },
+    /// Write an encrypted backup of this station (wallet + ledger + config).
+    ///
+    /// Safe to run while the station is running: the ledger is captured as a
+    /// consistent live snapshot. Prompts for the wallet passphrase, which both
+    /// protects the archive and is verified before anything is written.
+    Backup {
+        /// Where to write the archive. Defaults to a timestamped file
+        /// `station-backup-<unix>.rrnbak` in the current directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Restore a station from an encrypted backup archive into the data dir.
+    ///
+    /// Refuses to overwrite a data dir that already holds a station unless
+    /// `--force` is given. Restore into a stopped station (or a fresh dir).
+    Restore {
+        /// The backup archive to restore.
+        archive: PathBuf,
+        /// Overwrite even if the data dir already holds a wallet or database.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -82,6 +104,8 @@ fn main() -> Result<()> {
         Command::PairMobile { address } => cmd_pair_mobile(&data_dir, address),
         Command::ListMobiles => cmd_list_mobiles(&data_dir),
         Command::Unpair { address } => cmd_unpair(&data_dir, address),
+        Command::Backup { out } => cmd_backup(&data_dir, out),
+        Command::Restore { archive, force } => cmd_restore(&data_dir, &archive, force),
     }
 }
 
@@ -210,6 +234,40 @@ fn cmd_unpair(data_dir: &std::path::Path, address: String) -> Result<()> {
         eprintln!("{address} was not paired.");
     }
     Ok(())
+}
+
+/// `station backup [--out FILE]` — write an encrypted backup archive.
+fn cmd_backup(data_dir: &std::path::Path, out: Option<PathBuf>) -> Result<()> {
+    let out_path = out.unwrap_or_else(default_backup_path);
+    let passphrase = read_run_passphrase()?;
+    let written = rrn_station::backup::create_backup(data_dir, &passphrase, &out_path)?;
+    println!("{}", written.display());
+    eprintln!("Backed up station to {}", written.display());
+    eprintln!("Keep this file safe: it holds the ledger and the (encrypted) wallet.");
+    Ok(())
+}
+
+/// `station restore <archive> [--force]` — restore a station into the data dir.
+fn cmd_restore(data_dir: &std::path::Path, archive: &std::path::Path, force: bool) -> Result<()> {
+    let passphrase = read_run_passphrase()?;
+    let address = rrn_station::backup::restore_backup(archive, data_dir, &passphrase, force)?;
+    println!("{address}");
+    eprintln!("Restored station {address} into {}", data_dir.display());
+    eprintln!("Start it with `station run` (the search index rebuilds on first run).");
+    Ok(())
+}
+
+/// Default archive path for `station backup`: a timestamped file in the cwd.
+fn default_backup_path() -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!(
+        "station-backup-{secs}.{}",
+        rrn_station::backup::BACKUP_EXTENSION
+    ))
 }
 
 fn read_run_passphrase() -> Result<String> {

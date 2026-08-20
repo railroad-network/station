@@ -37,6 +37,8 @@ pub const DB_FILE: &str = "station.db";
 pub const SOCKET_FILE: &str = "station.sock";
 /// Config file name within the data dir.
 pub const CONFIG_FILE: &str = "config.toml";
+/// Paired-mobiles list file name within the data dir (T1.3.3).
+pub const PAIRED_FILE: &str = "paired_mobiles.json";
 /// Marketplace full-text index directory within the data dir (T1.6.6).
 ///
 /// A derived cache, not data: per ADR-0010 deleting this directory is a

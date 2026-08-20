@@ -56,9 +56,12 @@ dcbor = "0.25"
 # dependency of its own — it runs its own thread — so it does not constrain the
 # tokio version here. Discovery is not a security boundary (see mdns.rs).
 mdns-sd = "0.20"
+# Temp dir for the `VACUUM INTO` snapshot taken during `station backup`
+# (T1.11.3): the live database is copied to a throwaway file, read into the
+# encrypted archive, and the temp dir is removed on drop.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # Only for the cross-platform vouch fixture generator (tests/cross_platform_vouch.rs):
 # it asserts the mobile tagged-JSON path through `canonical_bytes` yields the same
 # bytes as the typed encoder before committing the vector. No dependency cycle —

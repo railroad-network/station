@@ -21,7 +21,7 @@ use rrn_crypto::keypair::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// File under the station data dir that holds the paired list.
-const FILE: &str = "paired_mobiles.json";
+use crate::station::PAIRED_FILE as FILE;
 
 /// One paired mobile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
