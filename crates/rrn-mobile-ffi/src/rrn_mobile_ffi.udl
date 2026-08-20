@@ -36,6 +36,21 @@ namespace rrn_mobile_ffi {
     // canonical CBOR or do not match the payload shape.
     [Throws=RecoveryError]
     ShardInfo parse_shard_payload(bytes payload);
+
+    // Reads which identity a recovery request targets (T1.11.3 slice D), so a
+    // holder's app can show what it is being asked to help recover before
+    // contributing a shard. `Corrupt` if the request bytes are malformed.
+    [Throws=RecoveryError]
+    RecoveryRequestInfo parse_recovery_request(bytes request_payload);
+
+    // A holder's contribution to a recovery ceremony (T1.11.3 slice D): turns
+    // the shard the holder stored into a raw Shamir share re-sealed to the
+    // operator's ephemeral recovery key (carried in `request_payload`). The raw
+    // share never leaves in the clear — only the recovery secret opens the
+    // returned response. `AddressMismatch` if the held shard is for a different
+    // identity than the request targets; `Corrupt` on malformed input.
+    [Throws=RecoveryError]
+    bytes respond_to_recovery(WalletContents wallet, bytes stored_shard_payload, bytes request_payload);
 };
 
 // Flat error surface for canonical_bytes. Mirrors the tagged-value failure modes
@@ -205,7 +220,14 @@ enum RecoveryError {
     "ShardIndexOutOfRange",
     "Encryption",
     "Corrupt",
+    "AddressMismatch",
     "Internal",
+};
+
+// Non-secret description of a recovery request, for a holder's confirm screen
+// (via `parse_recovery_request`). Names the identity being recovered.
+dictionary RecoveryRequestInfo {
+    string target_address;
 };
 
 // Non-secret metadata read off a distributable shard payload by the holder's
