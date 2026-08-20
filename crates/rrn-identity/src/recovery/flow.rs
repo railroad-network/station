@@ -257,6 +257,84 @@ pub fn reconstruct_wallet(
     })
 }
 
+/// Reconstructs the wallet from `decrypted_shards` and verifies the recovered
+/// address equals `expected` — the package-free counterpart to
+/// [`reconstruct_wallet`], used by the recovery ceremony (which learns the
+/// expected address from a backup archive or a persisted package rather than
+/// carrying the whole package). Supplying fewer than the threshold, or wrong,
+/// shards reconstructs a different key whose address will not match, and is
+/// rejected here.
+pub fn reconstruct_wallet_for_address(
+    decrypted_shards: &[RawShard],
+    expected: &Address,
+) -> Result<WalletContents, RecoveryError> {
+    let mut secret = reconstruct_secret(decrypted_shards)?;
+    let secret_key = SecretKey::from_bytes(secret);
+    secret.zeroize();
+
+    let address = Address::from_public_key(Keypair::from_secret(secret_key.clone()).public_key());
+    if address != *expected {
+        return Err(RecoveryError::AddressMismatch);
+    }
+    Ok(WalletContents {
+        secret_key,
+        address,
+        created_at: now_secs(),
+        metadata: BTreeMap::new(),
+    })
+}
+
+/// The parsed contents of a distributable shard payload
+/// ([`RecoveryPackage::shard_payload`]): its public routing metadata plus the
+/// holder's sealed shard.
+#[derive(Clone, Debug)]
+pub struct ParsedShard {
+    /// The identity this shard helps recover.
+    pub original_address: Address,
+    /// `K` — holders required to reconstruct.
+    pub threshold: u8,
+    /// `N` — total holders.
+    pub total: u8,
+    /// The shard sealed to its holder.
+    pub shard: EncryptedShard,
+}
+
+/// Parses a distributable shard payload back into its metadata and sealed shard.
+///
+/// The single parser for the `{address, threshold, total, shard}` wire format,
+/// used by the mobile holder-receive flow and the recovery ceremony alike.
+pub fn parse_shard_payload(payload: &[u8]) -> Result<ParsedShard, RecoveryError> {
+    let cbor = CBOR::try_from_data(payload)
+        .map_err(|e| RecoveryError::Corrupt(format!("not canonical CBOR: {e}")))?;
+    let map = match cbor.into_case() {
+        CBORCase::Map(map) => map,
+        _ => return Err(RecoveryError::Corrupt("shard payload is not a map".into())),
+    };
+    let corrupt = |what: &str| RecoveryError::Corrupt(format!("shard payload: {what}"));
+    let original_address = map
+        .extract::<&str, Address>(KEY_ADDRESS)
+        .map_err(|_| corrupt("address"))?;
+    let threshold = u8::try_from(
+        map.extract::<&str, u64>(KEY_THRESHOLD)
+            .map_err(|_| corrupt("threshold"))?,
+    )
+    .map_err(|_| corrupt("threshold range"))?;
+    let total = u8::try_from(
+        map.extract::<&str, u64>(KEY_TOTAL)
+            .map_err(|_| corrupt("total"))?,
+    )
+    .map_err(|_| corrupt("total range"))?;
+    let shard = map
+        .extract::<&str, EncryptedShard>(KEY_SHARD)
+        .map_err(|_| corrupt("shard"))?;
+    Ok(ParsedShard {
+        original_address,
+        threshold,
+        total,
+        shard,
+    })
+}
+
 fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

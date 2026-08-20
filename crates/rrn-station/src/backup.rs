@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use dcbor::prelude::*;
 
-use rrn_crypto::keypair::{Keypair, PublicKey};
+use rrn_crypto::keypair::{Keypair, PublicKey, SecretKey};
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_identity::address::Address;
 use rrn_identity::envelope::DualWrapEnvelope;
@@ -176,7 +176,54 @@ pub fn restore_backup(
         );
     }
 
-    // Clobber guard: only if the destination already looks like a station.
+    write_bundle(&bundle, dest_dir, force, false)?;
+    envelope_address(&envelope)
+}
+
+/// Restores an archive using the station's **secret key** rather than the
+/// passphrase — the recovery path (T1.11.3 slice D) taken after a lost
+/// passphrase, once the key has been reconstructed from a threshold of holders.
+///
+/// Writes the ledger and the paired/config files, but **skips the stored wallet
+/// file**: it was encrypted under the lost passphrase and is useless. The caller
+/// writes a fresh wallet from the reconstructed key under a new passphrase.
+/// Returns the restored station's address.
+pub fn restore_with_secret(
+    archive_path: &Path,
+    dest_dir: &Path,
+    secret: &SecretKey,
+    force: bool,
+) -> Result<Address> {
+    let archive_bytes = std::fs::read(archive_path)
+        .with_context(|| format!("read archive {}", archive_path.display()))?;
+    let envelope: DualWrapEnvelope =
+        from_canonical_bytes(&archive_bytes).context("parse backup archive")?;
+
+    let plaintext = envelope
+        .open_with_secret_key(secret)
+        .context("open backup with the recovered key")?;
+    let bundle: BackupBundle =
+        from_canonical_bytes(&plaintext).context("parse decrypted backup bundle")?;
+    if bundle.version != BUNDLE_VERSION {
+        bail!(
+            "unsupported backup bundle version {} (this build supports {BUNDLE_VERSION})",
+            bundle.version
+        );
+    }
+
+    write_bundle(&bundle, dest_dir, force, true)?;
+    envelope_address(&envelope)
+}
+
+/// Writes a decrypted bundle's files into `dest_dir`, with the clobber guard and
+/// a path-traversal check. When `skip_wallet` is set the stored wallet file is
+/// not written (the caller supplies a freshly-keyed one).
+fn write_bundle(
+    bundle: &BackupBundle,
+    dest_dir: &Path,
+    force: bool,
+    skip_wallet: bool,
+) -> Result<()> {
     let occupied = dest_dir.join(WALLET_FILE).exists() || dest_dir.join(DB_FILE).exists();
     if occupied && !force {
         bail!(
@@ -188,6 +235,9 @@ pub fn restore_backup(
 
     std::fs::create_dir_all(dest_dir).with_context(|| format!("create {}", dest_dir.display()))?;
     for (name, bytes) in &bundle.files {
+        if skip_wallet && name == WALLET_FILE {
+            continue;
+        }
         // Defend against a tampered bundle steering a write outside dest_dir.
         if name.contains('/') || name.contains('\\') || name.contains("..") {
             bail!("refusing to restore suspicious filename {name:?}");
@@ -195,12 +245,25 @@ pub fn restore_backup(
         let path = dest_dir.join(name);
         std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
     }
+    Ok(())
+}
 
-    // Derive the restored address from the envelope's recorded public key.
-    let pub_bytes = envelope.recipient_public_key();
-    let public = PublicKey::from_bytes(pub_bytes)
+/// The station address recorded (in the clear) in an archive's envelope.
+fn envelope_address(envelope: &DualWrapEnvelope) -> Result<Address> {
+    let public = PublicKey::from_bytes(envelope.recipient_public_key())
         .map_err(|e| anyhow::anyhow!("archive carried an invalid station key: {e}"))?;
     Ok(Address::from_public_key(public))
+}
+
+/// Reads which station an archive belongs to without decrypting it — the
+/// envelope records the station's public key in the clear. Used by recovery to
+/// learn the target address before the key has been reconstructed.
+pub fn archive_address(archive_path: &Path) -> Result<Address> {
+    let archive_bytes = std::fs::read(archive_path)
+        .with_context(|| format!("read archive {}", archive_path.display()))?;
+    let envelope: DualWrapEnvelope =
+        from_canonical_bytes(&archive_bytes).context("parse backup archive")?;
+    envelope_address(&envelope)
 }
 
 #[cfg(test)]

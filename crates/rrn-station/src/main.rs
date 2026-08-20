@@ -110,6 +110,19 @@ enum RecoveryCmd {
         /// The holder's `rrn1…` address.
         address: String,
     },
+    /// Reconstruct the station key from a threshold of holders after a lost
+    /// passphrase. Prints a request QR for holders to scan, then reads their
+    /// responses. In place by default (data dir intact); pass a backup archive
+    /// to rebuild on a fresh machine.
+    Restore {
+        /// Rebuild from this backup archive (total-loss recovery). Omit to
+        /// re-key an intact data dir whose passphrase was lost.
+        #[arg(long = "from-backup", value_name = "ARCHIVE")]
+        from_backup: Option<PathBuf>,
+        /// Overwrite even if the data dir already holds a station.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -140,6 +153,9 @@ fn main() -> Result<()> {
             }
             RecoveryCmd::Status => cmd_recovery_status(&data_dir),
             RecoveryCmd::ShowShard { address } => cmd_recovery_show_shard(&data_dir, &address),
+            RecoveryCmd::Restore { from_backup, force } => {
+                cmd_recovery_restore(&data_dir, from_backup.as_deref(), force)
+            }
         },
     }
 }
@@ -337,6 +353,74 @@ fn cmd_recovery_show_shard(data_dir: &std::path::Path, address: &str) -> Result<
     println!("{}", rrn_station::recovery::render_qr(&shard.qr_payload));
     eprintln!("(or paste: {})", shard.qr_payload);
     Ok(())
+}
+
+/// `station recovery restore [--from-backup ARCHIVE]` — reconstruct the key from
+/// a threshold of holder responses and re-key the station.
+fn cmd_recovery_restore(
+    data_dir: &std::path::Path,
+    from_backup: Option<&std::path::Path>,
+    force: bool,
+) -> Result<()> {
+    use std::io::BufRead;
+
+    let (session, request_qr) = rrn_station::recovery::begin_restore(data_dir, from_backup)?;
+    eprintln!("Recovering station {}", session.target());
+    eprintln!("\nHave each holder scan this request in their wallet's \"help recover\" flow:\n");
+    println!("{}", rrn_station::recovery::render_qr(&request_qr));
+    eprintln!("(or send them this line: {request_qr})\n");
+    eprintln!(
+        "Paste each holder's response line below as it comes in. Press Enter on an empty line \
+         when you have enough:"
+    );
+
+    let mut responses = Vec::new();
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.context("read response")?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with(rrn_station::recovery::RESPONSE_PREFIX) {
+            responses.push(trimmed.to_string());
+            eprintln!("  collected {} response(s)", responses.len());
+        } else {
+            eprintln!(
+                "  (ignored — not an {} line)",
+                rrn_station::recovery::RESPONSE_PREFIX
+            );
+        }
+    }
+    if responses.is_empty() {
+        anyhow::bail!("no responses collected");
+    }
+
+    let new_passphrase = read_new_passphrase()?;
+    let address = rrn_station::recovery::finish_restore(
+        &session,
+        &responses,
+        &new_passphrase,
+        data_dir,
+        force,
+    )?;
+    println!("{address}");
+    eprintln!("Recovered station {address}. Start it with `station run` using the new passphrase.");
+    Ok(())
+}
+
+/// Reads a new passphrase for a recovered wallet: from `RRN_NEW_PASSPHRASE`, or
+/// prompted (twice, without echo).
+fn read_new_passphrase() -> Result<String> {
+    if let Ok(p) = std::env::var("RRN_NEW_PASSPHRASE") {
+        return Ok(p);
+    }
+    let first = rpassword::prompt_password("New wallet passphrase: ").context("read passphrase")?;
+    let second = rpassword::prompt_password("Confirm passphrase: ").context("read passphrase")?;
+    if first != second {
+        anyhow::bail!("passphrases did not match");
+    }
+    Ok(first)
 }
 
 /// Default archive path for `station backup`: a timestamped file in the cwd.

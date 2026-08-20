@@ -27,6 +27,7 @@
 //!   and a set of holders, persist it, and reconstruct the wallet from
 //!   decrypted shards.
 
+pub mod ceremony;
 pub mod encryption;
 pub mod flow;
 pub mod gf256;

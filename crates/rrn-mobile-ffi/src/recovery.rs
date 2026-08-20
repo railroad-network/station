@@ -18,21 +18,14 @@
 
 use std::sync::Arc;
 
-use dcbor::prelude::*;
-
 use rrn_identity::address::Address;
-use rrn_identity::recovery::encryption::EncryptedShard;
+use rrn_identity::recovery::ceremony::{self, RecoveryRequest};
 use rrn_identity::recovery::flow::{
-    RecoveryError as CoreRecoveryError, RecoveryPackage as CoreRecoveryPackage,
+    parse_shard_payload as core_parse_shard_payload, RecoveryError as CoreRecoveryError,
+    RecoveryPackage as CoreRecoveryPackage,
 };
 
 use crate::WalletContents;
-
-// Shard-payload map keys. Defined once so build and parse cannot drift.
-const KEY_ADDRESS: &str = "address";
-const KEY_THRESHOLD: &str = "threshold";
-const KEY_TOTAL: &str = "total";
-const KEY_SHARD: &str = "shard";
 
 /// Error surfaced across the FFI boundary for recovery operations.
 ///
@@ -62,6 +55,9 @@ pub enum RecoveryError {
     /// A shard payload was not valid canonical CBOR or had the wrong shape.
     #[error("corrupt shard payload")]
     Corrupt,
+    /// A held shard is for a different identity than a recovery request targets.
+    #[error("shard is for a different identity")]
+    AddressMismatch,
     /// An unexpected error from the recovery core (not reachable on this
     /// surface; present so the conversion is total).
     #[error("internal recovery error")]
@@ -76,11 +72,10 @@ impl From<CoreRecoveryError> for RecoveryError {
             CoreRecoveryError::ShardCrypto(_) => RecoveryError::Encryption,
             CoreRecoveryError::Corrupt(_) => RecoveryError::Corrupt,
             CoreRecoveryError::ShardIndexOutOfRange => RecoveryError::ShardIndexOutOfRange,
-            // Reconstruction, the address check, and file I/O do not happen on
-            // this FFI surface, so these are unreachable here.
-            CoreRecoveryError::Reconstruct(_)
-            | CoreRecoveryError::AddressMismatch
-            | CoreRecoveryError::Io(_) => RecoveryError::Internal,
+            // A holder can hold a shard for the wrong identity; surface that.
+            CoreRecoveryError::AddressMismatch => RecoveryError::AddressMismatch,
+            // Reconstruction and file I/O do not happen on this FFI surface.
+            CoreRecoveryError::Reconstruct(_) | CoreRecoveryError::Io(_) => RecoveryError::Internal,
         }
     }
 }
@@ -171,33 +166,52 @@ impl RecoveryPackage {
 /// store the payload under the original address. `Corrupt` if the bytes are not
 /// canonical CBOR or do not match the payload shape.
 pub fn parse_shard_payload(payload: Vec<u8>) -> Result<ShardInfo, RecoveryError> {
-    let cbor = CBOR::try_from_data(&payload).map_err(|_| RecoveryError::Corrupt)?;
-    let map = match cbor.into_case() {
-        CBORCase::Map(map) => map,
-        _ => return Err(RecoveryError::Corrupt),
-    };
-    let original_address = map
-        .extract::<&str, Address>(KEY_ADDRESS)
-        .map_err(|_| RecoveryError::Corrupt)?;
-    let threshold = u8::try_from(
-        map.extract::<&str, u64>(KEY_THRESHOLD)
-            .map_err(|_| RecoveryError::Corrupt)?,
-    )
-    .map_err(|_| RecoveryError::Corrupt)?;
-    let total = u8::try_from(
-        map.extract::<&str, u64>(KEY_TOTAL)
-            .map_err(|_| RecoveryError::Corrupt)?,
-    )
-    .map_err(|_| RecoveryError::Corrupt)?;
-    let shard = map
-        .extract::<&str, EncryptedShard>(KEY_SHARD)
-        .map_err(|_| RecoveryError::Corrupt)?;
+    let parsed = core_parse_shard_payload(&payload)?;
     Ok(ShardInfo {
-        original_address: original_address.to_string(),
-        holder_address: shard.holder.to_string(),
-        threshold,
-        total,
+        original_address: parsed.original_address.to_string(),
+        holder_address: parsed.shard.holder.to_string(),
+        threshold: parsed.threshold,
+        total: parsed.total,
     })
+}
+
+/// A holder's contribution to a recovery ceremony: turn the shard they hold into
+/// a raw Shamir share re-sealed to the operator's ephemeral recovery key (T1.11.3
+/// slice D). `stored_shard_payload` is the payload the holder received and
+/// stored; `request_payload` is the operator's [`RecoveryRequest`] bytes.
+///
+/// The returned bytes are the sealed response for the operator to collect. The
+/// raw share is never exposed in the clear — only the recovery secret opens it.
+/// `Corrupt` on a malformed input; `AddressMismatch` if the held shard is for a
+/// different identity than the request targets.
+pub fn respond_to_recovery(
+    wallet: Arc<WalletContents>,
+    stored_shard_payload: Vec<u8>,
+    request_payload: Vec<u8>,
+) -> Result<Vec<u8>, RecoveryError> {
+    let request = RecoveryRequest::from_bytes(&request_payload)?;
+    Ok(ceremony::build_response(
+        &stored_shard_payload,
+        &wallet.inner.secret_key,
+        &request,
+    )?)
+}
+
+/// Reads which identity a recovery request targets, so a holder's app can show
+/// what it is being asked to help recover before contributing a shard.
+pub fn parse_recovery_request(
+    request_payload: Vec<u8>,
+) -> Result<RecoveryRequestInfo, RecoveryError> {
+    let request = RecoveryRequest::from_bytes(&request_payload)?;
+    Ok(RecoveryRequestInfo {
+        target_address: request.target_address.to_string(),
+    })
+}
+
+/// Non-secret description of a recovery request, for a holder's confirm screen.
+pub struct RecoveryRequestInfo {
+    /// The `rrn1…` address of the identity being recovered.
+    pub target_address: String,
 }
 
 #[cfg(test)]
@@ -236,6 +250,66 @@ mod tests {
             assert_eq!(info.threshold, 3);
             assert_eq!(info.total, 5);
         }
+    }
+
+    #[test]
+    fn respond_to_recovery_produces_an_openable_response() {
+        use rrn_identity::address::Address as CoreAddress;
+        use rrn_identity::recovery::ceremony::{open_response, RecoveryRequest};
+
+        // A holder wallet whose secret we control, plus a throwaway second
+        // holder to satisfy N=2 / K=2.
+        let holder = Arc::new(WalletContents::create_new());
+        let holder_addr = holder.address();
+        let other = crate::Keypair::generate().public_key().to_address();
+
+        let station = Arc::new(WalletContents::create_new());
+        let station_addr = station.address();
+        let package =
+            RecoveryPackage::create(station, vec![holder_addr, other], 2).expect("create");
+        let payload = package.shard_payload(0).expect("shard_payload");
+
+        // The operator's ephemeral recovery key and request.
+        let recovery = rrn_crypto::keypair::Keypair::generate();
+        let request = RecoveryRequest {
+            recovery_pubkey: recovery.public_key(),
+            target_address: station_addr.parse::<CoreAddress>().unwrap(),
+        };
+        let request_bytes = request.to_bytes();
+
+        // The phone can read which identity it is being asked to recover.
+        let info = parse_recovery_request(request_bytes.clone()).unwrap();
+        assert_eq!(info.target_address, station_addr);
+
+        // And produce a response the operator can open with the recovery secret.
+        let response = respond_to_recovery(holder, payload, request_bytes).unwrap();
+        assert!(!response.is_empty());
+        assert!(open_response(&response, recovery.secret_key()).is_ok());
+    }
+
+    #[test]
+    fn respond_to_recovery_rejects_a_shard_for_another_identity() {
+        use rrn_identity::address::Address as CoreAddress;
+        use rrn_identity::recovery::ceremony::RecoveryRequest;
+
+        let holder = Arc::new(WalletContents::create_new());
+        let other = crate::Keypair::generate().public_key().to_address();
+        let station = Arc::new(WalletContents::create_new());
+        let package =
+            RecoveryPackage::create(station, vec![holder.address(), other], 2).expect("create");
+        let payload = package.shard_payload(0).expect("shard_payload");
+
+        let recovery = rrn_crypto::keypair::Keypair::generate();
+        // Request targets a different identity than the shard is for.
+        let stranger = crate::Keypair::generate().public_key().to_address();
+        let request = RecoveryRequest {
+            recovery_pubkey: recovery.public_key(),
+            target_address: stranger.parse::<CoreAddress>().unwrap(),
+        };
+        assert!(matches!(
+            respond_to_recovery(holder, payload, request.to_bytes()),
+            Err(RecoveryError::AddressMismatch)
+        ));
     }
 
     #[test]
