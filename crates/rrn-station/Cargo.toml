@@ -56,6 +56,12 @@ dcbor = "0.25"
 # dependency of its own — it runs its own thread — so it does not constrain the
 # tokio version here. Discovery is not a security boundary (see mdns.rs).
 mdns-sd = "0.20"
+# `station recovery setup` renders each sealed shard as a scannable terminal QR
+# (the mobile holder-receive flow ingests shards only by QR scan) carrying the
+# `rrnrecovery:<base64>` payload. qrcode with no default features avoids pulling
+# the `image` stack; base64 is the RFC 4648 alphabet the mobile decoder expects.
+qrcode = { version = "0.14", default-features = false }
+base64 = "0.22"
 # Temp dir for the `VACUUM INTO` snapshot taken during `station backup`
 # (T1.11.3): the live database is copied to a throwaway file, read into the
 # encrypted archive, and the temp dir is removed on drop.

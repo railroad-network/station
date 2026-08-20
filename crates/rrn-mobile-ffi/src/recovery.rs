@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use dcbor::prelude::*;
 
-use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::recovery::encryption::EncryptedShard;
 use rrn_identity::recovery::flow::{
@@ -76,6 +75,7 @@ impl From<CoreRecoveryError> for RecoveryError {
             CoreRecoveryError::Split(_) => RecoveryError::InvalidParameters,
             CoreRecoveryError::ShardCrypto(_) => RecoveryError::Encryption,
             CoreRecoveryError::Corrupt(_) => RecoveryError::Corrupt,
+            CoreRecoveryError::ShardIndexOutOfRange => RecoveryError::ShardIndexOutOfRange,
             // Reconstruction, the address check, and file I/O do not happen on
             // this FFI surface, so these are unreachable here.
             CoreRecoveryError::Reconstruct(_)
@@ -154,17 +154,12 @@ impl RecoveryPackage {
     /// later reconstruct. Only the addressed holder's secret key can open the
     /// sealed shard, so the payload is safe to move over an untrusted channel.
     pub fn shard_payload(&self, index: u32) -> Result<Vec<u8>, RecoveryError> {
-        let shard = self
-            .inner
-            .shards
-            .get(index as usize)
-            .ok_or(RecoveryError::ShardIndexOutOfRange)?;
-        let mut map = Map::new();
-        map.insert(KEY_ADDRESS, self.inner.recovery_metadata.original_address);
-        map.insert(KEY_THRESHOLD, self.inner.threshold as u64);
-        map.insert(KEY_TOTAL, self.inner.total as u64);
-        map.insert(KEY_SHARD, shard.clone());
-        Ok(to_canonical_bytes(map))
+        // Delegate to the core producer so the phone and the station emit
+        // byte-identical payloads (the station's `recovery setup` calls the same
+        // `RecoveryPackage::shard_payload`).
+        self.inner
+            .shard_payload(index as usize)
+            .map_err(|_| RecoveryError::ShardIndexOutOfRange)
     }
 }
 

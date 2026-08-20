@@ -39,6 +39,16 @@ use super::shamir::{
 /// File extension for a saved recovery package.
 pub const RECOVERY_EXTENSION: &str = "rrnrecovery";
 
+/// CBOR map keys for a distributable shard payload
+/// ([`RecoveryPackage::shard_payload`]). This is a **cross-surface wire
+/// format**: the mobile holder-receive flow parses exactly these keys (see the
+/// mobile app's `recoveryShard.ts` / `parse_shard_payload` in `rrn-mobile-ffi`),
+/// so they must not change without updating every consumer.
+const KEY_ADDRESS: &str = "address";
+const KEY_THRESHOLD: &str = "threshold";
+const KEY_TOTAL: &str = "total";
+const KEY_SHARD: &str = "shard";
+
 /// Public, non-secret metadata describing a recovery package.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryMetadata {
@@ -95,6 +105,10 @@ pub enum RecoveryError {
     /// The package file was not valid canonical CBOR or had the wrong shape.
     #[error("corrupt recovery package: {0}")]
     Corrupt(String),
+    /// A shard index passed to [`RecoveryPackage::shard_payload`] was outside
+    /// `0..shards.len()`.
+    #[error("shard index out of range")]
+    ShardIndexOutOfRange,
 }
 
 impl RecoveryPackage {
@@ -186,6 +200,30 @@ impl RecoveryPackage {
     pub fn load_from_file(path: &Path) -> Result<Self, RecoveryError> {
         let bytes = std::fs::read(path)?;
         from_canonical_bytes(&bytes).map_err(|e| RecoveryError::Corrupt(e.to_string()))
+    }
+
+    /// The self-contained, distributable payload for the shard at `index`:
+    /// canonical CBOR of `{address, threshold, total, shard}`.
+    ///
+    /// A holder receives this (typically by scanning a QR) and stores it; it
+    /// carries the shard sealed to that holder plus the public metadata needed
+    /// to route it and later reconstruct. Only the addressed holder's secret key
+    /// can open the sealed shard, so the payload is safe to move over an
+    /// untrusted channel. Valid indices are `0..self.shards.len()`.
+    ///
+    /// This is the byte format the mobile holder-receive flow parses, so both
+    /// the phone (via `rrn-mobile-ffi`) and the station produce it here.
+    pub fn shard_payload(&self, index: usize) -> Result<Vec<u8>, RecoveryError> {
+        let shard = self
+            .shards
+            .get(index)
+            .ok_or(RecoveryError::ShardIndexOutOfRange)?;
+        let mut map = Map::new();
+        map.insert(KEY_ADDRESS, self.recovery_metadata.original_address);
+        map.insert(KEY_THRESHOLD, self.threshold as u64);
+        map.insert(KEY_TOTAL, self.total as u64);
+        map.insert(KEY_SHARD, shard.clone());
+        Ok(to_canonical_bytes(map))
     }
 }
 

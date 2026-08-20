@@ -82,6 +82,34 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Manage key recovery: split the station key across trusted holders so a
+    /// threshold of them can restore it after a lost passphrase (ADR-0016).
+    Recovery {
+        #[command(subcommand)]
+        cmd: RecoveryCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCmd {
+    /// Arm recovery: split the station key across holders and print a shard QR
+    /// for each. Prompts for the wallet passphrase. Re-running re-splits and
+    /// invalidates shards handed out before.
+    Setup {
+        /// A holder's `rrn1…` address. Repeat once per holder (N total).
+        #[arg(long = "holder", required = true, value_name = "ADDRESS")]
+        holders: Vec<String>,
+        /// K — how many holders must cooperate to recover (2 ≤ K ≤ N).
+        #[arg(long)]
+        threshold: u8,
+    },
+    /// Show the current recovery configuration.
+    Status,
+    /// Re-display one holder's shard QR (for redelivery).
+    ShowShard {
+        /// The holder's `rrn1…` address.
+        address: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,6 +134,13 @@ fn main() -> Result<()> {
         Command::Unpair { address } => cmd_unpair(&data_dir, address),
         Command::Backup { out } => cmd_backup(&data_dir, out),
         Command::Restore { archive, force } => cmd_restore(&data_dir, &archive, force),
+        Command::Recovery { cmd } => match cmd {
+            RecoveryCmd::Setup { holders, threshold } => {
+                cmd_recovery_setup(&data_dir, &holders, threshold)
+            }
+            RecoveryCmd::Status => cmd_recovery_status(&data_dir),
+            RecoveryCmd::ShowShard { address } => cmd_recovery_show_shard(&data_dir, &address),
+        },
     }
 }
 
@@ -254,6 +289,53 @@ fn cmd_restore(data_dir: &std::path::Path, archive: &std::path::Path, force: boo
     println!("{address}");
     eprintln!("Restored station {address} into {}", data_dir.display());
     eprintln!("Start it with `station run` (the search index rebuilds on first run).");
+    Ok(())
+}
+
+/// `station recovery setup` — split the key across holders and print shard QRs.
+fn cmd_recovery_setup(data_dir: &std::path::Path, holders: &[String], threshold: u8) -> Result<()> {
+    let passphrase = read_run_passphrase()?;
+    let shards = rrn_station::recovery::setup(data_dir, &passphrase, holders, threshold)?;
+    eprintln!(
+        "Recovery armed: {}-of-{} holders. Show each holder their QR to scan into their wallet.\n",
+        threshold,
+        shards.len()
+    );
+    for (i, shard) in shards.iter().enumerate() {
+        eprintln!(
+            "── Holder {} of {} — {}",
+            i + 1,
+            shards.len(),
+            shard.address
+        );
+        println!("{}", rrn_station::recovery::render_qr(&shard.qr_payload));
+        eprintln!("(or paste this if scanning fails: {})\n", shard.qr_payload);
+    }
+    eprintln!(
+        "Keep at least {threshold} holders reachable — any {threshold} of them can restore the \
+         station key even if the passphrase is lost."
+    );
+    Ok(())
+}
+
+/// `station recovery status` — print the current recovery configuration.
+fn cmd_recovery_status(data_dir: &std::path::Path) -> Result<()> {
+    let st = rrn_station::recovery::status(data_dir)?;
+    println!("{}-of-{} recovery", st.threshold, st.total);
+    eprintln!("Holders:");
+    for h in &st.holders {
+        println!("  {h}");
+    }
+    eprintln!("Armed at (unix): {}", st.created_at);
+    Ok(())
+}
+
+/// `station recovery show-shard <address>` — re-print one holder's shard QR.
+fn cmd_recovery_show_shard(data_dir: &std::path::Path, address: &str) -> Result<()> {
+    let shard = rrn_station::recovery::shard_for(data_dir, address)?;
+    eprintln!("Shard for {} — have them scan this:", shard.address);
+    println!("{}", rrn_station::recovery::render_qr(&shard.qr_payload));
+    eprintln!("(or paste: {})", shard.qr_payload);
     Ok(())
 }
 
