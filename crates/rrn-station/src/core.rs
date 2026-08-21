@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_dispute::escalation::{
     EscalationBallot, EscalationReason, EscalationRecord, SignedEscalation, SignedEscalationBallot,
 };
@@ -28,7 +28,10 @@ use rrn_dispute::resolution::{
 };
 use rrn_dispute::verdict::{JurorVerdict, SignedVerdict};
 use rrn_dispute::DisputeParams;
-use rrn_governance::charter::{create_charter, store_charter, CharterParams};
+use rrn_governance::charter::{
+    create_charter, latest_charter, store_charter, store_pending_charter, CharterParams,
+    SignedCharter,
+};
 use rrn_governance::proposal::{
     append_cosign, append_proposal, Proposal, ProposalCosign, ProposalId, ProposalKind,
 };
@@ -665,6 +668,10 @@ impl Core {
             "governance_proposal" => self.m_governance_proposal(req),
             "governance_statutes" => self.m_governance_statutes(),
             "governance_init_charter" => self.m_governance_init_charter(req),
+            "governance_charter_begin" => self.m_governance_charter_begin(req),
+            "governance_pending_charter" => self.m_governance_pending_charter(),
+            "governance_add_charter_signature" => self.m_governance_add_charter_signature(req),
+            "governance_charter_sign" => self.m_governance_charter_sign(req),
             "governance_propose" => self.m_governance_propose(req),
             "governance_cosign" => self.m_governance_cosign(req),
             "governance_vote" => self.m_governance_vote(req),
@@ -2190,6 +2197,169 @@ impl Core {
         })
     }
 
+    /// `governance_charter_begin` — open a distributed founding ceremony. The
+    /// operator declares the founders **by address** (not by secret key), so
+    /// founders who hold their keys on a phone can take part: the coordinator
+    /// station fixes the Charter body (including a single `created_at`), adds its
+    /// own signature if it is itself a founder, and appends it as a *pending*
+    /// Charter. Each remaining founder then signs the same body on their own
+    /// device and submits the signature (`governance_submit_charter_signature`
+    /// over the channel, or `governance_add_charter_signature` locally); the
+    /// Charter publishes automatically once the founder threshold is met.
+    fn m_governance_charter_begin(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovCharterBeginParams = parse_params(req)?;
+        if latest_charter(&self.db).map_err(internal)?.is_some() {
+            return Err(invalid_params(
+                "a charter already exists for this community (pending or published)",
+            ));
+        }
+        let station = self.station_keypair();
+        let now = self.clock.now();
+
+        let mut founders = Vec::with_capacity(params.founders.len());
+        for a in &params.founders {
+            founders.push(parse_addr(a)?);
+        }
+
+        let charter_params = CharterParams {
+            version: 1,
+            community_id: params.community_id,
+            founding_principles: params.founding_principles,
+            rights_floor: params.rights_floor,
+            governance_structure: rrn_governance::charter::GovernanceStructure::default(),
+            amendment_rules: rrn_governance::charter::AmendmentRules::default(),
+            founders,
+            created_at: now,
+            previous_hash: None,
+        };
+        // The coordinator co-signs at once only if it is itself a declared founder.
+        let self_signer: Vec<Keypair> = if charter_params.founders.contains(&self.wallet.address) {
+            vec![station.clone()]
+        } else {
+            vec![]
+        };
+        let signed = create_charter(charter_params, &self_signer)
+            .map_err(|e| invalid_params(e.to_string()))?;
+
+        let mut log = AppendLog::new(&self.db);
+        store_pending_charter(&mut log, &station, signed.clone())
+            .map_err(|e| invalid_params(e.to_string()))?;
+        ok(&self.pending_charter_view(&signed))
+    }
+
+    /// `governance_pending_charter` — the state of the founding ceremony: the
+    /// Charter body being signed, which founders have signed, the threshold, and
+    /// whether it has published. `None` before any `charter-begin`.
+    fn m_governance_pending_charter(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        match latest_charter(&self.db).map_err(internal)? {
+            Some(signed) => ok(&self.pending_charter_view(&signed)),
+            None => ok(&serde_json::json!({ "exists": false })),
+        }
+    }
+
+    /// `governance_add_charter_signature` — ingest a founder signature collected
+    /// out of band (e.g. another station founder ran `governance charter-sign`).
+    /// The channel path (`channel_governance_submit_charter_signature`) is the
+    /// same logic keyed off the authenticated mobile instead.
+    fn m_governance_add_charter_signature(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovAddCharterSignatureParams = parse_params(req)?;
+        let signer = parse_pubkey_hex(&params.signer_pubkey_hex)?;
+        let signature = parse_signature_hex(&params.signature_hex)?;
+        let signed = self
+            .ingest_charter_signature(signer, signature)
+            .map_err(|(code, message)| rpc::RpcError { code, message })?;
+        ok(&self.pending_charter_view(&signed))
+    }
+
+    /// `governance_charter_sign` — sign a Charter body's canonical bytes with this
+    /// station's own wallet, returning the `(signer, signature)` pair. A founder
+    /// station runs this on the body the coordinator shares (its `body_hex`) and
+    /// hands the signature back — the CLI counterpart of a phone signing over the
+    /// channel. It signs the supplied bytes and does not itself touch the log.
+    fn m_governance_charter_sign(
+        &self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovCharterSignParams = parse_params(req)?;
+        let body = unhex(params.charter_body_hex.trim())
+            .ok_or_else(|| invalid_params("charter_body_hex is not valid hex"))?;
+        // Round-trips the body so a mistyped blob is caught, not silently signed.
+        from_canonical_bytes::<rrn_governance::charter::Charter>(&body)
+            .map_err(|_| invalid_params("charter_body_hex is not a valid Charter body"))?;
+        let station = self.station_keypair();
+        let signature = station.sign(&body);
+        ok(&rpc::GovCharterSignResult {
+            signer_pubkey_hex: hex(&station.public_key().to_bytes()),
+            signature_hex: hex(&signature.to_bytes()),
+        })
+    }
+
+    /// Adds one founder's remote signature to the pending Charter and re-appends
+    /// it, publishing (a threshold-clearing append) once enough founders have
+    /// signed. Shared by the local and channel entry points; returns the updated
+    /// Charter.
+    fn ingest_charter_signature(
+        &mut self,
+        signer: PublicKey,
+        signature: Signature,
+    ) -> Result<SignedCharter, (i32, String)> {
+        let mut signed = latest_charter(&self.db)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+            .ok_or_else(|| {
+                (
+                    rpc::INVALID_PARAMS,
+                    "no founding charter in progress; run governance charter-begin".to_string(),
+                )
+            })?;
+        if signed.verify_founders().is_ok() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "the charter has already published; no more signatures are needed".to_string(),
+            ));
+        }
+        signed
+            .add_remote_signature(signer, signature)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        let station = self.station_keypair();
+        let mut log = AppendLog::new(&self.db);
+        // Threshold-clearing appends publish (verify_founders holds); short of it,
+        // the Charter stays pending — both are the same append, gated on reads.
+        store_pending_charter(&mut log, &station, signed.clone())
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(signed)
+    }
+
+    /// Renders a Charter (pending or published) as the ceremony view.
+    fn pending_charter_view(&self, signed: &SignedCharter) -> rpc::GovPendingCharterResult {
+        let charter = signed.charter();
+        let founders: Vec<String> = charter.founders.iter().map(|a| a.to_string()).collect();
+        let signed_founders: Vec<String> = signed
+            .signed_founders()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        rpc::GovPendingCharterResult {
+            exists: true,
+            published: signed.verify_founders().is_ok(),
+            charter_hash: signed.charter_hash().to_string(),
+            community_id: charter.community_id.clone(),
+            founding_principles: charter.founding_principles.clone(),
+            rights_floor: charter.rights_floor.clone(),
+            founders,
+            signed_founders,
+            threshold: rrn_governance::charter::founder_threshold(charter.founders.len()),
+            created_at: charter.created_at,
+            version: charter.version,
+            body_hex: hex(&to_canonical_bytes(charter.clone())),
+        }
+    }
+
     /// `governance_propose` — author a proposal signed by the station wallet. The
     /// author must be an established member, as the governance guard enforces.
     fn m_governance_propose(
@@ -2584,6 +2754,27 @@ impl Core {
             rrn_governance::proposal::proposal_records(&AppendLog::new(&self.db), &id, &self.db)
                 .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "cosigner_count": records.cosigner_count() }))
+    }
+
+    /// `governance_submit_charter_signature` — a founder's phone signs the genesis
+    /// Charter body on-device and submits its signature (the distributed founding
+    /// ceremony). The founder is the authenticated mobile, so the signature is
+    /// attributed to `envelope.signer`; the payload carries only the 64-byte
+    /// signature over the Charter body's canonical bytes. Publishes the Charter
+    /// once the founder threshold is met.
+    fn channel_governance_submit_charter_signature(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let sig_bytes = hex_param(&envelope.params, "charter_signature")?;
+        let arr: [u8; 64] = sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| (rpc::INVALID_PARAMS, "signature must be 64 bytes".into()))?;
+        let signature = Signature::from_bytes(arr)
+            .map_err(|_| (rpc::INVALID_PARAMS, "signature is malformed".into()))?;
+        let signed = self.ingest_charter_signature(envelope.signer, signature)?;
+        Ok(serde_json::to_value(self.pending_charter_view(&signed)).unwrap_or_default())
     }
 
     /// `governance_submit_vote` — accept a mobile-signed [`Vote`].
@@ -3062,6 +3253,9 @@ impl Core {
             "governance_submit_proposal" => self.channel_governance_submit_proposal(envelope),
             "governance_submit_cosign" => self.channel_governance_submit_cosign(envelope),
             "governance_submit_vote" => self.channel_governance_submit_vote(envelope),
+            "governance_submit_charter_signature" => {
+                self.channel_governance_submit_charter_signature(envelope)
+            }
             // Dispute writes (T1.10.5): each carries a mobile-signed record whose
             // signer must be the authenticated mobile. Reads fall through to the
             // shared, signer-less dispatch below.
@@ -3075,6 +3269,7 @@ impl Core {
             | "transactions"
             | "next_nonce"
             | "governance_charter"
+            | "governance_pending_charter"
             | "governance_proposals"
             | "governance_proposal"
             | "governance_statutes"
@@ -4116,6 +4311,26 @@ fn parse_secret_keypair(hex_secret: &str) -> Result<Keypair, rpc::RpcError> {
     Ok(Keypair::from_secret(
         rrn_crypto::keypair::SecretKey::from_bytes(arr),
     ))
+}
+
+/// Parses a hex-encoded 32-byte public key (a founder's identity).
+fn parse_pubkey_hex(s: &str) -> Result<PublicKey, rpc::RpcError> {
+    let bytes = unhex(s.trim()).ok_or_else(|| invalid_params("signer key is not valid hex"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_params("signer key must be 32 bytes"))?;
+    PublicKey::from_bytes(arr).map_err(|_| invalid_params("signer key is not a valid public key"))
+}
+
+/// Parses a hex-encoded 64-byte Ed25519 signature.
+fn parse_signature_hex(s: &str) -> Result<Signature, rpc::RpcError> {
+    let bytes = unhex(s.trim()).ok_or_else(|| invalid_params("signature is not valid hex"))?;
+    let arr: [u8; 64] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_params("signature must be 64 bytes"))?;
+    Signature::from_bytes(arr).map_err(|_| invalid_params("signature is malformed"))
 }
 
 fn parse_proposal_kind(p: &rpc::GovProposeParams) -> Result<ProposalKind, rpc::RpcError> {
@@ -6305,6 +6520,81 @@ mod tests {
         assert_eq!(r["version"], 1);
         let c = call(&mut core, "governance_charter", serde_json::json!({}));
         assert_eq!(c["founders"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn governance_charter_ceremony_collects_remote_signatures_and_publishes() {
+        let mut core = test_core();
+        // Founders = the station coordinator + 3 external (phone-held) founders,
+        // so the threshold is ceil(4 × 0.75) = 3.
+        let externals: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        let mut founders: Vec<String> = vec![core.wallet.address.to_string()];
+        founders.extend(
+            externals
+                .iter()
+                .map(|k| Address::from_public_key(k.public_key()).to_string()),
+        );
+
+        let begun = call(
+            &mut core,
+            "governance_charter_begin",
+            serde_json::json!({ "community_id": "pilot", "founders": founders }),
+        );
+        assert_eq!(begun["exists"], true);
+        // The coordinator's own signature only — 1 of 4, short of the bar.
+        assert_eq!(begun["published"], false);
+        assert_eq!(begun["threshold"], 3);
+        assert_eq!(begun["signed_founders"].as_array().unwrap().len(), 1);
+        // Not yet the community's genesis charter.
+        assert_eq!(
+            call(&mut core, "governance_charter", serde_json::json!({}))["published"],
+            false
+        );
+
+        // The body each founder signs, shared to them by the coordinator.
+        let body = unhex(begun["body_hex"].as_str().unwrap()).unwrap();
+
+        // Two external founders sign remotely and submit; the third stays absent.
+        for f in &externals[..2] {
+            let sig = f.sign(&body);
+            call(
+                &mut core,
+                "governance_add_charter_signature",
+                serde_json::json!({
+                    "signer_pubkey_hex": hex(&f.public_key().to_bytes()),
+                    "signature_hex": hex(&sig.to_bytes()),
+                }),
+            );
+        }
+
+        // 3 of 4 have now signed → the charter publishes automatically.
+        let pending = call(
+            &mut core,
+            "governance_pending_charter",
+            serde_json::json!({}),
+        );
+        assert_eq!(pending["published"], true);
+        assert_eq!(pending["signed_founders"].as_array().unwrap().len(), 3);
+        let c = call(&mut core, "governance_charter", serde_json::json!({}));
+        assert_eq!(c["published"], true);
+        assert_eq!(c["founders"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn governance_charter_begin_refuses_a_second_ceremony() {
+        let mut core = test_core();
+        let founders = vec![core.wallet.address.to_string()];
+        call(
+            &mut core,
+            "governance_charter_begin",
+            serde_json::json!({ "community_id": "pilot", "founders": founders.clone() }),
+        );
+        let err = call_err(
+            &mut core,
+            "governance_charter_begin",
+            serde_json::json!({ "community_id": "pilot", "founders": founders }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
     }
 
     #[test]
