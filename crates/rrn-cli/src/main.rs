@@ -471,6 +471,45 @@ enum GovernanceCmd {
         #[arg(long = "founder-key")]
         founder_keys: Vec<PathBuf>,
     },
+    /// Open a distributed founding ceremony: declare the founders **by address**
+    /// so a founder who holds their key on a phone can sign later, on-device,
+    /// without ever handing over the secret. The Charter publishes automatically
+    /// once `ceil(founders × 0.75)` have signed.
+    CharterBegin {
+        /// A stable identifier for the community.
+        #[arg(long)]
+        community_id: String,
+        /// A founding principle; repeatable.
+        #[arg(long = "principle")]
+        principles: Vec<String>,
+        /// A guaranteed right; repeatable.
+        #[arg(long = "right")]
+        rights: Vec<String>,
+        /// A founder's bech32 `rrn1…` address; repeatable. Include the station's
+        /// own address to have it co-sign at once.
+        #[arg(long = "founder")]
+        founders: Vec<String>,
+    },
+    /// Show the founding ceremony's progress: who has signed, the threshold, and
+    /// the Charter body (`body_hex`) a station founder signs with `charter-sign`.
+    CharterStatus,
+    /// Sign a shared Charter body with this station's wallet, printing the
+    /// `(pubkey, signature)` a station founder hands back to the coordinator.
+    CharterSign {
+        /// The Charter body's canonical bytes, hex (the coordinator's `body_hex`).
+        #[arg(long = "body")]
+        body_hex: String,
+    },
+    /// Add a founder's collected signature to the pending Charter (a station
+    /// founder's `charter-sign` output), publishing it if the threshold is met.
+    CharterAddSignature {
+        /// The founder's public key, hex-encoded.
+        #[arg(long = "pubkey")]
+        pubkey_hex: String,
+        /// Their signature over the Charter body, hex-encoded.
+        #[arg(long = "signature")]
+        signature_hex: String,
+    },
     /// Show the community's current (effective) Charter.
     Charter,
     /// List proposals with their phase and vote so far.
@@ -1004,6 +1043,52 @@ async fn cmd_governance(
                 Ok(format!("charter v{} {}", r.version, r.charter_hash))
             })
         }
+        GovernanceCmd::CharterBegin {
+            community_id,
+            principles,
+            rights,
+            founders,
+        } => {
+            let params = json!({
+                "community_id": community_id,
+                "founding_principles": principles,
+                "rights_floor": rights,
+                "founders": founders,
+            });
+            let v = client.call("governance_charter_begin", params).await?;
+            emit(fmt, &v, || Ok(render_pending_charter(&v)))
+        }
+        GovernanceCmd::CharterStatus => {
+            let v = client.call("governance_pending_charter", json!({})).await?;
+            emit(fmt, &v, || Ok(render_pending_charter(&v)))
+        }
+        GovernanceCmd::CharterSign { body_hex } => {
+            let v = client
+                .call(
+                    "governance_charter_sign",
+                    json!({ "charter_body_hex": body_hex }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                Ok(format!(
+                    "pubkey    {}\nsignature {}",
+                    v["signer_pubkey_hex"].as_str().unwrap_or(""),
+                    v["signature_hex"].as_str().unwrap_or(""),
+                ))
+            })
+        }
+        GovernanceCmd::CharterAddSignature {
+            pubkey_hex,
+            signature_hex,
+        } => {
+            let v = client
+                .call(
+                    "governance_add_charter_signature",
+                    json!({ "signer_pubkey_hex": pubkey_hex, "signature_hex": signature_hex }),
+                )
+                .await?;
+            emit(fmt, &v, || Ok(render_pending_charter(&v)))
+        }
         GovernanceCmd::Charter => {
             let v = client.call("governance_charter", json!({})).await?;
             emit(fmt, &v, || Ok(render_charter(&v)))
@@ -1264,6 +1349,45 @@ fn i(v: &serde_json::Value, key: &str) -> Option<i64> {
 // --- governance text rendering (T1.9.7b) ------------------------------------
 
 /// The effective Charter and its governing thresholds.
+fn render_pending_charter(v: &serde_json::Value) -> String {
+    if v.get("exists").and_then(|e| e.as_bool()) != Some(true) {
+        return "no founding ceremony in progress (run governance charter-begin)".to_string();
+    }
+    let published = v["published"].as_bool().unwrap_or(false);
+    let signed: std::collections::HashSet<&str> = v["signed_founders"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let founders = v["founders"].as_array().cloned().unwrap_or_default();
+    let threshold = v["threshold"].as_u64().unwrap_or(0);
+    let community = v["community_id"].as_str().unwrap_or("—");
+
+    let status = if published {
+        "PUBLISHED".to_string()
+    } else {
+        format!(
+            "pending — {} of {} founders signed (need {})",
+            signed.len(),
+            founders.len(),
+            threshold,
+        )
+    };
+    let mut out = format!("{community} — founding charter\n  status:   {status}\n  founders:");
+    for f in &founders {
+        let a = f.as_str().unwrap_or("");
+        let mark = if signed.contains(a) { "✓" } else { "·" };
+        out.push_str(&format!("\n    {mark} {a}"));
+    }
+    if !published {
+        if let Some(body) = v["body_hex"].as_str() {
+            out.push_str(&format!(
+                "\n  body_hex: {body}\n  (a station founder signs this with `rrn governance charter-sign --body <hex>`)"
+            ));
+        }
+    }
+    out
+}
+
 fn render_charter(v: &serde_json::Value) -> String {
     let c: CharterView = match serde_json::from_value(v.clone()) {
         Ok(c) => c,

@@ -717,6 +717,79 @@ pub struct GovCharterResult {
     pub version: u32,
 }
 
+/// `governance_charter_begin` params — open a distributed founding ceremony. The
+/// founders are named by **address** (not secret key), so a founder holding its
+/// key on a phone can take part by signing later over the channel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovCharterBeginParams {
+    /// A stable identifier for the community.
+    pub community_id: String,
+    /// The founding principles, free text.
+    #[serde(default)]
+    pub founding_principles: Vec<String>,
+    /// Rights guaranteed above the federation floor.
+    #[serde(default)]
+    pub rights_floor: Vec<String>,
+    /// The founding set, as bech32 `rrn1…` addresses.
+    pub founders: Vec<String>,
+}
+
+/// `governance_pending_charter` / ceremony result — the founding Charter's state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovPendingCharterResult {
+    /// Whether a founding Charter exists at all (a ceremony has begun).
+    pub exists: bool,
+    /// Whether it has cleared the founder threshold and published.
+    pub published: bool,
+    /// The Charter body's content hash, hex-encoded.
+    pub charter_hash: String,
+    /// The community identifier.
+    pub community_id: String,
+    /// The founding principles.
+    pub founding_principles: Vec<String>,
+    /// The rights floor.
+    pub rights_floor: Vec<String>,
+    /// The declared founders, bech32 `rrn1…`.
+    pub founders: Vec<String>,
+    /// The founders who have signed so far, bech32 `rrn1…`.
+    pub signed_founders: Vec<String>,
+    /// Signatures needed to publish: `ceil(founders × 0.75)`.
+    pub threshold: usize,
+    /// The single `created_at` fixed at `charter-begin`, Unix seconds.
+    pub created_at: i64,
+    /// The Charter version (1 at genesis).
+    pub version: u32,
+    /// The Charter body's canonical bytes, hex-encoded — what each founder signs.
+    /// A station founder signs this with `governance charter-sign`.
+    pub body_hex: String,
+}
+
+/// `governance_add_charter_signature` params — ingest a founder signature
+/// collected out of band (a station founder's `governance charter-sign` output).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovAddCharterSignatureParams {
+    /// The founder's public key, hex-encoded (32 bytes).
+    pub signer_pubkey_hex: String,
+    /// Their signature over the Charter body, hex-encoded (64 bytes).
+    pub signature_hex: String,
+}
+
+/// `governance_charter_sign` params — sign a Charter body with this station wallet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovCharterSignParams {
+    /// The Charter body's canonical bytes, hex-encoded (the coordinator's `body_hex`).
+    pub charter_body_hex: String,
+}
+
+/// `governance_charter_sign` result — this station's founder signature.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovCharterSignResult {
+    /// This station's public key, hex-encoded.
+    pub signer_pubkey_hex: String,
+    /// Its signature over the supplied Charter body, hex-encoded.
+    pub signature_hex: String,
+}
+
 /// `governance_propose` params — author a proposal (daemon-signed by the station
 /// wallet). `kind` is `statute` (default), `administrative_rule` (with `scope`),
 /// or `emergency` (with `expires_at`). Charter amendments carry a full replacement

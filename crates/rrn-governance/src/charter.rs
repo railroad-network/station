@@ -198,6 +198,12 @@ pub enum CharterError {
     /// A signing keypair is not among the declared founders.
     #[error("a signer is not one of the declared founders")]
     NonFounderSigner,
+    /// A collected signature did not verify over the Charter body.
+    #[error("a collected founder signature did not verify over the Charter body")]
+    BadSignature,
+    /// A founder whose signature is already present tried to sign again.
+    #[error("this founder has already signed the Charter")]
+    AlreadySigned,
     /// The signatures were structurally malformed.
     #[error("charter signatures: {0}")]
     Signatures(#[from] MultiVerifyError),
@@ -298,6 +304,55 @@ impl SignedCharter {
         }
         Ok(())
     }
+
+    /// Appends one founder's signature collected *remotely* — the distributed
+    /// founding ceremony, where each founder (a phone holding its key in the
+    /// device keychain, or another station) signs the Charter body on their own
+    /// device and hands back only the `(signer, signature)` pair, never their
+    /// secret. This is the [`MultiSignedPayload::sign`]-with-every-secret path's
+    /// counterpart for a set of founders who cannot pool their keys.
+    ///
+    /// The signature must verify over *this* Charter body's canonical bytes and be
+    /// produced by a **declared founder** who has not already signed. A single
+    /// added signature never on its own authorizes the Charter — that is still
+    /// [`verify_founders`](Self::verify_founders)' threshold decision.
+    pub fn add_remote_signature(
+        &mut self,
+        signer: PublicKey,
+        signature: Signature,
+    ) -> Result<(), CharterError> {
+        let address = Address::from_public_key(signer);
+        if !self.charter().founders.contains(&address) {
+            return Err(CharterError::NonFounderSigner);
+        }
+        if self.0.signers.contains(&signer) {
+            return Err(CharterError::AlreadySigned);
+        }
+        let bytes = to_canonical_bytes(self.0.payload.clone());
+        signer
+            .verify(&bytes, &signature)
+            .map_err(|_| CharterError::BadSignature)?;
+        self.0.signers.push(signer);
+        self.0.signatures.push(signature);
+        Ok(())
+    }
+
+    /// The declared founders who have contributed a valid signature so far, in
+    /// founder-declaration order — the ceremony's progress. Deduplicated, and a
+    /// signature from a non-founder key is ignored, mirroring
+    /// [`verify_founders`](Self::verify_founders).
+    pub fn signed_founders(&self) -> Vec<Address> {
+        let valid: HashSet<Address> = match self.0.verify() {
+            Ok(signers) => signers.into_iter().map(Address::from_public_key).collect(),
+            Err(_) => HashSet::new(),
+        };
+        self.charter()
+            .founders
+            .iter()
+            .copied()
+            .filter(|f| valid.contains(f))
+            .collect()
+    }
 }
 
 /// Publishes a founder-authorized Charter to the log, wrapped in a
@@ -350,6 +405,45 @@ pub fn founder_charter(db: &Database) -> Result<Option<SignedCharter>, CharterEr
 /// The `charter_hash` of the [`founder_charter`], or `None` if none is published.
 pub fn founder_charter_hash(db: &Database) -> Result<Option<Hash>, CharterError> {
     Ok(founder_charter(db)?.map(|signed| signed.charter_hash()))
+}
+
+/// Appends a Charter to the log **without** the founder-threshold check that
+/// [`store_charter`] enforces — the distributed founding ceremony's write path,
+/// where the Charter starts under-signed and accumulates signatures over several
+/// appends. Under-signed entries are inert: [`founder_charter`] skips any that do
+/// not clear the threshold, so a pending Charter is not treated as the community's
+/// genesis root until enough founders have signed. The final, threshold-clearing
+/// append is what publishes it.
+pub fn store_pending_charter(
+    log: &mut AppendLog,
+    publisher: &Keypair,
+    charter: SignedCharter,
+) -> Result<LogEntry, CharterError> {
+    Ok(log.append(SignedPayload::sign(charter, publisher))?)
+}
+
+/// The most recently appended Charter, **regardless of whether it clears the
+/// founder threshold** — the current state of a founding ceremony (the pending,
+/// still-accumulating Charter, or the published one once enough have signed). Ties
+/// on log position break toward the later entry.
+///
+/// Distinct from [`founder_charter`], which returns only a threshold-cleared
+/// (authorized) Charter: this is what the ceremony reads to know what to sign and
+/// how far along it is. Call [`SignedCharter::verify_founders`] on the result to
+/// tell a still-pending Charter from a now-published one.
+pub fn latest_charter(db: &Database) -> Result<Option<SignedCharter>, CharterError> {
+    let log = AppendLog::new(db);
+    let mut best: Option<(u64, SignedCharter)> = None;
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(signed) = from_canonical_bytes::<SignedCharter>(&entry.payload.bytes) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(seq, _)| entry.seq > *seq) {
+            best = Some((entry.seq, signed));
+        }
+    }
+    Ok(best.map(|(_, signed)| signed))
 }
 
 // --- Canonical CBOR ---------------------------------------------------------
@@ -672,6 +766,105 @@ mod tests {
                 founders: 4,
             })
         ));
+    }
+
+    /// Signs a Charter body the way a remote founder (a phone) does: over the
+    /// body's canonical bytes, handing back only the `(pubkey, signature)` pair.
+    fn remote_sign(signed: &SignedCharter, founder: &Keypair) -> Signature {
+        let bytes = to_canonical_bytes(signed.charter().clone());
+        founder.sign(&bytes)
+    }
+
+    #[test]
+    fn remote_signatures_accumulate_to_threshold() {
+        let founders = founder_keys(4);
+        // The coordinator (founder 0) begins with only its own signature — below
+        // the 3-of-4 bar.
+        let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
+        assert!(signed.verify_founders().is_err());
+        assert_eq!(signed.signed_founders().len(), 1);
+
+        // Two more founders sign remotely; now 3 of 4 → authorized.
+        let sig1 = remote_sign(&signed, &founders[1]);
+        signed
+            .add_remote_signature(founders[1].public_key(), sig1)
+            .unwrap();
+        let sig2 = remote_sign(&signed, &founders[2]);
+        signed
+            .add_remote_signature(founders[2].public_key(), sig2)
+            .unwrap();
+
+        assert_eq!(signed.signed_founders().len(), 3);
+        assert!(signed.verify_founders().is_ok());
+    }
+
+    #[test]
+    fn remote_signature_from_a_non_founder_is_rejected() {
+        let founders = founder_keys(4);
+        let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
+        let outsider = Keypair::generate();
+        let sig = remote_sign(&signed, &outsider);
+        assert!(matches!(
+            signed.add_remote_signature(outsider.public_key(), sig),
+            Err(CharterError::NonFounderSigner)
+        ));
+    }
+
+    #[test]
+    fn a_signature_that_does_not_verify_is_rejected() {
+        let founders = founder_keys(4);
+        let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
+        // Founder 1's key, but a signature over the *wrong* bytes.
+        let bogus = founders[1].sign(b"not the charter body");
+        assert!(matches!(
+            signed.add_remote_signature(founders[1].public_key(), bogus),
+            Err(CharterError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn the_same_founder_cannot_sign_twice() {
+        let founders = founder_keys(4);
+        let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
+        let sig = remote_sign(&signed, &founders[1]);
+        signed
+            .add_remote_signature(founders[1].public_key(), sig)
+            .unwrap();
+        let again = remote_sign(&signed, &founders[1]);
+        assert!(matches!(
+            signed.add_remote_signature(founders[1].public_key(), again),
+            Err(CharterError::AlreadySigned)
+        ));
+    }
+
+    #[test]
+    fn pending_charter_is_not_genesis_until_it_clears_the_threshold() {
+        let db = fresh_db();
+        let founders = founder_keys(4);
+        let coordinator = &founders[0];
+
+        // Begin: the coordinator's signature only, appended as a pending charter.
+        let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
+        let mut log = AppendLog::new(&db);
+        store_pending_charter(&mut log, coordinator, signed.clone()).unwrap();
+        // Latest sees the pending one; founder_charter (threshold-gated) does not.
+        assert!(latest_charter(&db).unwrap().is_some());
+        assert!(latest_charter(&db)
+            .unwrap()
+            .unwrap()
+            .verify_founders()
+            .is_err());
+        assert!(founder_charter(&db).unwrap().is_none());
+
+        // Collect two more signatures and append the now-authorized charter.
+        for f in &founders[1..3] {
+            let sig = remote_sign(&signed, f);
+            signed.add_remote_signature(f.public_key(), sig).unwrap();
+        }
+        let mut log = AppendLog::new(&db);
+        store_charter(&mut log, coordinator, signed).unwrap();
+        // Now it is the community's genesis root.
+        assert!(founder_charter(&db).unwrap().is_some());
     }
 
     #[test]
