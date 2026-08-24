@@ -475,12 +475,18 @@ and Samsung are repeat offenders; Xiaomi/Huawei even more so) cut a
 suspended app's network entirely. The symptom: a member gets no
 notifications and their app shows stale balances until they open it.
 
-The fix, once per phone: **Settings → Apps → Railroad Network → Battery →
-Unrestricted** (wording varies: "Don't optimize", "No restrictions"). Make
-this part of every member's day-one setup, right after pairing. If a
-member's phone still goes quiet, look for vendor-specific "battery
-manager" / "protected apps" screens — each OEM hides one somewhere
-different.
+The short version, once per phone at onboarding: in the app, **Settings →
+Notifications** — allow notifications and turn on **"Sync while the app is
+closed"**, accepting the battery dialog the app then shows. (If that dialog
+was missed: system **Settings → Apps → Railroad Network → Battery →
+Unrestricted**.) Some brands need one extra vendor-specific setting on top.
+
+The full story — what background sync actually does, the per-vendor traps
+(Samsung sleep lists, Xiaomi autostart, and friends), a ten-minute
+verification drill for each phone, and the expectations to set with
+members — is its own runbook:
+[`background-reliability.md`](background-reliability.md). Make its
+checklist part of every member's day-one setup, right after pairing.
 
 Momentary blips are normal: on a cold start the app may show a
 **Connecting…** pill for a second while it re-establishes its subscription,
