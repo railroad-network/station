@@ -2,9 +2,10 @@
 
 [![CI](https://github.com/railroad-network/station/actions/workflows/ci.yml/badge.svg)](https://github.com/railroad-network/station/actions/workflows/ci.yml)
 
-> **Status:** Phase 1 — in progress (M1.1–M1.10 landed: mobile transport,
-> vouching, reputation, marketplace, oracle tiers 1–2, governance, and dispute
-> resolution; M1.11 pilot readiness underway). The stack remains pre-audit.
+> **Status:** Phase 1 — M1.1–M1.11 landed: mobile transport, vouching,
+> reputation, marketplace, oracle tiers 1–2, governance, dispute resolution,
+> and pilot readiness (sideload packaging, guided onboarding, backup/recovery,
+> and operator runbooks). The stack remains pre-audit.
 > **Do not use with real value.**
 
 **Railroad Network** is a federated platform for self-organizing communities: a
@@ -23,10 +24,11 @@ That foundation is implemented and is being prepared for an external security
 audit (see [Audit status](#audit-status)).
 
 Phase 1 builds on it: mobile↔station transport, social vouching, reputation
-scoring, the marketplace, oracle tiers 1–2, community governance, and dispute
-resolution have all landed, and the current milestone (M1.11) is pilot
-readiness — sideload packaging, guided onboarding, backup/recovery, and
-operator documentation. This work is pre-audit and experimental.
+scoring, the marketplace, oracle tiers 1–2, community governance, dispute
+resolution, and pilot readiness — sideload packaging, guided onboarding,
+backup/recovery, and operator documentation — have all landed. What remains is
+to run the pilot itself: a real community using it day to day. This work is
+pre-audit and experimental.
 
 > This is research-stage software. The cryptography has **not** yet been
 > independently audited. Do not use it to hold, transfer, or represent anything
@@ -85,10 +87,11 @@ Built on the Phase 0 foundation, and exercised end-to-end with the
 - **Dispute resolution (M1.10).** `rrn-dispute` per ADR-0014 —
   standing-weighted sortition juries over contested transactions, escalation
   and appeal to the electorate, and reputation forfeiture on upheld rulings.
-- **Pilot readiness (M1.11, in progress).** Bootstrap-grace electorate for
-  young communities (ADR-0015), encrypted station backup/restore plus
-  Shamir-based station key recovery (ADR-0016), guided multi-device
-  onboarding, and a signed sideloadable Android release.
+- **Pilot readiness (M1.11).** Bootstrap-grace electorate for young
+  communities (ADR-0015), encrypted station backup/restore plus Shamir-based
+  station key recovery (ADR-0016), guided multi-device onboarding, a signed
+  sideloadable Android release, and steward runbooks for community setup and
+  background reliability.
 
 ## What does NOT work yet
 
@@ -151,8 +154,11 @@ rrn history                     # the local append-only log, decoded
 To stand up an actual pilot community — a station on an always-on machine,
 members' phones sideloaded and paired, a founding Charter, backups, and key
 recovery — follow the steward's runbook:
-[`docs/community-setup.md`](docs/community-setup.md). The phone-side install
-guide is the mobile repo's
+[`docs/community-setup.md`](docs/community-setup.md). Keeping members' phones
+syncing reliably in the background (per-vendor battery quirks and a
+verification drill) has a companion runbook:
+[`docs/background-reliability.md`](docs/background-reliability.md). The
+phone-side install guide is the mobile repo's
 [`SIDELOAD.md`](https://github.com/railroad-network/mobile/blob/main/SIDELOAD.md).
 
 ## Audit status
