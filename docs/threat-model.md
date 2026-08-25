@@ -666,7 +666,7 @@ it.
   relaxed to *any* member so the community is not deadlocked; that grace sunsets
   automatically by condition.
 - *Residual risk:* in Phase 1 the stake is **consequence-free** — there is no
-  dispute-resolution or forfeiture path yet (Phase 2), so the stake functions as
+  dispute-resolution or forfeiture path yet (Phase 3), so the stake functions as
   an eligibility filter and an audit anchor, not a live financial deterrent. The
   bootstrap grace is a genuine window in which a small colluding founding group
   can attest to each other's Tier-2 transactions; it is bounded by the
@@ -679,7 +679,7 @@ it.
   detect a two-party conspiracy. Tier 1 tolerates this as acceptable micro-scale
   loss (the value at risk is small by construction); Tier 2 raises the cost by
   putting the confirmer's reputation on record. Detecting collusion requires
-  independent witnesses, which is precisely what Tier 3+ adds in Phase 2.
+  independent witnesses, which is precisely what Tier 3+ adds in Phase 3.
 - *Residual risk:* Tier-1 and Tier-2 collusion is a known, accepted risk for the
   value bands they cover. It is not mitigated in Phase 1.
 
@@ -1091,7 +1091,7 @@ credit and never delivers.
   current composite, so manufactured standing does lift a listing, and the
   reputation defences above are what bound how much of it can be manufactured.
 - *Residual risk:* collusion among genuinely-vouched real members is hard to
-  distinguish from honest trade; quantitative detection is deferred to Phase 2.
+  distinguish from honest trade; quantitative detection is deferred to Phase 3.
 - *Residual risk:* nothing yet feeds marketplace activity *back* into reputation.
   `domain_competence` — the dimension a category was made a controlled vocabulary
   to protect — is still structurally `0.0`, and its first inputs arrive with the
@@ -1170,7 +1170,7 @@ inherited standing.
   *volume*, not correctness — writing vouches is itself the way to raise the
   dimension (ADR-0009, Consequences). Weighting attestations by the attester's own
   standing and discounting reciprocal or clustered ones needs the graph analysis
-  deferred to Phase 2; retroactively marking an attestation wrong needs fraud
+  deferred to Phase 3; retroactively marking an attestation wrong needs fraud
   findings (M1.8+). Sophisticated collusion inside a real vouch cluster remains
   hard to detect.
 
@@ -1185,7 +1185,7 @@ inherited standing.
   dimension survives roughly four years of total inactivity before reaching zero,
   so coasting is slow but real. Decay is also uniform, not activity-shaped: a
   member who front-loads and stops is indistinguishable from one who is merely
-  quiet, which is deliberate (Phase 2 may add a reentry reward).
+  quiet, which is deliberate (Phase 3 may add a reentry reward).
 
 #### Sybil clusters and manufactured standing (M1.5)
 
@@ -1217,7 +1217,7 @@ inherited standing.
   patience buys a full trade-reliability score and, with it, the standing to
   anchor each other and any number of further identities. Velocity flagging plus
   human review is what stands against that; detecting the pattern structurally is
-  the Phase 2 graph analysis, and a chain-of-trust walk from a genesis identity
+  the Phase 3 graph analysis, and a chain-of-trust walk from a genesis identity
   (recorded in ADR-0009 as the rejected-for-now alternative) is the variant that
   would close it. The velocity check is itself a known undercount: it compares
   consecutive snapshots rather than a true trailing-7-day window (the cache
@@ -1230,7 +1230,7 @@ inherited standing.
   composite rather than trust the exporter's word for it. Only the first
   qualifying voucher's entries travel, which is the least disclosure that
   verifies, but it does expose one member's trade history inside another member's
-  bundle. A succinct proof of the voucher's standing is the Phase 2 improvement.
+  bundle. A succinct proof of the voucher's standing is the Phase 3 improvement.
 
 #### Reading a score over the mobile channel (T1.5.9)
 
@@ -1293,7 +1293,7 @@ channel.
 > schema, the founder/amendment rules, and the established-member electorate at
 > the design level. Mitigations below are **shipped** unless marked otherwise.
 > Only **direct** voting exists in Phase 1; liquid/sortition/quadratic/consent
-> and a statute→config rule engine are Phase 2. Vote records carry the voter's
+> and a statute→config rule engine are Phase 3. Vote records carry the voter's
 > address in clear — there is **no ballot secrecy** in Phase 1, a tradeoff called
 > out under vote buying.
 
@@ -1321,7 +1321,7 @@ channel.
   binding everyone (verified in live testing: a two-member electorate passed a
   statute on a single Yes). The stated position is that communities that small do
   not need formal governance yet; there is no floor on electorate size before
-  proposals may pass, and adding one is a Phase 2 question.
+  proposals may pass, and adding one is a Phase 3 question.
 
 #### Proposal flooding / governance DoS
 
@@ -1354,7 +1354,7 @@ channel.
   retaliation, since anyone replaying the log can see how a member voted.
   Off-system bribery is fundamentally hard to prevent technically and is left to
   community norms plus keeping each vote low-value. Ballot secrecy (which would
-  blunt both buying and coercion) is a Phase 2 design question, in tension with
+  blunt both buying and coercion) is a Phase 3 design question, in tension with
   the replay-verifiability the tally depends on.
 
 #### Tally forgery / fabricated ballots
@@ -1401,7 +1401,7 @@ channel.
   root of trust before its Charter) but means Charter legitimacy rests on
   first-writer honesty plus out-of-band social agreement. Two competing enacted
   amendments to the same version resolve first-found-wins; principled conflict
-  resolution is Phase 2.
+  resolution is Phase 3.
 
 #### Founder key disclosure at multi-founder genesis
 
@@ -1414,7 +1414,7 @@ channel.
   socket and live briefly in daemon memory, so this assumes the operator legitimately
   holds (or is trusted to marshal) those keys at founding. A distributed
   founder-signing ceremony, where each founder signs on their own device and only
-  signatures are collected, is Phase 2. The solo-bootstrap default (station wallet
+  signatures are collected, is Phase 3. The solo-bootstrap default (station wallet
   as sole founder, threshold 1) avoids the issue entirely.
 
 #### Enactment forgery
@@ -1430,7 +1430,7 @@ channel.
 - *Residual risk:* enactment merely *records* that a statute is in force; Phase 1
   has no engine that turns a passed statute into an enforced configuration change,
   so compliance is still a matter of members and operators honoring it (the
-  statute→config rule engine is Phase 2).
+  statute→config rule engine is Phase 3).
 
 ## Mobile client (Phase 1)
 
@@ -1910,7 +1910,7 @@ label for a person; the correctness of the community a vouch is stamped into.
   by subject address, as a display hint for the voucher's own browser. Because it
   never enters the attestation, it is not in the record the station stores, not in
   the `vouch_received` event the subject receives, and not in anything that would
-  federate in Phase 2 — the subject never learns what you called them. It is
+  federate in Phase 3 — the subject never learns what you called them. It is
   non-secret and carries no biometric gate. *Residual risk:* a local attacker on the
   *voucher's own* device can read their private labels (a device-only social hint,
   bounded by the same device-trust assumption); the label does not survive a wallet
@@ -2077,7 +2077,7 @@ edges of that scope.
   other to raise the uncapped composites that qualify them to anchor each other,
   and mutually-vouching keys remain cryptographically valid (see
   [Sybil clusters and manufactured standing](#sybil-clusters-and-manufactured-standing-m15)).
-  Statistical graph analysis is Phase 2.
+  Statistical graph analysis is Phase 3.
 - **No federation security.** Eclipse attacks, cross-replica ledger forks,
   rollback detection, and treaty abuse are out of scope (see
   [Log fork / rollback](#log-fork--rollback) and `rrn-protocol`).
@@ -2114,7 +2114,7 @@ edges of that scope.
   proposals a standing member may submit onto the permanently replicated log, and
   the cosign threshold is a fixed constant a community cannot raise. Ballots are
   signed records carrying the voter's address in clear, so votes are attributable
-  — enabling coercion as much as accountability; ballot secrecy is Phase 2. A
+  — enabling coercion as much as accountability; ballot secrecy is Phase 3. A
   community with only one or two established members has a one- or two-person
   electorate that trivially passes statutes, an accepted ADR-0012 tradeoff with no
   minimum-electorate floor. And an enacted statute is only *recorded* as in force —
