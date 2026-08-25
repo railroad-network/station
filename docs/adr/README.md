@@ -55,6 +55,7 @@ Decision Records) convention, using the structure in
 - [0015 — Bootstrapping the electorate: a governance and dispute grace so a young community can actually govern](0015-electorate-bootstrap-grace.md)
 - [0016 — Station backup and key recovery: an encrypted archive whose key survives a lost passphrase](0016-station-backup-and-key-recovery.md)
 - [0017 — Single-community resilience comes before federation](0017-resilience-before-federation.md)
+- [0018 — A debt floor bounds how far a member can sign themselves into debt](0018-debt-floor.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.

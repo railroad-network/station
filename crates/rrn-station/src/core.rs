@@ -469,6 +469,8 @@ pub struct Core {
     db: Database,
     wallet: WalletContents,
     settlement: SettlementConfig,
+    /// The debt floor the transaction engine enforces (ADR-0018).
+    credit: rrn_ledger::credit::CreditConfig,
     clock: Clock,
     /// Mobiles that have completed pairing — the authorization list for the
     /// mobile HTTP surface (T1.3.3). Persisted across restarts.
@@ -497,6 +499,7 @@ impl Core {
         db: Database,
         wallet: WalletContents,
         settlement: SettlementConfig,
+        credit: rrn_ledger::credit::CreditConfig,
         clock: Clock,
         paired: PairedMobiles,
         listings: SearchIndex,
@@ -506,6 +509,7 @@ impl Core {
             db,
             wallet,
             settlement,
+            credit,
             clock,
             paired,
             pending: BTreeMap::new(),
@@ -760,7 +764,7 @@ impl Core {
         let tx_id = proposal.id;
         let signed: SignedProposal = SignedProposal::sign(proposal, &station);
 
-        let mut engine = Engine::new(&self.db, station);
+        let mut engine = Engine::new(&self.db, station).with_credit_config(self.credit);
         engine.submit_proposal(signed, now).map_err(ledger_err)?;
 
         ok(&rpc::ProposeResult {
@@ -830,7 +834,7 @@ impl Core {
         };
         let signed: SignedConfirmation = SignedConfirmation::sign(confirmation, &station);
 
-        let mut engine = Engine::new(&self.db, station);
+        let mut engine = Engine::new(&self.db, station).with_credit_config(self.credit);
         engine
             .submit_confirmation(signed, now)
             .map_err(ledger_err)?;
@@ -1470,7 +1474,7 @@ impl Core {
         let tx_id = proposal.id;
         let signed: SignedProposal = SignedProposal::sign(proposal, &station);
 
-        let mut engine = Engine::new(&self.db, station);
+        let mut engine = Engine::new(&self.db, station).with_credit_config(self.credit);
         engine.submit_proposal(signed, now).map_err(ledger_err)?;
 
         ok(&rpc::ProposeResult {
@@ -3313,7 +3317,8 @@ impl Core {
         }
         let now = self.clock.now();
         let tx_id = signed.payload.id;
-        let mut engine = Engine::new(&self.db, self.station_keypair());
+        let mut engine =
+            Engine::new(&self.db, self.station_keypair()).with_credit_config(self.credit);
         engine
             .submit_proposal(signed, now)
             .map_err(ledger_err_pair)?;
@@ -3387,7 +3392,8 @@ impl Core {
             }
         }
 
-        let mut engine = Engine::new(&self.db, self.station_keypair());
+        let mut engine =
+            Engine::new(&self.db, self.station_keypair()).with_credit_config(self.credit);
         engine
             .submit_confirmation(signed, now)
             .map_err(ledger_err_pair)?;
@@ -4734,6 +4740,7 @@ mod tests {
             db,
             WalletContents::create_new(),
             SettlementConfig::default(),
+            rrn_ledger::credit::CreditConfig::default(),
             Clock::manual(1_000),
             PairedMobiles::default(),
             SearchIndex::in_memory(),
@@ -5143,12 +5150,13 @@ mod tests {
         let receiver = Keypair::generate(); // the confirming mobile
         let receiver_addr = Address::from_public_key(receiver.public_key());
 
-        // A Tier-2 proposal — 25 Commons = 2500 centi, above the 5-Common floor —
+        // A Tier-2 proposal — 15 Commons = 1500 centi, above the 5-Common Tier-2
+        // floor but within the sender's −20 Commons debt floor (ADR-0018) —
         // submitted over the channel by its sender.
         let proposal = TransactionProposal::new(
             Address::from_public_key(sender.public_key()),
             receiver_addr,
-            2500,
+            1500,
             Some("t2".into()),
             0,
             NOW,
@@ -6469,6 +6477,7 @@ mod tests {
             db,
             WalletContents::create_new(),
             SettlementConfig::default(),
+            rrn_ledger::credit::CreditConfig::default(),
             Clock::manual(TEN_MONTHS),
             PairedMobiles::default(),
             SearchIndex::in_memory(),

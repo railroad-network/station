@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use rrn_ledger::credit::DEFAULT_DEBT_FLOOR_CENTI;
 use rrn_ledger::settlement::{DEFAULT_TIER1_WINDOW_SECONDS, DEFAULT_TIER2_WINDOW_SECONDS};
 
 /// The parsed `config.toml`.
@@ -45,6 +46,10 @@ pub struct StationConfig {
     /// Tier 1 = 24h, Tier 2 = 48h, T1.8.4).
     #[serde(default)]
     pub settlement: SettlementSection,
+    /// Credit tuning (optional; defaults to the protocol debt floor of
+    /// −20 Commons, ADR-0018).
+    #[serde(default)]
+    pub credit: CreditSection,
     /// Background-loop intervals (optional; defaults to the daemon cadence).
     #[serde(default)]
     pub timers: TimersSection,
@@ -132,6 +137,31 @@ pub struct SettlementSection {
     /// to [`DEFAULT_TIER2_WINDOW_SECONDS`] (48h).
     #[serde(default = "default_tier2_window_seconds")]
     pub tier2_window_seconds: u64,
+}
+
+/// `[credit]` — how far into debt a member may sign themselves (ADR-0018).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreditSection {
+    /// The lowest projected balance, in centicommons, a member may commit
+    /// themselves down to. Must be ≤ 0. Defaults to
+    /// [`DEFAULT_DEBT_FLOOR_CENTI`] (−2,000 = −20 Commons); per-community
+    /// tuning through governance is a later milestone — until then this is the
+    /// operator's knob, and lowering it is a community-level decision, not a
+    /// personal one.
+    #[serde(default = "default_debt_floor_centi")]
+    pub debt_floor_centi: i64,
+}
+
+fn default_debt_floor_centi() -> i64 {
+    DEFAULT_DEBT_FLOOR_CENTI
+}
+
+impl Default for CreditSection {
+    fn default() -> Self {
+        Self {
+            debt_floor_centi: default_debt_floor_centi(),
+        }
+    }
 }
 
 /// `[timers]` — how often the background loops fire.
@@ -319,6 +349,7 @@ impl StationConfig {
             },
             mobile: MobileConfig::default(),
             settlement: SettlementSection::default(),
+            credit: CreditSection::default(),
             timers: TimersSection::default(),
         }
     }

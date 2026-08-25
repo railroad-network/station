@@ -629,9 +629,31 @@ transition; the derivability of all state from the log.
   double-apply (T0.5.5, T0.5.7).
 - *Residual risk:* the nonce is per-sender on a single replica; cross-replica
   nonce coordination (a sender acting on two stations) is a Phase 1+ federation
-  problem. Credit limits are not enforced — a sender can settle into arbitrary
-  debt in Phase 0 (Phase 1). The ±5 minute drift window is a deliberate
-  usability/security trade-off recorded here.
+  problem. The ±5 minute drift window is a deliberate usability/security
+  trade-off recorded here.
+
+#### Elevation of privilege — unbounded debt (ADR-0018)
+
+- *Threat:* mutual credit runs on negative balances, so without a bound a
+  member can accept value until arbitrarily negative and stop participating —
+  a walk-away subsidy paid by everyone holding the positive balances their
+  spending created. The settlement window compounds it: many proposals can be
+  stacked inside one window against a balance none of them has touched yet.
+- *Mitigation:* the **debt floor** (`rrn-ledger::credit`, default −20 Commons,
+  `[credit] debt_floor_centi`). The engine refuses any debit whose signer
+  would be committed below the floor, evaluated against the *committed
+  position*: settled balance minus every pending
+  (`Proposed`/`Confirmed`/`Disputed`) debit they already signed. Enforcement
+  follows the debtor's signature — proposal time for a sender, confirmation
+  time for a payment request's receiver — and pending inflows never add
+  headroom.
+- *Residual risk:* the recurring-contract charge path (`ContractCharge`,
+  T1.7.7) is not floor-checked, so contract periods can land a buyer below the
+  floor (the buyer did sign the contract; folding contract exposure into the
+  committed position is the named follow-up). The floor is per-station
+  config until a governance surface exists, so an operator can weaken it. What
+  a community does about a *departed* member's bounded debt remains a
+  governance question the floor caps but does not answer.
 
 #### Oracle tiering and the reputation stake
 
@@ -2090,8 +2112,12 @@ edges of that scope.
   same-user code-execution attacker or physical memory access defeats secrecy
   (per the device-trust assumption). `RRN_PASSPHRASE`, if used, is visible in
   the process environment.
-- **No credit limits / no debt bound.** A sender can settle into arbitrary debt
-  in Phase 0.
+- **Debt is bounded, not managed.** The debt floor (ADR-0018, default
+  −20 Commons) caps how far a member can sign themselves into debt, but the
+  contract-charge path is not floor-checked, the floor is operator config
+  rather than governance, and exit-with-debt policy (who absorbs a departed
+  member's balance) is unanswered — see the `rrn-ledger` elevation-of-privilege
+  section.
 - **No rate limiting or resource caps** on the IPC socket or the gossip port,
   and no message-size cap; the gossip stub pulls a peer's whole log each round.
   O(N) full-log replay has no snapshotting yet. All Phase 1/2.

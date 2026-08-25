@@ -139,10 +139,15 @@ impl Station {
             }
         };
 
+        let credit = rrn_ledger::credit::CreditConfig {
+            debt_floor_centi: config.credit.debt_floor_centi,
+        };
+
         let core = Core::new(
             db,
             wallet,
             settlement,
+            credit,
             params.clock.clone(),
             paired,
             listings,
