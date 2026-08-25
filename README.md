@@ -5,8 +5,9 @@
 > **Status:** Phase 1 — M1.1–M1.11 landed: mobile transport, vouching,
 > reputation, marketplace, oracle tiers 1–2, governance, dispute resolution,
 > and pilot readiness (sideload packaging, guided onboarding, backup/recovery,
-> and operator runbooks). The stack remains pre-audit.
-> **Do not use with real value.**
+> and operator runbooks). An internal AI-assisted security review has been
+> completed (no High-severity findings; see [Audit status](#audit-status)); an
+> independent professional audit is still pending. **Do not use with real value.**
 
 **Railroad Network** is a federated platform for self-organizing communities: a
 mutual-credit economy denominated in a single unit (the "Common"),
@@ -20,8 +21,9 @@ This repository, **`station`**, is the canonical Rust implementation: a Cargo
 workspace of crates that produce the `station` daemon binary and the `rrn`
 command-line client. Phase 0's goal was a correct cryptographic and ledger
 foundation, demonstrated end-to-end by two communities transacting locally.
-That foundation is implemented and is being prepared for an external security
-audit (see [Audit status](#audit-status)).
+That foundation is implemented and has been through an internal AI-assisted
+security review; an independent professional audit is still pending (see
+[Audit status](#audit-status)).
 
 Phase 1 builds on it: mobile↔station transport, social vouching, reputation
 scoring, the marketplace, oracle tiers 1–2, community governance, dispute
@@ -30,9 +32,10 @@ backup/recovery, and operator documentation — have all landed. What remains is
 to run the pilot itself: a real community using it day to day. This work is
 pre-audit and experimental.
 
-> This is research-stage software. The cryptography has **not** yet been
-> independently audited. Do not use it to hold, transfer, or represent anything
-> of real value.
+> This is research-stage software. It has had an internal AI-assisted security
+> review, but the cryptography has **not** yet been independently audited by a
+> professional firm. Do not use it to hold, transfer, or represent anything of
+> real value.
 
 ## What works in Phase 0
 
@@ -163,16 +166,27 @@ phone-side install guide is the mobile repo's
 
 ## Audit status
 
-**Pre-audit.** The Phase 0 cryptographic and ledger foundation is being
-prepared for an external security audit. Phase 1 work continues on top of it in
-parallel, but the whole stack — foundation and Phase 1 alike — remains
-unaudited and experimental until that review lands. The audit-prep materials —
-finalized threat model, expanded fuzz harnesses, and the coverage report — live
-under [`docs/`](docs/) and the CI workflows.
+**Internal AI-assisted review complete; independent professional audit
+pending.** A full-workspace security review was performed on 2026-08-25 at
+commit [`f59271c`](https://github.com/railroad-network/station/commit/f59271c),
+covering the cryptographic core, identity/recovery, storage, ledger, and the
+station's network and ceremony surfaces. It reported **no High-severity
+findings** — the cryptographic core came out in notably good shape (strict
+signature verification, canonical-by-construction serialization with domain
+separation, disciplined zeroization, and a Shamir implementation matching its
+ADR) — with **3 Medium, 5 Low, and 4 Info** findings concentrated at the
+protocol and exposure level. The full report, with each finding's failure
+scenario and a remediation order, is at
+[`docs/security/audit-2026-08.md`](docs/security/audit-2026-08.md).
 
-This section will be updated as the audit progresses (planned → scheduled →
-in progress → complete), and will link to the published report once received.
-Per the project's open-source posture, the audit report will be public.
+Important: this was a **code review performed by an AI model** operated by the
+maintainer, **not** a penetration test or an attestation by a professional
+security firm. It is intended to raise the floor, not to clear the stack for
+production. Absence of a finding is not evidence of absence, and an independent
+professional audit remains warranted before any deployment where real people
+depend on this software's guarantees. The whole stack — Phase 0 foundation and
+Phase 1 alike — stays experimental until that review lands. Per the project's
+open-source posture, all audit reports are public.
 
 ## Design documents
 
