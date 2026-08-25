@@ -112,11 +112,15 @@ async fn socket_rpc(socket: &Path, method: &str, params: serde_json::Value) -> s
 /// Pairs `mobile` with the station: POST /pair, then operator `pair_confirm`.
 async fn pair_mobile(socket: &Path, mobile: &Keypair) {
     let token = [0x11u8; 32];
-    let msg = request_signed_bytes(&mobile.public_key(), &token, now_secs());
+    // One clock read: the signature covers `requested_at`, so a second `now_secs()`
+    // that straddled a second boundary would sign a different timestamp than the one
+    // sent, and the station would reject the request as a signature mismatch (400).
+    let requested_at = now_secs();
+    let msg = request_signed_bytes(&mobile.public_key(), &token, requested_at);
     let request = PairRequest {
         mobile_address: Address::from_public_key(mobile.public_key()).to_string(),
         token: hex(&token),
-        requested_at: now_secs(),
+        requested_at,
         signature: hex(&mobile.sign(&msg).to_bytes()),
     };
     let (status, _) = http_post(
