@@ -34,18 +34,17 @@ An internal AI-assisted security review is done (`docs/security/audit-2026-08.md
 High-severity findings); the independent professional audit is still pending. **Do not use
 with real value.**
 
-## Planning documents
+## Planning documents and work tickets
 
-Detailed phase plans and per-task specs live outside this repo, in the maintainer's
-local planning workspace (not distributed with the code): `Phase 0 Plan.md`, the
-`Reticulum Assessment.md` behind ADR-0013, and per-task specs under `Phase 0 Tasks/`
-and `Phase 1 Tasks/` (T`N.X.Y`: crate, dependencies, deliverable, hints,
-acceptance criteria, out-of-scope).
-The design overview itself is in-repo at `docs/design/Railroad-Network-Overview.md`.
+The design overview is in-repo at `docs/design/Railroad-Network-Overview.md`; locked
+decisions live in `docs/adr/`. Historical phase plans and per-task specs for Phases 0–1
+(now complete) are retained in the maintainer's local planning workspace and are not
+distributed with the code. Active development tickets, when present, live in the
+gitignored `.tickets/` directory — read its `PROCESS.md` before starting any ticket.
 
-**How to work from the task specs:**
-- Do tasks in dependency order; every field in a spec is load-bearing.
-- Verify against the spec's **Acceptance** criteria/commands before considering it done.
+**How to work from any spec or ticket:**
+- Do tasks in dependency order; verify against the stated **Acceptance** criteria/commands
+  before considering one done.
 - Respect **Out of scope** — don't expand a task to cover adjacent work; another task covers it.
 - If a spec is wrong or missing information, **stop and surface the question** rather than
   guessing — specs encode locked design decisions.
