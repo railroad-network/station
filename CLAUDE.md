@@ -36,10 +36,10 @@ with real value.**
 
 ## Planning documents
 
-Detailed phase plans and per-task specs live outside this repo, at
-`/Users/arsood/Documents/Claude/Projects/Railroad Network/` (local to this machine):
-`Phase 0 Plan.md`, the `Reticulum Assessment.md` behind ADR-0013, and per-task specs under
-`Phase 0 Tasks/` and `Phase 1 Tasks/` (T`N.X.Y`: crate, dependencies, deliverable, hints,
+Detailed phase plans and per-task specs live outside this repo, in the maintainer's
+local planning workspace (not distributed with the code): `Phase 0 Plan.md`, the
+`Reticulum Assessment.md` behind ADR-0013, and per-task specs under `Phase 0 Tasks/`
+and `Phase 1 Tasks/` (T`N.X.Y`: crate, dependencies, deliverable, hints,
 acceptance criteria, out-of-scope).
 The design overview itself is in-repo at `docs/design/Railroad-Network-Overview.md`.
 
