@@ -55,7 +55,7 @@ impl Default for CreditConfig {
 }
 
 /// The total pending debit `party` has already **signed for** but not yet
-/// settled, in centicommons (≥ 0).
+/// settled as of `now`, in centicommons (≥ 0).
 ///
 /// A transaction counts against its debtor once the debtor's own signature is
 /// on it: a positive-amount proposal binds its sender from `Proposed` onward,
@@ -64,11 +64,28 @@ impl Default for CreditConfig {
 /// `Disputed` still counts — a frozen transaction may yet settle as confirmed.
 /// `Settled` amounts are already in the balance and `Cancelled` ones never will
 /// be, so neither contributes.
-pub fn committed_debits_centi(snapshot: &LedgerSnapshot, party: &Address) -> i64 {
+///
+/// A still-`Proposed` transaction whose `expires_at` has passed (beyond the
+/// engine's clock-skew tolerance) no longer counts: the engine refuses a
+/// confirmation past that same boundary, so the debit can never land, and
+/// holding its headroom forever would let a counterparty who simply ignores a
+/// proposal permanently shrink the sender's credit.
+pub fn committed_debits_centi(snapshot: &LedgerSnapshot, party: &Address, now: i64) -> i64 {
     let mut total: i64 = 0;
     for (_, state) in snapshot.iter() {
         let (proposal, receiver_committed) = match state {
-            TransactionState::Proposed { proposal } => (proposal, false),
+            TransactionState::Proposed { proposal } => {
+                let expiry_cutoff = proposal
+                    .payload
+                    .expires_at
+                    .saturating_add(crate::engine::CLOCK_SKEW_TOLERANCE_SECS);
+                if now > expiry_cutoff {
+                    // Expired unconfirmed: the engine will never accept its
+                    // confirmation, so it can no longer bind its sender.
+                    continue;
+                }
+                (proposal, false)
+            }
             TransactionState::Confirmed { proposal, .. }
             | TransactionState::Disputed { proposal, .. } => (proposal, true),
             TransactionState::Settled { .. } | TransactionState::Cancelled { .. } => continue,
@@ -120,8 +137,8 @@ mod tests {
         log.append(SignedProposal::sign(request, &alice)).unwrap();
 
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
-        assert_eq!(committed_debits_centi(&snapshot, &addr(&alice)), 300);
-        assert_eq!(committed_debits_centi(&snapshot, &addr(&bob)), 0);
+        assert_eq!(committed_debits_centi(&snapshot, &addr(&alice), 150), 300);
+        assert_eq!(committed_debits_centi(&snapshot, &addr(&bob), 150), 0);
 
         // Bob confirms the request: now the 200 binds him.
         let c = TransactionConfirmation {
@@ -133,7 +150,33 @@ mod tests {
             .append(SignedConfirmation::sign(c, &bob))
             .unwrap();
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
-        assert_eq!(committed_debits_centi(&snapshot, &addr(&bob)), 200);
-        assert_eq!(committed_debits_centi(&snapshot, &addr(&alice)), 300);
+        assert_eq!(committed_debits_centi(&snapshot, &addr(&bob), 250), 200);
+        assert_eq!(committed_debits_centi(&snapshot, &addr(&alice), 250), 300);
+    }
+
+    #[test]
+    fn an_expired_unconfirmed_proposal_stops_counting() {
+        let db = Database::open_in_memory().unwrap();
+        migrations::run(&db).unwrap();
+        let (alice, bob) = (Keypair::generate(), Keypair::generate());
+        let mut log = AppendLog::new(&db);
+
+        // Alice proposes 300 to Bob, valid from t=100 to t=1_000.
+        let pay = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 100, 1_000);
+        log.append(SignedProposal::sign(pay, &alice)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+
+        // Within the window (and its skew tolerance) the 300 binds Alice; once
+        // the proposal can no longer be confirmed, the headroom is released.
+        let skew = crate::engine::CLOCK_SKEW_TOLERANCE_SECS;
+        assert_eq!(committed_debits_centi(&snapshot, &addr(&alice), 500), 300);
+        assert_eq!(
+            committed_debits_centi(&snapshot, &addr(&alice), 1_000 + skew),
+            300
+        );
+        assert_eq!(
+            committed_debits_centi(&snapshot, &addr(&alice), 1_001 + skew),
+            0
+        );
     }
 }

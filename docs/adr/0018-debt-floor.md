@@ -61,7 +61,12 @@ Concretely (`rrn-ledger::credit`, enforced by the `Engine` front door):
    transaction the member has signed as debtor. `Disputed` counts — a frozen
    transaction may yet settle as confirmed. Pending *credits* do **not**
    count: an unsettled inflow can still cancel, and headroom must never be
-   borrowed against it. A cancelled proposal releases its headroom.
+   borrowed against it. A cancelled proposal releases its headroom, and so
+   does a still-`Proposed` one that passes its `expires_at` (plus the clock-skew
+   tolerance) without being confirmed: past that boundary the engine refuses
+   the confirmation by its own clock, so the debit can never land — otherwise a
+   counterparty who simply ignored a proposal would consume the sender's
+   headroom forever.
 3. **The check is a front-door rejection, like the tier ceiling.** A breaching
    proposal or confirmation never reaches the log (`Error::DebtFloorExceeded`,
    surfacing over RPC as invalid-parameters with both the floor and the

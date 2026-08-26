@@ -71,10 +71,11 @@ impl<'db> Engine<'db> {
         snapshot: &LedgerSnapshot,
         debtor: &Address,
         debit_centi: i64,
+        now: i64,
     ) -> Result<()> {
         let settled = BalanceView::new(self.db).balance_of(debtor)?;
         let projected = settled
-            .saturating_sub(committed_debits_centi(snapshot, debtor))
+            .saturating_sub(committed_debits_centi(snapshot, debtor, now))
             .saturating_sub(debit_centi);
         if projected < self.credit.debt_floor_centi {
             return Err(Error::DebtFloorExceeded {
@@ -143,7 +144,7 @@ impl<'db> Engine<'db> {
         // payment request) debits the receiver, who has signed nothing yet —
         // that side is checked at confirmation time instead.
         if p.amount_centi > 0 {
-            self.check_debt_floor(&snapshot, &p.sender, p.amount_centi)?;
+            self.check_debt_floor(&snapshot, &p.sender, p.amount_centi, now)?;
         }
 
         let (id, nonce) = (p.id, p.nonce);
@@ -161,7 +162,6 @@ impl<'db> Engine<'db> {
         confirmation: SignedConfirmation,
         now: i64,
     ) -> Result<()> {
-        let _ = now; // `now` is reserved for future freshness checks on confirmations.
         confirmation.verify().map_err(|_| Error::BadSignature)?;
         let c = &confirmation.payload;
 
@@ -178,7 +178,14 @@ impl<'db> Engine<'db> {
             return Err(Error::ConfirmerMismatch);
         }
 
-        // A receiver may refuse to confirm an expired proposal; enforce it.
+        // A receiver may refuse to confirm an expired proposal; enforce it — by
+        // the station's own clock, not just the receiver-supplied `confirmed_at`
+        // (which a late confirmer could backdate). This is also what lets the
+        // debt floor release the headroom of an expired unconfirmed proposal:
+        // past this boundary the debit can never land (see [`crate::credit`]).
+        if now > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::Expired);
+        }
         if c.confirmed_at > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
             return Err(Error::Expired);
         }
@@ -189,7 +196,7 @@ impl<'db> Engine<'db> {
         // added explicitly here. (Positive amounts debit the sender, checked
         // when the proposal was submitted.)
         if p.amount_centi < 0 {
-            self.check_debt_floor(&snapshot, &p.receiver, p.amount_centi.saturating_abs())?;
+            self.check_debt_floor(&snapshot, &p.receiver, p.amount_centi.saturating_abs(), now)?;
         }
 
         let proposal_id = c.proposal_id;
@@ -792,6 +799,70 @@ mod tests {
         engine
             .submit_proposal(SignedProposal::sign(fits, &alice), 100)
             .unwrap();
+    }
+
+    #[test]
+    fn an_expired_unconfirmed_proposal_releases_its_headroom() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine =
+            Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
+                debt_floor_centi: -500,
+            });
+
+        // Alice signs 500 down to exactly the floor; Bob never confirms.
+        let stale = TransactionProposal::new(addr(&alice), addr(&bob), 500, None, 0, 100, 1_000);
+        engine
+            .submit_proposal(SignedProposal::sign(stale, &alice), 100)
+            .unwrap();
+
+        // While the stale proposal is still confirmable, its 500 stays committed.
+        let blocked = TransactionProposal::new(addr(&alice), addr(&bob), 100, None, 1, 100, 9_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(blocked, &alice), 500),
+            Err(Error::DebtFloorExceeded { .. })
+        ));
+
+        // Once it is past expiry (plus skew) it can never land, so the same
+        // amount fits again — without anyone writing a cancellation.
+        let after = 1_000 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        let fits = TransactionProposal::new(addr(&alice), addr(&bob), 100, None, 1, 100, 9_000);
+        engine
+            .submit_proposal(SignedProposal::sign(fits, &alice), after)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_backdated_confirmation_of_an_expired_proposal_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // Long after expiry, Bob backdates `confirmed_at` into the window. The
+        // station's own clock still refuses it — otherwise the expiry boundary
+        // (and the debt-floor headroom released past it) would be spoofable.
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 900,
+        };
+        let after = 1_000 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), after),
+            Err(Error::Expired)
+        ));
     }
 
     #[test]

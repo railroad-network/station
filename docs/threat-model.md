@@ -646,7 +646,10 @@ transition; the derivability of all state from the log.
   (`Proposed`/`Confirmed`/`Disputed`) debit they already signed. Enforcement
   follows the debtor's signature — proposal time for a sender, confirmation
   time for a payment request's receiver — and pending inflows never add
-  headroom.
+  headroom. An unconfirmed proposal past its expiry (plus clock-skew
+  tolerance) stops counting: the engine refuses its confirmation by the
+  station's own clock past that boundary, so a counterparty who ignores a
+  proposal cannot permanently consume the sender's headroom.
 - *Residual risk:* the recurring-contract charge path (`ContractCharge`,
   T1.7.7) is not floor-checked, so contract periods can land a buyer below the
   floor (the buyer did sign the contract; folding contract exposure into the
