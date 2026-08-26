@@ -1,6 +1,5 @@
-.claude
-
-CLAUDE.md
+# Claude Code: local settings stay out; shared project config and CLAUDE.md are tracked
+.claude/settings.local.json
 
 # Rust
 /target/
@@ -21,3 +20,6 @@ CLAUDE.md
 
 # Local environment
 .env
+
+# Local AI-agent work tickets (not for humans; never committed)
+/.tickets/
