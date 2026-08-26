@@ -188,7 +188,10 @@ impl<'db> Settler<'db> {
             {
                 // The window is a pure function of the transaction's tier, which
                 // is itself derived from the immutable signed proposal — nothing
-                // extra is recorded per transaction.
+                // extra is recorded per transaction. Measuring from the
+                // receiver-supplied `confirmed_at` is sound because the engine
+                // only admits a confirmation whose `confirmed_at` is within
+                // clock-skew tolerance of the station clock (ADR-0019).
                 let window = self.config.window_for(proposal.payload.effective_tier()) as i64;
                 if confirmation.payload.confirmed_at.saturating_add(window) <= now {
                     eligible.push(*id);

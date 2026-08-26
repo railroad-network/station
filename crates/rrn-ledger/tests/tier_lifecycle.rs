@@ -125,7 +125,13 @@ fn tiers_settle_on_their_own_windows() {
     let db = Database::open_in_memory().unwrap();
     migrations::run(&db).unwrap();
 
-    let mut engine = Engine::new(&db, station.clone());
+    // This test is about tier windows, not credit: Alice commits 28 Commons of
+    // pending debits at once, past the default −20 Commons debt floor
+    // (ADR-0018), so widen the floor explicitly to keep the subjects separate.
+    let mut engine =
+        Engine::new(&db, station.clone()).with_credit_config(rrn_ledger::credit::CreditConfig {
+            debt_floor_centi: -10_000,
+        });
     // The real production defaults — 24h Tier 1, 48h Tier 2.
     let mut settler = Settler::new(&db, station.clone(), SettlementConfig::default());
 

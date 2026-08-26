@@ -250,7 +250,20 @@ A healthy mutual credit economy needs credits moving, not hoarding:
 
 - **Demurrage** — Credits decay slightly over time if not spent (community-configurable, e.g., -1% per month). Based on Silvio Gesell's concept, tested successfully in the 1932 Wörgl Experiment. Forces circulation. Decayed credits are credited back to the commons pool, not destroyed.
 - **Credit ceilings** — Members cannot accumulate more than X Commons. Forces high earners to spend or donate to the commons pool.
+- **Debt floor** — The mirror bound on the negative side: a member cannot *commit* themselves below a floor (protocol default −20 Commons, ADR-0018), evaluated against their settled balance plus every pending debit they have already signed. Because the right to exit (2.5.1) must stay unconditional, exposure is bounded up front rather than clawed back at departure; the floor caps — but does not answer — the governance question of who absorbs a departed member's debt. Reputation-scaled limits (5.7) are the successor mechanism.
 - **Contribution requirements** — Members provide a minimum labor or service to the community regardless of credit balance, creating a social contract baseline.
+
+> **Open design problem — pool solvency and local policy on a global unit.** The
+> zero-sum invariant is an accounting identity, not an economic constraint: a
+> community's commons pool can go arbitrarily negative through issuance,
+> jubilees, and debt forgiveness, and a deeply negative pool is money creation
+> that still "sums to zero." Because the Common is universal while demurrage,
+> jubilees, and forgiveness are community-local policies, a local vote can have
+> federation-wide monetary effects (the Eurozone's known failure shape: one
+> currency, local fiscal policy, no transfer mechanism). Bounds on pool debt,
+> which community's policy governs a portable balance, and the Sybil exposure of
+> per-member base issuance (3.3.2) all need settling — by ADR — before any
+> credit-creation mechanism beyond plain mutual credit is enabled.
 
 ### 3.6 Addressing the Scarcity Problem — Essential Services
 
@@ -492,11 +505,17 @@ Dispute resolution is where the system gets tested. Everything works when people
 
 ### 7.3 The Four-Layer Resolution Stack
 
-#### Layer 1 — Automated Resolution
-For small, clear-cut cases: transaction not confirmed within settlement window auto-cancels; both parties agreeing to cancellation triggers immediate resolution with no reputation impact; amounts below micro-threshold resolved in favor of the receiver by default. Zero overhead.
+> **Updated 2026-08-25 to match the implementation.** Phase 1 ships Layers 1–2
+> in the form ADR-0014 specifies — which supersedes the earlier sketch of this
+> section (a mediation fee, overturn penalties, and receiver-default
+> micro-resolution are not part of the adopted design). Layers 3–4 remain the
+> Phase 3+ target shape.
 
-#### Layer 2 — Peer Mediation
-A randomly selected panel of 3 community members above a reputation threshold reviews evidence and makes a binding decision. Random selection prevents factional control. Panelists earn a small Commons fee. Panelists who consistently make decisions overturned on appeal take a small reputation hit — incentivizing honest judgment.
+#### Layer 1 — Automated Resolution
+For small, clear-cut cases, resolution costs nothing: a transaction not confirmed within its window auto-cancels; a sender may withdraw and a receiver may reject an unconfirmed proposal with no reputation impact; and a dispute nobody resolves within its bounded window **lapses to the confirmed status quo** — the bilaterally-confirmed transaction settles as agreed, so a meritless dispute costs at most a delay, never an indefinite freeze.
+
+#### Layer 2 — Sortition Jury *(implemented — ADR-0014)*
+Raising a dispute freezes settlement for a bounded resolution window (default 14 days). A three-member jury is drawn from the established-member pool (minus the parties and their direct vouchers) by **deterministic, standing-weighted sortition** — the draw is a pure function of the log, so anyone can replay it and prove the panel was not hand-picked. Majority rules; a silent juror is deterministically redrawn around. A party may appeal to a full governance vote of the electorate, and every path fails open to the confirmed transaction. An upheld dispute voids the pending transfer and records the confirmer's attestation as **proven wrong**, which is how the Tier-2 reputation stake actually bites (see 7.4).
 
 #### Layer 3 — Community Tribunal
 For larger stakes or appealed peer mediation. A formal panel of 7 members including at least one elected official. Structured evidence submission, longer deliberation window, **written reasoning required**. Written reasoning creates precedent — over time the community builds a body of case law.
@@ -506,21 +525,17 @@ For inter-community disputes or cases where a member alleges their own community
 
 ### 7.4 The Staking Mechanism
 
-Every dispute filing requires staking reputation:
+> **Updated 2026-08-25 to match the implementation.** An earlier version of this
+> section specified filing stakes as transferable reputation points (a fixed
+> table by disputed value, "portion of loser's stake" on a win). That model was
+> rejected in ADRs 0011/0014: reputation is *derived from the log* (ADR-0009)
+> and cannot be transferred like currency. Stakes are realized as follows
+> instead.
 
-```
-Disputed value             Reputation stake required
-under 5 Commons            0.1 points
-5 to under 50 Commons      0.5 points
-50 to under 500 Commons    1.5 points
-500 Commons and up         3.0 points
+Staking runs through the oracle layer, not the filing fee:
 
-On win:  stake returned + portion of loser's stake
-On loss: stake forfeited + additional reputation hit
-Fraud finding: heavier penalty than honest disagreement
-```
-
-Stakes are absolute points on the 0–5 scale, so filing a large dispute requires substantial standing — deliberate friction against frivolous high-value claims — but the top stake is capped well below the maximum score so that established members, not only perfect ones, can file.
+- **The confirmer stakes.** Confirming a Tier-2 transaction stakes the confirmer's standing (their raw composite at confirmation time, recomputable from the log — nothing is stored or locked). An upheld dispute records that confirmation as **proven wrong**, denting the `attestation_accuracy` dimension that carries 25% of the composite. This is the fraud deterrent.
+- **Filing is free but bounded.** Only a party to the transaction may dispute it, within the settlement window, one response per party — and the fail-open resolution window caps a bad-faith filing's damage at a delay. A disputant-side penalty for bad-faith filings is deferred work, recorded in ADR-0014, along with the pattern-attack defenses of 7.5.
 
 ### 7.5 The Pattern Attack Defense
 
@@ -585,7 +600,7 @@ Federation is deliberately not automatic. It should be a conscious community dec
 }
 ```
 
-The `charter_hash` is critical: a cryptographic fingerprint of the community's founding document. Any charter change produces a different hash. Treaty partners can verify they are still dealing with the same community they originally federated with. A community that rewrites its charter mid-treaty triggers an automatic renegotiation requirement.
+The `charter_hash` is critical: a cryptographic fingerprint of the community's founding document. Any charter change produces a different hash — but not every change is a rupture. Charters carry a version and a `previous_hash` lineage chain (ADR-0012), so an amendment passed under the charter's own rules is verifiably *the same community evolving*: a treaty partner follows the chain from the hash they pinned to the current one and checks each link's ratification. Only a hash with **no** valid lineage back to the pinned charter — a replacement rather than an amendment — triggers the automatic renegotiation requirement.
 
 ### 8.4 Treaty Types — Graduated Federation Depth
 
@@ -805,15 +820,24 @@ IDENTITY LAYER
 
 ### 10.3 Transport Layer — Graceful Degradation
 
+> **Updated 2026-08-25.** The concrete carrier for the degraded rungs of this
+> ladder is now decided: **Reticulum**, run as a supervised sidecar and treated
+> strictly as a dumb carrier — never the integrity or identity boundary
+> (ADR-0013, superseding this section's earlier "Tor-like onion routing" sketch
+> and the libp2p placeholder). Reticulum natively spans TCP, LoRa (via RNode),
+> serial, and packet radio, and its LXMF layer is store-and-forward — the
+> conductor pattern as a protocol primitive. All application payloads stay
+> signed and sealed with our own primitives regardless of carrier.
+
 | Connectivity Level | Available Transport |
 |---|---|
 | **Full internet** | TCP/IP, standard networking. Full feature set, real-time sync. |
-| **Partial/regional** | Tor-like onion routing for privacy. Core features work with delayed sync. |
+| **Partial/regional** | Reticulum over whatever links remain. Core features work with delayed sync. |
 | **Local network only** | WiFi mesh, Bluetooth mesh. Community fully functional, federation delayed. |
-| **No internet — LoRa** | Low-power radio, 5-15km range, ~250 bytes/second. Credit transactions, governance votes, and identity work. Marketplace degraded. |
-| **Complete isolation** | Store-and-forward via physical carriers. Conductors carry sync payloads. Ledgers reconcile on reconnect. |
+| **No internet — LoRa** | Low-power radio via Reticulum/RNode, 5-15km range, ~250 bytes/second raw. Credit transactions, governance votes, and identity work. Marketplace degraded. |
+| **Complete isolation** | Store-and-forward via physical carriers. Conductors carry sync payloads (LXMF, or QR/paper). Ledgers reconcile on reconnect. |
 
-**LoRa (Long Range radio)** achieves 5-15km range at very low power. At 250 bytes per second, it can handle credit transactions, governance votes, and identity attestations — the economic backbone of the system. Communities stay economically connected when the internet is entirely gone.
+**LoRa (Long Range radio)** achieves 5-15km range at very low power. The raw ~250 bytes per second is further reduced by legal duty-cycle limits (e.g. 1% on EU 868 MHz — sustained throughput closer to single-digit bytes/second, budgeted honestly in the Phase 2 plan), which is still enough for credit transactions, governance votes, and identity attestations — the economic backbone of the system. Communities stay economically connected when the internet is entirely gone.
 
 ### 10.4 Consensus Layer
 
@@ -852,14 +876,25 @@ A two-phase handshake cannot guarantee atomic commit across an unreliable networ
 
 Conflict-free Replicated Data Types (CRDTs) are mathematical data structures that can be merged from any two states without conflicts, regardless of the order updates arrived. This is the core primitive that makes offline-first work.
 
-| Data Type | CRDT Variant |
+> **Updated 2026-08-25.** The signed **append-only log is the source of truth**
+> for everything below; CRDTs are the *derived, mergeable view* of it, never an
+> independent authority. Two earlier rows of this table have been corrected
+> accordingly: reputation is **recomputed from the log** by the universal
+> algorithm (ADR-0009 — a synced score would be a second source of truth that
+> could drift and could not be re-verified), and governance votes are **signed
+> log records** tallied by replay (ADR-0012), not a 2P-Set. Note the ballot
+> consequence: replay-verifiable votes are attributable, not secret — ballot
+> secrecy is an open Phase-3 design question in tension with verifiability
+> (threat model, "Vote buying and coercion").
+
+| Data Type | Representation |
 |---|---|
-| **Credit balances** | PN-Counter CRDT (positive/negative increment counter) |
-| **Marketplace listings** | OR-Set CRDT (observed-remove set) |
-| **Reputation scores** | LWW-Register CRDT (last-write-wins with logical timestamps) |
-| **Governance votes** | 2P-Set CRDT (two-phase set — votes cannot be uncast) |
-| **Community membership** | OR-Set CRDT |
-| **Attestation records** | Append-only log with cryptographic chaining |
+| **Credit balances** | PN-Counter CRDT (positive/negative increment counter), derived from settlement records |
+| **Marketplace listings** | OR-Set CRDT (observed-remove set), derived from listing records |
+| **Reputation scores** | Recomputed from the log by the universal algorithm (ADR-0009); the snapshot table is a cache, never an authority |
+| **Governance votes** | Signed log records, tallied by replay (ADR-0012) |
+| **Community membership** | OR-Set CRDT, derived from vouch/membership records |
+| **Attestation records** | Append-only log with cryptographic chaining (the root of all of the above) |
 
 State propagates via **gossip protocol** — each node periodically selects random peers and exchanges state deltas. Information spreads in O(log N) rounds without central coordination. Nodes exchange only deltas, keeping bandwidth minimal for LoRa transport.
 
@@ -893,7 +928,7 @@ Each protocol is a defined message format plus a state machine. Any node impleme
 | **Ledger fork** | Raft quorum prevents accidental forks; a malicious leader can still equivocate, so every entry is signed and hash-chained — equivocation is automatically detectable, attributable to its signer, and punishable through governance |
 | **Sybil federation** | Community reputation scores are slow to build; new communities have limited governance weight during probation |
 | **Replay attack** | Every transaction includes a monotonically increasing nonce per identity plus a timestamp; nodes reject previously-seen nonces |
-| **Physical node seizure** | Data at rest encrypted with keys held by community members, not stored on the node; seizing a powered-off node yields an encrypted brick. Residual risk: a node seized while running has keys in memory — the mitigations there are physical custody and rapid re-bootstrap, not encryption |
+| **Physical node seizure** | **Target (Phase 2 deliverable), not current state:** data at rest encrypted with keys held by community members, not stored on the node, so a seized powered-off node yields an encrypted brick. **Today** only the wallet key is encrypted — the ledger (balances, memos, the vouch graph) is plaintext on disk (threat model, "Known limitations"); what exists now is the encrypted *backup* archive with Shamir-recoverable keys (ADR-0016). Residual risk either way: a node seized while running has keys in memory — the mitigations there are physical custody and rapid re-bootstrap, not encryption. Note the availability trade the target design buys: member-held keys mean every reboot needs a key ceremony |
 
 ### 10.9 The Technology Stack
 
@@ -906,6 +941,7 @@ Each protocol is a defined message format plus a state machine. Any node impleme
 | **Addresses** | bech32m with HRP `rrn` — addresses read `rrn1...` (ADR-0003) |
 | **Shamir secret sharing** | Own implementation over GF(256), Rijndael polynomial, in `rrn-identity` — existing crates evaluated and rejected (ADR-0004) |
 | **Consensus** | Custom Raft (evaluate `openraft` first) — small codebase, well-understood, adaptable to low-bandwidth. Phase 3+ (federation); a single-station community needs no consensus protocol |
+| **Federation / collapse transport** | Reticulum (ADR-0013) — run as a supervised `rnsd` sidecar, pluggable behind an `rrn-protocol` transport seam, strictly a carrier: identity, integrity, and encryption stay at the application layer |
 | **Mobile client** | React Native + TypeScript UI over the Rust core (`rrn-crypto`, `rrn-identity`) compiled for iOS/Android, bindings generated by `uniffi-rs` (ADR-0006, ADR-0007) |
 | **SMS interface** | Simple AT command parser — runs on any device with serial port access to a radio modem |
 | **ZK proofs** | arkworks-rs — Rust ZK library for duplicate identity detection |
@@ -1121,6 +1157,34 @@ serves the Phase 1 early adopters — rural communities with weak connectivity, 
 networks — who benefit from offline operation before they benefit from trading with
 other communities. (Decision recorded in ADR-0017.)
 
+**Design prerequisites (entrance criteria).** Three architectural questions are
+currently answered only for a single always-connected station, and each needs an
+ADR *before* the corresponding Phase 2 code, because retrofitting any of them
+after multi-node sync ships means a wire-format break:
+
+1. **Bounded invariants under partition.** A PN-Counter merges cleanly but
+   cannot *enforce a bound*: two partitioned nodes can each approve spending
+   against the same debt-floor headroom (ADR-0018) and the merge lands past the
+   floor. Phase 2 needs an escrowed-headroom design (bounded-counter style —
+   each node reserves the headroom it may commit while partitioned) plus an
+   explicit policy for what happens when a merge nevertheless reveals a
+   violation. "No credits lost" is the easy half of the exit criterion; "no
+   limits violated on merge" is the hard half.
+2. **The log's shape under multiple writers.** The current log is one linear
+   hash chain with one writer. Store-and-forward between nodes of one community
+   guarantees concurrent appends, and a linear chain cannot represent them:
+   the structure must become per-node chains with defined merge semantics or a
+   Merkle-DAG. Equivocation detection, replay determinism (ADR-0009 scoring,
+   ADR-0014 sortition), and reconciliation all depend on which — decide once,
+   by ADR, before the first delay-tolerant byte ships.
+3. **A time-trust model.** Settlement windows, dispute windows, decay, and
+   expiry all read timestamps; today the single station is the trusted clock
+   (ADR-0005). With multiple nodes, self-asserted timestamps become
+   attacker-controlled — any reconciliation rule of the form "signed before
+   the deadline wins" is defeated by backdating. State explicitly whose clock
+   is trusted for what, and anchor cross-node ordering in unforgeable structure
+   (log position, not claimed wall-clock time).
+
 **Deliverables:**
 - Offline-first hardening — full functionality with zero connectivity
 - Delay-tolerant networking — store and forward between disconnected nodes within a community
@@ -1135,7 +1199,8 @@ outages with real economic activity. Does everything reconcile correctly on reco
 Red team the physical security.
 
 **Exit criteria:** One community survives a simulated 72-hour full connectivity loss with
-real economic activity. All transactions reconcile. No credits lost. No ledger forks.
+real economic activity. All transactions reconcile. No credits lost. No ledger forks. No
+credit limit (debt floor, treaty limit, tier boundary) violated by any merge.
 
 ### Phase 3 — Multi-Community Federation (Months 17-26)
 

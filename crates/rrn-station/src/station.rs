@@ -139,10 +139,24 @@ impl Station {
             }
         };
 
+        // The floor is "how far below zero", so it must not be positive — a
+        // positive value would silently refuse every payment from members whose
+        // projected balance sits below it (ADR-0018).
+        if config.credit.debt_floor_centi > 0 {
+            anyhow::bail!(
+                "config: [credit] debt_floor_centi must be <= 0 (got {})",
+                config.credit.debt_floor_centi
+            );
+        }
+        let credit = rrn_ledger::credit::CreditConfig {
+            debt_floor_centi: config.credit.debt_floor_centi,
+        };
+
         let core = Core::new(
             db,
             wallet,
             settlement,
+            credit,
             params.clock.clone(),
             paired,
             listings,

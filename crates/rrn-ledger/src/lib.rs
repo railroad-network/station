@@ -22,6 +22,9 @@
 //! - [`contract`] — the [`contract::ContractCharge`], a second station-signed
 //!   balance record: the per-period direct debit a recurring service contract
 //!   executes (T1.7.7), a sibling of the settlement record.
+//! - [`credit`] — the debt floor (ADR-0018): the engine refuses a debit whose
+//!   signer would be committed below a bounded negative balance, counting both
+//!   the settled balance and every pending debit they have already signed.
 //!
 //! # The log is the source of truth
 //!
@@ -54,6 +57,7 @@
 #![warn(missing_docs)]
 
 pub mod contract;
+pub mod credit;
 pub mod dispute;
 pub mod engine;
 pub mod settlement;
@@ -90,14 +94,20 @@ pub enum Error {
         /// The nonce actually presented.
         got: u64,
     },
-    /// The proposal's `proposed_at` is too far in the future to be plausible,
-    /// even allowing for clock skew.
-    #[error("proposal is dated too far in the future (beyond clock-skew tolerance)")]
+    /// The proposal's `proposed_at` — or a confirmation's `confirmed_at` — is
+    /// too far in the future to be plausible, even allowing for clock skew.
+    #[error("record is dated too far in the future (beyond clock-skew tolerance)")]
     FutureDated,
     /// The proposal (or confirmation) is past its `expires_at`, allowing for
     /// clock skew.
     #[error("proposal has expired")]
     Expired,
+    /// The confirmation's `confirmed_at` is too far in the past, even allowing
+    /// for clock skew. `confirmed_at` anchors both the settlement window and
+    /// the dispute-open deadline, so a backdated confirmation would shrink —
+    /// or wholly skip — the dispute window ADR-0014 assumes (ADR-0019).
+    #[error("confirmation is dated too far in the past (beyond clock-skew tolerance)")]
+    StaleConfirmation,
     /// The proposal's window is degenerate: `proposed_at` is after `expires_at`.
     #[error("proposal window is invalid: proposed_at is after expires_at")]
     InvalidWindow,
@@ -112,6 +122,22 @@ pub enum Error {
         tier: u8,
         /// The highest tier Phase 1 can service ([`tier::MAX_PHASE1_TIER`]).
         max: u8,
+    },
+    /// Signing this debit would take the member's projected balance — settled
+    /// balance minus every pending debit they have already signed — below the
+    /// community's debt floor. Mutual credit runs on negative balances, but not
+    /// unbounded ones: the floor caps what a member can owe the community when
+    /// they stop participating (ADR-0018; see [`credit`]).
+    #[error(
+        "debt floor exceeded: this debit would take the projected balance to \
+         {projected_centi} centicommons, below the floor of {floor_centi}"
+    )]
+    DebtFloorExceeded {
+        /// The configured floor, in centicommons (≤ 0).
+        floor_centi: i64,
+        /// The balance the member would be committed to if this debit were
+        /// accepted, in centicommons.
+        projected_centi: i64,
     },
     /// No transaction with the given id exists in the log.
     #[error("transaction not found")]

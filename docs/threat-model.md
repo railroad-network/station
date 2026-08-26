@@ -629,9 +629,57 @@ transition; the derivability of all state from the log.
   double-apply (T0.5.5, T0.5.7).
 - *Residual risk:* the nonce is per-sender on a single replica; cross-replica
   nonce coordination (a sender acting on two stations) is a Phase 1+ federation
-  problem. Credit limits are not enforced — a sender can settle into arbitrary
-  debt in Phase 0 (Phase 1). The ±5 minute drift window is a deliberate
-  usability/security trade-off recorded here.
+  problem. The ±5 minute drift window is a deliberate usability/security
+  trade-off recorded here.
+
+#### Tampering — backdating `confirmed_at` to shrink the dispute window (ADR-0019)
+
+- *Threat:* the settlement window — which doubles as the Phase-1 dispute
+  window — and the dispute-open deadline are both measured from the
+  receiver-supplied, receiver-signed `confirmed_at`. A receiver confirming
+  late but inside the proposal's validity window could backdate
+  `confirmed_at` toward `proposed_at`, shrinking the sender's dispute window
+  or skipping it entirely (the next settlement sweep would see the window
+  already elapsed).
+- *Mitigation:* **confirmation freshness** (ADR-0019) — the engine admits a
+  confirmation only when `confirmed_at` is within ±5 minutes
+  (`CLOCK_SKEW_TOLERANCE_SECS`) of the station's own clock at receipt
+  (`Error::StaleConfirmation` past, `Error::FutureDated` ahead). This
+  completes the invariant that no party-asserted timestamp is accepted more
+  than skew tolerance from the receiving clock, so every window measured from
+  `confirmed_at` is trustworthy to ±5 minutes — worst-case shrinkage is 5
+  minutes of a 24–48 hour window.
+- *Residual risk:* the bound assumes Phase 1's synchronous transports (the
+  mobile signs at submission over a live channel). Delay-tolerant sync will
+  deliver genuinely old confirmations late; the Phase-2 time-trust ADR
+  (an Overview §12 entrance criterion) owns that redesign and supersedes this
+  rule there.
+
+#### Elevation of privilege — unbounded debt (ADR-0018)
+
+- *Threat:* mutual credit runs on negative balances, so without a bound a
+  member can accept value until arbitrarily negative and stop participating —
+  a walk-away subsidy paid by everyone holding the positive balances their
+  spending created. The settlement window compounds it: many proposals can be
+  stacked inside one window against a balance none of them has touched yet.
+- *Mitigation:* the **debt floor** (`rrn-ledger::credit`, default −20 Commons,
+  `[credit] debt_floor_centi`). The engine refuses any debit whose signer
+  would be committed below the floor, evaluated against the *committed
+  position*: settled balance minus every pending
+  (`Proposed`/`Confirmed`/`Disputed`) debit they already signed. Enforcement
+  follows the debtor's signature — proposal time for a sender, confirmation
+  time for a payment request's receiver — and pending inflows never add
+  headroom. An unconfirmed proposal past its expiry (plus clock-skew
+  tolerance) stops counting: the engine refuses its confirmation by the
+  station's own clock past that boundary, so a counterparty who ignores a
+  proposal cannot permanently consume the sender's headroom.
+- *Residual risk:* the recurring-contract charge path (`ContractCharge`,
+  T1.7.7) is not floor-checked, so contract periods can land a buyer below the
+  floor (the buyer did sign the contract; folding contract exposure into the
+  committed position is the named follow-up). The floor is per-station
+  config until a governance surface exists, so an operator can weaken it. What
+  a community does about a *departed* member's bounded debt remains a
+  governance question the floor caps but does not answer.
 
 #### Oracle tiering and the reputation stake
 
@@ -2090,8 +2138,12 @@ edges of that scope.
   same-user code-execution attacker or physical memory access defeats secrecy
   (per the device-trust assumption). `RRN_PASSPHRASE`, if used, is visible in
   the process environment.
-- **No credit limits / no debt bound.** A sender can settle into arbitrary debt
-  in Phase 0.
+- **Debt is bounded, not managed.** The debt floor (ADR-0018, default
+  −20 Commons) caps how far a member can sign themselves into debt, but the
+  contract-charge path is not floor-checked, the floor is operator config
+  rather than governance, and exit-with-debt policy (who absorbs a departed
+  member's balance) is unanswered — see the `rrn-ledger` elevation-of-privilege
+  section.
 - **No rate limiting or resource caps** on the IPC socket or the gossip port,
   and no message-size cap; the gossip stub pulls a peer's whole log each round.
   O(N) full-log replay has no snapshotting yet. All Phase 1/2.

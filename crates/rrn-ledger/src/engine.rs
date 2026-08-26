@@ -9,7 +9,11 @@
 //! - a **per-sender monotonic nonce** with no gaps and no duplicates;
 //! - a **timestamp window**: `proposed_at <= now <= expires_at`, with
 //!   [`CLOCK_SKEW_TOLERANCE_SECS`] of drift allowance either side;
-//! - **uniqueness**: a proposal whose id is already in the log is rejected.
+//! - **uniqueness**: a proposal whose id is already in the log is rejected;
+//! - the **debt floor** ([`crate::credit`], ADR-0018): a debit whose signer
+//!   would be committed below the floor — counting settled balance and every
+//!   pending debit they already signed — is rejected at the point they sign it
+//!   (propose for the sender, confirm for a payment request's receiver).
 //!
 //! Each accepted operation appends one signed entry to the log; the engine keeps
 //! no mutable state of its own, deriving everything from the log on demand.
@@ -18,8 +22,11 @@ use rrn_crypto::keypair::Keypair;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
+use rrn_identity::address::Address;
+
+use crate::credit::{committed_debits_centi, CreditConfig};
 use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
-use crate::settlement::SettlementConfig;
+use crate::settlement::{BalanceView, SettlementConfig};
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
 use crate::transaction::{SignedConfirmation, SignedProposal, TransactionId};
 use crate::{Error, Result};
@@ -35,13 +42,48 @@ pub const CLOCK_SKEW_TOLERANCE_SECS: i64 = 5 * 60;
 pub struct Engine<'db> {
     station: Keypair,
     db: &'db Database,
+    credit: CreditConfig,
 }
 
 impl<'db> Engine<'db> {
     /// Creates an engine over `db`, signing station-authored records (e.g.
-    /// cancellations) with `station`.
+    /// cancellations) with `station`. Uses the default [`CreditConfig`]; see
+    /// [`Engine::with_credit_config`] to override the debt floor.
     pub fn new(db: &'db Database, station: Keypair) -> Self {
-        Self { station, db }
+        Self {
+            station,
+            db,
+            credit: CreditConfig::default(),
+        }
+    }
+
+    /// Overrides the credit parameters (the debt floor) this engine enforces.
+    pub fn with_credit_config(mut self, credit: CreditConfig) -> Self {
+        self.credit = credit;
+        self
+    }
+
+    /// Rejects a new `debit_centi` (> 0) against `debtor` that would commit
+    /// them below the debt floor: settled balance, minus the pending debits
+    /// they have already signed, minus this one (ADR-0018; see [`crate::credit`]).
+    fn check_debt_floor(
+        &self,
+        snapshot: &LedgerSnapshot,
+        debtor: &Address,
+        debit_centi: i64,
+        now: i64,
+    ) -> Result<()> {
+        let settled = BalanceView::new(self.db).balance_of(debtor)?;
+        let projected = settled
+            .saturating_sub(committed_debits_centi(snapshot, debtor, now))
+            .saturating_sub(debit_centi);
+        if projected < self.credit.debt_floor_centi {
+            return Err(Error::DebtFloorExceeded {
+                floor_centi: self.credit.debt_floor_centi,
+                projected_centi: projected,
+            });
+        }
+        Ok(())
     }
 
     /// Submits a sender-signed proposal, enforcing replay protection.
@@ -97,6 +139,14 @@ impl<'db> Engine<'db> {
             });
         }
 
+        // Debt floor: a positive amount debits the sender, and their signature
+        // on this proposal is their commitment to it. A negative amount (a
+        // payment request) debits the receiver, who has signed nothing yet —
+        // that side is checked at confirmation time instead.
+        if p.amount_centi > 0 {
+            self.check_debt_floor(&snapshot, &p.sender, p.amount_centi, now)?;
+        }
+
         let (id, nonce) = (p.id, p.nonce);
         AppendLog::new(self.db).append(proposal)?;
         tracing::info!(tx = ?id, nonce, "proposal accepted");
@@ -106,13 +156,14 @@ impl<'db> Engine<'db> {
     /// Submits a receiver-signed confirmation of an existing proposal.
     ///
     /// Errors on a bad signature, an unknown or non-`Proposed` transaction, a
-    /// confirmer that is not the receiver, or a confirmation past expiry.
+    /// confirmer that is not the receiver, a confirmation past expiry, or a
+    /// `confirmed_at` outside clock-skew tolerance of the station's own clock
+    /// (ADR-0019).
     pub fn submit_confirmation(
         &mut self,
         confirmation: SignedConfirmation,
         now: i64,
     ) -> Result<()> {
-        let _ = now; // `now` is reserved for future freshness checks on confirmations.
         confirmation.verify().map_err(|_| Error::BadSignature)?;
         let c = &confirmation.payload;
 
@@ -129,9 +180,38 @@ impl<'db> Engine<'db> {
             return Err(Error::ConfirmerMismatch);
         }
 
-        // A receiver may refuse to confirm an expired proposal; enforce it.
+        // A receiver may refuse to confirm an expired proposal; enforce it — by
+        // the station's own clock, not just the receiver-supplied `confirmed_at`
+        // (which a late confirmer could backdate). This is also what lets the
+        // debt floor release the headroom of an expired unconfirmed proposal:
+        // past this boundary the debit can never land (see [`crate::credit`]).
+        if now > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::Expired);
+        }
         if c.confirmed_at > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
             return Err(Error::Expired);
+        }
+
+        // `confirmed_at` anchors both the settlement window and the dispute-
+        // open deadline, so it must be *fresh* — within clock-skew tolerance
+        // of the station's clock at receipt. Without this, a receiver
+        // confirming late but inside the validity window could backdate
+        // `confirmed_at` and shrink (or wholly skip) the dispute window the
+        // Phase-1 oracle rests on (ADR-0019).
+        if c.confirmed_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::FutureDated);
+        }
+        if c.confirmed_at < now.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::StaleConfirmation);
+        }
+
+        // Debt floor: confirming a negative-amount proposal (a payment request)
+        // is the receiver signing a debit against themselves — the still-
+        // `Proposed` request is not yet in their committed debits, so it is
+        // added explicitly here. (Positive amounts debit the sender, checked
+        // when the proposal was submitted.)
+        if p.amount_centi < 0 {
+            self.check_debt_floor(&snapshot, &p.receiver, p.amount_centi.saturating_abs(), now)?;
         }
 
         let proposal_id = c.proposal_id;
@@ -587,6 +667,301 @@ mod tests {
             engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 200),
             Err(Error::NotProposed)
         ));
+    }
+
+    #[test]
+    fn a_proposal_below_the_debt_floor_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine =
+            Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
+                debt_floor_centi: -500,
+            });
+
+        // 5 Commons (500 centi) down to exactly the floor: allowed.
+        let at_floor =
+            TransactionProposal::new(addr(&alice), addr(&bob), 500, None, 0, 100, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(at_floor, &alice), 100)
+            .unwrap();
+
+        // One more centicommon of committed debt breaches the floor. The pending
+        // (unsettled) 500 must count: the projected position is -501.
+        let over = TransactionProposal::new(addr(&alice), addr(&bob), 1, None, 1, 100, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(over, &alice), 100),
+            Err(Error::DebtFloorExceeded {
+                floor_centi: -500,
+                projected_centi: -501,
+            })
+        ));
+
+        // Nothing was written: nonce 1 is still free for a proposal that fits.
+        let recipient_pays =
+            TransactionProposal::new(addr(&alice), addr(&bob), -300, None, 1, 100, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(recipient_pays, &alice), 100)
+            .unwrap();
+    }
+
+    #[test]
+    fn confirming_a_payment_request_checks_the_receivers_floor() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine =
+            Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
+                debt_floor_centi: -500,
+            });
+
+        // Alice requests 501 from Bob (negative amount = receiver pays). The
+        // proposal itself is fine — Bob has signed nothing yet.
+        let request =
+            TransactionProposal::new(addr(&alice), addr(&bob), -501, None, 0, 100, 100_000);
+        let id = request.id;
+        engine
+            .submit_proposal(SignedProposal::sign(request, &alice), 100)
+            .unwrap();
+
+        // Bob's confirmation is his signature on the debit, and it breaches
+        // his floor.
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 200,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 200),
+            Err(Error::DebtFloorExceeded {
+                floor_centi: -500,
+                projected_centi: -501,
+            })
+        ));
+    }
+
+    #[test]
+    fn settled_debt_counts_against_the_floor() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine =
+            Engine::new(&db, station.clone()).with_credit_config(crate::credit::CreditConfig {
+                debt_floor_centi: -500,
+            });
+
+        // Alice pays Bob 300 and it settles: her settled balance is -300.
+        let id = confirmed(&mut engine, &alice, &bob, 200);
+        let mut settler =
+            crate::settlement::Settler::new(&db, station, SettlementConfig::uniform(10));
+        settler.settle(&id, 1_000).unwrap();
+
+        // `confirmed` used amount 300, so Alice sits at -300 settled. 200 more
+        // reaches -500 exactly; 201 would breach.
+        let breach =
+            TransactionProposal::new(addr(&alice), addr(&bob), 201, None, 1, 2_000, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(breach, &alice), 2_000),
+            Err(Error::DebtFloorExceeded {
+                floor_centi: -500,
+                projected_centi: -501,
+            })
+        ));
+        let fits = TransactionProposal::new(addr(&alice), addr(&bob), 200, None, 1, 2_000, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(fits, &alice), 2_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_proposal_releases_its_headroom() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine =
+            Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
+                debt_floor_centi: -500,
+            });
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 100_000); // 300 centi
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // With 300 pending, another 300 would project to -600: rejected.
+        let too_much =
+            TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 1, 100, 100_000);
+        assert!(engine
+            .submit_proposal(SignedProposal::sign(too_much, &alice), 100)
+            .is_err());
+
+        // Withdrawing the first releases its 300; the same amount now fits.
+        engine
+            .cancel_proposal(&id, CancelReason::WithdrawnBySender, 150)
+            .unwrap();
+        let fits = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 1, 100, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(fits, &alice), 100)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_expired_unconfirmed_proposal_releases_its_headroom() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine =
+            Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
+                debt_floor_centi: -500,
+            });
+
+        // Alice signs 500 down to exactly the floor; Bob never confirms.
+        let stale = TransactionProposal::new(addr(&alice), addr(&bob), 500, None, 0, 100, 1_000);
+        engine
+            .submit_proposal(SignedProposal::sign(stale, &alice), 100)
+            .unwrap();
+
+        // While the stale proposal is still confirmable, its 500 stays committed.
+        let blocked = TransactionProposal::new(addr(&alice), addr(&bob), 100, None, 1, 100, 9_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(blocked, &alice), 500),
+            Err(Error::DebtFloorExceeded { .. })
+        ));
+
+        // Once it is past expiry (plus skew) it can never land, so the same
+        // amount fits again — without anyone writing a cancellation.
+        let after = 1_000 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        let fits = TransactionProposal::new(addr(&alice), addr(&bob), 100, None, 1, 100, 9_000);
+        engine
+            .submit_proposal(SignedProposal::sign(fits, &alice), after)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_backdated_confirmation_of_an_expired_proposal_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // Long after expiry, Bob backdates `confirmed_at` into the window. The
+        // station's own clock still refuses it — otherwise the expiry boundary
+        // (and the debt-floor headroom released past it) would be spoofable.
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 900,
+        };
+        let after = 1_000 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), after),
+            Err(Error::Expired)
+        ));
+    }
+
+    #[test]
+    fn a_backdated_confirmation_inside_the_validity_window_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // Long before expiry, Bob confirms — but stamps `confirmed_at` back at
+        // the start of the validity window. Accepting it would start the
+        // settlement clock in the past and eat the dispute window, so anything
+        // staler than the skew tolerance is refused.
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 100,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 200_000),
+            Err(Error::StaleConfirmation)
+        ));
+    }
+
+    #[test]
+    fn a_future_dated_confirmation_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // A `confirmed_at` ahead of the station clock (beyond skew) would defer
+        // the settlement clock; it is refused symmetrically.
+        let now = 500;
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: now + CLOCK_SKEW_TOLERANCE_SECS + 1,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), now),
+            Err(Error::FutureDated)
+        ));
+    }
+
+    #[test]
+    fn a_confirmation_within_skew_of_the_station_clock_is_accepted() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // Exactly at the stale boundary: a mobile clock a full skew tolerance
+        // behind the station's is still legitimate.
+        let now = 200_000;
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: now - CLOCK_SKEW_TOLERANCE_SECS,
+        };
+        engine
+            .submit_confirmation(SignedConfirmation::sign(c, &bob), now)
+            .unwrap();
     }
 
     #[test]
