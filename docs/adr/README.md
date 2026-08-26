@@ -56,6 +56,7 @@ Decision Records) convention, using the structure in
 - [0016 — Station backup and key recovery: an encrypted archive whose key survives a lost passphrase](0016-station-backup-and-key-recovery.md)
 - [0017 — Single-community resilience comes before federation](0017-resilience-before-federation.md)
 - [0018 — A debt floor bounds how far a member can sign themselves into debt](0018-debt-floor.md)
+- [0019 — A freshness bound on `confirmed_at` protects the dispute window](0019-confirmation-freshness-bound.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.

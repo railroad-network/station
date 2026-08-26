@@ -632,6 +632,29 @@ transition; the derivability of all state from the log.
   problem. The ±5 minute drift window is a deliberate usability/security
   trade-off recorded here.
 
+#### Tampering — backdating `confirmed_at` to shrink the dispute window (ADR-0019)
+
+- *Threat:* the settlement window — which doubles as the Phase-1 dispute
+  window — and the dispute-open deadline are both measured from the
+  receiver-supplied, receiver-signed `confirmed_at`. A receiver confirming
+  late but inside the proposal's validity window could backdate
+  `confirmed_at` toward `proposed_at`, shrinking the sender's dispute window
+  or skipping it entirely (the next settlement sweep would see the window
+  already elapsed).
+- *Mitigation:* **confirmation freshness** (ADR-0019) — the engine admits a
+  confirmation only when `confirmed_at` is within ±5 minutes
+  (`CLOCK_SKEW_TOLERANCE_SECS`) of the station's own clock at receipt
+  (`Error::StaleConfirmation` past, `Error::FutureDated` ahead). This
+  completes the invariant that no party-asserted timestamp is accepted more
+  than skew tolerance from the receiving clock, so every window measured from
+  `confirmed_at` is trustworthy to ±5 minutes — worst-case shrinkage is 5
+  minutes of a 24–48 hour window.
+- *Residual risk:* the bound assumes Phase 1's synchronous transports (the
+  mobile signs at submission over a live channel). Delay-tolerant sync will
+  deliver genuinely old confirmations late; the Phase-2 time-trust ADR
+  (an Overview §12 entrance criterion) owns that redesign and supersedes this
+  rule there.
+
 #### Elevation of privilege — unbounded debt (ADR-0018)
 
 - *Threat:* mutual credit runs on negative balances, so without a bound a

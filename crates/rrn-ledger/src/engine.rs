@@ -156,7 +156,9 @@ impl<'db> Engine<'db> {
     /// Submits a receiver-signed confirmation of an existing proposal.
     ///
     /// Errors on a bad signature, an unknown or non-`Proposed` transaction, a
-    /// confirmer that is not the receiver, or a confirmation past expiry.
+    /// confirmer that is not the receiver, a confirmation past expiry, or a
+    /// `confirmed_at` outside clock-skew tolerance of the station's own clock
+    /// (ADR-0019).
     pub fn submit_confirmation(
         &mut self,
         confirmation: SignedConfirmation,
@@ -188,6 +190,19 @@ impl<'db> Engine<'db> {
         }
         if c.confirmed_at > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
             return Err(Error::Expired);
+        }
+
+        // `confirmed_at` anchors both the settlement window and the dispute-
+        // open deadline, so it must be *fresh* — within clock-skew tolerance
+        // of the station's clock at receipt. Without this, a receiver
+        // confirming late but inside the validity window could backdate
+        // `confirmed_at` and shrink (or wholly skip) the dispute window the
+        // Phase-1 oracle rests on (ADR-0019).
+        if c.confirmed_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::FutureDated);
+        }
+        if c.confirmed_at < now.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::StaleConfirmation);
         }
 
         // Debt floor: confirming a negative-amount proposal (a payment request)
@@ -863,6 +878,90 @@ mod tests {
             engine.submit_confirmation(SignedConfirmation::sign(c, &bob), after),
             Err(Error::Expired)
         ));
+    }
+
+    #[test]
+    fn a_backdated_confirmation_inside_the_validity_window_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // Long before expiry, Bob confirms — but stamps `confirmed_at` back at
+        // the start of the validity window. Accepting it would start the
+        // settlement clock in the past and eat the dispute window, so anything
+        // staler than the skew tolerance is refused.
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 100,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 200_000),
+            Err(Error::StaleConfirmation)
+        ));
+    }
+
+    #[test]
+    fn a_future_dated_confirmation_is_rejected() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // A `confirmed_at` ahead of the station clock (beyond skew) would defer
+        // the settlement clock; it is refused symmetrically.
+        let now = 500;
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: now + CLOCK_SKEW_TOLERANCE_SECS + 1,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), now),
+            Err(Error::FutureDated)
+        ));
+    }
+
+    #[test]
+    fn a_confirmation_within_skew_of_the_station_clock_is_accepted() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        // Exactly at the stale boundary: a mobile clock a full skew tolerance
+        // behind the station's is still legitimate.
+        let now = 200_000;
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: now - CLOCK_SKEW_TOLERANCE_SECS,
+        };
+        engine
+            .submit_confirmation(SignedConfirmation::sign(c, &bob), now)
+            .unwrap();
     }
 
     #[test]

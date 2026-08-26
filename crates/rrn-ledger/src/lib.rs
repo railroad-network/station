@@ -94,14 +94,20 @@ pub enum Error {
         /// The nonce actually presented.
         got: u64,
     },
-    /// The proposal's `proposed_at` is too far in the future to be plausible,
-    /// even allowing for clock skew.
-    #[error("proposal is dated too far in the future (beyond clock-skew tolerance)")]
+    /// The proposal's `proposed_at` — or a confirmation's `confirmed_at` — is
+    /// too far in the future to be plausible, even allowing for clock skew.
+    #[error("record is dated too far in the future (beyond clock-skew tolerance)")]
     FutureDated,
     /// The proposal (or confirmation) is past its `expires_at`, allowing for
     /// clock skew.
     #[error("proposal has expired")]
     Expired,
+    /// The confirmation's `confirmed_at` is too far in the past, even allowing
+    /// for clock skew. `confirmed_at` anchors both the settlement window and
+    /// the dispute-open deadline, so a backdated confirmation would shrink —
+    /// or wholly skip — the dispute window ADR-0014 assumes (ADR-0019).
+    #[error("confirmation is dated too far in the past (beyond clock-skew tolerance)")]
+    StaleConfirmation,
     /// The proposal's window is degenerate: `proposed_at` is after `expires_at`.
     #[error("proposal window is invalid: proposed_at is after expires_at")]
     InvalidWindow,
