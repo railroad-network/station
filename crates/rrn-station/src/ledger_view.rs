@@ -112,7 +112,7 @@ mod tests {
             settled_at,
         };
         AppendLog::new(db)
-            .append(SignedPayload::sign(rec, station))
+            .append(SignedPayload::sign(rec, station), 0)
             .unwrap();
         proposal.id
     }
@@ -153,7 +153,7 @@ mod tests {
                 settled_at,
             };
             AppendLog::new(&db)
-                .append(SignedPayload::sign(rec, &station))
+                .append(SignedPayload::sign(rec, &station), 0)
                 .unwrap();
         }
         assert_eq!(balance_of(&db, &b).unwrap(), 300); // not 600
@@ -185,7 +185,7 @@ mod tests {
             charged_at: 1_000 + i64::from(period_index),
         };
         AppendLog::new(db)
-            .append(SignedPayload::sign(rec, station))
+            .append(SignedPayload::sign(rec, station), 0)
             .unwrap();
     }
 
@@ -233,7 +233,7 @@ mod tests {
             let mut r = rec;
             r.charged_at = charged_at;
             AppendLog::new(&db)
-                .append(SignedPayload::sign(r, &station))
+                .append(SignedPayload::sign(r, &station), 0)
                 .unwrap();
         }
         assert_eq!(balance_of(&db, &p).unwrap(), 500); // not 1000

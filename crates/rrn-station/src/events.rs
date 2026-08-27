@@ -257,7 +257,7 @@ mod tests {
         );
         let id = p.id;
         AppendLog::new(db)
-            .append(SignedProposal::sign(p, sender))
+            .append(SignedProposal::sign(p, sender), 0)
             .unwrap();
         id
     }
@@ -269,7 +269,7 @@ mod tests {
             confirmed_at: 1_100,
         };
         AppendLog::new(db)
-            .append(SignedConfirmation::sign(c, receiver))
+            .append(SignedConfirmation::sign(c, receiver), 0)
             .unwrap();
     }
 
@@ -288,7 +288,7 @@ mod tests {
             settled_at: 2_000,
         };
         AppendLog::new(db)
-            .append(SignedPayload::sign(rec, station))
+            .append(SignedPayload::sign(rec, station), 0)
             .unwrap();
     }
 
@@ -304,7 +304,7 @@ mod tests {
             cancelled_at: 1_500,
         };
         AppendLog::new(db)
-            .append(SignedPayload::sign(rec, station))
+            .append(SignedPayload::sign(rec, station), 0)
             .unwrap();
     }
 
@@ -441,7 +441,7 @@ mod tests {
             150,
         );
         let expected_id = vouch.payload_hash().to_hex();
-        rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch).unwrap();
+        rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch, 0).unwrap();
 
         let to_bob = events_since(&db, &addr(&bob), 0, ALL);
         assert_eq!(kinds(&to_bob), vec![EventKind::VouchReceived]);
@@ -466,7 +466,7 @@ mod tests {
             Keypair::generate(),
         );
         let vouch = rrn_identity::vouch::create_vouch(&alice, &addr(&bob), "rrn-phase0", "", 0);
-        rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch).unwrap();
+        rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch, 0).unwrap();
 
         assert!(events_since(&db, &addr(&carol), 0, ALL).is_empty());
     }

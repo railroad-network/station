@@ -23,7 +23,7 @@ fn identity_a_vouches_for_identity_b() {
 
     // Alice vouches for Bob; the vouch is appended.
     let vouch = create_vouch(&alice, &bob_addr, "demo-community", "known in person", 500);
-    let entry = append_vouch(&mut log, vouch).unwrap();
+    let entry = append_vouch(&mut log, vouch, 1_000).unwrap();
 
     // Exactly one entry, and the chain verifies.
     assert_eq!(entry.seq, 1);

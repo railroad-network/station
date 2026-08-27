@@ -152,7 +152,11 @@ pub type SignedNeed = SignedPayload<Need>;
 /// judged when matching, against the caller's clock, and refusing here would
 /// mean this station's clock decided whether someone else's record was
 /// well-formed.
-pub fn append_need_announced(log: &mut AppendLog, signed: SignedNeed) -> Result<LogEntry> {
+pub fn append_need_announced(
+    log: &mut AppendLog,
+    signed: SignedNeed,
+    now: i64,
+) -> Result<LogEntry> {
     let need = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
     if signer != need.seeker {
@@ -163,7 +167,7 @@ pub fn append_need_announced(log: &mut AppendLog, signed: SignedNeed) -> Result<
         .into());
     }
     need.validate()?;
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// A need as it sits on the log, with the sequence number that identifies it.
@@ -389,7 +393,7 @@ mod tests {
         provider: &Keypair,
         listing: &Listing,
     ) {
-        append_listing_created(log, SignedPayload::sign(listing.clone(), provider)).unwrap();
+        append_listing_created(log, SignedPayload::sign(listing.clone(), provider), NOW).unwrap();
         let state = compute_state(log, &listing.id, station, NOW)
             .unwrap()
             .unwrap();
@@ -668,6 +672,7 @@ mod tests {
                 &grower,
             ),
             &station,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &squash.id, &station, NOW)
@@ -701,14 +706,15 @@ mod tests {
         let impostor = Keypair::generate();
         let need = need_for(&seeker, "food", 10, None);
 
-        let err = append_need_announced(&mut log, SignedPayload::sign(need.clone(), &impostor))
-            .unwrap_err();
+        let err =
+            append_need_announced(&mut log, SignedPayload::sign(need.clone(), &impostor), NOW)
+                .unwrap_err();
         assert!(matches!(
             err,
             Error::Need(NeedError::SignerNotSeeker { .. })
         ));
 
-        append_need_announced(&mut log, SignedPayload::sign(need, &seeker)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(need, &seeker), NOW).unwrap();
         assert_eq!(log.iter_from(1).count(), 1);
     }
 
@@ -726,7 +732,8 @@ mod tests {
             valid_until: VALID_UNTIL,
         };
 
-        let err = append_need_announced(&mut log, SignedPayload::sign(need, &seeker)).unwrap_err();
+        let err =
+            append_need_announced(&mut log, SignedPayload::sign(need, &seeker), NOW).unwrap_err();
         assert!(matches!(err, Error::Need(NeedError::UnknownCategory(_))));
         assert_eq!(log.iter_from(1).count(), 0);
     }
@@ -740,7 +747,7 @@ mod tests {
 
         // Whether it is worth answering is judged when matching, against the
         // reader's clock — not by this station's clock at write time.
-        append_need_announced(&mut log, SignedPayload::sign(need.clone(), &seeker)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(need.clone(), &seeker), NOW).unwrap();
         assert!(need.has_expired(VALID_UNTIL + 1));
     }
 
@@ -782,7 +789,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
         let seeker = Keypair::generate();
         let need = need_for(&seeker, "food", 12, Some(250));
-        append_need_announced(&mut log, SignedPayload::sign(need.clone(), &seeker)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(need.clone(), &seeker), NOW).unwrap();
 
         let entry = log.iter_from(1).next().unwrap().unwrap();
         let decoded =
@@ -800,9 +807,9 @@ mod tests {
         let first = need_for(&seeker, "food", 12, Some(250));
         let second = need_for(&seeker, "tools", 1, None);
         let theirs = need_for(&other, "food", 3, None);
-        append_need_announced(&mut log, SignedPayload::sign(first.clone(), &seeker)).unwrap();
-        append_need_announced(&mut log, SignedPayload::sign(theirs, &other)).unwrap();
-        append_need_announced(&mut log, SignedPayload::sign(second.clone(), &seeker)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(first.clone(), &seeker), NOW).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(theirs, &other), NOW).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(second.clone(), &seeker), NOW).unwrap();
 
         let mine = announced_needs(&log, &Address::from_public_key(seeker.public_key())).unwrap();
         assert_eq!(mine.len(), 2, "another seeker's need is not mine");
@@ -822,7 +829,7 @@ mod tests {
         // entry could carry, since replication does not run the append guard.
         let need = need_for(&seeker, "food", 12, None);
         let mut log = AppendLog::new(&db);
-        log.append(SignedPayload::sign(need, &impostor)).unwrap();
+        log.append(SignedPayload::sign(need, &impostor), 0).unwrap();
 
         let mine = announced_needs(&log, &Address::from_public_key(seeker.public_key())).unwrap();
         assert!(mine.is_empty(), "an unsigned-for need is not evidence");
@@ -835,7 +842,7 @@ mod tests {
         let seeker = Keypair::generate();
         let mut need = need_for(&seeker, "food", 1, None);
         need.valid_until = NOW - 1;
-        append_need_announced(&mut log, SignedPayload::sign(need, &seeker)).unwrap();
+        append_need_announced(&mut log, SignedPayload::sign(need, &seeker), NOW).unwrap();
 
         // Listing them is not judging them: a seeker reviewing what they asked
         // for needs to see the stale entries to know to restate them.

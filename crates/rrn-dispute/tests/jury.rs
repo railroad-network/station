@@ -58,26 +58,33 @@ fn append_settled(db: &Database, sender: &Keypair, receiver: &Keypair, nonce: u6
         i64::MAX / 2,
     );
     let pid = proposal.id;
-    log.append(SignedPayload::sign(proposal, sender)).unwrap();
-    log.append(SignedPayload::sign(
-        TransactionConfirmation {
-            proposal_id: pid,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        },
-        receiver,
-    ))
+    log.append(SignedPayload::sign(proposal, sender), 0)
+        .unwrap();
+    log.append(
+        SignedPayload::sign(
+            TransactionConfirmation {
+                proposal_id: pid,
+                confirmer: addr(receiver),
+                confirmed_at: at,
+            },
+            receiver,
+        ),
+        0,
+    )
     .unwrap();
-    log.append(SignedPayload::sign(
-        SettlementRecord {
-            proposal_id: pid,
-            sender: addr(sender),
-            receiver: addr(receiver),
-            amount_centi: 300,
-            settled_at: at,
-        },
-        receiver, // any signer works for the test log; the station is not modeled here
-    ))
+    log.append(
+        SignedPayload::sign(
+            SettlementRecord {
+                proposal_id: pid,
+                sender: addr(sender),
+                receiver: addr(receiver),
+                amount_centi: 300,
+                settled_at: at,
+            },
+            receiver, // any signer works for the test log; the station is not modeled here
+        ),
+        0,
+    )
     .unwrap();
 }
 
@@ -94,7 +101,7 @@ fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
         issued_at: at,
         expires_at: None,
     };
-    log.append(vouch.sign(voucher)).unwrap();
+    log.append(vouch.sign(voucher), 0).unwrap();
 }
 
 fn earn_raw_standing(db: &Database, who: &Keypair, at: i64) {
@@ -141,15 +148,19 @@ fn append_disputed(
         i64::MAX / 2,
     );
     let id = proposal.id;
-    log.append(SignedPayload::sign(proposal, sender)).unwrap();
-    log.append(SignedPayload::sign(
-        TransactionConfirmation {
-            proposal_id: id,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        },
-        receiver,
-    ))
+    log.append(SignedPayload::sign(proposal, sender), 0)
+        .unwrap();
+    log.append(
+        SignedPayload::sign(
+            TransactionConfirmation {
+                proposal_id: id,
+                confirmer: addr(receiver),
+                confirmed_at: at,
+            },
+            receiver,
+        ),
+        0,
+    )
     .unwrap();
     let dispute = DisputeRecord {
         proposal_id: id,
@@ -158,7 +169,7 @@ fn append_disputed(
         evidence_hash: None,
         opened_at: at,
     };
-    log.append(SignedDispute::sign(dispute, sender)).unwrap();
+    log.append(SignedDispute::sign(dispute, sender), 0).unwrap();
     id
 }
 

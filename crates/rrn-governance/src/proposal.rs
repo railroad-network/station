@@ -587,6 +587,7 @@ pub fn append_proposal(
     log: &mut AppendLog,
     signed: SignedProposal,
     db: &Database,
+    now: i64,
 ) -> Result<LogEntry, ProposalError> {
     let proposal = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -606,7 +607,7 @@ pub fn append_proposal(
     if find_proposal(log, &proposal.proposal_id, db)?.is_some() {
         return Err(ProposalError::AlreadyProposed(proposal.proposal_id));
     }
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Records a member's endorsement of a proposal: appends the co-signer's signed
@@ -620,6 +621,7 @@ pub fn append_cosign(
     log: &mut AppendLog,
     signed: SignedCosign,
     db: &Database,
+    now: i64,
 ) -> Result<LogEntry, ProposalError> {
     let cosign = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -648,7 +650,7 @@ pub fn append_cosign(
             cosigner: cosign.cosigner,
         });
     }
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// A proposal or co-signature the write path would not accept, or a record the
@@ -909,26 +911,33 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
-        log.append(SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: addr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ))
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
+        log.append(
+            SignedPayload::sign(
+                TransactionConfirmation {
+                    proposal_id: pid,
+                    confirmer: addr(receiver),
+                    confirmed_at: at,
+                },
+                receiver,
+            ),
+            0,
+        )
         .unwrap();
-        log.append(SignedPayload::sign(
-            SettlementRecord {
-                proposal_id: pid,
-                sender: addr(sender),
-                receiver: addr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            station,
-        ))
+        log.append(
+            SignedPayload::sign(
+                SettlementRecord {
+                    proposal_id: pid,
+                    sender: addr(sender),
+                    receiver: addr(receiver),
+                    amount_centi: 300,
+                    settled_at: at,
+                },
+                station,
+            ),
+            0,
+        )
         .unwrap();
     }
 
@@ -945,7 +954,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        log.append(vouch.sign(voucher)).unwrap();
+        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
@@ -1022,6 +1031,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -1040,6 +1050,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(statute(&newcomer, NOW), &newcomer),
             &db,
+            NOW,
         )
         .unwrap_err();
 
@@ -1059,6 +1070,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(statute(&members[0], NOW), &members[1]),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, ProposalError::SignerNotAuthor { .. }));
@@ -1080,6 +1092,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -1093,8 +1106,8 @@ mod tests {
         );
 
         // Two of three: still short of the threshold.
-        append_cosign(&mut log, cosign(&members[1], &proposal, NOW), &db).unwrap();
-        append_cosign(&mut log, cosign(&members[2], &proposal, NOW), &db).unwrap();
+        append_cosign(&mut log, cosign(&members[1], &proposal, NOW), &db, NOW).unwrap();
+        append_cosign(&mut log, cosign(&members[2], &proposal, NOW), &db, NOW).unwrap();
         let records = proposal_records(&log, &proposal.proposal_id, &db).unwrap();
         assert_eq!(records.cosigner_count(), 2);
         assert!(!records.is_published(DEFAULT_COSIGN_THRESHOLD));
@@ -1104,7 +1117,7 @@ mod tests {
         );
 
         // The third publishes it: now open for voting.
-        append_cosign(&mut log, cosign(&members[3], &proposal, NOW), &db).unwrap();
+        append_cosign(&mut log, cosign(&members[3], &proposal, NOW), &db, NOW).unwrap();
         let records = proposal_records(&log, &proposal.proposal_id, &db).unwrap();
         assert_eq!(records.cosigner_count(), 3);
         assert!(records.is_published(DEFAULT_COSIGN_THRESHOLD));
@@ -1127,10 +1140,11 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
         for c in &members[1..4] {
-            append_cosign(&mut log, cosign(c, &proposal, NOW), &db).unwrap();
+            append_cosign(&mut log, cosign(c, &proposal, NOW), &db, NOW).unwrap();
         }
         let records = proposal_records(&log, &proposal.proposal_id, &db).unwrap();
 
@@ -1163,6 +1177,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
         let records = proposal_records(&log, &proposal.proposal_id, &db).unwrap();
@@ -1189,10 +1204,11 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
-        let err = append_cosign(&mut log, cosign(&author, &proposal, NOW), &db).unwrap_err();
+        let err = append_cosign(&mut log, cosign(&author, &proposal, NOW), &db, NOW).unwrap_err();
         assert!(matches!(err, ProposalError::AuthorCannotCosign));
     }
 
@@ -1209,11 +1225,12 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
-        append_cosign(&mut log, cosign(&cosigner, &proposal, NOW), &db).unwrap();
+        append_cosign(&mut log, cosign(&cosigner, &proposal, NOW), &db, NOW).unwrap();
 
-        let err = append_cosign(&mut log, cosign(&cosigner, &proposal, NOW), &db).unwrap_err();
+        let err = append_cosign(&mut log, cosign(&cosigner, &proposal, NOW), &db, NOW).unwrap_err();
         assert!(matches!(err, ProposalError::AlreadyCosigned { .. }));
     }
 
@@ -1230,10 +1247,11 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
-        let err = append_cosign(&mut log, cosign(&outsider, &proposal, NOW), &db).unwrap_err();
+        let err = append_cosign(&mut log, cosign(&outsider, &proposal, NOW), &db, NOW).unwrap_err();
         assert!(matches!(err, ProposalError::CosignerNotEstablished { .. }));
     }
 
@@ -1246,7 +1264,8 @@ mod tests {
 
         // A proposal that was never appended.
         let phantom = statute(&members[0], NOW);
-        let err = append_cosign(&mut log, cosign(&members[1], &phantom, NOW), &db).unwrap_err();
+        let err =
+            append_cosign(&mut log, cosign(&members[1], &phantom, NOW), &db, NOW).unwrap_err();
         assert!(matches!(err, ProposalError::UnknownProposal(_)));
     }
 
@@ -1262,10 +1281,11 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
-        let err =
-            append_proposal(&mut log, SignedPayload::sign(proposal, &author), &db).unwrap_err();
+        let err = append_proposal(&mut log, SignedPayload::sign(proposal, &author), &db, NOW)
+            .unwrap_err();
         assert!(matches!(err, ProposalError::AlreadyProposed(_)));
     }
 
@@ -1283,6 +1303,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -1290,10 +1311,10 @@ mod tests {
         // (author has no standing), an outsider's co-signature, and the author
         // self-co-signing must all be dropped by replay.
         let outsider_proposal = statute(&outsider, NOW);
-        log.append(SignedPayload::sign(outsider_proposal.clone(), &outsider))
+        log.append(SignedPayload::sign(outsider_proposal.clone(), &outsider), 0)
             .unwrap();
-        log.append(cosign(&outsider, &proposal, NOW)).unwrap();
-        log.append(cosign(&author, &proposal, NOW)).unwrap();
+        log.append(cosign(&outsider, &proposal, NOW), 0).unwrap();
+        log.append(cosign(&author, &proposal, NOW), 0).unwrap();
 
         assert!(find_proposal(&log, &outsider_proposal.proposal_id, &db)
             .unwrap()
@@ -1302,7 +1323,7 @@ mod tests {
         assert_eq!(records.cosigner_count(), 0);
 
         // A legitimate co-signature still counts.
-        append_cosign(&mut log, cosign(&cosigner, &proposal, NOW), &db).unwrap();
+        append_cosign(&mut log, cosign(&cosigner, &proposal, NOW), &db, NOW).unwrap();
         let records = proposal_records(&log, &proposal.proposal_id, &db).unwrap();
         assert_eq!(records.cosigner_count(), 1);
     }

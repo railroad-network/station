@@ -121,9 +121,14 @@ pub fn create_vouch(
 /// Appends a signed vouch to the append-only log as the next entry.
 ///
 /// The signature is verified before the entry is written (by the log layer); an
-/// invalid vouch is never persisted.
-pub fn append_vouch(log: &mut AppendLog, vouch: SignedVouch) -> rrn_storage::Result<LogEntry> {
-    log.append(vouch)
+/// invalid vouch is never persisted. `now` is the admitting station's injected
+/// clock (ADR-0022); the daemon threads it from `clock.rs`.
+pub fn append_vouch(
+    log: &mut AppendLog,
+    vouch: SignedVouch,
+    now: i64,
+) -> rrn_storage::Result<LogEntry> {
+    log.append(vouch, now)
 }
 
 fn now_secs() -> i64 {
@@ -155,7 +160,7 @@ mod tests {
 
         let db = fresh_log_db();
         let mut log = AppendLog::new(&db);
-        let entry = append_vouch(&mut log, signed.clone()).unwrap();
+        let entry = append_vouch(&mut log, signed.clone(), 1_000).unwrap();
         assert_eq!(entry.seq, 1);
 
         // Retrieve by seq and confirm the stored signature still verifies.
@@ -177,7 +182,7 @@ mod tests {
 
         let db = fresh_log_db();
         let mut log = AppendLog::new(&db);
-        let entry = append_vouch(&mut log, signed).unwrap();
+        let entry = append_vouch(&mut log, signed, 1_000).unwrap();
 
         // Flip a byte in the stored payload bytes; the signature must no longer
         // verify against the altered content.

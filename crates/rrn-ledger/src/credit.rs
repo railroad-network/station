@@ -127,14 +127,15 @@ mod tests {
 
         // Alice proposes to pay Bob 300: binds Alice immediately.
         let pay = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 100, 100_000);
-        log.append(SignedProposal::sign(pay, &alice)).unwrap();
+        log.append(SignedProposal::sign(pay, &alice), 100).unwrap();
 
         // Alice requests 200 from Bob (negative amount): does not bind Bob until
         // he confirms.
         let request =
             TransactionProposal::new(addr(&alice), addr(&bob), -200, None, 1, 100, 100_000);
         let request_id = request.id;
-        log.append(SignedProposal::sign(request, &alice)).unwrap();
+        log.append(SignedProposal::sign(request, &alice), 100)
+            .unwrap();
 
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
         assert_eq!(committed_debits_centi(&snapshot, &addr(&alice), 150), 300);
@@ -147,7 +148,7 @@ mod tests {
             confirmed_at: 200,
         };
         AppendLog::new(&db)
-            .append(SignedConfirmation::sign(c, &bob))
+            .append(SignedConfirmation::sign(c, &bob), 200)
             .unwrap();
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
         assert_eq!(committed_debits_centi(&snapshot, &addr(&bob), 250), 200);
@@ -163,7 +164,7 @@ mod tests {
 
         // Alice proposes 300 to Bob, valid from t=100 to t=1_000.
         let pay = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 100, 1_000);
-        log.append(SignedProposal::sign(pay, &alice)).unwrap();
+        log.append(SignedProposal::sign(pay, &alice), 100).unwrap();
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
 
         // Within the window (and its skew tolerance) the 300 binds Alice; once

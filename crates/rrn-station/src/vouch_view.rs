@@ -188,7 +188,7 @@ mod tests {
     fn vouch(db: &Database, voucher: &Keypair, subject: &Address) {
         let signed = create_vouch(voucher, subject, "demo", "I know them", 0);
         let mut log = AppendLog::new(db);
-        append_vouch(&mut log, signed).unwrap();
+        append_vouch(&mut log, signed, 0).unwrap();
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod tests {
         let signed = create_vouch(voucher, subject, "demo", "I know them", 0);
         let id = hex(&signed.payload_hash().to_bytes());
         let mut log = AppendLog::new(db);
-        append_vouch(&mut log, signed).unwrap();
+        append_vouch(&mut log, signed, 0).unwrap();
         id
     }
 

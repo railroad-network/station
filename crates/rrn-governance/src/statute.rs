@@ -133,7 +133,7 @@ pub fn record_implementation(
         proposal_id: proposal.proposal_id,
         implemented_at: now,
     };
-    Ok(log.append(SignedPayload::sign(record, station))?)
+    Ok(log.append(SignedPayload::sign(record, station), now)?)
 }
 
 /// Every proposal in force, derived from the log: for each enactment record, the

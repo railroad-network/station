@@ -568,7 +568,11 @@ fn closer_is_entitled(
 ///
 /// Rejects a listing whose signer is not its provider, one that breaks its own
 /// rules, and one already on this log.
-pub fn append_listing_created(log: &mut AppendLog, signed: SignedListing) -> Result<LogEntry> {
+pub fn append_listing_created(
+    log: &mut AppendLog,
+    signed: SignedListing,
+    now: i64,
+) -> Result<LogEntry> {
     let listing = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
     if signer != listing.provider {
@@ -582,7 +586,7 @@ pub fn append_listing_created(log: &mut AppendLog, signed: SignedListing) -> Res
     if find_created(log, &listing.id)?.is_some() {
         return Err(LifecycleError::AlreadyCreated(listing.id).into());
     }
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Records a provider's change to their listing.
@@ -597,6 +601,7 @@ pub fn append_listing_updated(
     log: &mut AppendLog,
     signed: SignedListingUpdate,
     station: &PublicKey,
+    now: i64,
 ) -> Result<LogEntry> {
     let update = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -631,7 +636,7 @@ pub fn append_listing_updated(
     }
     update.patch.apply_to(&current).validate()?;
 
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Closes a listing, signed by the provider or by `station`.
@@ -643,6 +648,7 @@ pub fn append_listing_closed(
     log: &mut AppendLog,
     signed: SignedListingClose,
     station: &PublicKey,
+    now: i64,
 ) -> Result<LogEntry> {
     let close = signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -666,7 +672,7 @@ pub fn append_listing_closed(
         .into());
     }
 
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Records a station-attested sale against a listing (T1.7.6 Stage B): appends a
@@ -683,6 +689,7 @@ pub fn append_stock_consumed(
     log: &mut AppendLog,
     signed: SignedStockConsumed,
     station: &PublicKey,
+    now: i64,
 ) -> Result<LogEntry> {
     let consumed = signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -692,7 +699,7 @@ pub fn append_stock_consumed(
     if find_created(log, &consumed.listing_id)?.is_none() {
         return Err(LifecycleError::UnknownListing(consumed.listing_id).into());
     }
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Which listing a log payload concerns, or `None` for a payload that is not one
@@ -963,6 +970,8 @@ pub enum LifecycleError {
 
 #[cfg(test)]
 mod tests {
+    /// Fixed admission time; nothing in these tests reads `created_at` (ADR-0022).
+    const NOW: i64 = 1_800_000_000;
     use super::*;
     use crate::listing::{AvailabilityStatus, ListingError, PricingModel, Requirements, Surface};
     use crate::Error;
@@ -1059,7 +1068,12 @@ mod tests {
         let station = Keypair::generate();
         let listing = listing_of(&provider);
 
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         assert_eq!(log.iter_from(1).count(), 1);
         let records = listing_records(&log, &listing.id, &station.public_key()).unwrap();
@@ -1074,12 +1088,18 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         append_listing_updated(
             &mut log,
             update_of(&provider, &listing, price_patch(199)),
             &station.public_key(),
+            NOW,
         )
         .unwrap();
 
@@ -1117,11 +1137,17 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
         append_listing_updated(
             &mut log,
             update_of(&provider, &listing, price_patch(199)),
             &station.public_key(),
+            NOW,
         )
         .unwrap();
 
@@ -1129,6 +1155,7 @@ mod tests {
             &mut log,
             close_of(&provider, &listing, CloseReason::ProviderClosed),
             &station.public_key(),
+            NOW,
         )
         .unwrap();
 
@@ -1144,6 +1171,7 @@ mod tests {
             &mut log,
             close_of(&provider, &listing, CloseReason::ProviderClosed),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1154,6 +1182,7 @@ mod tests {
             &mut log,
             update_of(&provider, &listing, price_patch(150)),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1173,6 +1202,7 @@ mod tests {
         let err = append_listing_created(
             &mut log,
             SignedPayload::sign(listing_of(&provider), &impostor),
+            NOW,
         )
         .unwrap_err();
 
@@ -1191,8 +1221,8 @@ mod tests {
         let mut listing = listing_of(&provider);
         listing.title = String::new();
 
-        let err =
-            append_listing_created(&mut log, SignedPayload::sign(listing, &provider)).unwrap_err();
+        let err = append_listing_created(&mut log, SignedPayload::sign(listing, &provider), NOW)
+            .unwrap_err();
 
         assert!(matches!(err, Error::Listing(ListingError::EmptyTitle)));
         assert_eq!(log.iter_from(1).count(), 0);
@@ -1204,10 +1234,15 @@ mod tests {
         let mut log = AppendLog::new(&db);
         let provider = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
-        let err =
-            append_listing_created(&mut log, SignedPayload::sign(listing, &provider)).unwrap_err();
+        let err = append_listing_created(&mut log, SignedPayload::sign(listing, &provider), NOW)
+            .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1224,13 +1259,19 @@ mod tests {
         let station = Keypair::generate();
         let impostor = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // Signed by someone else, and honest about it in the content.
         let err = append_listing_updated(
             &mut log,
             update_of(&impostor, &listing, price_patch(1)),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1248,7 +1289,7 @@ mod tests {
             },
             &impostor,
         );
-        let err = append_listing_updated(&mut log, lie, &station.public_key()).unwrap_err();
+        let err = append_listing_updated(&mut log, lie, &station.public_key(), NOW).unwrap_err();
         assert!(matches!(
             err,
             Error::Lifecycle(LifecycleError::SignerDisagreesWithContent { .. })
@@ -1263,13 +1304,19 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // Goods may not be subsidized — the same rule `Listing::new` enforces.
         let err = append_listing_updated(
             &mut log,
             update_of(&provider, &listing, price_patch(-1)),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1286,6 +1333,7 @@ mod tests {
             &mut log,
             update_of(&provider, &listing, backdated),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1302,12 +1350,18 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         let err = append_listing_updated(
             &mut log,
             update_of(&provider, &listing, ListingPatch::empty()),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
 
@@ -1324,7 +1378,12 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         let cleared = ListingPatch {
             expires_at: ExpiryPatch::Clear,
@@ -1334,6 +1393,7 @@ mod tests {
             &mut log,
             update_of(&provider, &listing, cleared),
             &station.public_key(),
+            NOW,
         )
         .unwrap();
 
@@ -1348,7 +1408,12 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // The station claiming the provider withdrew is the one thing ADR-0010
         // forbids it: it would be attesting to someone else's decision.
@@ -1356,6 +1421,7 @@ mod tests {
             &mut log,
             close_of(&station, &listing, CloseReason::ProviderClosed),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1367,6 +1433,7 @@ mod tests {
             &mut log,
             close_of(&station, &listing, CloseReason::ExpirationReached),
             &station.public_key(),
+            NOW,
         )
         .unwrap();
         let records = listing_records(&log, &listing.id, &station.public_key()).unwrap();
@@ -1383,13 +1450,19 @@ mod tests {
         let provider = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         for reason in [CloseReason::ExpirationReached, CloseReason::StationCleanup] {
             let err = append_listing_closed(
                 &mut log,
                 close_of(&provider, &listing, reason),
                 &station.public_key(),
+                NOW,
             )
             .unwrap_err();
             assert!(matches!(
@@ -1407,7 +1480,12 @@ mod tests {
         let station = Keypair::generate();
         let stranger = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         for reason in [
             CloseReason::ProviderClosed,
@@ -1418,6 +1496,7 @@ mod tests {
                 &mut log,
                 close_of(&stranger, &listing, reason),
                 &station.public_key(),
+                NOW,
             )
             .unwrap_err();
             assert!(matches!(
@@ -1439,6 +1518,7 @@ mod tests {
             &mut log,
             update_of(&provider, &listing, price_patch(1)),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1450,6 +1530,7 @@ mod tests {
             &mut log,
             close_of(&provider, &listing, CloseReason::ProviderClosed),
             &station.public_key(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1466,14 +1547,22 @@ mod tests {
         let impostor = Keypair::generate();
         let station = Keypair::generate();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // Bypass the append guards exactly as replication does, then check that
         // replay reaches the same verdict the write path would have.
-        log.append(update_of(&impostor, &listing, price_patch(1)))
+        log.append(update_of(&impostor, &listing, price_patch(1)), 0)
             .unwrap();
-        log.append(close_of(&impostor, &listing, CloseReason::ProviderClosed))
-            .unwrap();
+        log.append(
+            close_of(&impostor, &listing, CloseReason::ProviderClosed),
+            0,
+        )
+        .unwrap();
 
         let records = listing_records(&log, &listing.id, &station.public_key()).unwrap();
         assert!(records.updates.is_empty());
@@ -1544,7 +1633,12 @@ mod tests {
         let station_key = station.public_key();
         let listing = listing_of(&provider);
 
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
         let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
             .unwrap()
             .unwrap();
@@ -1556,6 +1650,7 @@ mod tests {
             &mut log,
             update_of(&provider, &listing, price_patch(199)),
             &station_key,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
@@ -1568,6 +1663,7 @@ mod tests {
             &mut log,
             close_of(&provider, &listing, CloseReason::ProviderClosed),
             &station_key,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
@@ -1686,7 +1782,12 @@ mod tests {
         let station = Keypair::generate();
         let station_key = station.public_key();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // The provider — anyone but the station — may not attest a sale.
         let record = consumed(&listing, tx(1), WHILE_OPEN);
@@ -1694,6 +1795,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(record, &provider),
             &station_key,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1706,6 +1808,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(record, &station),
             &station_key,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &listing.id, &station_key, WHILE_OPEN)
@@ -1722,7 +1825,12 @@ mod tests {
         let station = Keypair::generate();
         let station_key = station.public_key();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // The expiry passes. No record has been written — the sweep has not run
         // — but the listing must already be off the market, or sweep latency
@@ -1747,6 +1855,7 @@ mod tests {
             &mut log,
             close_of(&provider, &listing, CloseReason::ProviderClosed),
             &station_key,
+            NOW,
         )
         .unwrap();
         assert!(matches!(
@@ -1764,7 +1873,12 @@ mod tests {
         let provider = Keypair::generate();
         let station_key = Keypair::generate().public_key();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // Inclusive of `expires_at` itself, matching the ledger's window — and
         // expired the very next second, with no skew grace.
@@ -1785,7 +1899,12 @@ mod tests {
         let provider = Keypair::generate();
         let station_key = Keypair::generate().public_key();
         let listing = listing_expiring(&provider, None);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         assert!(compute_state(&log, &listing.id, &station_key, i64::MAX)
             .unwrap()
@@ -1801,11 +1920,17 @@ mod tests {
         let station = Keypair::generate();
         let station_key = station.public_key();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
         append_listing_closed(
             &mut log,
             close_of(&station, &listing, CloseReason::ExpirationReached),
             &station_key,
+            NOW,
         )
         .unwrap();
 
@@ -1855,8 +1980,12 @@ mod tests {
         let providers: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
         let listings: Vec<Listing> = providers.iter().map(listing_of).collect();
         for (provider, listing) in providers.iter().zip(&listings) {
-            append_listing_created(&mut log, SignedPayload::sign(listing.clone(), provider))
-                .unwrap();
+            append_listing_created(
+                &mut log,
+                SignedPayload::sign(listing.clone(), provider),
+                NOW,
+            )
+            .unwrap();
         }
 
         // One closed, one updated (still active), one never expiring.
@@ -1864,12 +1993,14 @@ mod tests {
             &mut log,
             close_of(&providers[0], &listings[0], CloseReason::ProviderClosed),
             &station_key,
+            NOW,
         )
         .unwrap();
         append_listing_updated(
             &mut log,
             update_of(&providers[1], &listings[1], price_patch(199)),
             &station_key,
+            NOW,
         )
         .unwrap();
 
@@ -1896,8 +2027,12 @@ mod tests {
         let providers: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
         let listings: Vec<Listing> = providers.iter().map(listing_of).collect();
         for (provider, listing) in providers.iter().zip(&listings) {
-            append_listing_created(&mut log, SignedPayload::sign(listing.clone(), provider))
-                .unwrap();
+            append_listing_created(
+                &mut log,
+                SignedPayload::sign(listing.clone(), provider),
+                NOW,
+            )
+            .unwrap();
         }
 
         // The batch scan and the single-listing scan are the same function; this
@@ -1920,19 +2055,25 @@ mod tests {
         let providers: Vec<Keypair> = (0..5).map(|_| Keypair::generate()).collect();
         let listings: Vec<Listing> = providers.iter().map(listing_of).collect();
         for (provider, listing) in providers.iter().zip(&listings) {
-            append_listing_created(&mut log, SignedPayload::sign(listing.clone(), provider))
-                .unwrap();
+            append_listing_created(
+                &mut log,
+                SignedPayload::sign(listing.clone(), provider),
+                NOW,
+            )
+            .unwrap();
         }
         append_listing_updated(
             &mut log,
             update_of(&providers[2], &listings[2], price_patch(199)),
             &station_key,
+            NOW,
         )
         .unwrap();
         append_listing_closed(
             &mut log,
             close_of(&providers[3], &listings[3], CloseReason::ProviderClosed),
             &station_key,
+            NOW,
         )
         .unwrap();
 
@@ -1954,14 +2095,22 @@ mod tests {
         let impostor = Keypair::generate();
         let station_key = Keypair::generate().public_key();
         let listing = listing_of(&provider);
-        append_listing_created(&mut log, SignedPayload::sign(listing.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
 
         // Replication bypasses the append guards entirely, so the state machine
         // has to refuse these on its own.
-        log.append(update_of(&impostor, &listing, price_patch(1)))
+        log.append(update_of(&impostor, &listing, price_patch(1)), 0)
             .unwrap();
-        log.append(close_of(&impostor, &listing, CloseReason::ProviderClosed))
-            .unwrap();
+        log.append(
+            close_of(&impostor, &listing, CloseReason::ProviderClosed),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(
             compute_state(&log, &listing.id, &station_key, WHILE_OPEN)

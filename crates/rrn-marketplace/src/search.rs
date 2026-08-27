@@ -576,7 +576,7 @@ mod tests {
         provider: &Keypair,
         listing: &Listing,
     ) {
-        append_listing_created(log, SignedPayload::sign(listing.clone(), provider)).unwrap();
+        append_listing_created(log, SignedPayload::sign(listing.clone(), provider), NOW).unwrap();
         let state = compute_state(log, &listing.id, station, NOW)
             .unwrap()
             .unwrap();
@@ -918,6 +918,7 @@ mod tests {
                 &bob,
             ),
             &station,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &withdrawn.id, &station, NOW)
@@ -997,6 +998,7 @@ mod tests {
                 &providers[3],
             ),
             &station,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &listings[3].id, &station, NOW)
@@ -1113,6 +1115,7 @@ mod tests {
                 &alice,
             ),
             &station,
+            NOW,
         )
         .unwrap();
         let state = compute_state(&log, &original.id, &station, NOW)

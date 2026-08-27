@@ -125,26 +125,33 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
-        log.append(SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: addr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ))
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
+        log.append(
+            SignedPayload::sign(
+                TransactionConfirmation {
+                    proposal_id: pid,
+                    confirmer: addr(receiver),
+                    confirmed_at: at,
+                },
+                receiver,
+            ),
+            0,
+        )
         .unwrap();
-        log.append(SignedPayload::sign(
-            SettlementRecord {
-                proposal_id: pid,
-                sender: addr(sender),
-                receiver: addr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            station,
-        ))
+        log.append(
+            SignedPayload::sign(
+                SettlementRecord {
+                    proposal_id: pid,
+                    sender: addr(sender),
+                    receiver: addr(receiver),
+                    amount_centi: 300,
+                    settled_at: at,
+                },
+                station,
+            ),
+            0,
+        )
         .unwrap();
     }
 
@@ -161,7 +168,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        log.append(vouch.sign(voucher)).unwrap();
+        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
@@ -215,7 +222,7 @@ mod tests {
         let signed = create_charter(params, founders).unwrap();
         let hash = signed.charter_hash();
         let mut log = AppendLog::new(db);
-        log.append(SignedPayload::sign(signed, &founders[0]))
+        log.append(SignedPayload::sign(signed, &founders[0]), 0)
             .unwrap();
         hash
     }
@@ -251,13 +258,14 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &members[0]),
             db,
+            NOW,
         )
         .unwrap();
         for c in &members[1..4] {
-            append_cosign(&mut log, cosign(c, proposal, NOW), db).unwrap();
+            append_cosign(&mut log, cosign(c, proposal, NOW), db, NOW).unwrap();
         }
         for m in members {
-            append_vote(&mut log, vote(m, proposal, choice, NOW), db).unwrap();
+            append_vote(&mut log, vote(m, proposal, choice, NOW), db, NOW).unwrap();
         }
     }
 
@@ -451,13 +459,16 @@ mod tests {
         // gossiped entry could carry one — bypassing the guard.
         {
             let mut log = AppendLog::new(&db);
-            log.append(SignedPayload::sign(
-                crate::statute::ProposalImplemented {
-                    proposal_id: amendment.proposal_id,
-                    implemented_at: amendment.implementation_at,
-                },
-                &station,
-            ))
+            log.append(
+                SignedPayload::sign(
+                    crate::statute::ProposalImplemented {
+                        proposal_id: amendment.proposal_id,
+                        implemented_at: amendment.implementation_at,
+                    },
+                    &station,
+                ),
+                0,
+            )
             .unwrap();
         }
 

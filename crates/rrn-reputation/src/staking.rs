@@ -264,13 +264,14 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
         let confirmation = TransactionConfirmation {
             proposal_id: pid,
             confirmer: addr(receiver),
             confirmed_at: at,
         };
-        log.append(SignedPayload::sign(confirmation, receiver))
+        log.append(SignedPayload::sign(confirmation, receiver), 0)
             .unwrap();
         let settlement = SettlementRecord {
             proposal_id: pid,
@@ -279,7 +280,7 @@ mod tests {
             amount_centi: 300,
             settled_at: at,
         };
-        log.append(SignedPayload::sign(settlement, station))
+        log.append(SignedPayload::sign(settlement, station), 0)
             .unwrap();
     }
 
@@ -296,7 +297,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        log.append(vouch.sign(voucher)).unwrap();
+        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     /// Raises `who`'s **raw** composite over the Member band — ten settled trades

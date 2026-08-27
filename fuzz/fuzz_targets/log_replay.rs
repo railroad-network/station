@@ -35,8 +35,10 @@ fuzz_target!(|chunks: Vec<Vec<u8>>| {
             signer: keypair.public_key(),
             signature,
         };
-        // Errors are fine; the contract is "no panic".
-        let _ = log.append_raw(payload);
+        // Errors are fine; the contract is "no panic". A fixed injected clock
+        // keeps the harness deterministic; the monotone clamp (ADR-0022 §6)
+        // pins every re-chained entry to this same reading.
+        let _ = log.append_raw(payload, 0);
     }
 
     // The chain must always verify after a sequence of re-chained appends.
