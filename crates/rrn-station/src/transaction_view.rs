@@ -279,7 +279,7 @@ mod tests {
             );
             let id = proposal.id;
             AppendLog::new(&db)
-                .append(SignedProposal::sign(proposal, &sender))
+                .append(SignedProposal::sign(proposal, &sender), 0)
                 .unwrap();
             let confirmation = TransactionConfirmation {
                 proposal_id: id,
@@ -287,7 +287,7 @@ mod tests {
                 confirmed_at,
             };
             AppendLog::new(&db)
-                .append(SignedConfirmation::sign(confirmation, &receiver))
+                .append(SignedConfirmation::sign(confirmation, &receiver), 0)
                 .unwrap();
         }
 

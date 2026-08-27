@@ -39,6 +39,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "listings_index",
         sql: include_str!("../migrations/0003_listings_index.sql"),
     },
+    Migration {
+        version: 4,
+        name: "log_content_hash_index",
+        sql: include_str!("../migrations/0004_log_content_hash_index.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -143,6 +148,7 @@ mod tests {
 
         let expected_indexes: BTreeSet<String> = [
             "idx_attestations_signer",
+            "idx_log_entries_content_hash",
             "idx_transactions_receiver",
             "idx_transactions_sender",
             "idx_transactions_state",

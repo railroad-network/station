@@ -7,6 +7,7 @@ CREATE TABLE log_entries ( seq INTEGER PRIMARY KEY AUTOINCREMENT, prev_hash BLOB
 CREATE TABLE reputation_snapshots ( address BLOB PRIMARY KEY, last_computed_at INTEGER NOT NULL, profile_cbor BLOB NOT NULL ) STRICT
 CREATE TABLE transactions ( id BLOB PRIMARY KEY, sender BLOB NOT NULL, receiver BLOB NOT NULL, amount_centicommons INTEGER NOT NULL, state TEXT NOT NULL, nonce INTEGER NOT NULL, proposed_at INTEGER NOT NULL, settled_at INTEGER ) STRICT
 CREATE INDEX idx_attestations_signer ON attestations (signer)
+CREATE INDEX idx_log_entries_content_hash ON log_entries (content_hash)
 CREATE INDEX idx_transactions_receiver ON transactions (receiver)
 CREATE INDEX idx_transactions_sender ON transactions (sender)
 CREATE INDEX idx_transactions_state ON transactions (state)

@@ -321,26 +321,33 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
-        log.append(SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: addr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ))
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
+        log.append(
+            SignedPayload::sign(
+                TransactionConfirmation {
+                    proposal_id: pid,
+                    confirmer: addr(receiver),
+                    confirmed_at: at,
+                },
+                receiver,
+            ),
+            0,
+        )
         .unwrap();
-        log.append(SignedPayload::sign(
-            SettlementRecord {
-                proposal_id: pid,
-                sender: addr(sender),
-                receiver: addr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            station,
-        ))
+        log.append(
+            SignedPayload::sign(
+                SettlementRecord {
+                    proposal_id: pid,
+                    sender: addr(sender),
+                    receiver: addr(receiver),
+                    amount_centi: 300,
+                    settled_at: at,
+                },
+                station,
+            ),
+            0,
+        )
         .unwrap();
     }
 
@@ -357,7 +364,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        log.append(vouch.sign(voucher)).unwrap();
+        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
@@ -414,7 +421,7 @@ mod tests {
         let signed = create_charter(params, founders).unwrap();
         // The log stores single-signer entries; wrap in a publisher envelope.
         let mut log = AppendLog::new(db);
-        log.append(SignedPayload::sign(signed, &founders[0]))
+        log.append(SignedPayload::sign(signed, &founders[0]), 0)
             .unwrap();
     }
 
@@ -466,9 +473,15 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
         let proposal = statute(&author, NOW);
-        append_proposal(&mut log, SignedPayload::sign(proposal.clone(), &author), db).unwrap();
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(proposal.clone(), &author),
+            db,
+            NOW,
+        )
+        .unwrap();
         for c in &members[1..4] {
-            append_cosign(&mut log, cosign(c, &proposal, NOW), db).unwrap();
+            append_cosign(&mut log, cosign(c, &proposal, NOW), db, NOW).unwrap();
         }
         (members, proposal)
     }
@@ -485,15 +498,16 @@ mod tests {
 
         // 5 yes, 2 no, 1 abstain — 8 of 10 participate.
         for m in &members[0..5] {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db).unwrap();
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db, NOW).unwrap();
         }
         for m in &members[5..7] {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::No, NOW), &db).unwrap();
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::No, NOW), &db, NOW).unwrap();
         }
         append_vote(
             &mut log,
             vote(&members[7], &proposal, VoteChoice::Abstain, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -520,12 +534,14 @@ mod tests {
             &mut log,
             vote(&members[0], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         append_vote(
             &mut log,
             vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -548,10 +564,11 @@ mod tests {
             &mut log,
             vote(&members[0], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         for m in &members[1..4] {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::No, NOW), &db).unwrap();
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::No, NOW), &db, NOW).unwrap();
         }
 
         let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
@@ -573,24 +590,28 @@ mod tests {
             &mut log,
             vote(&members[0], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         append_vote(
             &mut log,
             vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         append_vote(
             &mut log,
             vote(&members[2], &proposal, VoteChoice::Abstain, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         append_vote(
             &mut log,
             vote(&members[3], &proposal, VoteChoice::Abstain, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -609,7 +630,13 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         for m in &members[0..4] {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::Abstain, NOW), &db).unwrap();
+            append_vote(
+                &mut log,
+                vote(m, &proposal, VoteChoice::Abstain, NOW),
+                &db,
+                NOW,
+            )
+            .unwrap();
         }
 
         let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
@@ -631,6 +658,7 @@ mod tests {
             &mut log,
             vote(&members[0], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -648,7 +676,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         for m in &members[0..3] {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db).unwrap();
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db, NOW).unwrap();
         }
 
         let closed = proposal.voting_ends_at + 1;
@@ -693,21 +721,29 @@ mod tests {
             &mut log,
             SignedPayload::sign(amendment.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
         for c in &members[1..4] {
-            append_cosign(&mut log, cosign(c, &amendment, NOW), &db).unwrap();
+            append_cosign(&mut log, cosign(c, &amendment, NOW), &db, NOW).unwrap();
         }
 
         // 3 yes, 1 no = 75% approval. The 50% statute bar would pass this; the 75%
         // charter bar it must meet exactly does too, and quorum (100%) clears 50%.
         for m in &members[0..3] {
-            append_vote(&mut log, vote(m, &amendment, VoteChoice::Yes, NOW), &db).unwrap();
+            append_vote(
+                &mut log,
+                vote(m, &amendment, VoteChoice::Yes, NOW),
+                &db,
+                NOW,
+            )
+            .unwrap();
         }
         append_vote(
             &mut log,
             vote(&members[3], &amendment, VoteChoice::No, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -739,20 +775,22 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
         for c in &founders[1..4] {
-            append_cosign(&mut log, cosign(c, &proposal, NOW), &db).unwrap();
+            append_cosign(&mut log, cosign(c, &proposal, NOW), &db, NOW).unwrap();
         }
 
         // The founders vote: 3 yes, 1 no.
         for m in &founders[0..3] {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db).unwrap();
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db, NOW).unwrap();
         }
         append_vote(
             &mut log,
             vote(&founders[3], &proposal, VoteChoice::No, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -777,10 +815,11 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
         for c in &founders[1..4] {
-            append_cosign(&mut log, cosign(c, &proposal, NOW), &db).unwrap();
+            append_cosign(&mut log, cosign(c, &proposal, NOW), &db, NOW).unwrap();
         }
 
         // An outsider — paired, perhaps, but neither established nor a founder —
@@ -790,6 +829,7 @@ mod tests {
             &mut log,
             vote(&outsider, &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::VoterNotEstablished { .. }));
@@ -814,6 +854,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -823,13 +864,14 @@ mod tests {
             &mut log,
             vote(&author, &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap_err();
 
         // The one other founder co-signs, meeting the clamped bar.
-        append_cosign(&mut log, cosign(&founders[1], &proposal, NOW), &db).unwrap();
+        append_cosign(&mut log, cosign(&founders[1], &proposal, NOW), &db, NOW).unwrap();
         for m in &founders {
-            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db).unwrap();
+            append_vote(&mut log, vote(m, &proposal, VoteChoice::Yes, NOW), &db, NOW).unwrap();
         }
 
         let t = tally(&db, &proposal.proposal_id, proposal.voting_ends_at + 1).unwrap();
@@ -851,6 +893,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &founder),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -860,6 +903,7 @@ mod tests {
             &mut log,
             vote(&founder, &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -895,10 +939,11 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
         for c in &members[1..4] {
-            append_cosign(&mut log, cosign(c, &proposal, NOW), &db).unwrap();
+            append_cosign(&mut log, cosign(c, &proposal, NOW), &db, NOW).unwrap();
         }
 
         let err = tally(&db, &proposal.proposal_id, NOW).unwrap_err();

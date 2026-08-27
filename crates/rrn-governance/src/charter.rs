@@ -363,9 +363,10 @@ pub fn store_charter(
     log: &mut AppendLog,
     publisher: &Keypair,
     charter: SignedCharter,
+    now: i64,
 ) -> Result<LogEntry, CharterError> {
     charter.verify_founders()?;
-    Ok(log.append(SignedPayload::sign(charter, publisher))?)
+    Ok(log.append(SignedPayload::sign(charter, publisher), now)?)
 }
 
 /// The community's genesis root Charter: the highest-`version`, founder-authorized
@@ -418,8 +419,9 @@ pub fn store_pending_charter(
     log: &mut AppendLog,
     publisher: &Keypair,
     charter: SignedCharter,
+    now: i64,
 ) -> Result<LogEntry, CharterError> {
-    Ok(log.append(SignedPayload::sign(charter, publisher))?)
+    Ok(log.append(SignedPayload::sign(charter, publisher), now)?)
 }
 
 /// The most recently appended Charter, **regardless of whether it clears the
@@ -709,6 +711,10 @@ mod tests {
     use super::*;
     use rrn_crypto::serialize::to_canonical_bytes;
 
+    /// A fixed admission time for appends whose exact value the test ignores
+    /// (ADR-0022: `created_at` is station-local metadata; nothing here reads it).
+    const NOW: i64 = 1_700_000_000;
+
     fn founder_keys(n: usize) -> Vec<Keypair> {
         (0..n).map(|_| Keypair::generate()).collect()
     }
@@ -846,7 +852,7 @@ mod tests {
         // Begin: the coordinator's signature only, appended as a pending charter.
         let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
         let mut log = AppendLog::new(&db);
-        store_pending_charter(&mut log, coordinator, signed.clone()).unwrap();
+        store_pending_charter(&mut log, coordinator, signed.clone(), NOW).unwrap();
         // Latest sees the pending one; founder_charter (threshold-gated) does not.
         assert!(latest_charter(&db).unwrap().is_some());
         assert!(latest_charter(&db)
@@ -862,7 +868,7 @@ mod tests {
             signed.add_remote_signature(f.public_key(), sig).unwrap();
         }
         let mut log = AppendLog::new(&db);
-        store_charter(&mut log, coordinator, signed).unwrap();
+        store_charter(&mut log, coordinator, signed, NOW).unwrap();
         // Now it is the community's genesis root.
         assert!(founder_charter(&db).unwrap().is_some());
     }
@@ -935,7 +941,7 @@ mod tests {
         let want_hash = signed.charter_hash();
         {
             let mut log = AppendLog::new(&db);
-            store_charter(&mut log, &founders[0], signed).unwrap();
+            store_charter(&mut log, &founders[0], signed, NOW).unwrap();
         }
         let current = founder_charter(&db)
             .unwrap()
@@ -957,8 +963,8 @@ mod tests {
         let v2_hash = v2.charter_hash();
 
         let mut log = AppendLog::new(&db);
-        store_charter(&mut log, &founders[0], v1).unwrap();
-        store_charter(&mut log, &founders[1], v2).unwrap();
+        store_charter(&mut log, &founders[0], v1, NOW).unwrap();
+        store_charter(&mut log, &founders[1], v2, NOW).unwrap();
 
         let current = founder_charter(&db).unwrap().unwrap();
         assert_eq!(current.charter().version, 2);
@@ -972,7 +978,7 @@ mod tests {
         let under = create_charter(params_for(&founders), &founders[..2]).unwrap();
         let mut log = AppendLog::new(&db);
         assert!(matches!(
-            store_charter(&mut log, &founders[0], under),
+            store_charter(&mut log, &founders[0], under, NOW),
             Err(CharterError::BelowThreshold { .. })
         ));
         // Nothing was written.

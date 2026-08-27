@@ -141,7 +141,7 @@ mod tests {
 
     /// Appends a `BalanceEntry`, signed by `kp`, to the log.
     fn append_balance(log: &mut AppendLog, kp: &Keypair, be: BalanceEntry) {
-        log.append(SignedPayload::sign(be, kp)).unwrap();
+        log.append(SignedPayload::sign(be, kp), 1_000).unwrap();
     }
 
     #[test]

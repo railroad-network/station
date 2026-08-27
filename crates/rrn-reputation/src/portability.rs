@@ -233,7 +233,10 @@ fn replay_into_profile(
     {
         let mut log = AppendLog::new(&db);
         for entry in &history.log_entries {
-            log.append_raw(entry.payload.clone())?;
+            // The scratch log re-stamps admission time itself (ADR-0022);
+            // scoring ignores `created_at`, so `computed_at` is an arbitrary but
+            // reasonable reading here.
+            log.append_raw(entry.payload.clone(), computed_at)?;
         }
     }
     ReputationScorer::new(&db).score_at(&history.address, computed_at)
@@ -460,13 +463,14 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
         let confirmation = TransactionConfirmation {
             proposal_id: pid,
             confirmer: addr(receiver),
             confirmed_at: at,
         };
-        log.append(SignedPayload::sign(confirmation, receiver))
+        log.append(SignedPayload::sign(confirmation, receiver), 0)
             .unwrap();
         let settlement = SettlementRecord {
             proposal_id: pid,
@@ -475,7 +479,7 @@ mod tests {
             amount_centi: 300,
             settled_at: at,
         };
-        log.append(SignedPayload::sign(settlement, station))
+        log.append(SignedPayload::sign(settlement, station), 0)
             .unwrap();
     }
 
@@ -493,7 +497,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        log.append(vouch.sign(voucher)).unwrap();
+        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     /// A station log where alice trades with bob both ways and vouches for him,

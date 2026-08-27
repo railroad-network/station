@@ -148,7 +148,7 @@ impl<'db> Engine<'db> {
         }
 
         let (id, nonce) = (p.id, p.nonce);
-        AppendLog::new(self.db).append(proposal)?;
+        AppendLog::new(self.db).append(proposal, now)?;
         tracing::info!(tx = ?id, nonce, "proposal accepted");
         Ok(())
     }
@@ -215,7 +215,7 @@ impl<'db> Engine<'db> {
         }
 
         let proposal_id = c.proposal_id;
-        AppendLog::new(self.db).append(confirmation)?;
+        AppendLog::new(self.db).append(confirmation, now)?;
         tracing::info!(tx = ?proposal_id, "confirmation accepted");
         Ok(())
     }
@@ -240,10 +240,10 @@ impl<'db> Engine<'db> {
             reason,
             cancelled_at: now,
         };
-        AppendLog::new(self.db).append(rrn_crypto::signed::SignedPayload::sign(
-            record,
-            &self.station,
-        ))?;
+        AppendLog::new(self.db).append(
+            rrn_crypto::signed::SignedPayload::sign(record, &self.station),
+            now,
+        )?;
         tracing::info!(tx = ?tx_id, ?reason, "proposal cancelled");
         Ok(())
     }
@@ -306,7 +306,7 @@ impl<'db> Engine<'db> {
 
         let proposal_id = d.proposal_id;
         let raiser = d.raiser;
-        AppendLog::new(self.db).append(dispute)?;
+        AppendLog::new(self.db).append(dispute, now)?;
         tracing::info!(tx = ?proposal_id, ?raiser, "dispute raised");
         Ok(())
     }
@@ -333,10 +333,10 @@ impl<'db> Engine<'db> {
             reason: CancelReason::DisputeUpheld,
             cancelled_at: now,
         };
-        AppendLog::new(self.db).append(rrn_crypto::signed::SignedPayload::sign(
-            record,
-            &self.station,
-        ))?;
+        AppendLog::new(self.db).append(
+            rrn_crypto::signed::SignedPayload::sign(record, &self.station),
+            now,
+        )?;
         tracing::info!(tx = ?tx_id, "dispute upheld: transfer voided");
         Ok(())
     }
@@ -385,7 +385,7 @@ impl<'db> Engine<'db> {
         }
 
         let (proposal_id, responder) = (r.proposal_id, r.responder);
-        AppendLog::new(self.db).append(response)?;
+        AppendLog::new(self.db).append(response, now)?;
         tracing::info!(tx = ?proposal_id, ?responder, "dispute response recorded");
         Ok(())
     }

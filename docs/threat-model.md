@@ -278,6 +278,41 @@ of committed writes.
   append-only structure preserves a tamper-evident signed history. Non-
   repudiation rests on the `rrn-crypto` key-secrecy assumption.
 
+#### Tampering / Repudiation — the admission clock (ADR-0022)
+
+- *Threat:* a party backdates or forward-dates a self-asserted timestamp in a
+  signed record to move a window, reorder records against arrival, or otherwise
+  bend a deadline in their favour under multi-hop (DTN) carriage, where "signed
+  before the deadline" cannot be verified.
+- *Mitigation:* each log entry's `created_at` is the *admission time* — the
+  admitting station's own clock at the moment it appended the entry, set by
+  `AppendLog::append`/`append_raw` from an injected `now`, never from any
+  party-asserted field. It is station-local, unsigned metadata: the admitting
+  station uses it for window/ordering decisions, and every decision with
+  downstream effect is restated in a station-signed record (settlement,
+  cancellation) that carries the reading outward (ADR-0005 pattern). Admission
+  times are **clamped monotone non-decreasing** in log order
+  (`now.max(tail.created_at)`), so a station clock stepping *backwards* cannot
+  reorder admission times against the log's own arrival order. Replicas do not
+  inherit the origin's reading: `append_raw` re-stamps `created_at` from the
+  local clock, since only the admitting station's clock bears on its own
+  windows.
+- *Residual risk:* the station clock is an operational trust root (ADR-0022 §6,
+  already implied by ADR-0005's trusted-attestor model). A station clock set
+  wildly wrong stretches or compresses *everyone's* windows uniformly — a
+  station-operator trust, not a new per-member attack surface; the operator
+  keeps it roughly right (NTP when networked, manual/GPS discipline when not).
+  Because the clamp only ratchets *upward*, a single transient forward glitch
+  (an NTP step to a far-future instant, one bad injected `now`) is not
+  self-correcting: it raises the tail's `created_at`, and every later entry
+  inherits `max(now, tail)` even after the clock is fixed, since a log entry's
+  admission time is immutable. This is the deliberate cost of the monotone
+  guarantee (recovering downward would let a backward step reorder windows,
+  the very attack the clamp exists to stop); the mitigation is operational —
+  the operator must not step the station clock forward past the true time.
+  A replica's re-stamped `created_at` values are cosmetic; any consumer needing
+  authoritative times reads the station-signed records, not a replica's log.
+
 #### Information disclosure
 
 - *Threat:* the SQLite file is read by anyone with filesystem access, exposing

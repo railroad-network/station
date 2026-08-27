@@ -854,6 +854,7 @@ pub fn append_service_contract(
     signed: SignedServiceContract,
     station: &PublicKey,
     admits: &dyn Fn(&Listing, &Address) -> bool,
+    now: i64,
 ) -> Result<LogEntry> {
     let contract = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -864,7 +865,7 @@ pub fn append_service_contract(
         }
         .into());
     }
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Ends a contract early, signed by the buyer or the provider. Takes effect after
@@ -878,6 +879,7 @@ pub fn append_contract_termination(
     signed: SignedContractTermination,
     station: &PublicKey,
     admits: &dyn Fn(&Listing, &Address) -> bool,
+    now: i64,
 ) -> Result<LogEntry> {
     let term = signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -896,7 +898,7 @@ pub fn append_contract_termination(
         return Err(ContractError::TerminationNotPermitted { signer }.into());
     }
 
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// The four parties involved when a contract's buyer/provider disagree with its
@@ -998,6 +1000,8 @@ pub enum ContractError {
 
 #[cfg(test)]
 mod tests {
+    /// Fixed admission time; nothing in these tests reads `created_at` (ADR-0022).
+    const NOW: i64 = 1_800_000_000;
     use super::*;
     use crate::inquiry::{
         append_inquiry_closed, append_inquiry_opened, Admits, InquiryClosed, InquiryOpened,
@@ -1078,7 +1082,7 @@ mod tests {
 
     fn publish(log: &mut AppendLog, provider: &Keypair) -> Listing {
         let listing = recurring_listing(provider);
-        append_listing_created(log, SignedPayload::sign(listing.clone(), provider)).unwrap();
+        append_listing_created(log, SignedPayload::sign(listing.clone(), provider), NOW).unwrap();
         listing
     }
 
@@ -1120,12 +1124,13 @@ mod tests {
     ) -> InquiryId {
         let opened = opened_of(buyer, listing);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(log, opened, listing, 3.0, true).unwrap();
+        append_inquiry_opened(log, opened, listing, 3.0, true, NOW).unwrap();
         append_inquiry_closed(
             log,
             agreed_close(provider, inquiry_id, listing.pricing.amount_centi),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
         inquiry_id
@@ -1235,7 +1240,8 @@ mod tests {
 
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE));
         let contract_id = signed.payload.contract_id;
-        append_service_contract(&mut log, signed, &station.public_key(), &admit_all()).unwrap();
+        append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+            .unwrap();
 
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
             .unwrap()
@@ -1278,6 +1284,7 @@ mod tests {
             SignedPayload::sign(contract, &impostor),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1298,11 +1305,12 @@ mod tests {
         // Open the inquiry but do not have the provider grant it.
         let opened = opened_of(&buyer, &listing);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE));
-        let err = append_service_contract(&mut log, signed, &station.public_key(), &admit_all())
-            .unwrap_err();
+        let err =
+            append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+                .unwrap_err();
         assert!(matches!(
             err,
             Error::Contract(ContractError::InquiryNotAgreed { .. })
@@ -1346,12 +1354,18 @@ mod tests {
             None,
         )
         .unwrap();
-        append_listing_created(&mut log, SignedPayload::sign(one_off.clone(), &provider)).unwrap();
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(one_off.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
         let inquiry_id = agree_inquiry(&mut log, &buyer, &provider, &station, &one_off);
 
         let signed = contract_of(&buyer, &provider, inquiry_id, &one_off, terms(PRICE));
-        let err = append_service_contract(&mut log, signed, &station.public_key(), &admit_all())
-            .unwrap_err();
+        let err =
+            append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+                .unwrap_err();
         assert!(matches!(
             err,
             Error::Contract(ContractError::ListingNotRecurring(_))
@@ -1370,9 +1384,14 @@ mod tests {
 
         // A price other than the agreed one is refused.
         let wrong_price = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE + 1));
-        let err =
-            append_service_contract(&mut log, wrong_price, &station.public_key(), &admit_all())
-                .unwrap_err();
+        let err = append_service_contract(
+            &mut log,
+            wrong_price,
+            &station.public_key(),
+            &admit_all(),
+            NOW,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             Error::Contract(ContractError::TermsMismatch { .. })
@@ -1382,8 +1401,9 @@ mod tests {
         let mut wrong_cadence = terms(PRICE);
         wrong_cadence.duration_periods = PERIODS + 1;
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, wrong_cadence);
-        let err = append_service_contract(&mut log, signed, &station.public_key(), &admit_all())
-            .unwrap_err();
+        let err =
+            append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+                .unwrap_err();
         assert!(matches!(
             err,
             Error::Contract(ContractError::TermsMismatch { .. })
@@ -1405,6 +1425,7 @@ mod tests {
             contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE)),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
 
@@ -1419,6 +1440,7 @@ mod tests {
             contract_of(&buyer, &provider, inquiry_id, &listing, other),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1441,7 +1463,8 @@ mod tests {
         let inquiry_id = agree_inquiry(&mut log, &buyer, &provider, &station, &listing);
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE));
         let contract_id = signed.payload.contract_id;
-        append_service_contract(&mut log, signed, &station.public_key(), &admit_all()).unwrap();
+        append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+            .unwrap();
 
         // A stranger cannot terminate.
         let err = append_contract_termination(
@@ -1454,6 +1477,7 @@ mod tests {
             ),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1472,6 +1496,7 @@ mod tests {
             ),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1490,6 +1515,7 @@ mod tests {
             ),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
 
@@ -1504,6 +1530,7 @@ mod tests {
             ),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1523,7 +1550,8 @@ mod tests {
         let inquiry_id = agree_inquiry(&mut log, &buyer, &provider, &station, &listing);
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE));
         let contract_id = signed.payload.contract_id;
-        append_service_contract(&mut log, signed, &station.public_key(), &admit_all()).unwrap();
+        append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+            .unwrap();
 
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
             .unwrap()
@@ -1562,6 +1590,7 @@ mod tests {
             termination_of(&buyer, contract_id, TerminatedBy::Buyer, STARTED_AT + WEEK),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
@@ -1602,7 +1631,8 @@ mod tests {
         let inquiry_id = agree_inquiry(&mut log, &buyer, &provider, &station, &listing);
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE));
         let contract_id = signed.payload.contract_id;
-        append_service_contract(&mut log, signed, &station.public_key(), &admit_all()).unwrap();
+        append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+            .unwrap();
 
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
             .unwrap()
@@ -1627,6 +1657,7 @@ mod tests {
             termination_of(&buyer, contract_id, TerminatedBy::Buyer, STARTED_AT),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
@@ -1662,7 +1693,7 @@ mod tests {
             STARTED_AT,
         )
         .unwrap();
-        log.append(SignedPayload::sign(contract.clone(), &impostor))
+        log.append(SignedPayload::sign(contract.clone(), &impostor), 0)
             .unwrap();
 
         // Its buyer never agreed an inquiry, so replay drops it.
@@ -1678,13 +1709,17 @@ mod tests {
         // A real contract, then a stranger's termination bypassing the guard.
         let signed = contract_of(&buyer, &provider, inquiry_id, &listing, terms(PRICE));
         let contract_id = signed.payload.contract_id;
-        append_service_contract(&mut log, signed, &station.public_key(), &admit_all()).unwrap();
-        log.append(termination_of(
-            &impostor,
-            contract_id,
-            TerminatedBy::Buyer,
-            STARTED_AT + WEEK,
-        ))
+        append_service_contract(&mut log, signed, &station.public_key(), &admit_all(), NOW)
+            .unwrap();
+        log.append(
+            termination_of(
+                &impostor,
+                contract_id,
+                TerminatedBy::Buyer,
+                STARTED_AT + WEEK,
+            ),
+            0,
+        )
         .unwrap();
 
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())

@@ -239,7 +239,7 @@ impl<'db> Settler<'db> {
             amount_centi: p.amount_centi,
             settled_at: now,
         };
-        AppendLog::new(self.db).append(SignedPayload::sign(record, &self.station))?;
+        AppendLog::new(self.db).append(SignedPayload::sign(record, &self.station), now)?;
 
         self.apply_balance(&p.sender, &p.receiver, p.amount_centi)?;
         tracing::info!(tx = ?tx_id, amount_centi = p.amount_centi, "settled");
@@ -348,14 +348,18 @@ mod tests {
         );
         let id = proposal.id;
         let mut log = AppendLog::new(db);
-        log.append(SignedProposal::sign(proposal, sender)).unwrap();
+        log.append(SignedProposal::sign(proposal, sender), confirmed_at)
+            .unwrap();
         let confirmation = TransactionConfirmation {
             proposal_id: id,
             confirmer: addr(receiver),
             confirmed_at,
         };
-        log.append(SignedConfirmation::sign(confirmation, receiver))
-            .unwrap();
+        log.append(
+            SignedConfirmation::sign(confirmation, receiver),
+            confirmed_at,
+        )
+        .unwrap();
         id
     }
 
@@ -496,7 +500,7 @@ mod tests {
             opened_at,
         };
         AppendLog::new(db)
-            .append(SignedDispute::sign(dispute, sender))
+            .append(SignedDispute::sign(dispute, sender), opened_at)
             .unwrap();
         id
     }

@@ -121,7 +121,7 @@ pub fn append_verdict(
         _ => return Err(Error::NotSeated),
     }
 
-    AppendLog::new(db).append(verdict)?;
+    AppendLog::new(db).append(verdict, now)?;
     tracing::info!(tx = ?proposal_id, ?juror, uphold, "verdict recorded");
     Ok(())
 }
@@ -177,7 +177,7 @@ pub fn open_escalation(
         return Err(Error::NotEscalatable);
     }
 
-    AppendLog::new(db).append(escalation)?;
+    AppendLog::new(db).append(escalation, now)?;
     tracing::info!(tx = ?record.proposal_id, reason = ?record.reason, "escalation opened");
     Ok(())
 }
@@ -224,7 +224,7 @@ pub fn append_escalation_ballot(
         return Err(Error::AlreadyVoted);
     }
 
-    AppendLog::new(db).append(ballot)?;
+    AppendLog::new(db).append(ballot, now)?;
     tracing::info!(tx = ?proposal_id, ?voter, "escalation ballot recorded");
     Ok(())
 }

@@ -855,6 +855,7 @@ pub fn append_inquiry_opened(
     listing: &Listing,
     buyer_capped_composite: f32,
     buyer_in_listing_community: bool,
+    now: i64,
 ) -> Result<LogEntry> {
     let opened = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -883,7 +884,7 @@ pub fn append_inquiry_opened(
     if already_opened(log, &opened.inquiry_id)? {
         return Err(InquiryError::AlreadyOpened(opened.inquiry_id).into());
     }
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Records a message from the buyer or the provider in an open inquiry.
@@ -892,6 +893,7 @@ pub fn append_inquiry_message(
     signed: SignedInquiryMessage,
     station: &PublicKey,
     admits: &dyn Fn(&Listing, &Address) -> bool,
+    now: i64,
 ) -> Result<LogEntry> {
     let message = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -918,7 +920,7 @@ pub fn append_inquiry_message(
         return Err(InquiryError::SenderNotParty { sender: signer }.into());
     }
 
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// Closes an inquiry, signed by the buyer, the provider, or the station.
@@ -931,6 +933,7 @@ pub fn append_inquiry_closed(
     signed: SignedInquiryClosed,
     station: &PublicKey,
     admits: &dyn Fn(&Listing, &Address) -> bool,
+    now: i64,
 ) -> Result<LogEntry> {
     let close = signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -977,7 +980,7 @@ pub fn append_inquiry_closed(
         }
     }
 
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// A listing requirement a buyer did not meet at open time. One variant per
@@ -1098,6 +1101,8 @@ pub enum InquiryError {
 
 #[cfg(test)]
 mod tests {
+    /// Fixed admission time; nothing in these tests reads `created_at` (ADR-0022).
+    const NOW: i64 = 1_800_000_000;
     use super::*;
     use crate::listing::{
         Availability, AvailabilityStatus, Listing, Pricing, PricingModel, Requirements, Surface,
@@ -1165,6 +1170,7 @@ mod tests {
         crate::lifecycle::append_listing_created(
             log,
             SignedPayload::sign(listing.clone(), provider),
+            NOW,
         )
         .unwrap();
         listing
@@ -1339,6 +1345,7 @@ mod tests {
             &listing,
             1.0,
             true,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1356,6 +1363,7 @@ mod tests {
             &listing,
             2.0,
             true,
+            NOW,
         )
         .unwrap();
         assert_eq!(log.iter_from(1).count(), 2);
@@ -1376,6 +1384,7 @@ mod tests {
             &listing,
             3.0,
             false, // not a member of the listing's community
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1410,6 +1419,7 @@ mod tests {
             &listing,
             3.0,
             true,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1432,6 +1442,7 @@ mod tests {
             &listing,
             3.0,
             true,
+            NOW,
         )
         .unwrap();
         let err = append_inquiry_opened(
@@ -1440,6 +1451,7 @@ mod tests {
             &listing,
             3.0,
             true,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1461,7 +1473,7 @@ mod tests {
         let listing = publish(&mut log, &provider, true);
         let opened = opened_of(&buyer, &listing, Some(250));
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         // Buyer and provider both land.
         append_inquiry_message(
@@ -1469,6 +1481,7 @@ mod tests {
             message_of(&buyer, inquiry_id, "still there?", None, OPENED_AT + 5),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
         append_inquiry_message(
@@ -1476,6 +1489,7 @@ mod tests {
             message_of(&provider, inquiry_id, "yes", Some(275), OPENED_AT + 6),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
 
@@ -1485,6 +1499,7 @@ mod tests {
             message_of(&stranger, inquiry_id, "me too", None, OPENED_AT + 7),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1509,13 +1524,14 @@ mod tests {
         let listing = publish(&mut log, &provider, true);
         let opened = opened_of(&buyer, &listing, None);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         let err = append_inquiry_message(
             &mut log,
             message_of(&buyer, inquiry_id, "   ", None, OPENED_AT + 5),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, Error::Inquiry(InquiryError::EmptyMessage)));
@@ -1526,6 +1542,7 @@ mod tests {
             message_of(&buyer, inquiry_id, "", Some(250), OPENED_AT + 6),
             &station.public_key(),
             &admit_all(),
+            NOW,
         )
         .unwrap();
     }
@@ -1541,7 +1558,7 @@ mod tests {
         let listing = publish(&mut log, &provider, true);
         let opened = opened_of(&buyer, &listing, Some(250));
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         append_inquiry_message(
             &mut log,
@@ -1554,6 +1571,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
 
@@ -1564,6 +1582,7 @@ mod tests {
             message_of(&buyer, inquiry_id, "Deal — 2.75", Some(275), OPENED_AT + 8),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
 
@@ -1580,6 +1599,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
 
@@ -1608,6 +1628,7 @@ mod tests {
             message_of(&buyer, inquiry_id, "actually...", None, OPENED_AT + 30),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1627,7 +1648,7 @@ mod tests {
         let listing = publish(&mut log, &provider, false); // not negotiable, 300
         let opened = opened_of(&buyer, &listing, None);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         // The provider agreeing at anything but the listed price is refused.
         let err = append_inquiry_closed(
@@ -1642,6 +1663,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1662,6 +1684,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
     }
@@ -1677,7 +1700,7 @@ mod tests {
         let listing = publish(&mut log, &provider, true);
         let opened = opened_of(&buyer, &listing, None);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         // The buyer cannot decline "as the seller", and no party may sign Expired.
         for (signer, outcome) in [
@@ -1690,6 +1713,7 @@ mod tests {
                 close_of(signer, inquiry_id, outcome, OPENED_AT + 10),
                 &station_key,
                 &admit_all(),
+                NOW,
             )
             .unwrap_err();
             assert!(matches!(
@@ -1709,6 +1733,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
     }
@@ -1724,7 +1749,7 @@ mod tests {
         let listing = publish(&mut log, &provider, true); // negotiable
         let opened = opened_of(&buyer, &listing, Some(250));
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         // The buyer cannot accept their own inquiry — only the provider grants.
         let err = append_inquiry_closed(
@@ -1739,6 +1764,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1760,6 +1786,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
         for price in [275, 250] {
@@ -1775,6 +1802,7 @@ mod tests {
                 ),
                 &station_key,
                 &admit_all(),
+                NOW,
             )
             .unwrap_err();
             assert!(matches!(
@@ -1790,6 +1818,7 @@ mod tests {
             message_of(&buyer, inquiry_id, "ok, 2.75", Some(275), OPENED_AT + 8),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
         append_inquiry_closed(
@@ -1804,6 +1833,7 @@ mod tests {
             ),
             &station_key,
             &admit_all(),
+            NOW,
         )
         .unwrap();
     }
@@ -1818,7 +1848,7 @@ mod tests {
         let listing = publish(&mut log, &provider, true);
         let opened = opened_of(&buyer, &listing, None);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         let records = inquiry_records(&log, &inquiry_id, &station.public_key(), &admit_all())
             .unwrap()
@@ -1864,13 +1894,14 @@ mod tests {
         crate::lifecycle::append_listing_created(
             &mut log,
             SignedPayload::sign(listing.clone(), &provider),
+            NOW,
         )
         .unwrap();
 
         // A gossiped open bypasses the append guard entirely.
         let opened = opened_of(&buyer, &listing, None);
         let inquiry_id = opened.payload.inquiry_id;
-        log.append(opened).unwrap();
+        log.append(opened, 0).unwrap();
 
         // A predicate standing in for "read the buyer's reputation": this buyer
         // is below the floor, so replay must not believe the inquiry.
@@ -1905,17 +1936,23 @@ mod tests {
         let listing = publish(&mut log, &provider, true);
         let opened = opened_of(&buyer, &listing, None);
         let inquiry_id = opened.payload.inquiry_id;
-        append_inquiry_opened(&mut log, opened, &listing, 3.0, true).unwrap();
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
 
         // Gossip a stranger's message and a stranger's decline.
-        log.append(message_of(&stranger, inquiry_id, "hi", None, OPENED_AT + 5))
-            .unwrap();
-        log.append(close_of(
-            &stranger,
-            inquiry_id,
-            InquiryOutcome::DeclinedBySeller,
-            OPENED_AT + 6,
-        ))
+        log.append(
+            message_of(&stranger, inquiry_id, "hi", None, OPENED_AT + 5),
+            0,
+        )
+        .unwrap();
+        log.append(
+            close_of(
+                &stranger,
+                inquiry_id,
+                InquiryOutcome::DeclinedBySeller,
+                OPENED_AT + 6,
+            ),
+            0,
+        )
         .unwrap();
 
         let records = inquiry_records(&log, &inquiry_id, &station.public_key(), &admit_all())

@@ -155,6 +155,7 @@ pub fn append_vote(
     log: &mut AppendLog,
     signed: SignedVote,
     db: &Database,
+    now: i64,
 ) -> Result<LogEntry, VoteError> {
     let vote = &signed.payload;
     let signer = Address::from_public_key(signed.signer);
@@ -195,7 +196,7 @@ pub fn append_vote(
         });
     }
 
-    Ok(log.append(signed)?)
+    Ok(log.append(signed, now)?)
 }
 
 /// A ballot the write path would not accept, or a record the replay would not
@@ -361,26 +362,33 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
-        log.append(SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: addr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ))
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
+        log.append(
+            SignedPayload::sign(
+                TransactionConfirmation {
+                    proposal_id: pid,
+                    confirmer: addr(receiver),
+                    confirmed_at: at,
+                },
+                receiver,
+            ),
+            0,
+        )
         .unwrap();
-        log.append(SignedPayload::sign(
-            SettlementRecord {
-                proposal_id: pid,
-                sender: addr(sender),
-                receiver: addr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            station,
-        ))
+        log.append(
+            SignedPayload::sign(
+                SettlementRecord {
+                    proposal_id: pid,
+                    sender: addr(sender),
+                    receiver: addr(receiver),
+                    amount_centi: 300,
+                    settled_at: at,
+                },
+                station,
+            ),
+            0,
+        )
         .unwrap();
     }
 
@@ -397,7 +405,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        log.append(vouch.sign(voucher)).unwrap();
+        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
@@ -483,9 +491,15 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
         let proposal = statute(&author, NOW);
-        append_proposal(&mut log, SignedPayload::sign(proposal.clone(), &author), db).unwrap();
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(proposal.clone(), &author),
+            db,
+            NOW,
+        )
+        .unwrap();
         for c in &members[1..4] {
-            append_cosign(&mut log, cosign(c, &proposal, NOW), db).unwrap();
+            append_cosign(&mut log, cosign(c, &proposal, NOW), db, NOW).unwrap();
         }
         (members, proposal)
     }
@@ -503,6 +517,7 @@ mod tests {
             &mut log,
             vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -522,18 +537,21 @@ mod tests {
             &mut log,
             vote(&members[0], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         append_vote(
             &mut log,
             vote(&members[1], &proposal, VoteChoice::No, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         append_vote(
             &mut log,
             vote(&members[2], &proposal, VoteChoice::Abstain, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -556,6 +574,7 @@ mod tests {
             &mut log,
             vote(&members[0], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         assert!(votes(&log, &proposal.proposal_id, &db)
@@ -582,7 +601,7 @@ mod tests {
             },
             &members[2],
         );
-        let err = append_vote(&mut log, forged, &db).unwrap_err();
+        let err = append_vote(&mut log, forged, &db, NOW).unwrap_err();
         assert!(matches!(err, VoteError::SignerNotVoter { .. }));
     }
 
@@ -597,6 +616,7 @@ mod tests {
             &mut log,
             vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
         // Even a different choice cannot replace the first ballot.
@@ -604,6 +624,7 @@ mod tests {
             &mut log,
             vote(&members[1], &proposal, VoteChoice::No, NOW),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::AlreadyVoted { .. }));
@@ -625,6 +646,7 @@ mod tests {
                 proposal.voting_ends_at + 1,
             ),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::OutsideVotingWindow { .. }));
@@ -646,6 +668,7 @@ mod tests {
                 proposal.created_at - 1,
             ),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::OutsideVotingWindow { .. }));
@@ -663,6 +686,7 @@ mod tests {
             &mut log,
             vote(&outsider, &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::VoterNotEstablished { .. }));
@@ -681,6 +705,7 @@ mod tests {
             &mut log,
             vote(&members[1], &phantom, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::UnknownProposal(_)));
@@ -699,6 +724,7 @@ mod tests {
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
+            NOW,
         )
         .unwrap();
 
@@ -706,6 +732,7 @@ mod tests {
             &mut log,
             vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::ProposalNotPublished(_)));
@@ -728,32 +755,39 @@ mod tests {
             &mut log,
             vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
+            NOW,
         )
         .unwrap();
 
         // Bypass the guards exactly as replication does: an outsider's ballot, a
         // ballot out of window, a ballot forged onto another member, and a second
         // ballot from members[1] must all be dropped by replay.
-        log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW))
+        log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW), 0)
             .unwrap();
-        log.append(vote(
-            &members[2],
-            &proposal,
-            VoteChoice::Yes,
-            proposal.voting_ends_at + 1,
-        ))
+        log.append(
+            vote(
+                &members[2],
+                &proposal,
+                VoteChoice::Yes,
+                proposal.voting_ends_at + 1,
+            ),
+            0,
+        )
         .unwrap();
-        log.append(SignedPayload::sign(
-            Vote {
-                proposal_id: proposal.proposal_id,
-                voter: addr(&members[3]),
-                choice: VoteChoice::No,
-                cast_at: NOW,
-            },
-            &members[2], // signer != voter
-        ))
+        log.append(
+            SignedPayload::sign(
+                Vote {
+                    proposal_id: proposal.proposal_id,
+                    voter: addr(&members[3]),
+                    choice: VoteChoice::No,
+                    cast_at: NOW,
+                },
+                &members[2], // signer != voter
+            ),
+            0,
+        )
         .unwrap();
-        log.append(vote(&members[1], &proposal, VoteChoice::No, NOW))
+        log.append(vote(&members[1], &proposal, VoteChoice::No, NOW), 0)
             .unwrap();
 
         let ballots = votes(&log, &proposal.proposal_id, &db).unwrap();

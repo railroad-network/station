@@ -898,8 +898,9 @@ impl Core {
             params.stake_centi,
         );
         let vouch_id = hex(&vouch.payload_hash().to_bytes());
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
-        append_vouch(&mut log, vouch).map_err(internal)?;
+        append_vouch(&mut log, vouch, now).map_err(internal)?;
 
         ok(&rpc::VouchResult { vouch_id })
     }
@@ -1009,6 +1010,7 @@ impl Core {
         rrn_marketplace::lifecycle::append_listing_created(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(listing, &station),
+            now,
         )
         .map_err(marketplace_err)?;
         // Bring browse in step in the same call that published, so a listing is
@@ -1047,6 +1049,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(record, &station),
             &station_pk,
+            now,
         )
         .map_err(marketplace_err)?;
         self.reindex_listing(&listing_id);
@@ -1131,10 +1134,12 @@ impl Core {
             patch,
             signed_by: self.wallet.address,
         };
+        let now = self.clock.now();
         rrn_marketplace::lifecycle::append_listing_updated(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(update, &station),
             &station_pk,
+            now,
         )
         .map_err(marketplace_err)?;
         self.reindex_listing(&listing_id);
@@ -1174,9 +1179,11 @@ impl Core {
         .map_err(|e| invalid_params(e.to_string()))?;
 
         let mut log = AppendLog::new(&self.db);
+        let now = self.clock.now();
         let entry = rrn_marketplace::need::append_need_announced(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(need, &station),
+            now,
         )
         .map_err(marketplace_err)?;
 
@@ -1267,6 +1274,7 @@ impl Core {
             &listing,
             composite,
             in_community,
+            now,
         )
         .map_err(marketplace_err)?;
         ok(&rpc::InquireResult {
@@ -1300,6 +1308,7 @@ impl Core {
             rrn_crypto::signed::SignedPayload::sign(message, &station),
             &station_pk,
             &admits,
+            now,
         )
         .map_err(marketplace_err)?;
         ok(&rpc::InquireResult {
@@ -1362,6 +1371,7 @@ impl Core {
             rrn_crypto::signed::SignedPayload::sign(record, &station),
             &station_pk,
             &admits,
+            now,
         )
         .map_err(marketplace_err)?;
         ok(&rpc::InquiryStateResult {
@@ -1539,6 +1549,7 @@ impl Core {
             rrn_crypto::signed::SignedPayload::sign(contract, &station),
             &station_pk,
             &admits,
+            now,
         )
         .map_err(marketplace_err)?;
 
@@ -1606,6 +1617,7 @@ impl Core {
             rrn_crypto::signed::SignedPayload::sign(record, &station),
             &station_pk,
             &admits,
+            now,
         )
         .map_err(marketplace_err)?;
 
@@ -1745,6 +1757,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(record, &station),
             &station_pk,
+            now,
         ) {
             Ok(_) => self.reindex_listing(&listing_id),
             Err(e) => tracing::warn!(error = %e, "could not attest a sale"),
@@ -1872,6 +1885,7 @@ impl Core {
                 &mut log,
                 rrn_crypto::signed::SignedPayload::sign(record, &station),
                 &station_pk,
+                now,
             ) {
                 Ok(_) => closed += 1,
                 // Most likely a race with a provider's own close landing first,
@@ -1935,6 +1949,7 @@ impl Core {
                 rrn_crypto::signed::SignedPayload::sign(record, &station),
                 &station_pk,
                 &admits,
+                now,
             ) {
                 Ok(_) => closed += 1,
                 Err(e) => tracing::warn!(error = %e, "could not close an expired inquiry"),
@@ -1999,7 +2014,7 @@ impl Core {
                     period_index: index,
                     charged_at: now,
                 };
-                if !self.append_contract_charge(charge, &station) {
+                if !self.append_contract_charge(charge, &station, now) {
                     break;
                 }
                 appended += 1;
@@ -2031,7 +2046,7 @@ impl Core {
                         period_index: PENALTY_PERIOD_INDEX,
                         charged_at: now,
                     };
-                    if self.append_contract_charge(charge, &station) {
+                    if self.append_contract_charge(charge, &station, now) {
                         appended += 1;
                     }
                 }
@@ -2044,10 +2059,11 @@ impl Core {
     /// The station is the only party that can produce a valid one, so — like a
     /// settlement record — it needs no append-time entitlement guard beyond the
     /// signature; the balance fold's per-period dedup absorbs any duplicate.
-    fn append_contract_charge(&self, charge: ContractCharge, station: &Keypair) -> bool {
-        match AppendLog::new(&self.db)
-            .append(rrn_crypto::signed::SignedPayload::sign(charge, station))
-        {
+    fn append_contract_charge(&self, charge: ContractCharge, station: &Keypair, now: i64) -> bool {
+        match AppendLog::new(&self.db).append(
+            rrn_crypto::signed::SignedPayload::sign(charge, station),
+            now,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!(error = %e, "could not append a contract charge");
@@ -2088,6 +2104,10 @@ impl Core {
         // inline because each reindex replays the log, and a gossip round can
         // carry many records for one listing.
         let mut touched: Vec<ListingId> = Vec::new();
+        // Replicas re-stamp admission time from their own clock (ADR-0022 §1);
+        // one reading for the whole gossip round is fine — the log's monotone
+        // clamp keeps them non-decreasing in receipt order.
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
         for w in entries {
             let stored = match w.to_stored() {
@@ -2098,7 +2118,7 @@ impl Core {
                 }
             };
             let listing = touched_listing(&stored.bytes);
-            match log.append_raw(stored) {
+            match log.append_raw(stored, now) {
                 Ok(Some(_)) => {
                     appended += 1;
                     if let Some(id) = listing {
@@ -2194,7 +2214,8 @@ impl Core {
         let version = signed.charter().version;
 
         let mut log = AppendLog::new(&self.db);
-        store_charter(&mut log, &station, signed).map_err(|e| invalid_params(e.to_string()))?;
+        store_charter(&mut log, &station, signed, now)
+            .map_err(|e| invalid_params(e.to_string()))?;
         ok(&rpc::GovCharterResult {
             charter_hash,
             version,
@@ -2249,7 +2270,7 @@ impl Core {
             .map_err(|e| invalid_params(e.to_string()))?;
 
         let mut log = AppendLog::new(&self.db);
-        store_pending_charter(&mut log, &station, signed.clone())
+        store_pending_charter(&mut log, &station, signed.clone(), now)
             .map_err(|e| invalid_params(e.to_string()))?;
         ok(&self.pending_charter_view(&signed))
     }
@@ -2331,10 +2352,11 @@ impl Core {
             .add_remote_signature(signer, signature)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         let station = self.station_keypair();
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
         // Threshold-clearing appends publish (verify_founders holds); short of it,
         // the Charter stays pending — both are the same append, gated on reads.
-        store_pending_charter(&mut log, &station, signed.clone())
+        store_pending_charter(&mut log, &station, signed.clone(), now)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(signed)
     }
@@ -2393,6 +2415,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(proposal, &station),
             &self.db,
+            now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
         ok(&rpc::GovProposeResult { proposal_id })
@@ -2417,6 +2440,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(cosign, &station),
             &self.db,
+            now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
         let records =
@@ -2448,6 +2472,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(vote, &station),
             &self.db,
+            now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
         Ok(serde_json::json!({ "ok": true }))
@@ -2729,8 +2754,9 @@ impl Core {
             ));
         }
         let proposal_id = signed.payload.proposal_id.to_string();
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
-        append_proposal(&mut log, signed, &self.db)
+        append_proposal(&mut log, signed, &self.db, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "proposal_id": proposal_id }))
     }
@@ -2751,8 +2777,9 @@ impl Core {
             ));
         }
         let id = signed.payload.proposal_id;
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
-        append_cosign(&mut log, signed, &self.db)
+        append_cosign(&mut log, signed, &self.db, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         let records =
             rrn_governance::proposal::proposal_records(&AppendLog::new(&self.db), &id, &self.db)
@@ -2795,8 +2822,9 @@ impl Core {
                 "voter is not the authenticated mobile".into(),
             ));
         }
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
-        append_vote(&mut log, signed, &self.db)
+        append_vote(&mut log, signed, &self.db, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "ok": true }))
     }
@@ -3429,8 +3457,9 @@ impl Core {
             )
         })?;
         let vouch_id = hex(&signed.payload_hash().to_bytes());
+        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
-        append_vouch(&mut log, signed).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        append_vouch(&mut log, signed, now).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "vouch_id": vouch_id }))
     }
 
@@ -3479,7 +3508,8 @@ impl Core {
         let listing_id = signed.payload.id;
         let oracle_tier = signed.payload.oracle_tier;
         let mut log = AppendLog::new(&self.db);
-        rrn_marketplace::lifecycle::append_listing_created(&mut log, signed)
+        let now = self.clock.now();
+        rrn_marketplace::lifecycle::append_listing_created(&mut log, signed, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         // Bring browse in step in the same call that published, as the operator
         // path does, so the listing is findable the moment the reply returns.
@@ -3517,7 +3547,8 @@ impl Core {
         let listing_id = signed.payload.listing_id;
         let station_pk = self.station_keypair().public_key();
         let mut log = AppendLog::new(&self.db);
-        append_listing_closed(&mut log, signed, &station_pk)
+        let now = self.clock.now();
+        append_listing_closed(&mut log, signed, &station_pk, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         self.reindex_listing(&listing_id);
         Ok(serde_json::json!({
@@ -3560,7 +3591,8 @@ impl Core {
         let listing_id = signed.payload.listing_id;
         let station_pk = self.station_keypair().public_key();
         let mut log = AppendLog::new(&self.db);
-        rrn_marketplace::lifecycle::append_listing_updated(&mut log, signed, &station_pk)
+        let now = self.clock.now();
+        rrn_marketplace::lifecycle::append_listing_updated(&mut log, signed, &station_pk, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         self.reindex_listing(&listing_id);
         Ok(serde_json::json!({
@@ -3629,6 +3661,7 @@ impl Core {
             &listing,
             composite,
             in_community,
+            now,
         )
         .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
@@ -3685,8 +3718,10 @@ impl Core {
         let inquiry_id = signed.payload.inquiry_id;
         let admits = self.inquiry_admits(now);
         let mut log = AppendLog::new(&self.db);
-        rrn_marketplace::inquiry::append_inquiry_message(&mut log, signed, station_pk, &admits)
-            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        rrn_marketplace::inquiry::append_inquiry_message(
+            &mut log, signed, station_pk, &admits, now,
+        )
+        .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
     }
 
@@ -3718,7 +3753,7 @@ impl Core {
         let inquiry_id = signed.payload.inquiry_id;
         let admits = self.inquiry_admits(now);
         let mut log = AppendLog::new(&self.db);
-        rrn_marketplace::inquiry::append_inquiry_closed(&mut log, signed, station_pk, &admits)
+        rrn_marketplace::inquiry::append_inquiry_closed(&mut log, signed, station_pk, &admits, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
     }
@@ -3786,8 +3821,10 @@ impl Core {
         let contract_id = signed.payload.contract_id;
         let admits = self.inquiry_admits(now);
         let mut log = AppendLog::new(&self.db);
-        rrn_marketplace::contract::append_service_contract(&mut log, signed, station_pk, &admits)
-            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
+        rrn_marketplace::contract::append_service_contract(
+            &mut log, signed, station_pk, &admits, now,
+        )
+        .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         // A fresh contract has charged nothing, so it stands `active` at `now`.
         Ok(serde_json::json!({
             "contract_id": hex(&contract_id.to_bytes()),
@@ -3826,7 +3863,7 @@ impl Core {
         let admits = self.inquiry_admits(now);
         let mut log = AppendLog::new(&self.db);
         rrn_marketplace::contract::append_contract_termination(
-            &mut log, signed, station_pk, &admits,
+            &mut log, signed, station_pk, &admits, now,
         )
         .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "contract_id": hex(&contract_id.to_bytes()) }))
@@ -5040,6 +5077,7 @@ mod tests {
         append_listing_created(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
+            NOW,
         )
         .unwrap();
     }
@@ -5896,6 +5934,7 @@ mod tests {
         append_listing_created(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
+            NOW,
         )
         .unwrap();
 
@@ -5908,6 +5947,7 @@ mod tests {
             &listing,
             0.0,
             true,
+            NOW,
         )
         .unwrap();
         append_inquiry_closed(
@@ -5924,6 +5964,7 @@ mod tests {
             ),
             &station_pk,
             &admit_all,
+            NOW,
         )
         .unwrap();
         (listing, inquiry_id)
@@ -5962,6 +6003,7 @@ mod tests {
             rrn_crypto::signed::SignedPayload::sign(contract, buyer),
             &core.station_keypair().public_key(),
             &|_: &Listing, _: &Address| true,
+            NOW,
         )
         .unwrap();
         contract_id
@@ -6013,6 +6055,7 @@ mod tests {
         append_listing_created(
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
+            NOW,
         )
         .unwrap();
 
@@ -6033,6 +6076,7 @@ mod tests {
             &listing,
             0.0,
             true,
+            NOW,
         )
         .unwrap();
         if let Some(final_price_centi) = agreed {
@@ -6048,6 +6092,7 @@ mod tests {
                 ),
                 &station_pk,
                 &admit_all,
+                NOW,
             )
             .unwrap();
         }
@@ -6198,6 +6243,7 @@ mod tests {
                 ),
                 &core.station_keypair().public_key(),
                 &|_: &Listing, _: &Address| true,
+                NOW,
             )
             .unwrap();
         }
@@ -6406,27 +6452,33 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(rrn_crypto::signed::SignedPayload::sign(proposal, sender))
+        log.append(rrn_crypto::signed::SignedPayload::sign(proposal, sender), 0)
             .unwrap();
-        log.append(rrn_crypto::signed::SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: gaddr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ))
+        log.append(
+            rrn_crypto::signed::SignedPayload::sign(
+                TransactionConfirmation {
+                    proposal_id: pid,
+                    confirmer: gaddr(receiver),
+                    confirmed_at: at,
+                },
+                receiver,
+            ),
+            0,
+        )
         .unwrap();
-        log.append(rrn_crypto::signed::SignedPayload::sign(
-            rrn_ledger::settlement::SettlementRecord {
-                proposal_id: pid,
-                sender: gaddr(sender),
-                receiver: gaddr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            settler,
-        ))
+        log.append(
+            rrn_crypto::signed::SignedPayload::sign(
+                rrn_ledger::settlement::SettlementRecord {
+                    proposal_id: pid,
+                    sender: gaddr(sender),
+                    receiver: gaddr(receiver),
+                    amount_centi: 300,
+                    settled_at: at,
+                },
+                settler,
+            ),
+            0,
+        )
         .unwrap();
     }
 
@@ -6446,7 +6498,7 @@ mod tests {
             issued_at: at,
             expires_at: None,
         };
-        AppendLog::new(db).append(vouch.sign(voucher)).unwrap();
+        AppendLog::new(db).append(vouch.sign(voucher), 0).unwrap();
     }
 
     /// Builds `n` established members anchored in a ring — the electorate the

@@ -326,13 +326,14 @@ mod tests {
             i64::MAX / 2,
         );
         let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender)).unwrap();
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
         let confirmation = TransactionConfirmation {
             proposal_id: pid,
             confirmer: addr(receiver),
             confirmed_at: at,
         };
-        log.append(SignedPayload::sign(confirmation, receiver))
+        log.append(SignedPayload::sign(confirmation, receiver), 0)
             .unwrap();
         let settlement = SettlementRecord {
             proposal_id: pid,
@@ -341,7 +342,7 @@ mod tests {
             amount_centi: 300,
             settled_at: at,
         };
-        log.append(SignedPayload::sign(settlement, station))
+        log.append(SignedPayload::sign(settlement, station), 0)
             .unwrap();
     }
 
@@ -444,7 +445,7 @@ mod tests {
         append_settled(&db, &newcomer, &Keypair::generate(), &station, 0, now);
 
         let signed = create_vouch(&anchor, &addr(&newcomer), "demo", "I know them", 0);
-        append_vouch(&mut AppendLog::new(&db), signed).unwrap();
+        append_vouch(&mut AppendLog::new(&db), signed, 0).unwrap();
 
         // `create_vouch` stamps `issued_at` from the live clock, and
         // `anchoring_voucher` ignores a vouch issued after the time being scored

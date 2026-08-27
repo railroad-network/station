@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use dcbor::prelude::*;
 use rrn_crypto::serialize::from_canonical_bytes;
-use rrn_storage::log::{AppendLog, StoredPayload};
+use rrn_storage::log::{AppendLog, LogEntry};
 use serde::{Deserialize, Serialize};
 
 use crate::dispute::{DisputeRecord, SignedDispute};
@@ -302,6 +302,27 @@ impl TransactionState {
     }
 }
 
+/// Station-local admission metadata for one transaction's lifecycle records
+/// (ADR-0022): the log positions and admission-clock readings of the entries
+/// that produced the current state. Local and unsigned — for display and for
+/// window arithmetic on the admitting station only, never signed content (see
+/// ADR-0022 §1). T2.1.2 re-anchors settlement and dispute windows onto these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionTimes {
+    /// Log seq of the admitting proposal entry.
+    pub proposal_seq: u64,
+    /// Admission-clock reading (`created_at`) of the proposal entry.
+    pub proposal_admitted_at: i64,
+    /// Log seq of the confirmation entry, once confirmed.
+    pub confirmation_seq: Option<u64>,
+    /// Admission-clock reading of the confirmation entry, once confirmed.
+    pub confirmation_admitted_at: Option<i64>,
+    /// Log seq of the dispute entry, once disputed.
+    pub dispute_seq: Option<u64>,
+    /// Admission-clock reading of the dispute entry, once disputed.
+    pub dispute_admitted_at: Option<i64>,
+}
+
 /// A point-in-time view of every transaction, derived by replaying the log.
 ///
 /// Replay is the only way to learn a transaction's state: the log is the source
@@ -314,6 +335,9 @@ pub struct LedgerSnapshot {
     states: BTreeMap<TransactionId, TransactionState>,
     /// Highest proposal nonce seen per sender (keyed by raw 32-byte pubkey).
     max_nonce: BTreeMap<[u8; 32], u64>,
+    /// Admission metadata per transaction (ADR-0022), captured during replay
+    /// from the admitting log entry of each lifecycle record.
+    admissions: BTreeMap<TransactionId, AdmissionTimes>,
 }
 
 impl LedgerSnapshot {
@@ -321,14 +345,17 @@ impl LedgerSnapshot {
     pub fn derive(log: &AppendLog) -> Result<Self> {
         let mut snapshot = LedgerSnapshot::default();
         for entry in log.iter_from(1) {
-            snapshot.apply(&entry?.payload);
+            snapshot.apply(&entry?);
         }
         Ok(snapshot)
     }
 
-    /// Folds one stored log payload into the snapshot. Unrecognized payloads
-    /// (e.g. vouches written by `rrn-identity`) are ignored.
-    fn apply(&mut self, stored: &StoredPayload) {
+    /// Folds one log entry into the snapshot. Unrecognized payloads (e.g.
+    /// vouches written by `rrn-identity`) are ignored. Alongside each applied
+    /// lifecycle record, captures the entry's admission metadata — its `seq`
+    /// and `created_at` (ADR-0022) — for the transaction it advances.
+    fn apply(&mut self, entry: &LogEntry) {
+        let stored = &entry.payload;
         let bytes = &stored.bytes;
 
         if let Ok(proposal) = from_canonical_bytes::<TransactionProposal>(bytes) {
@@ -343,6 +370,15 @@ impl LedgerSnapshot {
             };
             self.states
                 .insert(id, TransactionState::Proposed { proposal: signed });
+            // A proposal opens a transaction: seed its admission metadata.
+            self.admissions.insert(
+                id,
+                AdmissionTimes {
+                    proposal_seq: entry.seq,
+                    proposal_admitted_at: entry.created_at,
+                    ..AdmissionTimes::default()
+                },
+            );
             return;
         }
 
@@ -362,6 +398,12 @@ impl LedgerSnapshot {
                         confirmation: signed,
                     },
                 );
+                // Capture confirmation admission only on the real transition,
+                // matching the state insert above.
+                if let Some(admission) = self.admissions.get_mut(&confirmation.proposal_id) {
+                    admission.confirmation_seq = Some(entry.seq);
+                    admission.confirmation_admitted_at = Some(entry.created_at);
+                }
             }
             return;
         }
@@ -391,6 +433,11 @@ impl LedgerSnapshot {
                             dispute: Box::new(signed),
                         },
                     );
+                    // Capture dispute admission only on the real transition.
+                    if let Some(admission) = self.admissions.get_mut(&dispute.proposal_id) {
+                        admission.dispute_seq = Some(entry.seq);
+                        admission.dispute_admitted_at = Some(entry.created_at);
+                    }
                 }
             }
             return;
@@ -458,6 +505,13 @@ impl LedgerSnapshot {
     /// The state of one transaction, if it appears in the log.
     pub fn get(&self, id: &TransactionId) -> Option<&TransactionState> {
         self.states.get(id)
+    }
+
+    /// The station-local admission metadata for one transaction (ADR-0022), if
+    /// it appears in the log. `Some` for every transaction in the snapshot: a
+    /// transaction exists only because a proposal admitted it, which seeds this.
+    pub fn admission(&self, id: &TransactionId) -> Option<&AdmissionTimes> {
+        self.admissions.get(id)
     }
 
     /// The next nonce expected from `sender`: one past the highest seen, or 0 if
@@ -616,6 +670,80 @@ mod tests {
             confirmation: c,
         };
         assert!(matches!(state.verify(), Err(Error::ConfirmerMismatch)));
+    }
+
+    fn fresh_db() -> rrn_storage::db::Database {
+        let db = rrn_storage::db::Database::open_in_memory().unwrap();
+        rrn_storage::migrations::run(&db).unwrap();
+        db
+    }
+
+    #[test]
+    fn snapshot_carries_admission_times() {
+        let db = fresh_db();
+        let sender = Keypair::generate();
+        let receiver = Keypair::generate();
+        let p = proposal(&sender, &receiver);
+        let id = p.payload.id;
+        let c = confirmation(&p, &receiver);
+
+        {
+            let mut log = AppendLog::new(&db);
+            // Proposal admitted at 100 (seq 1), confirmation at 250 (seq 2).
+            log.append(p, 100).unwrap();
+            log.append(c, 250).unwrap();
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let admission = snapshot.admission(&id).expect("admission present");
+        assert_eq!(admission.proposal_seq, 1);
+        assert_eq!(admission.proposal_admitted_at, 100);
+        assert_eq!(admission.confirmation_seq, Some(2));
+        assert_eq!(admission.confirmation_admitted_at, Some(250));
+        assert_eq!(admission.dispute_seq, None);
+        assert_eq!(admission.dispute_admitted_at, None);
+    }
+
+    #[test]
+    fn admission_times_survive_full_lifecycle() {
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let sender = Keypair::generate();
+        let receiver = Keypair::generate();
+        let p = proposal(&sender, &receiver);
+        let id = p.payload.id;
+        let c = confirmation(&p, &receiver);
+        let settlement = SettlementRecord {
+            proposal_id: id,
+            sender: p.payload.sender,
+            receiver: p.payload.receiver,
+            amount_centi: p.payload.amount_centi,
+            settled_at: 9_000,
+        };
+
+        {
+            let mut log = AppendLog::new(&db);
+            log.append(p, 100).unwrap();
+            log.append(c, 250).unwrap();
+            // Settlement admitted later (seq 3); it captures no admission of its
+            // own — its signed `settled_at` carries the reading outward.
+            log.append(
+                rrn_crypto::signed::SignedPayload::sign(settlement, &station),
+                9_000,
+            )
+            .unwrap();
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        assert!(matches!(
+            snapshot.get(&id),
+            Some(TransactionState::Settled { .. })
+        ));
+        // Confirmation admission metadata is still reported through settlement.
+        let admission = snapshot.admission(&id).expect("admission present");
+        assert_eq!(admission.proposal_admitted_at, 100);
+        assert_eq!(admission.confirmation_seq, Some(2));
+        assert_eq!(admission.confirmation_admitted_at, Some(250));
     }
 
     #[test]

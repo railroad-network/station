@@ -27,7 +27,6 @@ use rrn_crypto::keypair::{PublicKey, Signature};
 use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rusqlite::OptionalExtension;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 use crate::{Error, Result};
@@ -97,7 +96,12 @@ pub struct LogEntry {
     pub content_hash: Hash,
     /// The signed content.
     pub payload: StoredPayload,
-    /// Unix seconds when the entry was appended.
+    /// The admitting station's clock (Unix seconds) at admission — the
+    /// *admission time* (ADR-0022 §1). Clamped monotone non-decreasing in log
+    /// order (§6). This is station-local, unsigned metadata: it is never part
+    /// of signed content and is never replicated as authoritative — a replica
+    /// re-stamps it locally on [`AppendLog::append_raw`], so only the admitting
+    /// station's reading is load-bearing for that station's window decisions.
     pub created_at: i64,
 }
 
@@ -118,16 +122,27 @@ impl<'a> AppendLog<'a> {
     /// does not verify is never persisted. The bound is `Clone + Into<CBOR>`
     /// (not `Serialize`): the signature covers the canonical CBOR of the value,
     /// per ADR-0002, so that is the trait the log needs.
-    pub fn append<T: Clone + Into<CBOR>>(&mut self, signed: SignedPayload<T>) -> Result<LogEntry> {
+    ///
+    /// `now` is the admitting station's injected clock reading (Unix seconds);
+    /// library code threads it from its own `now` parameter, the daemon edge
+    /// from `clock.rs`. The stored [`created_at`](LogEntry::created_at) is `now`
+    /// clamped monotone non-decreasing against the current tail (ADR-0022 §6),
+    /// so a backwards clock step cannot reorder admission times against log
+    /// order. It is station-local, unsigned metadata — never signed content,
+    /// never replicated as authoritative.
+    pub fn append<T: Clone + Into<CBOR>>(
+        &mut self,
+        signed: SignedPayload<T>,
+        now: i64,
+    ) -> Result<LogEntry> {
         signed.verify().map_err(|_| Error::InvalidSignature)?;
 
         let bytes = to_canonical_bytes(signed.payload.clone());
         let content_hash = Hash::of(&bytes);
-        let prev_hash = match self.tail()? {
-            Some(prev) => prev.content_hash,
-            None => zero_hash(),
+        let (prev_hash, created_at) = match self.tail()? {
+            Some(prev) => (prev.content_hash, now.max(prev.created_at)),
+            None => (zero_hash(), now),
         };
-        let created_at = now_secs();
         let payload = StoredPayload {
             bytes,
             signer: signed.signer,
@@ -175,18 +190,24 @@ impl<'a> AppendLog<'a> {
     /// appended (chained to *this* replica's current tail) and returned as
     /// `Ok(Some(entry))`. Two replicas thus converge on the same *set* of
     /// payloads even though their hash chains link them in receipt order.
-    pub fn append_raw(&mut self, payload: StoredPayload) -> Result<Option<LogEntry>> {
+    ///
+    /// `now` is this replica's own injected clock at the moment it admits the
+    /// entry (the daemon threads it from `clock.rs`). Replicas re-stamp
+    /// [`created_at`](LogEntry::created_at) locally rather than inheriting the
+    /// origin's admission time — only the admitting station's reading bears on
+    /// its own window decisions (ADR-0022 §1). The same monotone clamp (§6)
+    /// applies against this replica's tail.
+    pub fn append_raw(&mut self, payload: StoredPayload, now: i64) -> Result<Option<LogEntry>> {
         payload.verify().map_err(|_| Error::InvalidSignature)?;
 
         let content_hash = Hash::of(&payload.bytes);
         if self.contains(&content_hash)? {
             return Ok(None);
         }
-        let prev_hash = match self.tail()? {
-            Some(prev) => prev.content_hash,
-            None => zero_hash(),
+        let (prev_hash, created_at) = match self.tail()? {
+            Some(prev) => (prev.content_hash, now.max(prev.created_at)),
+            None => (zero_hash(), now),
         };
-        let created_at = now_secs();
 
         let conn = self.db.conn();
         let tx = conn.unchecked_transaction()?;
@@ -226,6 +247,28 @@ impl<'a> AppendLog<'a> {
             )
             .optional()?;
         Ok(found.is_some())
+    }
+
+    /// Admission metadata of the entry holding `content_hash`, if present:
+    /// `(seq, created_at)`. `created_at` is this station's admission-clock
+    /// reading for that entry (ADR-0022). Used by idempotent ingest, receipts,
+    /// and window re-anchoring (T2.1.2) to find when an entry was admitted here.
+    pub fn admission_of(&self, content_hash: &Hash) -> Result<Option<(u64, i64)>> {
+        let row: Option<(i64, i64)> = self
+            .db
+            .conn()
+            .query_row(
+                // ORDER BY seq: content_hash is not declared UNIQUE (append_raw's
+                // dedup keeps it one in practice, but not by schema constraint),
+                // so pin the result to the earliest — the admission that counts —
+                // rather than whichever row the planner happens to pick.
+                "SELECT seq, created_at FROM log_entries WHERE content_hash = ?1 \
+                 ORDER BY seq LIMIT 1",
+                [content_hash.to_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(seq, created_at)| (seq as u64, created_at)))
     }
 
     /// Fetches the entry at `seq`, if present.
@@ -347,17 +390,14 @@ fn zero_hash() -> Hash {
     Hash::from_bytes([0u8; 32])
 }
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rrn_crypto::keypair::Keypair;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A fixed admission time for tests that do not exercise the clock.
+    const NOW: i64 = 1_000;
 
     /// A minimal signed value: `Into<CBOR>` is all the log requires.
     #[derive(Clone)]
@@ -375,8 +415,14 @@ mod tests {
         db
     }
 
+    /// Appends a note at the fixed [`NOW`]; used where admission time is
+    /// incidental to what the test asserts.
     fn append_note(log: &mut AppendLog, kp: &Keypair, n: u64) -> LogEntry {
-        log.append(SignedPayload::sign(Note(n), kp)).unwrap()
+        append_note_at(log, kp, n, NOW)
+    }
+
+    fn append_note_at(log: &mut AppendLog, kp: &Keypair, n: u64, now: i64) -> LogEntry {
+        log.append(SignedPayload::sign(Note(n), kp), now).unwrap()
     }
 
     #[test]
@@ -505,7 +551,7 @@ mod tests {
         let mut signed = SignedPayload::sign(Note(7), &kp);
         signed.payload = Note(8); // mutate after signing → signature no longer valid
 
-        let err = log.append(signed).unwrap_err();
+        let err = log.append(signed, NOW).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature), "{err:?}");
         // Nothing was written.
         assert!(log.tail().unwrap().is_none());
@@ -531,15 +577,21 @@ mod tests {
 
         // Replicate the source payloads verbatim. They land at seq 2, 3 and are
         // re-chained to *this* replica's tail, not the source's.
-        let e2 = dst.append_raw(s1.clone()).unwrap().expect("newly appended");
-        let e3 = dst.append_raw(s2.clone()).unwrap().expect("newly appended");
+        let e2 = dst
+            .append_raw(s1.clone(), NOW)
+            .unwrap()
+            .expect("newly appended");
+        let e3 = dst
+            .append_raw(s2.clone(), NOW)
+            .unwrap()
+            .expect("newly appended");
         assert_eq!((e2.seq, e3.seq), (2, 3));
         assert_eq!(e3.prev_hash, e2.content_hash);
         assert_eq!(dst.verify_chain().unwrap(), 3);
 
         // Re-replicating an already-held payload is a no-op (dedup by content).
-        assert!(dst.append_raw(s1).unwrap().is_none());
-        assert!(dst.append_raw(s2).unwrap().is_none());
+        assert!(dst.append_raw(s1, NOW).unwrap().is_none());
+        assert!(dst.append_raw(s2, NOW).unwrap().is_none());
         assert_eq!(dst.tail().unwrap().unwrap().seq, 3);
     }
 
@@ -556,8 +608,74 @@ mod tests {
             signer: good.signer,
             signature: good.signature,
         };
-        let err = log.append_raw(tampered).unwrap_err();
+        let err = log.append_raw(tampered, NOW).unwrap_err();
         assert!(matches!(err, Error::InvalidSignature), "{err:?}");
         assert!(log.tail().unwrap().is_none());
+    }
+
+    #[test]
+    fn append_stamps_injected_time() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+
+        let e = append_note_at(&mut log, &kp, 1, 1_000);
+        assert_eq!(e.created_at, 1_000);
+        assert_eq!(log.get(1).unwrap().unwrap().created_at, 1_000);
+    }
+
+    #[test]
+    fn admission_time_is_clamped_monotone() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+
+        // First entry stamps its injected time verbatim.
+        assert_eq!(append_note_at(&mut log, &kp, 1, 1_000).created_at, 1_000);
+        // A backwards clock step cannot lower the admission time below the tail:
+        // it is clamped up to the previous entry's.
+        assert_eq!(append_note_at(&mut log, &kp, 2, 900).created_at, 1_000);
+        // A forwards step advances normally.
+        assert_eq!(append_note_at(&mut log, &kp, 3, 1_100).created_at, 1_100);
+    }
+
+    #[test]
+    fn append_raw_clamps_admission_time_monotone() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let src_db = fresh_log_db();
+        let payload = {
+            let mut src = AppendLog::new(&src_db);
+            append_note_at(&mut src, &kp, 7, 500).payload
+        };
+        let mut dst = AppendLog::new(&db);
+        append_note_at(&mut dst, &kp, 1, 2_000);
+        // The replica re-stamps at its own clock, clamped to its tail — it does
+        // not inherit the origin's admission time (ADR-0022 §1).
+        let e = dst.append_raw(payload, 1_500).unwrap().expect("appended");
+        assert_eq!(e.created_at, 2_000);
+    }
+
+    #[test]
+    fn admission_of_finds_entries_and_misses_unknowns() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+
+        let e1 = append_note_at(&mut log, &kp, 10, 1_000);
+        let e2 = append_note_at(&mut log, &kp, 20, 1_200);
+
+        assert_eq!(
+            log.admission_of(&e1.content_hash).unwrap(),
+            Some((1, 1_000))
+        );
+        assert_eq!(
+            log.admission_of(&e2.content_hash).unwrap(),
+            Some((2, 1_200))
+        );
+        assert_eq!(
+            log.admission_of(&Hash::of(b"never appended")).unwrap(),
+            None
+        );
     }
 }
