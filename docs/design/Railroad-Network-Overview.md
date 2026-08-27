@@ -1185,6 +1185,21 @@ after multi-node sync ships means a wire-format break:
    is trusted for what, and anchor cross-node ordering in unforgeable structure
    (log position, not claimed wall-clock time).
 
+> **Updated 2026-08-27.** Criteria 2 and 3 are discharged. **Criterion 2** (log
+> shape) is answered by **ADR-0020**: the community log stays a single linear
+> hash chain with the station as sole writer; concurrent appends are serialized
+> through one admission point (DTN submission carries records *to* that point,
+> it does not add writers), so equivocation detection, replay determinism, and
+> reconciliation keep the Phase-0/1 structure. **Criterion 3** (time trust) is
+> answered by **ADR-0022**: the station's clock *at admission* is the only
+> window-bearing clock; party-asserted timestamps are plausibility-bounded
+> testimony that decide nothing zero-sum, and cross-record order is log order —
+> so "signed before the deadline" backdating is defeated by construction.
+> Settlement and dispute windows now run from confirmation admission
+> (`rrn-ledger`, T2.1.1–T2.1.2). **Criterion 1** (bounded invariants under
+> partition) remains open: ADR-0021 specifies escrowed headroom certificates,
+> but the implementation is still owed (T2.3.x).
+
 **Deliverables:**
 - Offline-first hardening — full functionality with zero connectivity
 - Delay-tolerant networking — store and forward between disconnected nodes within a community

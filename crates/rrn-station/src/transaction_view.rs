@@ -16,7 +16,7 @@ use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
 use rrn_ledger::settlement::SettlementConfig;
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
-use rrn_ledger::transaction::ListingRef;
+use rrn_ledger::transaction::{ListingRef, TransactionId};
 use rrn_marketplace::lifecycle::listing_records;
 use rrn_marketplace::listing::ListingId;
 use rrn_storage::log::AppendLog;
@@ -38,32 +38,41 @@ pub fn member_transactions(
     station: &PublicKey,
     settlement: &SettlementConfig,
 ) -> Vec<TransactionRow> {
-    let mut rows: Vec<TransactionRow> = snapshot
+    let mut rows: Vec<(TransactionId, TransactionRow)> = snapshot
         .iter()
-        .filter_map(|(_, state)| row_for(state, member))
+        .filter_map(|(id, state)| row_for(state, member).map(|row| (*id, row)))
         .collect();
     // Newest first; ties broken by id so the order is stable (the mobile groups
     // History by day and relies on a deterministic order).
-    rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
+    rows.sort_by(|a, b| {
+        b.1.timestamp
+            .cmp(&a.1.timestamp)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
     if let Some(limit) = limit {
         rows.truncate(limit as usize);
     }
     let mut titles: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for row in &mut rows {
+    for (id, row) in &mut rows {
         if let Some(listing_hex) = &row.listing_id {
             row.listing_title = titles
                 .entry(listing_hex.clone())
                 .or_insert_with(|| listing_title(log, station, listing_hex))
                 .clone();
         }
-        // Once confirmed, the settlement window is `confirmed_at` + the tier's
-        // window; the phone counts down to this instant. Derived here, not stored,
-        // exactly like the tier and the window itself (ADR-0011).
-        if let Some(confirmed_at) = row.confirmed_at {
-            row.settle_by = Some(confirmed_at + settlement.window_for(row.oracle_tier) as i64);
+        // Once confirmed, the settlement window is the tier's window measured from
+        // when this station *admitted* the confirmation (ADR-0022 §2), not from
+        // the receiver-claimed `confirmed_at` the row still echoes for display.
+        // The phone counts down to this instant; derived here, not stored, exactly
+        // like the tier and the window itself (ADR-0011).
+        if let Some(admitted_at) = snapshot
+            .admission(id)
+            .and_then(|a| a.confirmation_admitted_at)
+        {
+            row.settle_by = Some(admitted_at + settlement.window_for(row.oracle_tier) as i64);
         }
     }
-    rows
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// The title of the listing named by `listing_hex`, read from the marketplace
@@ -265,8 +274,12 @@ mod tests {
         let receiver_addr = Address::from_public_key(receiver.public_key());
 
         // A sub-5-Common payment is Tier 1 (24h window); a 5.00-Common payment is
-        // Tier 2 (48h). Confirm each so it has a settlement window to derive.
+        // Tier 2 (48h). Confirm each so it has a settlement window to derive. The
+        // window runs from *admission* (ADR-0022 §2): the confirmation is admitted
+        // at 2_000, while its claimed `confirmed_at` is an older 1_100 — proving
+        // `settle_by` anchors on the admission clock, not the party's testimony.
         let confirmed_at = 1_100;
+        let admitted_at = 2_000;
         for (nonce, amount) in [300i64, 500].into_iter().enumerate() {
             let proposal = TransactionProposal::new(
                 sender_addr,
@@ -279,7 +292,7 @@ mod tests {
             );
             let id = proposal.id;
             AppendLog::new(&db)
-                .append(SignedProposal::sign(proposal, &sender), 0)
+                .append(SignedProposal::sign(proposal, &sender), 1_000)
                 .unwrap();
             let confirmation = TransactionConfirmation {
                 proposal_id: id,
@@ -287,7 +300,10 @@ mod tests {
                 confirmed_at,
             };
             AppendLog::new(&db)
-                .append(SignedConfirmation::sign(confirmation, &receiver), 0)
+                .append(
+                    SignedConfirmation::sign(confirmation, &receiver),
+                    admitted_at,
+                )
                 .unwrap();
         }
 
@@ -305,11 +321,11 @@ mod tests {
             .expect("a tier-2 row");
         assert_eq!(
             tier1.settle_by,
-            Some(confirmed_at + DEFAULT_TIER1_WINDOW_SECONDS as i64)
+            Some(admitted_at + DEFAULT_TIER1_WINDOW_SECONDS as i64)
         );
         assert_eq!(
             tier2.settle_by,
-            Some(confirmed_at + DEFAULT_TIER2_WINDOW_SECONDS as i64)
+            Some(admitted_at + DEFAULT_TIER2_WINDOW_SECONDS as i64)
         );
     }
 }
