@@ -310,13 +310,18 @@ pub struct TransactionRow {
     /// Unix seconds an unconfirmed proposal auto-cancels; present while pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
-    /// Unix seconds the receiver confirmed; present once confirmed/settled.
+    /// Unix seconds the receiver *claims* they confirmed — plausibility-bounded
+    /// testimony, not a window anchor (ADR-0022). Present once confirmed/settled.
+    /// For a confirmation carried offline this can be well before `settle_by`
+    /// minus the window; use `settle_by` for countdowns, never `confirmed_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<i64>,
-    /// Unix seconds the settlement window closes — `confirmed_at` plus this tier's
-    /// window (Tier 1 = 24h, Tier 2 = 48h; T1.8.4/T1.8.6). Present once confirmed,
-    /// so the wallet can count down to settlement without hardcoding the window or
-    /// re-deriving it from the tier. Absent while a proposal is still pending.
+    /// Unix seconds the settlement window closes — the confirmation's *admission*
+    /// time plus this tier's window (Tier 1 = 24h, Tier 2 = 48h; ADR-0022 §2,
+    /// T1.8.4/T1.8.6), i.e. when the community's ledger learned of the
+    /// confirmation, not the receiver-claimed `confirmed_at`. Present once
+    /// confirmed, so the wallet can count down to settlement without hardcoding
+    /// the window or re-deriving it from the tier. Absent while still pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_by: Option<i64>,
     /// Unix seconds the transaction settled; present once settled.

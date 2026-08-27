@@ -191,6 +191,10 @@ impl<'db> Settler<'db> {
                 // arrives, so late knowledge delays settlement without ever
                 // truncating the dispute window that shares this instant.
                 let window = self.config.window_for(proposal.payload.effective_tier()) as i64;
+                // Every `Confirmed` state carries confirmation admission metadata:
+                // replay seeds it on the confirm transition (T2.1.1 invariant), so
+                // `None` here is a snapshot-derivation bug, not reachable data. Fail
+                // loudly rather than silently skipping a settlement.
                 let admitted_at = snapshot
                     .admission(id)
                     .and_then(|a| a.confirmation_admitted_at)

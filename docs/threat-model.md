@@ -700,6 +700,28 @@ transition; the derivability of all state from the log.
   settlement record. The window-integrity residual is now the station-clock
   trust root recorded in the admission-clock section above, not a per-member
   timestamp attack.
+- *Known limitation (dispute sortition anchor — follow-up owed):* the
+  re-anchoring above covers the *ledger's* settlement and dispute-open windows
+  (`rrn-ledger`), but **not** the dispute *resolution* layer. A raiser-asserted
+  `opened_at` currently anchors jury sortition and the resolution/vote windows in
+  `rrn-dispute` (`sortition.rs` `eligible_pool`/`tier2_stake_centi` at
+  `at_time = opened_at`; `resolution.rs` `[opened_at, opened_at + window]`).
+  Because ADR-0022 removes the freshness floor on `opened_at` (old means
+  carried — a dispute may legitimately be signed peer-to-peer during offline
+  carriage before its confirmation is admitted here), a malicious raiser can
+  backdate `opened_at` to grind the historical reputation snapshot the jury is
+  drawn from, hand-picking a favourable pool and weights — the ADR-0022 §5
+  forbidden pattern (a party-asserted timestamp deciding a zero-sum outcome).
+  Keeping a lower bound on `opened_at` would not close it (a colluding receiver
+  backdates `confirmed_at` in lockstep) and would refuse honest carried
+  disputes; the real fix is re-anchoring `rrn-dispute` to the dispute record's
+  *admission* time. That is design-heavy — admission time is station-local and
+  does not replay to replicas (ADR-0022 §1), and `resolution.rs` deliberately
+  uses the record's `opened_at` for replay-deterministic verdicts, so the fix
+  must thread admission metadata through verdict computation and restate the
+  outcome in a station-signed record (the ADR-0005 pattern) — and is deferred to
+  a dedicated follow-up ticket, to land within M2.1 before T2.2.3 bundle ingest
+  widens the attack surface.
 
 #### Elevation of privilege — unbounded debt (ADR-0018)
 
