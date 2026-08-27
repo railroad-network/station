@@ -156,9 +156,15 @@ impl<'db> Engine<'db> {
     /// Submits a receiver-signed confirmation of an existing proposal.
     ///
     /// Errors on a bad signature, an unknown or non-`Proposed` transaction, a
-    /// confirmer that is not the receiver, a confirmation past expiry, or a
-    /// `confirmed_at` outside clock-skew tolerance of the station's own clock
-    /// (ADR-0019).
+    /// confirmer that is not the receiver, a proposal past expiry *by the
+    /// admission clock*, a `confirmed_at` dated into the future beyond clock-skew
+    /// tolerance, or a `confirmed_at` that predates its own proposal.
+    ///
+    /// Under the admission clock (ADR-0022 §3), `confirmed_at` is testimony, not
+    /// a window anchor: an arbitrarily *old* confirmation is admissible — old
+    /// means carried by a slow transport — because the settlement and dispute
+    /// windows run from when this station admits the confirmation, not from the
+    /// receiver's claim. This supersedes ADR-0019's staleness refusal.
     pub fn submit_confirmation(
         &mut self,
         confirmation: SignedConfirmation,
@@ -180,29 +186,31 @@ impl<'db> Engine<'db> {
             return Err(Error::ConfirmerMismatch);
         }
 
-        // A receiver may refuse to confirm an expired proposal; enforce it — by
-        // the station's own clock, not just the receiver-supplied `confirmed_at`
-        // (which a late confirmer could backdate). This is also what lets the
-        // debt floor release the headroom of an expired unconfirmed proposal:
-        // past this boundary the debit can never land (see [`crate::credit`]).
+        // Proposal expiry is judged by the admission clock alone (ADR-0022 §4):
+        // the station admits a confirmation only while `now` is still within the
+        // sender's offer window (plus skew). The parallel check against the
+        // claimed `confirmed_at` is dropped — it was testimony comparison, now
+        // meaningless. This boundary is also what lets the debt floor release the
+        // headroom of an expired unconfirmed proposal: past it the debit can
+        // never land (see [`crate::credit`]).
         if now > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
             return Err(Error::Expired);
         }
-        if c.confirmed_at > p.expires_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
-            return Err(Error::Expired);
-        }
 
-        // `confirmed_at` anchors both the settlement window and the dispute-
-        // open deadline, so it must be *fresh* — within clock-skew tolerance
-        // of the station's clock at receipt. Without this, a receiver
-        // confirming late but inside the validity window could backdate
-        // `confirmed_at` and shrink (or wholly skip) the dispute window the
-        // Phase-1 oracle rests on (ADR-0019).
+        // `confirmed_at` is plausibility-bounded testimony (ADR-0022 §3), not a
+        // window anchor: the only bounds left are that it may not be dated into
+        // the future beyond skew (a record from the future is a forgery or a
+        // broken clock), and that it must be internally consistent — a
+        // confirmation cannot claim to predate its own proposal. Arbitrarily
+        // *old* is legal: the settlement/dispute windows run from admission.
         if c.confirmed_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
             return Err(Error::FutureDated);
         }
-        if c.confirmed_at < now.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) {
-            return Err(Error::StaleConfirmation);
+        if c.confirmed_at < p.proposed_at.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::InconsistentTimestamp {
+                confirmed_at: c.confirmed_at,
+                proposed_at: p.proposed_at,
+            });
         }
 
         // Debt floor: confirming a negative-amount proposal (a payment request)
@@ -270,11 +278,10 @@ impl<'db> Engine<'db> {
         }
 
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
-        let (proposal, confirmation) = match snapshot.get(&d.proposal_id) {
-            Some(TransactionState::Confirmed {
-                proposal,
-                confirmation,
-            }) => (proposal, confirmation),
+        // The window now runs from confirmation *admission* (below), not from any
+        // field of the confirmation record, so only the proposal is bound here.
+        let proposal = match snapshot.get(&d.proposal_id) {
+            Some(TransactionState::Confirmed { proposal, .. }) => proposal,
             Some(_) => return Err(Error::NotConfirmed),
             None => return Err(Error::UnknownTransaction),
         };
@@ -287,20 +294,30 @@ impl<'db> Engine<'db> {
             return Err(Error::NotAParty);
         }
 
-        // The dispute must fall inside the settlement window: no earlier than the
-        // confirmation it contests, and no later than the moment the sweep would
-        // have settled it (with clock-skew tolerance, as elsewhere). A dispute
-        // that arrives after settlement finds the transaction already `Settled`
-        // and fails the `Confirmed` check above; this bounds the honest case.
+        // The dispute window is the settlement window, measured from when this
+        // station *admitted* the confirmation (ADR-0022 §2) — not from the
+        // receiver's claimed `confirmed_at`, which is testimony. A confirmation
+        // carried offline for days therefore serves its full window from arrival.
+        // The station's own clock decides the window is shut ("first" means first
+        // admitted, §5); the raiser's `opened_at` is testimony too, bounded only
+        // against future-dating. A dispute that arrives after settlement finds the
+        // transaction already `Settled` and fails the `Confirmed` check above.
         let window = settlement.window_for(p.effective_tier()) as i64;
-        let confirmed_at = confirmation.payload.confirmed_at;
-        let deadline = confirmed_at
+        let admitted_at = snapshot
+            .admission(&d.proposal_id)
+            .and_then(|a| a.confirmation_admitted_at)
+            .ok_or_else(|| {
+                Error::Invalid(
+                    "confirmed transaction missing confirmation admission metadata".into(),
+                )
+            })?;
+        let deadline = admitted_at
             .saturating_add(window)
             .saturating_add(CLOCK_SKEW_TOLERANCE_SECS);
-        if d.opened_at < confirmed_at.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS)
-            || d.opened_at > deadline
-            || d.opened_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS)
-        {
+        if d.opened_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::FutureDated);
+        }
+        if now > deadline {
             return Err(Error::DisputeWindowClosed);
         }
 
@@ -881,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn a_backdated_confirmation_inside_the_validity_window_is_rejected() {
+    fn an_old_confirmation_is_admissible() {
         let db = fresh_db();
         let (alice, bob, station) = (
             Keypair::generate(),
@@ -890,27 +907,92 @@ mod tests {
         );
         let mut engine = Engine::new(&db, station);
 
+        // Propose at t=100 with a long validity window.
         let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
         let id = p.payload.id;
         engine.submit_proposal(p, 100).unwrap();
 
-        // Long before expiry, Bob confirms — but stamps `confirmed_at` back at
-        // the start of the validity window. Accepting it would start the
-        // settlement clock in the past and eat the dispute window, so anything
-        // staler than the skew tolerance is refused.
+        // A confirmation carried offline arrives at t=500_000 still claiming an
+        // old `confirmed_at=150`. Under the admission clock this is admissible —
+        // old means carried; the windows run from admission (ADR-0022 §3). Under
+        // the retired ADR-0019 staleness refusal it would have been rejected.
         let c = TransactionConfirmation {
             proposal_id: id,
             confirmer: addr(&bob),
-            confirmed_at: 100,
+            confirmed_at: 150,
         };
+        engine
+            .submit_confirmation(SignedConfirmation::sign(c, &bob), 500_000)
+            .unwrap();
         assert!(matches!(
-            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 200_000),
-            Err(Error::StaleConfirmation)
+            engine.get_state(&id).unwrap(),
+            Some(TransactionState::Confirmed { .. })
         ));
     }
 
     #[test]
-    fn a_future_dated_confirmation_is_rejected() {
+    fn a_confirmation_predating_its_proposal_is_refused() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // Proposed at t=10_000; a confirmation cannot claim to have happened
+        // before that (beyond skew) — that is not "carried", it is inconsistent
+        // testimony (ADR-0022 §3).
+        let p = signed_proposal(&alice, &bob, 0, 10_000, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 10_000).unwrap();
+
+        let confirmed_at = 10_000 - CLOCK_SKEW_TOLERANCE_SECS - 1;
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 20_000),
+            Err(Error::InconsistentTimestamp {
+                confirmed_at: got_confirmed,
+                proposed_at: 10_000,
+            }) if got_confirmed == confirmed_at
+        ));
+    }
+
+    #[test]
+    fn expiry_is_judged_by_the_admission_clock() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // Offer stands only until t=1_000. A confirmation admitted past that
+        // boundary (plus skew) is `Expired` regardless of a small, in-window
+        // `confirmed_at` — expiry is the admission clock's call alone (§4).
+        let p = signed_proposal(&alice, &bob, 0, 100, 1_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 150,
+        };
+        let after = 1_000 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), after),
+            Err(Error::Expired)
+        ));
+    }
+
+    #[test]
+    fn a_future_dated_confirmation_is_still_refused() {
         let db = fresh_db();
         let (alice, bob, station) = (
             Keypair::generate(),
@@ -951,8 +1033,9 @@ mod tests {
         let id = p.payload.id;
         engine.submit_proposal(p, 100).unwrap();
 
-        // Exactly at the stale boundary: a mobile clock a full skew tolerance
-        // behind the station's is still legitimate.
+        // A mobile clock a full skew tolerance behind the station's is
+        // legitimate testimony — accepted, as any non-future, internally
+        // consistent `confirmed_at` now is (ADR-0022 §3).
         let now = 200_000;
         let c = TransactionConfirmation {
             proposal_id: id,
@@ -995,6 +1078,30 @@ mod tests {
         id
     }
 
+    /// Proposes and confirms a transaction, admitting the confirmation at a
+    /// `admitted_at` distinct from its claimed `confirmed_at`, so window
+    /// arithmetic can be tested against admission time specifically.
+    fn confirmed_with_admission(
+        engine: &mut Engine,
+        alice: &Keypair,
+        bob: &Keypair,
+        confirmed_at: i64,
+        admitted_at: i64,
+    ) -> TransactionId {
+        let p = signed_proposal(alice, bob, 0, 100, 1_000_000);
+        let id = p.payload.id;
+        engine.submit_proposal(p, 100).unwrap();
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(bob),
+            confirmed_at,
+        };
+        engine
+            .submit_confirmation(SignedConfirmation::sign(c, bob), admitted_at)
+            .unwrap();
+        id
+    }
+
     fn signed_dispute(id: TransactionId, raiser: &Keypair, opened_at: i64) -> SignedDispute {
         let d = crate::dispute::DisputeRecord {
             proposal_id: id,
@@ -1025,6 +1132,50 @@ mod tests {
         assert!(matches!(
             engine.get_state(&id).unwrap(),
             Some(TransactionState::Disputed { .. })
+        ));
+    }
+
+    #[test]
+    fn dispute_window_runs_from_confirmation_admission() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let w = 5_000i64;
+        let cfg = SettlementConfig::uniform(w as u64);
+
+        // Confirmed with a backdated `confirmed_at=100` but admitted at 10_000.
+        // The window is measured from admission, so it closes at 10_000 + w, not
+        // at the claimed 100 + w (which is already long past).
+        let id = confirmed_with_admission(&mut engine, &alice, &bob, 100, 10_000);
+
+        // Just inside the window from admission → admitted, even with an ancient
+        // claimed `opened_at` (testimony is not staleness-checked, ADR-0022 §5).
+        engine
+            .raise_dispute(signed_dispute(id, &alice, 100), &cfg, 10_000 + w - 1)
+            .unwrap();
+        assert!(matches!(
+            engine.get_state(&id).unwrap(),
+            Some(TransactionState::Disputed { .. })
+        ));
+
+        // Past the window from admission (plus skew) → refused, even though the
+        // same `now` is well within `confirmed_at + w` under the old anchor.
+        let db2 = fresh_db();
+        let (a2, b2, s2) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine2 = Engine::new(&db2, s2);
+        let id2 = confirmed_with_admission(&mut engine2, &a2, &b2, 100, 10_000);
+        let too_late = 10_000 + w + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        assert!(matches!(
+            engine2.raise_dispute(signed_dispute(id2, &a2, too_late), &cfg, too_late),
+            Err(Error::DisputeWindowClosed)
         ));
     }
 

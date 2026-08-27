@@ -667,28 +667,39 @@ transition; the derivability of all state from the log.
   problem. The ±5 minute drift window is a deliberate usability/security
   trade-off recorded here.
 
-#### Tampering — backdating `confirmed_at` to shrink the dispute window (ADR-0019)
+#### Tampering — backdating `confirmed_at` to shrink the dispute window (retired by ADR-0022)
 
 - *Threat:* the settlement window — which doubles as the Phase-1 dispute
-  window — and the dispute-open deadline are both measured from the
+  window — and the dispute-open deadline were originally measured from the
   receiver-supplied, receiver-signed `confirmed_at`. A receiver confirming
   late but inside the proposal's validity window could backdate
   `confirmed_at` toward `proposed_at`, shrinking the sender's dispute window
   or skipping it entirely (the next settlement sweep would see the window
   already elapsed).
-- *Mitigation:* **confirmation freshness** (ADR-0019) — the engine admits a
-  confirmation only when `confirmed_at` is within ±5 minutes
-  (`CLOCK_SKEW_TOLERANCE_SECS`) of the station's own clock at receipt
-  (`Error::StaleConfirmation` past, `Error::FutureDated` ahead). This
-  completes the invariant that no party-asserted timestamp is accepted more
-  than skew tolerance from the receiving clock, so every window measured from
-  `confirmed_at` is trustworthy to ±5 minutes — worst-case shrinkage is 5
-  minutes of a 24–48 hour window.
-- *Residual risk:* the bound assumes Phase 1's synchronous transports (the
-  mobile signs at submission over a live channel). Delay-tolerant sync will
-  deliver genuinely old confirmations late; the Phase-2 time-trust ADR
-  (an Overview §12 entrance criterion) owns that redesign and supersedes this
-  rule there.
+- *Mitigation:* **the attack is retired, not merely bounded.** ADR-0019's
+  freshness refusal (`Error::StaleConfirmation`) — which capped the shrinkage
+  at ±5 minutes but would have refused *every* genuinely old record under
+  delay-tolerant carriage — is superseded by the admission clock (ADR-0022;
+  see "Tampering / Repudiation — the admission clock" above). Both windows now
+  run from the confirmation's **admission time** (`admitted_at(confirmation) +
+  window`), the admitting station's own clock reading when it appended the
+  confirmation, not from any party-asserted field. `confirmed_at` carries no
+  window weight at all, so backdating it moves nothing: `find_eligible` and
+  `raise_dispute` read admission metadata (`AdmissionTimes`), and a
+  confirmation carried offline for days serves its *full* 24/48-hour window
+  from arrival. `confirmed_at` survives only as plausibility-bounded testimony
+  — refused only if dated into the future beyond skew (`Error::FutureDated`)
+  or if it predates its own proposal (`Error::InconsistentTimestamp`);
+  arbitrarily old is legal, because old means carried.
+- *Residual risk:* the receiver's `confirmed_at` is still shown to human
+  readers (transaction history, receipts) and may be a lie — a late confirmer
+  can stamp any non-future, internally consistent value. It decides nothing
+  zero-sum, but a UI that presented it as "when the community learned of this"
+  would mislead; displays that need an authoritative instant should prefer the
+  admission time (`settle_by` is derived from it) or the station-signed
+  settlement record. The window-integrity residual is now the station-clock
+  trust root recorded in the admission-clock section above, not a per-member
+  timestamp attack.
 
 #### Elevation of privilege — unbounded debt (ADR-0018)
 

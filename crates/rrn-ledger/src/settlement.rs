@@ -176,24 +176,30 @@ impl<'db> Settler<'db> {
     }
 
     /// Transaction ids that are confirmed and whose settlement window has now
-    /// elapsed (`confirmed_at + window_seconds <= now`).
+    /// elapsed (`admitted_at(confirmation) + window_seconds <= now`).
     pub fn find_eligible(&self, now: i64) -> Result<Vec<TransactionId>> {
         let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
         let mut eligible = Vec::new();
         for (id, state) in snapshot.iter() {
-            if let TransactionState::Confirmed {
-                proposal,
-                confirmation,
-            } = state
-            {
-                // The window is a pure function of the transaction's tier, which
-                // is itself derived from the immutable signed proposal — nothing
-                // extra is recorded per transaction. Measuring from the
-                // receiver-supplied `confirmed_at` is sound because the engine
-                // only admits a confirmation whose `confirmed_at` is within
-                // clock-skew tolerance of the station clock (ADR-0019).
+            if let TransactionState::Confirmed { proposal, .. } = state {
+                // The window is a pure function of the transaction's tier (derived
+                // from the immutable signed proposal), measured from when this
+                // station *admitted* the confirmation (ADR-0022 §2). The
+                // receiver-supplied `confirmed_at` is plausibility-bounded
+                // testimony carrying no window weight: a confirmation carried
+                // offline for days becomes eligible a full window after it
+                // arrives, so late knowledge delays settlement without ever
+                // truncating the dispute window that shares this instant.
                 let window = self.config.window_for(proposal.payload.effective_tier()) as i64;
-                if confirmation.payload.confirmed_at.saturating_add(window) <= now {
+                let admitted_at = snapshot
+                    .admission(id)
+                    .and_then(|a| a.confirmation_admitted_at)
+                    .ok_or_else(|| {
+                        Error::Invalid(
+                            "confirmed transaction missing confirmation admission metadata".into(),
+                        )
+                    })?;
+                if admitted_at.saturating_add(window) <= now {
                     eligible.push(*id);
                 }
             }
@@ -363,8 +369,65 @@ mod tests {
         id
     }
 
+    /// Like [`confirmed_tx`], but admits the confirmation at `admitted_at`
+    /// (distinct from the claimed `confirmed_at`) so window arithmetic can be
+    /// tested against the admission clock (ADR-0022 §2) specifically.
+    fn confirmed_tx_admitted(
+        db: &Database,
+        sender: &Keypair,
+        receiver: &Keypair,
+        amount_centi: i64,
+        confirmed_at: i64,
+        admitted_at: i64,
+    ) -> TransactionId {
+        let proposal = TransactionProposal::new(
+            addr(sender),
+            addr(receiver),
+            amount_centi,
+            None,
+            0,
+            0,
+            1_000_000,
+        );
+        let id = proposal.id;
+        let mut log = AppendLog::new(db);
+        log.append(SignedProposal::sign(proposal, sender), admitted_at)
+            .unwrap();
+        let confirmation = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(receiver),
+            confirmed_at,
+        };
+        log.append(
+            SignedConfirmation::sign(confirmation, receiver),
+            admitted_at,
+        )
+        .unwrap();
+        id
+    }
+
     fn settler<'a>(db: &'a Database, station: &Keypair, window: u64) -> Settler<'a> {
         Settler::new(db, station.clone(), SettlementConfig::uniform(window))
+    }
+
+    #[test]
+    fn settlement_waits_for_admission_plus_window() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        // Backdated `confirmed_at=100`, but admitted at 10_000.
+        let id = confirmed_tx_admitted(&db, &alice, &bob, 300, 100, 10_000);
+        let w = 5_000i64;
+        let s = settler(&db, &station, w as u64);
+
+        // A window past the *claimed* time is not enough — nothing is eligible.
+        assert!(s.find_eligible(100 + w).unwrap().is_empty());
+        // A window past *admission* is: the tx becomes eligible then.
+        assert!(s.find_eligible(10_000 + w - 1).unwrap().is_empty());
+        assert_eq!(s.find_eligible(10_000 + w).unwrap(), vec![id]);
     }
 
     #[test]
@@ -571,5 +634,92 @@ mod tests {
         let balances = BalanceView::new(&db);
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 300);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), -300);
+    }
+
+    use crate::engine::{Engine, CLOCK_SKEW_TOLERANCE_SECS};
+    use proptest::prelude::*;
+
+    /// The proposal's fixed `proposed_at` used by the invariance proptest below.
+    const PROPOSED_AT: i64 = 100;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The settlement-eligibility instant and the dispute deadline are
+        /// functions of the confirmation's *admission* time only (ADR-0022 §2):
+        /// across the whole legal range of the party-asserted `confirmed_at`,
+        /// both boundaries stay fixed at `confirm_admit + window` (+ skew for the
+        /// dispute deadline). If any `confirmed_at` moved either boundary, this
+        /// would fail — that is exactly the backdating attack the ADR retires.
+        #[test]
+        fn windows_are_a_function_of_admission_not_confirmed_at(
+            confirm_admit in 1_000i64..500_000,
+            window in 1i64..50_000,
+            confirmed_pick in 0u32..=1000,
+        ) {
+            // Sweep `confirmed_at` across its full legal range at admission: no
+            // earlier than the proposal (minus skew), no later than admission
+            // (plus skew). Every pick must leave both windows unmoved.
+            let skew = CLOCK_SKEW_TOLERANCE_SECS;
+            let (lo, hi) = (PROPOSED_AT - skew, confirm_admit + skew);
+            let confirmed_at = lo + ((hi - lo) * confirmed_pick as i64) / 1000;
+
+            let db = fresh_db();
+            let (alice, bob, station) = (
+                Keypair::generate(),
+                Keypair::generate(),
+                Keypair::generate(),
+            );
+            let mut engine = Engine::new(&db, station.clone());
+
+            // Propose at PROPOSED_AT; admit the confirmation at `confirm_admit`
+            // while it claims the swept-over `confirmed_at`.
+            let proposal = TransactionProposal::new(
+                addr(&alice),
+                addr(&bob),
+                300,
+                None,
+                0,
+                PROPOSED_AT,
+                1_000_000,
+            );
+            let id = proposal.id;
+            engine
+                .submit_proposal(SignedProposal::sign(proposal, &alice), PROPOSED_AT)
+                .unwrap();
+            let confirmation = TransactionConfirmation {
+                proposal_id: id,
+                confirmer: addr(&bob),
+                confirmed_at,
+            };
+            engine
+                .submit_confirmation(SignedConfirmation::sign(confirmation, &bob), confirm_admit)
+                .unwrap();
+
+            // Eligibility instant is admission + window, independent of the claim.
+            let s = settler(&db, &station, window as u64);
+            prop_assert!(s.find_eligible(confirm_admit + window - 1).unwrap().is_empty());
+            prop_assert_eq!(s.find_eligible(confirm_admit + window).unwrap(), vec![id]);
+
+            // Dispute deadline is admission + window + skew, independent too. Test
+            // the just-past case first (it does not mutate), then the boundary.
+            let cfg = SettlementConfig::uniform(window as u64);
+            let deadline = confirm_admit + window + CLOCK_SKEW_TOLERANCE_SECS;
+            let dispute = |opened_at: i64| {
+                let d = DisputeRecord {
+                    proposal_id: id,
+                    raiser: addr(&alice),
+                    reason: "contested".into(),
+                    evidence_hash: None,
+                    opened_at,
+                };
+                SignedDispute::sign(d, &alice)
+            };
+            prop_assert!(matches!(
+                engine.raise_dispute(dispute(deadline + 1), &cfg, deadline + 1),
+                Err(Error::DisputeWindowClosed)
+            ));
+            prop_assert!(engine.raise_dispute(dispute(deadline), &cfg, deadline).is_ok());
+        }
     }
 }

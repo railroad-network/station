@@ -95,19 +95,32 @@ pub enum Error {
         got: u64,
     },
     /// The proposal's `proposed_at` — or a confirmation's `confirmed_at` — is
-    /// too far in the future to be plausible, even allowing for clock skew.
+    /// too far in the future to be plausible, even allowing for clock skew. Under
+    /// the admission clock (ADR-0022 §3) future-dating is the *only* freshness
+    /// bound that survives: a record from the future is a forgery or a broken
+    /// clock, but an arbitrarily *old* one is legal — old means carried.
     #[error("record is dated too far in the future (beyond clock-skew tolerance)")]
     FutureDated,
     /// The proposal (or confirmation) is past its `expires_at`, allowing for
-    /// clock skew.
+    /// clock skew. Judged by the admission clock alone (ADR-0022 §4).
     #[error("proposal has expired")]
     Expired,
-    /// The confirmation's `confirmed_at` is too far in the past, even allowing
-    /// for clock skew. `confirmed_at` anchors both the settlement window and
-    /// the dispute-open deadline, so a backdated confirmation would shrink —
-    /// or wholly skip — the dispute window ADR-0014 assumes (ADR-0019).
-    #[error("confirmation is dated too far in the past (beyond clock-skew tolerance)")]
-    StaleConfirmation,
+    /// A party-asserted timestamp is internally inconsistent with the record it
+    /// belongs to: a confirmation's `confirmed_at` claims to predate its own
+    /// proposal's `proposed_at` (beyond clock-skew tolerance). Under the
+    /// admission clock old timestamps are legal — old means carried — but a
+    /// confirmation cannot have happened before the proposal it confirms
+    /// (ADR-0022 §3). Supersedes the ADR-0019 staleness refusal.
+    #[error(
+        "confirmation timestamp {confirmed_at} predates its proposal's \
+         proposed_at {proposed_at} (beyond clock-skew tolerance)"
+    )]
+    InconsistentTimestamp {
+        /// The confirmation's claimed `confirmed_at`.
+        confirmed_at: i64,
+        /// The proposal's `proposed_at`, which the confirmation cannot precede.
+        proposed_at: i64,
+    },
     /// The proposal's window is degenerate: `proposed_at` is after `expires_at`.
     #[error("proposal window is invalid: proposed_at is after expires_at")]
     InvalidWindow,
