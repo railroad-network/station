@@ -158,13 +158,16 @@ pub fn open_escalation(
     if escalation_of(db, &record.proposal_id)?.is_some() {
         return Err(Error::AlreadyEscalated);
     }
-    // The record's own timestamp is what applicability (and later, replay) is judged
-    // at; it cannot be dated into the future.
+    // Applicability is judged at the admission instant — this record is about to be
+    // appended at `now`, so `now` *is* its admission time (ADR-0022 §5). The signed
+    // `opened_at` is testimony and enters no window arithmetic; a future-dated one is
+    // still rejected as plainly bogus, but that is input hygiene, not a freshness
+    // floor (ADR-0022 drops the floor: an old `opened_at` may be legitimately carried).
     if record.opened_at > now {
         return Err(Error::NotEscalatable);
     }
 
-    let (jury, jury_at, pool_len, majority) = jury_view(
+    let jury = jury_view(
         db,
         founders,
         &record.proposal_id,
@@ -173,7 +176,7 @@ pub fn open_escalation(
         anchor,
         now,
     )?;
-    if !escalation_applies(&record, &info, pool_len, majority, jury, jury_at, params) {
+    if !escalation_applies(&record, now, &info, &jury, params) {
         return Err(Error::NotEscalatable);
     }
 
@@ -208,14 +211,12 @@ pub fn append_escalation_ballot(
     }
 
     let info = disputed_info(db, &proposal_id)?;
-    let escalation = escalation_of(db, &proposal_id)?.ok_or(Error::NotEscalated)?;
-    let close = escalation_close(&escalation, &info, params);
+    let (_escalation, esc_admitted_at) =
+        escalation_of(db, &proposal_id)?.ok_or(Error::NotEscalated)?;
+    let close = escalation_close(esc_admitted_at, &info, params);
 
-    let electorate = escalation_electorate(db, founders, &info, escalation.opened_at)?;
-    if !electorate.contains(&voter)
-        || cast_at < escalation.opened_at
-        || cast_at > close
-        || cast_at > now
+    let electorate = escalation_electorate(db, founders, &info, esc_admitted_at)?;
+    if !electorate.contains(&voter) || cast_at < esc_admitted_at || cast_at > close || cast_at > now
     {
         return Err(Error::NotEligible);
     }
@@ -276,34 +277,24 @@ fn decide(
 ) -> Result<Resolution> {
     let info = disputed_info(db, tx_id)?;
     let main_close = info.opened_at.saturating_add(params.window_seconds);
-    let (jury, jury_at, pool_len, majority) =
-        jury_view(db, founders, tx_id, &info, params, anchor, now)?;
+    let jury = jury_view(db, founders, tx_id, &info, params, anchor, now)?;
 
     // A validly-opened escalation governs the outcome; a bogus or inapplicable one
     // is ignored, and the jury path resumes.
-    if let Some(escalation) = escalation_of(db, tx_id)? {
+    if let Some((escalation, esc_admitted_at)) = escalation_of(db, tx_id)? {
         let by_party = escalation.initiator == info.sender || escalation.initiator == info.receiver;
-        if by_party
-            && escalation_applies(
-                &escalation,
-                &info,
-                pool_len,
-                majority,
-                jury,
-                jury_at,
-                params,
-            )
-        {
-            return decide_escalation(db, founders, tx_id, &info, &escalation, params, now);
+        if by_party && escalation_applies(&escalation, esc_admitted_at, &info, &jury, params) {
+            return decide_escalation(db, founders, tx_id, &info, esc_admitted_at, params, now);
         }
     }
 
-    match jury {
+    match jury.outcome {
         Some(outcome) => {
             // A ruling is not enacted until its appeal window closes, giving a party
             // the chance to escalate it — bounded, like everything, by the main
             // window.
-            let appeal_deadline = jury_at
+            let appeal_deadline = jury
+                .ruled_at
                 .expect("a terminal tally has a ruling time")
                 .saturating_add(params.appeal_window_seconds)
                 .min(main_close);
@@ -321,9 +312,21 @@ fn decide(
     }
 }
 
-/// Derives the jury outcome, when its ruling formed, the eligible-pool size, and the
-/// majority threshold — the shared view [`resolve`] and [`open_escalation`] both key
-/// off.
+/// The jury as of a given instant — the shared view [`resolve`] and
+/// [`open_escalation`] both key off: the tallied outcome (if a majority has formed),
+/// when that ruling formed, the eligible-pool size, and the majority threshold.
+struct JuryView {
+    /// The tallied outcome, once a majority of seated jurors agree.
+    outcome: Option<DisputeOutcome>,
+    /// When the ruling formed (the deciding verdict's instant), if it has.
+    ruled_at: Option<i64>,
+    /// How many members were eligible for the draw.
+    pool_len: usize,
+    /// Votes needed for a majority of the panel.
+    majority: usize,
+}
+
+/// Derives the [`JuryView`] for a dispute as of `now`.
 fn jury_view(
     db: &Database,
     founders: &[Address],
@@ -332,46 +335,49 @@ fn jury_view(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
-) -> Result<(Option<DisputeOutcome>, Option<i64>, usize, usize)> {
+) -> Result<JuryView> {
     let pool = eligible_pool(db, founders, info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let existing = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, now);
-    let jury = tally(&panel, params);
-    let jury_at = ruling_reached_at(&panel, &existing, params);
-    Ok((jury, jury_at, pool.len(), params.panel_size / 2 + 1))
+    Ok(JuryView {
+        outcome: tally(&panel, params),
+        ruled_at: ruling_reached_at(&panel, &existing, params),
+        pool_len: pool.len(),
+        majority: params.panel_size / 2 + 1,
+    })
 }
 
 /// Whether an escalation record is applicable given the dispute's state, judged at
-/// the record's own `opened_at` so the verdict is deterministic on replay.
+/// the escalation's **admission time** (`admitted_at`), never the initiator's signed
+/// `opened_at` (ADR-0022 §5). On the sole-writer station (ADR-0020) the admission
+/// time is fixed in the log entry, so this stays deterministic on local replay.
 fn escalation_applies(
     escalation: &EscalationRecord,
+    admitted_at: i64,
     info: &DisputedInfo,
-    pool_len: usize,
-    majority: usize,
-    jury: Option<DisputeOutcome>,
-    jury_at: Option<i64>,
+    jury: &JuryView,
     params: &DisputeParams,
 ) -> bool {
     let main_close = info.opened_at.saturating_add(params.window_seconds);
     match escalation.reason {
         // An appeal is valid only against a live jury ruling, and only inside that
         // ruling's appeal window.
-        EscalationReason::Appeal => match (jury, jury_at) {
+        EscalationReason::Appeal => match (jury.outcome, jury.ruled_at) {
             (Some(_), Some(ruled_at)) => {
                 let deadline = ruled_at
                     .saturating_add(params.appeal_window_seconds)
                     .min(main_close);
-                escalation.opened_at >= ruled_at && escalation.opened_at <= deadline
+                admitted_at >= ruled_at && admitted_at <= deadline
             }
             _ => false,
         },
         // A cannot-seat escalation is valid only while the pool genuinely cannot
         // reach a majority, inside the overall window.
         EscalationReason::CannotSeat => {
-            pool_len < majority
-                && escalation.opened_at >= info.opened_at
-                && escalation.opened_at <= main_close
+            jury.pool_len < jury.majority
+                && admitted_at >= info.opened_at
+                && admitted_at <= main_close
         }
     }
 }
@@ -384,17 +390,17 @@ fn decide_escalation(
     founders: &[Address],
     tx_id: &TransactionId,
     info: &DisputedInfo,
-    escalation: &EscalationRecord,
+    admitted_at: i64,
     params: &DisputeParams,
     now: i64,
 ) -> Result<Resolution> {
-    let close = escalation_close(escalation, info, params);
+    let close = escalation_close(admitted_at, info, params);
     if now < close {
         return Ok(Resolution::EscalationPending);
     }
-    let electorate = escalation_electorate(db, founders, info, escalation.opened_at)?;
+    let electorate = escalation_electorate(db, founders, info, admitted_at)?;
     let ballots = escalation_ballots(db, tx_id)?;
-    let tallied = count_escalation(&ballots, &electorate, params, escalation.opened_at, close);
+    let tallied = count_escalation(&ballots, &electorate, params, admitted_at, close);
     Ok(match tallied.terminal_outcome() {
         Some(DisputeOutcome::Upheld) => Resolution::EscalationUpheld,
         Some(DisputeOutcome::Rejected) => Resolution::EscalationRejected,
@@ -403,14 +409,11 @@ fn decide_escalation(
 }
 
 /// An escalation's effective close: its own sub-window, never past the dispute's
-/// overall window — the hard outer bound that guarantees termination.
-fn escalation_close(
-    escalation: &EscalationRecord,
-    info: &DisputedInfo,
-    params: &DisputeParams,
-) -> i64 {
-    escalation
-        .opened_at
+/// overall window — the hard outer bound that guarantees termination. Runs from the
+/// escalation's admission time (`admitted_at`), never the signed `opened_at`
+/// (ADR-0022 §5).
+fn escalation_close(admitted_at: i64, info: &DisputedInfo, params: &DisputeParams) -> i64 {
+    admitted_at
         .saturating_add(params.escalation_window_seconds)
         .min(info.opened_at.saturating_add(params.window_seconds))
 }

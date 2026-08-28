@@ -2638,6 +2638,12 @@ impl Core {
         req: &rpc::Request,
     ) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::DisputeResolveParams = parse_params(req)?;
+        // A targeted single-tx request surfaces its error to the caller; the
+        // unfiltered sweep skips-and-warns per dispute, exactly like the background
+        // resolution timer (`do_resolve_disputes`), so one un-resolvable dispute
+        // (e.g. a corrupt record yielding `MissingAdmission`) cannot block resolving
+        // every other one.
+        let targeted = params.tx_id.is_some();
         let ids = match &params.tx_id {
             Some(hex) => vec![parse_tx_id(hex)?],
             None => find_disputed(&self.db).map_err(dispute_err)?,
@@ -2649,7 +2655,7 @@ impl Core {
         let founders = self.dispute_founders()?;
         let mut resolved = Vec::with_capacity(ids.len());
         for id in ids {
-            let outcome = resolve(
+            match resolve(
                 &self.db,
                 &founders,
                 &station,
@@ -2657,12 +2663,16 @@ impl Core {
                 &disp_params,
                 &anchor,
                 now,
-            )
-            .map_err(dispute_err)?;
-            resolved.push(rpc::DisputeResolvedRow {
-                tx_id: id.0.to_string(),
-                resolution: resolution_name(outcome).to_string(),
-            });
+            ) {
+                Ok(outcome) => resolved.push(rpc::DisputeResolvedRow {
+                    tx_id: id.0.to_string(),
+                    resolution: resolution_name(outcome).to_string(),
+                }),
+                Err(e) if targeted => return Err(dispute_err(e)),
+                Err(e) => {
+                    tracing::warn!(tx = ?id, error = %e, "dispute_resolve sweep: skipping failed dispute");
+                }
+            }
         }
         ok(&rpc::DisputeResolveResult { resolved })
     }
@@ -4560,7 +4570,7 @@ fn ledger_err_pair(e: rrn_ledger::Error) -> (i32, String) {
 fn dispute_err(e: rrn_dispute::Error) -> rpc::RpcError {
     use rrn_dispute::Error::*;
     match e {
-        Storage(_) | Reputation(_) => internal(e),
+        Storage(_) | Reputation(_) | MissingAdmission => internal(e),
         Ledger(l) => ledger_err(l),
         NotDisputed | BadVerdict | NotSeated | AlreadyVoted | BadEscalation | BadBallot
         | NotEscalatable | AlreadyEscalated | NotEligible | NotEscalated => {

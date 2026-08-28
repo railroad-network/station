@@ -35,23 +35,54 @@ pub struct DisputedInfo {
     pub sender: Address,
     /// The transaction's receiver (also the confirmer under contest).
     pub receiver: Address,
-    /// Unix seconds when the dispute was opened — the instant standing is judged
-    /// at, and the start of the resolution window.
+    /// The admission-clock reading (`created_at`) of the dispute record — the
+    /// instant standing is judged at, and the start of the resolution window.
+    ///
+    /// This is the station's admission time for the dispute entry, **not** the
+    /// `opened_at` the raiser signs into their [`DisputeRecord`]. A party's
+    /// asserted timestamp is testimony and must never enter window, ordering, or
+    /// eligibility arithmetic (ADR-0022); the sortition draw and the resolution
+    /// window both key on this admitted value so a lying party cannot shift the
+    /// jury or the ballot window.
+    ///
+    /// [`DisputeRecord`]: rrn_ledger::dispute::DisputeRecord
     pub opened_at: i64,
 }
 
-/// Reads the parties and open time of a transaction that must currently be in the
-/// `Disputed` state.
+/// Reads the parties and admitted open time of a transaction that must currently
+/// be in the `Disputed` state.
+///
+/// `opened_at` is taken from the station's admission metadata for the dispute
+/// entry (ADR-0022), never from the `opened_at` the raiser signed — see
+/// [`DisputedInfo::opened_at`]. A `Disputed` state exists only because a dispute
+/// entry was admitted, which records `dispute_admitted_at`; its absence means a
+/// corrupt or partially-replayed log and is a hard error rather than a fall-back
+/// to the party's value.
 pub fn disputed_info(db: &Database, tx_id: &TransactionId) -> Result<DisputedInfo> {
     let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+    disputed_info_from_snapshot(&snapshot, tx_id)
+}
+
+/// [`disputed_info`] against a snapshot the caller already holds, so a caller in a
+/// loop (or one that has just derived a snapshot for other reasons) does not pay for
+/// a second full-log replay. The anchoring rule is identical — `opened_at` comes from
+/// the dispute entry's admission time, never the party's signed value.
+pub fn disputed_info_from_snapshot(
+    snapshot: &LedgerSnapshot,
+    tx_id: &TransactionId,
+) -> Result<DisputedInfo> {
     match snapshot.get(tx_id) {
-        Some(TransactionState::Disputed {
-            proposal, dispute, ..
-        }) => Ok(DisputedInfo {
-            sender: proposal.payload.sender,
-            receiver: proposal.payload.receiver,
-            opened_at: dispute.payload.opened_at,
-        }),
+        Some(TransactionState::Disputed { proposal, .. }) => {
+            let opened_at = snapshot
+                .admission(tx_id)
+                .and_then(|a| a.dispute_admitted_at)
+                .ok_or(Error::MissingAdmission)?;
+            Ok(DisputedInfo {
+                sender: proposal.payload.sender,
+                receiver: proposal.payload.receiver,
+                opened_at,
+            })
+        }
         _ => Err(Error::NotDisputed),
     }
 }
