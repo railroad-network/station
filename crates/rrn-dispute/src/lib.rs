@@ -140,6 +140,12 @@ pub enum Error {
     /// live dispute to seat a jury for or resolve.
     #[error("transaction is not in the Disputed state")]
     NotDisputed,
+    /// A `Disputed` transaction is missing its dispute admission-clock reading
+    /// (ADR-0022) — a corrupt or partially-replayed log. The draw and resolution
+    /// window key on the admitted time and refuse to fall back to the party's
+    /// signed `opened_at`.
+    #[error("disputed transaction is missing its admission-clock reading")]
+    MissingAdmission,
     /// A verdict's signature did not verify, or its signer is not the juror it
     /// names.
     #[error("verdict signature is invalid or does not match the named juror")]

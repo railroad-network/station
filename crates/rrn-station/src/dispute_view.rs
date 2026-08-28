@@ -24,7 +24,7 @@ use rrn_dispute::escalation::{
 };
 use rrn_dispute::panel::resolve_panel;
 use rrn_dispute::resolution::{preview, Resolution};
-use rrn_dispute::sortition::{draw_sequence, eligible_pool, sortition_seed, DisputedInfo};
+use rrn_dispute::sortition::{disputed_info, draw_sequence, eligible_pool, sortition_seed};
 use rrn_dispute::verdict::verdicts;
 use rrn_dispute::DisputeParams;
 use rrn_identity::address::Address;
@@ -181,12 +181,7 @@ pub fn dispute_view(
 ) -> rrn_dispute::Result<Option<DisputeDetail>> {
     let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
     let state = snapshot.get(tx_id);
-    let Some(
-        state @ TransactionState::Disputed {
-            proposal, dispute, ..
-        },
-    ) = state
-    else {
+    let Some(state @ TransactionState::Disputed { .. }) = state else {
         return Ok(None);
     };
     let summary = summarize(db, founders, tx_id, state, params, anchor, now)?;
@@ -201,12 +196,10 @@ pub fn dispute_view(
         })
         .collect();
 
-    // Re-derive the seated jury exactly as resolution does, for display.
-    let info = DisputedInfo {
-        sender: proposal.payload.sender,
-        receiver: proposal.payload.receiver,
-        opened_at: dispute.payload.opened_at,
-    };
+    // Re-derive the seated jury exactly as resolution does, for display — keyed
+    // on the admitted dispute time, never the party's signed `opened_at`
+    // (ADR-0022), so this view cannot drift from the resolution path.
+    let info = disputed_info(db, tx_id)?;
     let pool = eligible_pool(db, founders, &info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let cast = verdicts(db, tx_id)?;
@@ -283,11 +276,9 @@ fn summarize(
     let p = &proposal.payload;
     let d = &dispute.payload;
 
-    let info = DisputedInfo {
-        sender: p.sender,
-        receiver: p.receiver,
-        opened_at: d.opened_at,
-    };
+    // Keyed on the admitted dispute time, never the party's signed `opened_at`
+    // (ADR-0022), so the summary matches the resolution path exactly.
+    let info = disputed_info(db, tx_id)?;
     let pool = eligible_pool(db, founders, &info, info.opened_at, params)?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let cast = verdicts(db, tx_id)?;

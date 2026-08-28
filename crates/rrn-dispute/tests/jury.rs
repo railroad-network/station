@@ -129,13 +129,30 @@ fn established_members(db: &Database, n: usize, at: i64) -> Vec<Keypair> {
 
 // --- Dispute setup ------------------------------------------------------------
 
-/// Appends proposal → confirmation → dispute so `sender`→`receiver` is Disputed.
+/// Appends proposal → confirmation → dispute so `sender`→`receiver` is Disputed,
+/// admitting the dispute entry at `at`. The raiser's signed `opened_at` also reads
+/// `at`, matching the admission time.
 fn append_disputed(
     db: &Database,
     sender: &Keypair,
     receiver: &Keypair,
     amount: i64,
     at: i64,
+) -> TransactionId {
+    append_disputed_admitted(db, sender, receiver, amount, at, at)
+}
+
+/// Like [`append_disputed`], but lets the raiser's signed `opened_at`
+/// (`party_opened_at`) diverge from the station's admission time (`admit_at`) for
+/// the dispute entry. The sortition draw and resolution window must key on
+/// `admit_at`, never on `party_opened_at` (ADR-0022).
+fn append_disputed_admitted(
+    db: &Database,
+    sender: &Keypair,
+    receiver: &Keypair,
+    amount: i64,
+    admit_at: i64,
+    party_opened_at: i64,
 ) -> TransactionId {
     let mut log = AppendLog::new(db);
     let proposal = TransactionProposal::new(
@@ -155,7 +172,7 @@ fn append_disputed(
             TransactionConfirmation {
                 proposal_id: id,
                 confirmer: addr(receiver),
-                confirmed_at: at,
+                confirmed_at: admit_at,
             },
             receiver,
         ),
@@ -167,9 +184,10 @@ fn append_disputed(
         raiser: addr(sender),
         reason: "goods never arrived".into(),
         evidence_hash: None,
-        opened_at: at,
+        opened_at: party_opened_at,
     };
-    log.append(SignedDispute::sign(dispute, sender), 0).unwrap();
+    log.append(SignedDispute::sign(dispute, sender), admit_at)
+        .unwrap();
     id
 }
 
@@ -294,6 +312,48 @@ fn the_draw_is_deterministic_and_covers_the_pool() {
     assert_eq!(seq1.len(), members.len());
     for m in &members {
         assert!(seq1.contains(&addr(m)));
+    }
+}
+
+#[test]
+fn party_opened_at_is_ignored_for_the_draw_and_window() {
+    // The raiser signs an `opened_at` far from the truth in both directions; the
+    // station admits the dispute at the real time `T`. `disputed_info` must report
+    // the admitted time, and the sortition draw must be identical to an honest
+    // dispute admitted at the same instant — a lying party cannot shift the jury
+    // or the resolution window (ADR-0022).
+    for lie in [T - 5_000_000, T + 5_000_000] {
+        let honest = fresh_db();
+        let liar = fresh_db();
+        let members: Vec<Keypair> = (0..5).map(|_| Keypair::generate()).collect();
+        for db in [&honest, &liar] {
+            for m in &members {
+                earn_raw_standing(db, m, T);
+            }
+            for i in 0..members.len() {
+                append_vouch(db, &members[(i + 1) % members.len()], &addr(&members[i]), T);
+            }
+        }
+        let (alice, bob) = (Keypair::generate(), Keypair::generate());
+
+        // Same parties, same amount, same admission time; only the signed
+        // `opened_at` differs between the two logs.
+        let tx_honest = append_disputed(&honest, &alice, &bob, 300, T);
+        let tx_liar = append_disputed_admitted(&liar, &alice, &bob, 300, T, lie);
+        assert_eq!(tx_honest, tx_liar, "same parties/amount/nonce ⇒ same tx id");
+
+        let info = disputed_info(&liar, &tx_liar).unwrap();
+        assert_eq!(
+            info.opened_at, T,
+            "opened_at must be the admitted time, not the party's signed lie ({lie})"
+        );
+
+        let p = params();
+        assert_eq!(
+            sequence(&liar, &tx_liar, &p),
+            sequence(&honest, &tx_honest, &p),
+            "the draw must not depend on the party's signed opened_at ({lie})"
+        );
     }
 }
 

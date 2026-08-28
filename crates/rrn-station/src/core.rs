@@ -4560,7 +4560,7 @@ fn ledger_err_pair(e: rrn_ledger::Error) -> (i32, String) {
 fn dispute_err(e: rrn_dispute::Error) -> rpc::RpcError {
     use rrn_dispute::Error::*;
     match e {
-        Storage(_) | Reputation(_) => internal(e),
+        Storage(_) | Reputation(_) | MissingAdmission => internal(e),
         Ledger(l) => ledger_err(l),
         NotDisputed | BadVerdict | NotSeated | AlreadyVoted | BadEscalation | BadBallot
         | NotEscalatable | AlreadyEscalated | NotEligible | NotEscalated => {
