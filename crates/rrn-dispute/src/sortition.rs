@@ -60,6 +60,17 @@ pub struct DisputedInfo {
 /// to the party's value.
 pub fn disputed_info(db: &Database, tx_id: &TransactionId) -> Result<DisputedInfo> {
     let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+    disputed_info_from_snapshot(&snapshot, tx_id)
+}
+
+/// [`disputed_info`] against a snapshot the caller already holds, so a caller in a
+/// loop (or one that has just derived a snapshot for other reasons) does not pay for
+/// a second full-log replay. The anchoring rule is identical — `opened_at` comes from
+/// the dispute entry's admission time, never the party's signed value.
+pub fn disputed_info_from_snapshot(
+    snapshot: &LedgerSnapshot,
+    tx_id: &TransactionId,
+) -> Result<DisputedInfo> {
     match snapshot.get(tx_id) {
         Some(TransactionState::Disputed { proposal, .. }) => {
             let opened_at = snapshot

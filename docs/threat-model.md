@@ -716,13 +716,24 @@ transition; the derivability of all state from the log.
   window — the ADR-0022 §5 forbidden pattern. A `Disputed` state whose admission
   metadata is absent (a corrupt or partially-replayed log) is a hard error
   (`Error::MissingAdmission`), never a silent fall-back to the party value.
-  Regression coverage: `jury.rs::party_opened_at_is_ignored_for_the_draw_and_window`
-  drives a dispute whose signed `opened_at` diverges from admission in both
-  directions and asserts the draw and window are unchanged. The residual is now
-  the same station-clock trust root as the settlement windows above, not a
-  per-member timestamp attack; verdict determinism holds because the sole-writer
-  station (ADR-0020) computes the draw from its own local admission metadata and
-  enacts the outcome through station-signed settlement/cancellation records.
+  The **escalation sub-path is anchored the same way**: an `EscalationRecord`'s
+  own signed `opened_at` no longer enters any arithmetic. `escalation_of` returns
+  the record paired with its log entry's admission time (`created_at`), and
+  applicability (`escalation_applies`), the sub-window (`escalation_close`), the
+  electorate snapshot (`escalation_electorate`), and the ballot-counting window
+  (`count_escalation`) all key on that admitted instant — at open time this is the
+  `now` the record is appended at, so the two coincide. An initiator therefore
+  cannot backdate an escalation to grind the electorate snapshot or move the vote
+  window either. Regression coverage:
+  `jury.rs::party_opened_at_is_ignored_for_the_draw_and_window` (dispute draw and
+  window, signed `opened_at` diverging in both directions) and
+  `jury.rs::escalation_opened_at_is_ignored_for_the_window_and_electorate` (a
+  backdated escalation whose ballot lands outside the lie's window but inside the
+  admitted one still counts). The residual is now the same station-clock trust
+  root as the settlement windows above, not a per-member timestamp attack; verdict
+  determinism holds because the sole-writer station (ADR-0020) computes the draw
+  and the escalation tally from its own local admission metadata and enacts the
+  outcome through station-signed settlement/cancellation records.
 
 #### Elevation of privilege — unbounded debt (ADR-0018)
 

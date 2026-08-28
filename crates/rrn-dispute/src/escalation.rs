@@ -175,8 +175,18 @@ impl TryFrom<CBOR> for EscalationBallot {
 
 /// The open escalation on `tx_id`, if any — the **first** one appended (a dispute
 /// escalates at most once; the append gate refuses a second, and replay keeps the
-/// first regardless).
-pub fn escalation_of(db: &Database, tx_id: &TransactionId) -> Result<Option<EscalationRecord>> {
+/// first regardless) — paired with its **admission time** (the log entry's
+/// `created_at`).
+///
+/// The admission time, not the initiator's signed `opened_at`, is what applicability,
+/// the electorate snapshot, and the sub-window key on (ADR-0022 §5): a party's
+/// asserted timestamp is testimony and must never enter window, ordering, or
+/// eligibility arithmetic. The signed `opened_at` rides along on the returned record
+/// for display only.
+pub fn escalation_of(
+    db: &Database,
+    tx_id: &TransactionId,
+) -> Result<Option<(EscalationRecord, i64)>> {
     let log = AppendLog::new(db);
     for entry in log.iter_from(1) {
         let entry = entry?;
@@ -184,7 +194,7 @@ pub fn escalation_of(db: &Database, tx_id: &TransactionId) -> Result<Option<Esca
             continue;
         };
         if esc.proposal_id == *tx_id {
-            return Ok(Some(esc));
+            return Ok(Some((esc, entry.created_at)));
         }
     }
     Ok(None)
@@ -216,7 +226,8 @@ pub fn escalation_ballots(
 }
 
 /// The electorate eligible to vote in an escalation, snapshotted as of `at` (the
-/// escalation's open time) — the governance electorate (established members, plus
+/// escalation's **admission** time, never the initiator's signed `opened_at`;
+/// ADR-0022 §5) — the governance electorate (established members, plus
 /// the genesis `founders` while the community is in bootstrap grace, per
 /// ADR-0015) minus the two parties, who never vote on their own dispute. Vouchers
 /// are *not* recused: unlike the jury, this is the whole community ruling.

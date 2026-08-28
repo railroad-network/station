@@ -681,6 +681,56 @@ fn cannot_seat_escalation_upheld_by_the_electorate_voids_the_transfer() {
 }
 
 #[test]
+fn escalation_opened_at_is_ignored_for_the_window_and_electorate() {
+    // The initiator signs an `opened_at` far in the past (T - 4000), but the station
+    // admits the escalation at T + 5. Both the sub-window and the ballot-counting
+    // window must run from the admission time, never the signed lie (ADR-0022 §5).
+    //
+    // The ballot is cast at T + 2000: inside the admission-anchored window
+    // [T+5, T+5+5000], but OUTSIDE the window the lie would imply
+    // ([T-4000, T-4000+5000] = [T-4000, T+1000]). If the escalation still keyed on
+    // the signed `opened_at`, this ballot would fall outside the window and the
+    // escalation would lapse; anchored on admission, it is counted and upholds.
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+    let station = Keypair::generate();
+
+    open_escalation(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T - 4000),
+        T + 5, // admission time
+    )
+    .unwrap();
+    append_escalation_ballot(
+        &db,
+        &[],
+        &p,
+        signed_ballot(&tx, &lone, true, T + 2000),
+        T + 2000,
+    )
+    .unwrap();
+
+    let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 6000).unwrap();
+    assert_eq!(
+        outcome,
+        Resolution::EscalationUpheld,
+        "the ballot must be counted against the admission-anchored window, not the signed opened_at"
+    );
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    assert!(matches!(
+        snapshot.get(&tx),
+        Some(TransactionState::Cancelled {
+            reason: CancelReason::DisputeUpheld,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn cannot_seat_escalation_rejected_by_the_electorate_settles() {
     let db = fresh_db();
     let (alice, bob, lone, tx) = cannot_seat_setup(&db);
