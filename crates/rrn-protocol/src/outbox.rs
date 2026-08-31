@@ -10,13 +10,16 @@
 //! # The embedded record
 //!
 //! The wrapped record travels as three fields — [`record_signer`], [`record_sig`],
-//! and [`record_bytes`] — which are the signer, signature, and *already-signed
-//! canonical bytes* of the carried record, mirroring
-//! [`rrn_storage::log::StoredPayload`] field-for-field but as explicit CBOR map
-//! entries rather than a packed blob. They are never re-serialized and never
-//! re-signed: [`record_hash`](OutboxEntry::record_hash) is the Blake3 of
-//! `record_bytes`, the same content hash the log admits under, so receipts,
-//! dedup, and admission all speak one identifier.
+//! and [`record_bytes`] — the signer, signature, and *canonical signed bytes* of
+//! the carried record, mirroring [`rrn_storage::log::StoredPayload`]
+//! field-for-field but as explicit CBOR map entries rather than a packed blob.
+//! The signer and signature are copied **verbatim** and never regenerated;
+//! `record_bytes` reproduces the payload's canonical dCBOR, which — because that
+//! encoding is deterministic (ADR-0002) — is byte-identical to what the author
+//! signed, and is thereafter carried and hashed verbatim. So
+//! [`record_hash`](OutboxEntry::record_hash) is the Blake3 of `record_bytes`, the
+//! same content hash the log admits under, and receipts, dedup, and admission all
+//! speak one identifier.
 //!
 //! [`record_signer`]: OutboxEntry::record_signer
 //! [`record_sig`]: OutboxEntry::record_sig
