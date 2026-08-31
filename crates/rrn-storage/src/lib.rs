@@ -19,6 +19,7 @@ pub mod db;
 pub mod listings_index;
 pub mod log;
 pub mod migrations;
+pub mod outbox;
 pub mod replay;
 pub mod reputation_snapshot;
 
@@ -44,6 +45,28 @@ pub enum Error {
         /// What specifically did not line up.
         reason: String,
     },
+    /// An outbox append presented a `position` that is not the next in the
+    /// author's chain (`head.position + 1`, or `0` for an empty chain).
+    #[error("outbox position gap: expected {expected}, got {got}")]
+    PositionGap {
+        /// The position the next entry must occupy.
+        expected: u64,
+        /// The position actually presented.
+        got: u64,
+    },
+    /// An outbox append presented a `prev_hash` that does not equal the author's
+    /// current head `entry_hash` (all-zero for an empty chain).
+    #[error("outbox chain mismatch: prev_hash does not link to head")]
+    ChainMismatch,
+    /// An outbox append presented a `record_hash` already stored for this author
+    /// — the same carried record cannot occupy two positions in one chain.
+    #[error("outbox duplicate record for author")]
+    DuplicateRecord,
+    /// A delivery receipt reported an outcome for a record that conflicts with an
+    /// outcome already recorded for it — a station cannot legitimately change its
+    /// answer for the same `record_hash`.
+    #[error("outbox conflicting ack for record")]
+    ConflictingAck,
 }
 
 /// Convenience alias for storage results.
