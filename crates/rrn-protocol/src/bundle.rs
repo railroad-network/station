@@ -191,8 +191,8 @@ impl Bundle {
     /// Decodes and structurally validates a bundle from its encoded bytes.
     ///
     /// Refuses, in order: an input over [`MAX_BUNDLE_BYTES`]; non-canonical or
-    /// mis-shaped CBOR; a wrong `v`; a missing/mistyped `assembled_at`; more than
-    /// [`MAX_BUNDLE_ENTRIES`] entries; a garbage (non-decodable) entry; and a
+    /// mis-shaped CBOR; a wrong `v`; more than [`MAX_BUNDLE_ENTRIES`] entries; a
+    /// missing/mistyped `assembled_at`; a garbage (non-decodable) entry; and a
     /// bundle whose *same-author* entries are out of position order. A gap in one
     /// author's positions is **legal** (partial carriage), and an *equal*
     /// position is legal too — both sides of an outbox fork, or a byte-identical
@@ -225,12 +225,6 @@ impl Bundle {
         {
             return Err(Error::Cbor("unsupported bundle version".into()));
         }
-        // Read the cheap scalar before walking the entries, so a bundle whose
-        // only fault is a missing/mistyped `assembled_at` fails fast rather than
-        // after decoding up to MAX_BUNDLE_ENTRIES bodies.
-        let assembled_at = map
-            .extract::<&str, i64>("assembled_at")
-            .map_err(|e| Error::Cbor(e.to_string()))?;
         let raw_entries = match map
             .extract::<&str, CBOR>("entries")
             .map_err(|e| Error::Cbor(e.to_string()))?
@@ -240,13 +234,21 @@ impl Bundle {
             _ => return Err(Error::Cbor("bundle entries is not an array".into())),
         };
         // Count cap first, so a bundle stuffed with tens of thousands of tiny
-        // envelopes is refused before any of them is decoded.
+        // envelopes is refused before any of them is decoded — and so a bundle
+        // that is *both* over-count and malformed elsewhere still reports the
+        // count fault, not a later one.
         if raw_entries.len() > MAX_BUNDLE_ENTRIES {
             return Err(Error::TooManyEntries {
                 found: raw_entries.len(),
                 max: MAX_BUNDLE_ENTRIES,
             });
         }
+        // Then the cheap scalar, still before the per-entry body decode, so a
+        // bundle whose only remaining fault is a missing/mistyped `assembled_at`
+        // fails fast rather than after decoding up to MAX_BUNDLE_ENTRIES bodies.
+        let assembled_at = map
+            .extract::<&str, i64>("assembled_at")
+            .map_err(|e| Error::Cbor(e.to_string()))?;
         let mut entries = Vec::with_capacity(raw_entries.len());
         for item in raw_entries {
             // Each element is a byte string wrapping the envelope's canonical
