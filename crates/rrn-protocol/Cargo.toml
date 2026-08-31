@@ -5,5 +5,23 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Delay-tolerant submission wire formats for Railroad Network: outbox chains, carriage bundles, and station delivery receipts (ADR-0020)."
 
 [dependencies]
+# Lower layers, path + version (not a `*` wildcard, which cargo-deny rejects).
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# Canonical CBOR for every record's signed bytes (ADR-0002); the native
+# `Into<CBOR>` / `TryFrom<CBOR>` mapping, same as the other crates.
+dcbor = "0.25"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+# Byte-stable cross-platform fixtures (outbox entry / bundle / receipt) for the
+# mobile repo to verify byte-identically; JSON convention shared with the other
+# crates' `cross_platform_*` vectors.
+serde_json = "1"
+hex = "0.4"

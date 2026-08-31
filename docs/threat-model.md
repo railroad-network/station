@@ -24,9 +24,11 @@ in the named crate/module and is covered by a unit or property test. If you find
 a claim here that the code does not support, that discrepancy is itself a
 finding — report it.
 
-The one deliberately-empty section is `rrn-protocol`, whose federation surface
-is a Phase 0 stub; its threats are Phase 1+ work and are marked as such rather
-than guessed at.
+The `rrn-protocol` section was deliberately empty through Phase 0–1, when the
+crate was a stub. As of Phase 2 (T2.2.1) it covers the delay-tolerant-submission
+wire layer (outbox chains, bundles, delivery receipts — ADR-0020) as built. The
+remaining *federation* surface (cross-community forks, Sybil federation, treaty
+abuse) is Phase 3 work and is still marked as such rather than guessed at.
 
 ## Scope
 
@@ -813,16 +815,116 @@ it.
 
 ### `rrn-protocol`
 
-**Intentionally unpopulated in Phase 0.** This crate contains only stubs — there
-is no wire format, no cross-community sync, no treaty or gossip *protocol* to
-analyze yet (the Phase 0 two-station demo's minimal gossip lives in
-`rrn-station`, and its threats are covered in that section). The federation
-attack surface — eclipse attacks, ledger forks across communities, Sybil
-federation, treaty abuse, transport authentication and encryption — is real but
-belongs to the design it will implement, and is **out of scope for the Phase 0
-audit** (see [Scope](#scope) and [Known limitations](#known-limitations)). A
-full STRIDE section per protocol message is added as the protocol is built in
-Phase 1+, so it is not pre-filled with speculation here.
+> **Phase 2 (T2.2.1).** The crate stops being a stub: it now carries the
+> delay-tolerant-submission *wire layer* of ADR-0020 — per-device **outbox
+> chains**, carriage **bundles**, and station **delivery receipts**
+> (`docs/spec/dtn-bundles.md`). This section covers that wire layer as built.
+> This is pure data + validation (no storage, ingest, or networking — those are
+> T2.2.2/T2.2.3); the *federation* attack surface (cross-community forks, Sybil
+> federation, treaty abuse) remains Phase 3 work and is not pre-filled here.
+
+The layer moves signed member commitments store-and-forward to the community's
+single-writer station over untrusted carriers (LoRa, SMS, paper, another
+member's phone). The station remains the sole admission point (ADR-0020), so
+these records are **carriage and evidence, never a second ledger**: every
+integrity and authenticity guarantee rests on the `SignedPayload` signatures of
+the carried records and the outbox entries, exactly as at the live front door —
+a carrier is a dumb pipe (ADR-0008/0013).
+
+**Assets:** the authenticity of each carried record (unchanged from live
+submission — it is the same signed bytes); the tamper-evidence of a device's
+outbox chain; the non-repudiable evidence of an outbox fork (device-owner
+equivocation, ADR-0021); the one-identifier property that a carried record's
+`record_hash` equals the hash the log admits under; the availability of the
+ingest path against oversized carriage.
+
+#### Spoofing — forging a carried record or an outbox entry
+
+- *Threat:* a courier (or anyone along the carriage path) injects a bundle
+  claiming a record a member never signed, or an outbox entry attributed to a
+  device that did not author it.
+- *Mitigation:* an `OutboxEntry` is a `SignedPayload<OutboxEntry>`; `validate`
+  checks the outer signature, requires `author == outer signer` (the chain owner
+  is the signer — `Error::AuthorSignerMismatch`), and verifies the *embedded*
+  record signature (`record_sig` by `record_signer` over `record_bytes` —
+  `Error::BadEmbeddedSignature`). The carried record is never re-signed; its
+  original signature travels verbatim and is checked at ingest exactly as a live
+  record's is. A bundle itself is unsigned and grants no authority — forging one
+  can at most carry records that still have to pass `validate`.
+- *Residual risk:* anyone holding a device's secret key acts as that device —
+  non-repudiation rests on the `rrn-crypto` key-secrecy assumption, unchanged
+  from the live path.
+
+#### Tampering — altering a carried record, a chain link, or a bundle
+
+- *Threat:* a carrier edits `record_bytes`, rewrites an entry's `prev_hash` to
+  hide a gap, or reorders/edits a bundle's entries.
+- *Mitigation:* editing `record_bytes` breaks both the embedded signature and
+  the outer entry signature (the body covers `record_bytes`), so the entry fails
+  `validate`. Each entry chains by `entry_hash` (Blake3 of the entry body), and
+  `validate_chain` requires sequential positions and each `prev_hash` linking to
+  the prior `entry_hash` — an edited or dropped mid-chain entry breaks the link
+  (`Error::ChainBroken`). A bundle is a dumb carrier: `Bundle::decode` refuses
+  same-author entries out of position order (`Error::EntriesOutOfOrder`, a cheap
+  courier-tamper tripwire) and a garbage entry, but any surviving tamper only
+  produces records that fail `validate` at ingest.
+- *Residual risk:* a courier can still *drop* an entry or a whole bundle
+  (suppression); the chain makes the gap detectable to the station and the
+  member, but delivery itself is best-effort (ADR-0020 accepts this — delayed,
+  and re-sendable).
+
+#### Repudiation — and its inverse, provable equivocation
+
+- *Threat:* a member denies authoring a record carried on their behalf; or,
+  conversely, a member double-spends offline by signing two conflicting records
+  at the same outbox position.
+- *Mitigation:* an outbox chain is a signed, hash-linked, per-device authorship
+  record — each entry is self-attributed and position-ordered. Two valid entries
+  by one author at the same `position` with different `entry_hash` are an
+  **outbox fork** (`is_fork`): a signed, self-incriminating pair that is the
+  evidence primitive ADR-0021/T2.3.3 turn into an automatic dispute. Same
+  position *and* same hash is a duplicate, not a fork (idempotent re-carriage).
+- *Residual risk:* fork *detection* here is the primitive only; the consequence
+  (dispute, reputation input) is T2.3.3. A member who never lets an entry reach
+  the station leaves no fork evidence — but also achieves no admission.
+
+#### Information disclosure
+
+- *Threat:* bundles carried by outside couriers expose the community's
+  transaction graph (who paid whom, memos) in cleartext.
+- *Mitigation:* the carried records were already log-public *within the
+  community*, so a bundle leaks nothing new to a community member. Bundles are
+  cleartext in T2.2.1; sealing a bundle to the station key (privacy against an
+  outside courier, ADR-0008 sealed envelopes) is a noted future upgrade
+  (`dtn-bundles.md` §6), deliberately out of scope here.
+- *Residual risk:* an outside courier physically holding a cleartext bundle sees
+  its contents. Accepted for T2.2.1; the sealing upgrade path is recorded.
+
+#### Denial of service
+
+- *Threat:* a hostile carrier submits a huge or pathological bundle to exhaust
+  the station's memory or CPU at decode.
+- *Mitigation:* `Bundle::decode` enforces documented bounds — `MAX_BUNDLE_BYTES`
+  (4 MiB, checked before the CBOR is walked) and `MAX_BUNDLE_ENTRIES` (512) —
+  and refuses non-canonical CBOR (dCBOR rejects non-shortest integers,
+  indefinite lengths, unsorted keys). A receipt's refusal reason is a closed set
+  of bounded slugs (`RefusalReason`), never attacker-controlled free text.
+- *Residual risk:* a carrier can still present many separate in-bound bundles;
+  rate-limiting and admission back-pressure at the ingest edge are T2.2.3/T2.4.1,
+  not this pure-data layer.
+
+#### Elevation of privilege
+
+- *Threat:* a carrier gains authority by relaying.
+- *Mitigation:* none is available to gain — a carrier is a dumb pipe. Carriage
+  confers no admission authority; only a signed record passing the station's
+  front-door checks is admitted, and only the station writes the log (ADR-0020).
+  A delivery receipt is transport state, never appended to the community log, so
+  it cannot be replayed into ledger state.
+
+**Residual / out of scope:** transport-level authentication and encryption
+(carrier framing is T2.2.5; Reticulum sidecar T2.6.x), ingest rate-limiting and
+persistence (T2.2.3/T2.4.1), and the federation surface (Phase 3).
 
 ### `rrn-station` / `rrn-cli`
 

@@ -1950,6 +1950,17 @@ dependencies = [
 [[package]]
 name = "rrn-protocol"
 version = "0.1.0"
+dependencies = [
+ "dcbor",
+ "hex",
+ "proptest",
+ "rrn-crypto",
+ "rrn-identity",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
 
 [[package]]
 name = "rrn-reputation"
