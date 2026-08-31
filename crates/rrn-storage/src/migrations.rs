@@ -44,6 +44,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "log_content_hash_index",
         sql: include_str!("../migrations/0004_log_content_hash_index.sql"),
     },
+    Migration {
+        version: 5,
+        name: "outbox_entries",
+        sql: include_str!("../migrations/0005_outbox_entries.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -138,6 +143,7 @@ mod tests {
             "kv",
             "listings_index",
             "log_entries",
+            "outbox_entries",
             "reputation_snapshots",
             "transactions",
         ]
@@ -149,6 +155,8 @@ mod tests {
         let expected_indexes: BTreeSet<String> = [
             "idx_attestations_signer",
             "idx_log_entries_content_hash",
+            "idx_outbox_pending",
+            "idx_outbox_record",
             "idx_transactions_receiver",
             "idx_transactions_sender",
             "idx_transactions_state",

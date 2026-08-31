@@ -315,6 +315,34 @@ of committed writes.
   A replica's re-stamped `created_at` values are cosmetic; any consumer needing
   authoritative times reads the station-signed records, not a replica's log.
 
+#### Tampering / Repudiation — the outbox store (ADR-0020)
+
+- *Threat:* the per-author outbox store (`outbox`) carries a device's own signed
+  records store-and-forward to the station. A courier or a filesystem attacker
+  could try to drop, reorder, or duplicate carried entries, or the store could be
+  fed an entry that breaks its chain — masking suppression of a member's records.
+- *Mitigation:* each outbox row records the entry's `entry_hash` and `prev_hash`,
+  and `OutboxStore::append` enforces *structural* chain integrity before writing —
+  positions must be dense from the chain head (`PositionGap`) and `prev_hash` must
+  link to the head's `entry_hash` (`ChainMismatch`), so a gap or a broken link is
+  refused at the store boundary and a dropped entry is detectable downstream.
+  A carried record cannot occupy two positions in one chain (`DuplicateRecord`,
+  backed by the `(author, record_hash)` unique index). Authenticity is *not* this
+  store's job: it holds opaque, already-validated envelope bytes, and the caller
+  (a layer with `rrn-protocol`) verifies the outer and embedded signatures via
+  `rrn_protocol::outbox::validate` before handing over columns — the layering
+  keeps `rrn-storage` below identity/protocol. Delivery-receipt outcomes are
+  applied idempotently, and a station reporting a *different* outcome for a record
+  it already answered trips `ConflictingAck` — a tamper/equivocation tripwire the
+  ADR-0021 equivocation work (T2.3.3) builds on.
+- *Residual risk:* outbox rows are **local plaintext state**, the same posture as
+  the log — a seized or imaged device discloses the carried records and the social
+  graph they imply, and a local writer with direct SQL access can still corrupt
+  rows (caught by the validating caller on read, not prevented at the row level).
+  At-rest encryption for this local state is deferred to the seizure-resistance
+  work (T2.9.x, pending ADR-0024). The `authored_at` column is party testimony
+  (ADR-0022 §3) and is never load-bearing for any window or ordering decision.
+
 #### Information disclosure
 
 - *Threat:* the SQLite file is read by anyone with filesystem access, exposing
