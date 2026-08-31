@@ -205,8 +205,13 @@ impl<'a> OutboxStore<'a> {
     pub fn pending(&self, author: &[u8; 32], limit: Option<usize>) -> Result<Vec<OutboxRow>> {
         let conn = self.db.conn();
         // SQLite treats a negative LIMIT as unbounded, which is exactly the
-        // "no cap" case — so map `None` to -1 rather than branching the SQL.
-        let cap: i64 = limit.map(|n| n as i64).unwrap_or(-1);
+        // "no cap" case — so map `None` to -1 rather than branching the SQL. A
+        // `usize` beyond `i64::MAX` saturates to `i64::MAX` (still a positive
+        // cap), never wrapping negative into an accidental "unbounded".
+        let cap: i64 = match limit {
+            Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
+            None => -1,
+        };
         let mut stmt = conn.prepare(
             "SELECT author, position, entry_hash, prev_hash, record_hash, \
              record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason \
@@ -220,11 +225,14 @@ impl<'a> OutboxStore<'a> {
     /// Applies one delivery-receipt outcome to the row for `(author,
     /// record_hash)`.
     ///
-    /// Idempotent: re-applying the *same* outcome to an already-acked row is
-    /// `Ok(true)` and changes nothing. A *conflicting* outcome for an
-    /// already-acked row is [`Error::ConflictingAck`] — a station cannot
-    /// legitimately change its answer for one record. `refusal_reason` is stored
-    /// only for [`AckOutcome::Refused`]; it is ignored for other outcomes.
+    /// Idempotent: re-applying the *identical* answer (same outcome, and for a
+    /// refusal the same reason slug) to an already-acked row is `Ok(true)` and
+    /// changes nothing. Any *different* answer for an already-acked row — a
+    /// different outcome, or a [`AckOutcome::Refused`] with a different reason —
+    /// is [`Error::ConflictingAck`]: a station cannot legitimately change its
+    /// answer for one record, and a change is a tamper/equivocation tripwire.
+    /// `refusal_reason` is stored only for [`AckOutcome::Refused`]; it is dropped
+    /// for other outcomes.
     ///
     /// Returns `false` when no row matches `record_hash` (a receipt for someone
     /// else's record — ignore it upstream); `true` when the row was found and is
@@ -237,39 +245,42 @@ impl<'a> OutboxStore<'a> {
         seq: Option<u64>,
         reason: Option<&str>,
     ) -> Result<bool> {
+        // A single read; under the single-writer model no transaction is needed,
+        // and the unknown / idempotent / conflict paths then do no write at all
+        // (no wasted write-transaction on the receipt-replay hot path).
         let conn = self.db.conn();
-        let tx = conn.unchecked_transaction()?;
-
-        let existing: Option<Option<String>> = tx
+        let existing: Option<(Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT acked_outcome FROM outbox_entries \
+                "SELECT acked_outcome, refusal_reason FROM outbox_entries \
                  WHERE author = ?1 AND record_hash = ?2",
                 rusqlite::params![author.as_slice(), record_hash.as_slice()],
-                |row| row.get::<_, Option<String>>(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
 
-        let current = match existing {
+        let (prior_outcome, prior_reason) = match existing {
             None => return Ok(false), // unknown record_hash
-            Some(current) => current,
+            Some(cols) => cols,
         };
 
-        if let Some(prior) = current {
-            // Already acked: the same outcome is an idempotent no-op; a
-            // different one is an illegitimate change of answer.
+        // The reason we would persist for this call — kept only for a refusal.
+        let stored_reason = match outcome {
+            AckOutcome::Refused => reason,
+            _ => None,
+        };
+
+        if let Some(prior) = prior_outcome {
+            // Already acked. Re-applying the identical answer is an idempotent
+            // no-op; anything else is the station changing its answer.
             let prior = AckOutcome::from_column(&prior)?;
-            if prior == outcome {
-                tx.commit()?;
+            if prior == outcome && prior_reason.as_deref() == stored_reason {
                 return Ok(true);
             }
             return Err(Error::ConflictingAck);
         }
 
-        let stored_reason = match outcome {
-            AckOutcome::Refused => reason,
-            _ => None,
-        };
-        tx.execute(
+        // Pending → record the outcome. A lone UPDATE is atomic on its own.
+        conn.execute(
             "UPDATE outbox_entries \
              SET acked_seq = ?3, acked_outcome = ?4, refusal_reason = ?5 \
              WHERE author = ?1 AND record_hash = ?2",
@@ -281,7 +292,6 @@ impl<'a> OutboxStore<'a> {
                 stored_reason,
             ],
         )?;
-        tx.commit()?;
         Ok(true)
     }
 
@@ -742,6 +752,55 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, Error::ConflictingAck), "{err:?}");
+    }
+
+    #[test]
+    fn apply_ack_refusal_reason_participates_in_idempotency() {
+        let db = fresh_db();
+        let mut store = OutboxStore::new(&db);
+        let mut c = Chain::new(0);
+        c.push(&mut store).unwrap();
+
+        // Refuse with a reason, then re-apply the *identical* refusal — no-op.
+        assert!(store
+            .apply_ack(
+                &c.author,
+                &c.record_hash_at(0),
+                AckOutcome::Refused,
+                Some(1),
+                Some("debt_floor"),
+            )
+            .unwrap());
+        assert!(store
+            .apply_ack(
+                &c.author,
+                &c.record_hash_at(0),
+                AckOutcome::Refused,
+                Some(1),
+                Some("debt_floor"),
+            )
+            .unwrap());
+        assert_eq!(
+            store.all_rows(&c.author).unwrap()[0].refusal_reason,
+            Some("debt_floor".to_string())
+        );
+
+        // A *different* refusal reason for the same record is a changed answer.
+        let err = store
+            .apply_ack(
+                &c.author,
+                &c.record_hash_at(0),
+                AckOutcome::Refused,
+                Some(1),
+                Some("expired"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ConflictingAck), "{err:?}");
+        // The originally-stored reason is untouched by the rejected change.
+        assert_eq!(
+            store.all_rows(&c.author).unwrap()[0].refusal_reason,
+            Some("debt_floor".to_string())
+        );
     }
 
     #[test]

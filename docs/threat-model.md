@@ -326,8 +326,12 @@ of committed writes.
   positions must be dense from the chain head (`PositionGap`) and `prev_hash` must
   link to the head's `entry_hash` (`ChainMismatch`), so a gap or a broken link is
   refused at the store boundary and a dropped entry is detectable downstream.
-  A carried record cannot occupy two positions in one chain (`DuplicateRecord`,
-  backed by the `(author, record_hash)` unique index). Authenticity is *not* this
+  A carried record cannot occupy two positions among an author's *stored*
+  entries (`DuplicateRecord`, backed by the `(author, record_hash)` unique
+  index); once an acked entry is pruned this local guard no longer covers it, and
+  the authoritative safeguard against a record being *admitted* twice is the
+  log's admission-time content-hash dedup (`AppendLog::append_raw`), not this
+  store. Authenticity is *not* this
   store's job: it holds opaque, already-validated envelope bytes, and the caller
   (a layer with `rrn-protocol`) verifies the outer and embedded signatures via
   `rrn_protocol::outbox::validate` before handing over columns — the layering
