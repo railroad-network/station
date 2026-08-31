@@ -87,13 +87,26 @@ impl EntryEnvelope {
     }
 }
 
+/// Builds the `{signer, sig, body}` envelope map. Shared by the owned and
+/// borrowing `Into<CBOR>` impls; `body` is passed owned since a CBOR byte string
+/// owns its bytes either way.
+fn entry_envelope_cbor(signer: &PublicKey, sig: &Signature, body: Vec<u8>) -> CBOR {
+    let mut m = Map::new();
+    m.insert("signer", CBOR::to_byte_string(signer.to_bytes()));
+    m.insert("sig", CBOR::to_byte_string(sig.to_bytes()));
+    m.insert("body", CBOR::to_byte_string(body));
+    m.into()
+}
+
 impl From<EntryEnvelope> for CBOR {
     fn from(e: EntryEnvelope) -> Self {
-        let mut m = Map::new();
-        m.insert("signer", CBOR::to_byte_string(e.signer.to_bytes()));
-        m.insert("sig", CBOR::to_byte_string(e.sig.to_bytes()));
-        m.insert("body", CBOR::to_byte_string(e.body));
-        m.into()
+        entry_envelope_cbor(&e.signer, &e.sig, e.body)
+    }
+}
+
+impl From<&EntryEnvelope> for CBOR {
+    fn from(e: &EntryEnvelope) -> Self {
+        entry_envelope_cbor(&e.signer, &e.sig, e.body.clone())
     }
 }
 
@@ -151,24 +164,40 @@ impl Bundle {
     }
 
     /// Encodes the bundle to canonical dCBOR bytes for carriage.
+    ///
+    /// Encodes through the borrowing [`From<&Bundle>`] so it does not deep-clone
+    /// the whole bundle first.
     pub fn encode(&self) -> Vec<u8> {
-        to_canonical_bytes(self.clone())
+        to_canonical_bytes(self)
     }
 
     /// Blake3 of the bundle's encoded bytes — a carriage identifier (see the
     /// module docs; not stable under re-bundling).
+    ///
+    /// A caller that already holds the encoded bytes (e.g. the send path, or
+    /// T2.2.5 chunking) should hash them with [`Bundle::id_from_encoded`] rather
+    /// than call this, which re-encodes.
     pub fn bundle_id(&self) -> Hash {
-        Hash::of(&self.encode())
+        Self::id_from_encoded(&self.encode())
+    }
+
+    /// Blake3 of a bundle's already-encoded bytes — the carriage identifier,
+    /// computed without a re-encode. [`Bundle::bundle_id`] is exactly this of
+    /// [`Bundle::encode`].
+    pub fn id_from_encoded(encoded: &[u8]) -> Hash {
+        Hash::of(encoded)
     }
 
     /// Decodes and structurally validates a bundle from its encoded bytes.
     ///
     /// Refuses, in order: an input over [`MAX_BUNDLE_BYTES`]; non-canonical or
     /// mis-shaped CBOR; a wrong `v`; more than [`MAX_BUNDLE_ENTRIES`] entries; a
-    /// garbage (non-decodable) entry; and a bundle whose *same-author* entries
-    /// are out of position order. A gap in one author's positions is **legal**
-    /// (partial carriage) — only disorder (a repeated or decreasing position for
-    /// one author) is refused. Signatures are **not** checked here; that is
+    /// missing/mistyped `assembled_at`; a garbage (non-decodable) entry; and a
+    /// bundle whose *same-author* entries are out of position order. A gap in one
+    /// author's positions is **legal** (partial carriage), and an *equal*
+    /// position is legal too — both sides of an outbox fork, or a byte-identical
+    /// duplicate, may ride together — so only a strictly *decreasing* position
+    /// for one author is refused. Signatures are **not** checked here; that is
     /// ingest's job (T2.2.3).
     ///
     /// This hand-parses rather than going through a blanket `TryFrom<CBOR>` so
@@ -205,13 +234,21 @@ impl Bundle {
             _ => return Err(Error::Cbor("bundle entries is not an array".into())),
         };
         // Count cap first, so a bundle stuffed with tens of thousands of tiny
-        // envelopes is refused before any of them is decoded.
+        // envelopes is refused before any of them is decoded — and so a bundle
+        // that is *both* over-count and malformed elsewhere still reports the
+        // count fault, not a later one.
         if raw_entries.len() > MAX_BUNDLE_ENTRIES {
             return Err(Error::TooManyEntries {
                 found: raw_entries.len(),
                 max: MAX_BUNDLE_ENTRIES,
             });
         }
+        // Then the cheap scalar, still before the per-entry body decode, so a
+        // bundle whose only remaining fault is a missing/mistyped `assembled_at`
+        // fails fast rather than after decoding up to MAX_BUNDLE_ENTRIES bodies.
+        let assembled_at = map
+            .extract::<&str, i64>("assembled_at")
+            .map_err(|e| Error::Cbor(e.to_string()))?;
         let mut entries = Vec::with_capacity(raw_entries.len());
         for item in raw_entries {
             // Each element is a byte string wrapping the envelope's canonical
@@ -223,9 +260,6 @@ impl Bundle {
             let env: EntryEnvelope = from_canonical_bytes(env_bytes.as_slice())?;
             entries.push(env);
         }
-        let assembled_at = map
-            .extract::<&str, i64>("assembled_at")
-            .map_err(|e| Error::Cbor(e.to_string()))?;
         let bundle = Bundle {
             entries,
             assembled_at,
@@ -235,18 +269,30 @@ impl Bundle {
     }
 
     /// Enforces that, for each author, the subsequence of that author's entries
-    /// (in carriage order) has strictly increasing positions. Gaps are allowed;
-    /// a repeated or decreasing position is [`Error::EntriesOutOfOrder`].
+    /// (in carriage order) has **non-decreasing** positions. Gaps are allowed
+    /// (partial carriage); a strictly *decreasing* position is
+    /// [`Error::EntriesOutOfOrder`] — the courier-reorder tripwire.
+    ///
+    /// An *equal* position is permitted: the two sides of an outbox fork (same
+    /// author and position, different entry hash) and a byte-identical duplicate
+    /// are legitimate carriage. A fork is signed, self-incriminating equivocation
+    /// evidence (ADR-0020 §2 / ADR-0021); refusing it here would force a witness
+    /// to split the pair across bundles and would let one fork pair poison an
+    /// otherwise-valid bundle. This decode-time check is structural hygiene over
+    /// *claimed* authors — signatures are not checked here — not a security
+    /// boundary; ingest (T2.2.3) verifies signatures and answers a fork's losing
+    /// side per-record (`outbox-fork`, or `known` for a duplicate).
     fn check_same_author_order(&self) -> Result<()> {
         let mut last: HashMap<[u8; 32], u64> = HashMap::new();
         for env in &self.entries {
-            // Decoding here rejects a garbage entry as well as reading the
-            // author/position needed for the order check.
-            let entry = env.to_signed()?;
-            let author = entry.payload.author.public_key().to_bytes();
-            let position = entry.payload.position;
+            // Decoding the body rejects a garbage entry and reads the
+            // author/position the check needs; the signed wrapper is not needed
+            // here (signature verification is ingest's job).
+            let entry: OutboxEntry = from_canonical_bytes(&env.body)?;
+            let author = entry.author.public_key().to_bytes();
+            let position = entry.position;
             if let Some(prev) = last.insert(author, position) {
-                if position <= prev {
+                if position < prev {
                     return Err(Error::EntriesOutOfOrder);
                 }
             }
@@ -255,20 +301,32 @@ impl Bundle {
     }
 }
 
+/// Builds the bundle map from its already-encoded entry blobs. Each entry rides
+/// as the canonical bytes of its `{signer, sig, body}` envelope — an opaque
+/// carriage blob (see the module docs).
+fn bundle_cbor(entry_blobs: Vec<Vec<u8>>, assembled_at: i64) -> CBOR {
+    let mut m = Map::new();
+    m.insert("v", BUNDLE_VERSION);
+    let entries: Vec<CBOR> = entry_blobs.into_iter().map(CBOR::to_byte_string).collect();
+    m.insert("entries", entries);
+    m.insert("assembled_at", assembled_at);
+    m.into()
+}
+
 impl From<Bundle> for CBOR {
     fn from(b: Bundle) -> Self {
-        let mut m = Map::new();
-        m.insert("v", BUNDLE_VERSION);
-        // Each entry rides as the canonical bytes of its `{signer, sig, body}`
-        // envelope — an opaque carriage blob (see the module docs).
-        let entries: Vec<CBOR> = b
-            .entries
-            .into_iter()
-            .map(|e| CBOR::to_byte_string(to_canonical_bytes(e)))
-            .collect();
-        m.insert("entries", entries);
-        m.insert("assembled_at", b.assembled_at);
-        m.into()
+        let blobs = b.entries.into_iter().map(to_canonical_bytes).collect();
+        bundle_cbor(blobs, b.assembled_at)
+    }
+}
+
+impl From<&Bundle> for CBOR {
+    fn from(b: &Bundle) -> Self {
+        // Borrowing encode: serialize each entry from a reference (one body clone
+        // per entry, as the CBOR byte string must own its bytes) without cloning
+        // the whole bundle first.
+        let blobs = b.entries.iter().map(to_canonical_bytes).collect();
+        bundle_cbor(blobs, b.assembled_at)
     }
 }
 
@@ -395,10 +453,11 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_position_for_one_author_is_refused() {
+    fn a_fork_or_duplicate_may_ride_in_one_bundle() {
         let device = Keypair::generate();
-        // Two distinct entries at position 0 (an outbox fork) carried together:
-        // not strictly increasing, so refused as disorder.
+        // Two DISTINCT entries at position 0 (an outbox fork) carried together:
+        // equal position is non-decreasing, so decode accepts it. This is signed
+        // equivocation evidence; ingest (T2.2.3) answers the losing side.
         let a = entry(&device, 0, zero_hash());
         let b = SignedPayload::sign(
             OutboxEntry::wrapping(
@@ -410,13 +469,43 @@ mod tests {
             ),
             &device,
         );
-        let bundle = Bundle::new(
+        assert_ne!(
+            a.payload.entry_hash(),
+            b.payload.entry_hash(),
+            "a genuine fork"
+        );
+        let forked = Bundle::new(
             vec![
                 EntryEnvelope::from_signed(&a),
                 EntryEnvelope::from_signed(&b),
             ],
             1,
         );
+        assert!(Bundle::decode(&forked.encode()).is_ok());
+
+        // A byte-identical duplicate (the same entry carried twice) is likewise
+        // legal carriage.
+        let dup = Bundle::new(
+            vec![
+                EntryEnvelope::from_signed(&a),
+                EntryEnvelope::from_signed(&a),
+            ],
+            1,
+        );
+        assert!(Bundle::decode(&dup.encode()).is_ok());
+    }
+
+    #[test]
+    fn a_decreasing_position_after_an_equal_one_is_still_refused() {
+        let device = Keypair::generate();
+        let full = chain(&device, 2); // positions 0, 1, correctly linked
+                                      // Carriage 1, 1, 0: the repeat is legal, the drop back to 0 is disorder.
+        let envs = vec![
+            EntryEnvelope::from_signed(&full[1]),
+            EntryEnvelope::from_signed(&full[1]),
+            EntryEnvelope::from_signed(&full[0]),
+        ];
+        let bundle = Bundle::new(envs, 1);
         assert_eq!(
             Bundle::decode(&bundle.encode()),
             Err(Error::EntriesOutOfOrder)
@@ -425,10 +514,9 @@ mod tests {
 
     #[test]
     fn oversize_entry_count_is_refused() {
-        // Build a bundle whose entry list exceeds the cap by reusing one
-        // author's single entry many times would trip the order check first, so
-        // use distinct authors (each at position 0) — order check passes,
-        // count check fires.
+        // Build a bundle whose entry list exceeds the cap. Distinct authors,
+        // each at position 0, so the same-author order check is irrelevant and
+        // the count cap is what fires.
         let mut envs = Vec::new();
         for _ in 0..(MAX_BUNDLE_ENTRIES + 1) {
             let device = Keypair::generate();

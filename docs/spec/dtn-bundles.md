@@ -115,10 +115,15 @@ therefore key on `record_hash`, never on `bundle_id`.
 - a bundle whose *same-author* entries are out of position order.
 
 Entries from multiple authors may share a bundle. For one author, the carried
-positions must be **strictly increasing** in carriage order — a **gap is legal**
-(partial carriage), only disorder (a repeated or decreasing position) is refused,
-a cheap courier-tamper tripwire. Signatures are **not** checked at decode; that
-is ingest's job (T2.2.3).
+positions must be **non-decreasing** in carriage order — a **gap is legal**
+(partial carriage), and an **equal position is legal** too: both sides of an
+outbox fork (§1), or a byte-identical duplicate, may ride in one bundle, so a
+witness need not split equivocation evidence across bundles and one fork pair
+cannot poison an otherwise-valid bundle. Only a strictly **decreasing** position
+is refused (the courier-reorder tripwire). Signatures are **not** checked at
+decode — this order check is structural hygiene over *claimed* authors, not a
+security boundary; ingest (T2.2.3) verifies signatures and answers a fork's
+losing side per record (`outbox-fork`, or `known` for a duplicate).
 
 ---
 
