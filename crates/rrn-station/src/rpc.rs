@@ -123,6 +123,23 @@ pub struct ProposeParams {
     pub oracle_tier: Option<u8>,
 }
 
+/// `bundle_submit` params (T2.2.3): a DTN [`Bundle`](rrn_protocol::bundle::Bundle)'s
+/// canonical bytes, hex-encoded — matching the repo convention for byte-carrying
+/// RPC params (see the `_hex` fields on the charter methods).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleSubmitParams {
+    /// The bundle's encoded bytes, hex-encoded.
+    pub bundle_hex: String,
+}
+
+/// `bundle_submit` result: the station-signed delivery receipt as its portable
+/// envelope bytes ([`rrn_protocol::receipt::encode_signed`]), hex-encoded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleSubmitResult {
+    /// The signed-receipt envelope bytes, hex-encoded.
+    pub receipt_hex: String,
+}
+
 /// `propose` result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProposeResult {

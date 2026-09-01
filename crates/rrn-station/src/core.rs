@@ -62,10 +62,18 @@ use rrn_marketplace::lifecycle::{
 use rrn_marketplace::listing::{Listing, ListingId, Surface};
 use rrn_marketplace::search::{SearchIndex, SearchQuery};
 use rrn_storage::db::Database;
+use rrn_storage::dtn::{DtnStore, NoteOutcome};
 use rrn_storage::log::{AppendLog, StoredPayload};
+
+use rrn_protocol::bundle::Bundle;
+use rrn_protocol::outbox;
+use rrn_protocol::receipt::{
+    self, DeliveryReceipt, Disposition, Outcome, RefusalReason, SignedReceipt,
+};
 
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{PublicKey, Signature};
+use rrn_crypto::signed::SignedPayload;
 
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
 
@@ -696,6 +704,11 @@ impl Core {
             "pair_confirm" => self.m_pair_confirm(req),
             "list_mobiles" => self.m_list_mobiles(),
             "unpair" => self.m_unpair(req),
+            // DTN bundle ingest (T2.2.3, ADR-0020): the operator/courier hands the
+            // station a bundle over the Unix socket; the station admits each
+            // carried record through the same engine front doors the live path
+            // uses and answers with one signed delivery receipt.
+            "bundle_submit" => self.m_bundle_submit(req),
             other => Err(rpc::RpcError {
                 code: rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
@@ -781,50 +794,19 @@ impl Core {
 
         // A Tier-2 transaction is confirmed by staking reputation on it (T1.8.2):
         // the confirmer must be an established member, or the community must still
-        // be inside its bootstrap grace. The stake itself is their raw composite at
-        // `now`, recomputable later, so nothing is frozen onto the confirmation.
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
-        let tier = snapshot
-            .get(&tx_id)
-            .and_then(proposal_of)
-            .map(|p| p.effective_tier())
-            // An unknown/absent proposal falls through as Tier 1; the engine below
-            // is what rejects it authoritatively with `UnknownTransaction`.
-            .unwrap_or(rrn_ledger::tier::MIN_TIER);
-        if tier >= 2 {
-            use rrn_reputation::staking::Tier2Eligibility;
-            match rrn_reputation::staking::evaluate_tier2_confirmation(
-                &self.db,
-                &self.wallet.address,
-                now,
-            )
+        // be inside its bootstrap grace. Shared with the mobile and DTN paths via
+        // `tier2_confirmation_gate`.
+        if let Some((composite, established)) = self
+            .tier2_confirmation_gate(&tx_id, &self.wallet.address, now)
             .map_err(internal)?
-            {
-                Tier2Eligibility::Allowed {
-                    stake_centi,
-                    via_grace,
-                } => {
-                    tracing::info!(
-                        tx = %params.tx_id,
-                        stake_centi,
-                        via_grace,
-                        "tier-2 confirmation: reputation staked"
-                    );
-                }
-                Tier2Eligibility::Refused {
-                    composite,
-                    established,
-                } => {
-                    let member_floor = rrn_reputation::model::BAND_MEMBER_MIN;
-                    return Err(invalid_params(format!(
-                        "cannot confirm a Tier-2 payment: your standing is {composite:.2}, \
-                         below the Member band ({member_floor:.1}) the community now \
-                         requires ({established} members are established, so the bootstrap \
-                         grace has ended)"
-                    )));
-                }
-            }
+        {
+            let member_floor = rrn_reputation::model::BAND_MEMBER_MIN;
+            return Err(invalid_params(format!(
+                "cannot confirm a Tier-2 payment: your standing is {composite:.2}, \
+                 below the Member band ({member_floor:.1}) the community now \
+                 requires ({established} members are established, so the bootstrap \
+                 grace has ended)"
+            )));
         }
 
         let confirmation = TransactionConfirmation {
@@ -3055,6 +3037,362 @@ impl Core {
         resolved
     }
 
+    /// `bundle_submit` (operator / Unix socket): ingest a DTN bundle handed over
+    /// by a courier and answer with the hex of the signed delivery receipt.
+    fn m_bundle_submit(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::BundleSubmitParams = parse_params(req)?;
+        let bundle_bytes = unhex(&params.bundle_hex).ok_or_else(|| rpc::RpcError {
+            code: rpc::INVALID_PARAMS,
+            message: "bundle_hex is not hex".into(),
+        })?;
+        let now = self.clock.now();
+        let receipt = self
+            .ingest_bundle(&bundle_bytes, now)
+            .map_err(|e| e.rpc_error())?;
+        ok(&rpc::BundleSubmitResult {
+            receipt_hex: hex(&receipt),
+        })
+    }
+
+    /// `bundle_submit` (paired mobile / sealed channel): the authenticated mobile
+    /// is a **courier** here, not the author — the carried records may be signed
+    /// by other members, so this does not bind the record signer to the mobile.
+    /// The pairing gate (already cleared before dispatch) is the DoS boundary;
+    /// per-entry signatures are the integrity boundary (ADR-0020 §3).
+    fn channel_bundle_submit(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bundle_bytes = hex_param(&envelope.params, "bundle_hex")?;
+        let now = self.clock.now();
+        let receipt = self
+            .ingest_bundle(&bundle_bytes, now)
+            .map_err(|e| e.pair_error())?;
+        Ok(serde_json::json!({ "receipt_hex": hex(&receipt) }))
+    }
+
+    /// Ingests a DTN bundle (ADR-0020 §3-§4): decode it, then for each carried
+    /// outbox entry in bundle order — validate signatures, track the author's
+    /// chain (detecting forks and gaps), and route the embedded record through
+    /// the **same** engine front door the live path uses — and answer with one
+    /// station-signed [`SignedReceipt`], returned as its portable envelope bytes.
+    ///
+    /// Idempotent: a byte-identical *presentation* (the same ordered record
+    /// hashes) returns the stored receipt verbatim; a different bundle
+    /// re-carrying already-admitted records yields `known` outcomes via the log's
+    /// own dedup. Neither path re-admits a record.
+    ///
+    /// The whole operation reads and writes only through `&self.db` (SQLite
+    /// interior mutability), so it takes `&self`; the caller supplies `now` from
+    /// the daemon clock.
+    fn ingest_bundle(&self, bundle_bytes: &[u8], now: i64) -> Result<Vec<u8>, BundleIngestError> {
+        let bundle = Bundle::decode(bundle_bytes)
+            .map_err(|e| BundleIngestError::Malformed(e.to_string()))?;
+
+        // Decode each carried entry once, up front, and capture the envelope
+        // bytes (for fork evidence) and the record hash (for the presentation
+        // hash, dedup, and the receipt outcome).
+        struct Prepared {
+            signed: rrn_protocol::outbox::SignedOutboxEntry,
+            envelope_bytes: Vec<u8>,
+            record_hash: Hash,
+        }
+        let mut entries = Vec::with_capacity(bundle.entries.len());
+        for env in &bundle.entries {
+            let signed = env
+                .to_signed()
+                .map_err(|e| BundleIngestError::Malformed(e.to_string()))?;
+            let record_hash = signed.payload.record_hash();
+            entries.push(Prepared {
+                signed,
+                envelope_bytes: to_canonical_bytes(env),
+                record_hash,
+            });
+        }
+
+        // Presentation hash: Blake3 over the ordered record-hash list — the
+        // idempotency key. Independent of how the records were bundled.
+        let mut pres = Vec::with_capacity(entries.len() * 32);
+        for pe in &entries {
+            pres.extend_from_slice(&pe.record_hash.to_bytes());
+        }
+        let presentation_hash = Hash::of(&pres);
+
+        // Idempotent replay: if this exact presentation was already answered,
+        // return that receipt's bytes verbatim (byte-identical guarantee).
+        if let Some(stored) = DtnStore::new(&self.db)
+            .receipt_for(&presentation_hash.to_bytes())
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+        {
+            return Ok(stored);
+        }
+
+        let mut outcomes = Vec::with_capacity(entries.len());
+        for pe in &entries {
+            let entry = &pe.signed.payload;
+            let record_hash = pe.record_hash;
+
+            // (a) Signature validation (outer entry sig, author == signer, inner
+            // record sig). A failure is a refusal, never a bundle abort.
+            if outbox::validate(&pe.signed).is_err() {
+                outcomes.push(refused(record_hash, RefusalReason::BadSignature));
+                continue;
+            }
+
+            // (b) Chain tracking: record the entry against the author's seen
+            // positions, detecting an outbox fork (same position, different
+            // content) or a benign duplicate. A gap does not refuse (couriers
+            // carry partial chains, ADR-0020 §2) — the store simply does not
+            // advance the contiguous head past it.
+            let author = entry.author.public_key().to_bytes();
+            let entry_hash = entry.entry_hash().to_bytes();
+            {
+                let mut dtn = DtnStore::new(&self.db);
+                match dtn
+                    .note_entry(
+                        &author,
+                        entry.position,
+                        &entry_hash,
+                        &pe.envelope_bytes,
+                        now,
+                    )
+                    .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+                {
+                    NoteOutcome::Fresh => {
+                        // A gap: this entry sits ahead of the contiguous head
+                        // (`Some(head)` with `head.position < position`), or there
+                        // is no head at all yet (`None` — a *leading* gap, the
+                        // author's position 0 has not been seen). Either way the
+                        // head did not advance to this entry; log the hole so a
+                        // suppressed run is visible (ADR-0020 §2).
+                        let head = dtn
+                            .head(&author)
+                            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+                        let at_head = head.map(|h| h.position) == Some(entry.position);
+                        if !at_head {
+                            tracing::info!(
+                                author = %entry.author,
+                                position = entry.position,
+                                contiguous_head = head.map(|h| h.position as i64).unwrap_or(-1),
+                                "outbox gap: entry recorded ahead of the contiguous head"
+                            );
+                        }
+                    }
+                    NoteOutcome::Duplicate => {}
+                    NoteOutcome::Fork {
+                        stored_entry_hash,
+                        stored_envelope,
+                    } => {
+                        dtn.record_fork(
+                            &author,
+                            entry.position,
+                            &stored_entry_hash,
+                            &stored_envelope,
+                            &entry_hash,
+                            &pe.envelope_bytes,
+                            now,
+                        )
+                        .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+                        tracing::warn!(
+                            author = %entry.author,
+                            position = entry.position,
+                            "outbox fork detected; refusing the conflicting entry (ADR-0021)"
+                        );
+                        outcomes.push(refused(record_hash, RefusalReason::OutboxFork));
+                        continue;
+                    }
+                }
+            }
+
+            // (c) Dedup against the log: a record already admitted answers
+            // `known` with its sequence — never re-admitted.
+            if let Some((seq, _)) = AppendLog::new(&self.db)
+                .admission_of(&record_hash)
+                .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+            {
+                outcomes.push(Outcome {
+                    record_hash,
+                    disposition: Disposition::Known { seq },
+                });
+                continue;
+            }
+
+            // (d) Route through the engine front door for the record's kind.
+            let disposition = self.route_dtn_record(&pe.signed, now)?;
+            outcomes.push(Outcome {
+                record_hash,
+                disposition,
+            });
+        }
+
+        // Build, sign, persist (keyed by presentation hash), and return the
+        // receipt as portable envelope bytes.
+        let receipt = DeliveryReceipt {
+            station: self.wallet.address,
+            outcomes,
+            received_at: now,
+        };
+        let signed = SignedReceipt::sign(receipt, &self.station_keypair());
+        let receipt_bytes = receipt::encode_signed(&signed);
+        DtnStore::new(&self.db)
+            .put_receipt(&presentation_hash.to_bytes(), &receipt_bytes, now)
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        Ok(receipt_bytes)
+    }
+
+    /// Routes one validated, not-yet-admitted outbox entry to the matching engine
+    /// front door and returns its [`Disposition`]. The engine re-verifies every
+    /// signature and enforces every admission rule; this adds no admission logic
+    /// of its own, only kind dispatch and error → refusal-slug mapping.
+    fn route_dtn_record(
+        &self,
+        signed: &rrn_protocol::outbox::SignedOutboxEntry,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let entry = &signed.payload;
+        let signer = entry.record_signer;
+        let signature = entry.record_sig;
+        let bytes = &entry.record_bytes;
+        let mut engine =
+            Engine::new(&self.db, self.station_keypair()).with_credit_config(self.credit);
+
+        // Decode the record's payload to its typed form (the `kind` inside the
+        // canonical bytes selects the branch), rebuild the signed envelope from
+        // the entry's carried signer/signature, and hand it to the engine. A
+        // decode failure on a matched kind is a malformed record → `rejected`.
+        let result = match dtn_record_kind(bytes).as_deref() {
+            Some(KIND_PROPOSAL) => match from_canonical_bytes::<TransactionProposal>(bytes) {
+                Ok(payload) => engine.submit_proposal(
+                    SignedPayload {
+                        payload,
+                        signer,
+                        signature,
+                    },
+                    now,
+                ),
+                Err(_) => return Ok(refused_disposition(RefusalReason::Rejected)),
+            },
+            Some(KIND_CONFIRMATION) => {
+                match from_canonical_bytes::<TransactionConfirmation>(bytes) {
+                    Ok(payload) => {
+                        // Enforce the same Tier-2 staking gate the live paths do
+                        // (T1.8.2) — a confirmation must clear it however it is
+                        // carried, so DTN is not a bypass. Keyed on the record's
+                        // own confirmer.
+                        if self
+                            .tier2_confirmation_gate(&payload.proposal_id, &payload.confirmer, now)
+                            .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+                            .is_some()
+                        {
+                            return Ok(refused_disposition(RefusalReason::Tier2Stake));
+                        }
+                        engine.submit_confirmation(
+                            SignedPayload {
+                                payload,
+                                signer,
+                                signature,
+                            },
+                            now,
+                        )
+                    }
+                    Err(_) => return Ok(refused_disposition(RefusalReason::Rejected)),
+                }
+            }
+            Some(KIND_DISPUTE) => match from_canonical_bytes::<DisputeRecord>(bytes) {
+                Ok(payload) => engine.raise_dispute(
+                    SignedPayload {
+                        payload,
+                        signer,
+                        signature,
+                    },
+                    &self.settlement,
+                    now,
+                ),
+                Err(_) => return Ok(refused_disposition(RefusalReason::Rejected)),
+            },
+            Some(KIND_DISPUTE_RESPONSE) => match from_canonical_bytes::<DisputeResponse>(bytes) {
+                Ok(payload) => engine.respond_to_dispute(
+                    SignedPayload {
+                        payload,
+                        signer,
+                        signature,
+                    },
+                    now,
+                ),
+                Err(_) => return Ok(refused_disposition(RefusalReason::Rejected)),
+            },
+            _ => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
+        };
+
+        match result {
+            Ok(()) => match AppendLog::new(&self.db)
+                .admission_of(&entry.record_hash())
+                .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+            {
+                Some((seq, _)) => Ok(Disposition::Admitted { seq }),
+                // The engine reported success but the record is not in the log:
+                // an invariant violation, not a member-visible refusal.
+                None => Err(BundleIngestError::Internal(
+                    "engine admitted a record absent from the log".into(),
+                )),
+            },
+            // A storage fault is an internal failure, not a refusal — abort the
+            // bundle rather than issue a receipt that misrepresents it.
+            Err(rrn_ledger::Error::Storage(e)) => Err(BundleIngestError::Internal(e.to_string())),
+            Err(e) => Ok(refused_disposition(map_refusal(&e))),
+        }
+    }
+
+    /// The Tier-2 confirmation staking gate (T1.8.2), shared by every path that
+    /// admits a confirmation — the operator CLI (`m_confirm`), the mobile channel
+    /// (`channel_submit_confirmation`), and DTN ingest (`route_dtn_record`) — so
+    /// a Tier-2 confirmation clears the same reputation bar however it is carried
+    /// (no bypass; ADR-0020 §4 admission parity).
+    ///
+    /// A confirmation of a Tier-2 proposal requires `confirmer` to clear the
+    /// Member band, unless the community is still in bootstrap grace (ADR-0015).
+    /// Returns `Ok(None)` when the confirmation may proceed (the proposal is
+    /// Tier 1, or Tier 2 and the confirmer is eligible) and `Ok(Some((composite,
+    /// established)))` when the gate refuses — the confirmer's composite standing
+    /// and how many members are established, for the caller's message.
+    fn tier2_confirmation_gate(
+        &self,
+        proposal_id: &TransactionId,
+        confirmer: &Address,
+        now: i64,
+    ) -> anyhow::Result<Option<(f32, usize)>> {
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))?;
+        let tier = snapshot
+            .get(proposal_id)
+            .and_then(proposal_of)
+            // An unknown proposal falls through as Tier 1; the engine is what
+            // rejects it authoritatively (UnknownTransaction).
+            .map(|p| p.effective_tier())
+            .unwrap_or(rrn_ledger::tier::MIN_TIER);
+        if tier < 2 {
+            return Ok(None);
+        }
+        use rrn_reputation::staking::Tier2Eligibility;
+        match rrn_reputation::staking::evaluate_tier2_confirmation(&self.db, confirmer, now)? {
+            Tier2Eligibility::Allowed {
+                stake_centi,
+                via_grace,
+            } => {
+                tracing::info!(
+                    tx = %hex(&proposal_id.to_bytes()),
+                    stake_centi,
+                    via_grace,
+                    "tier-2 confirmation: reputation staked"
+                );
+                Ok(None)
+            }
+            Tier2Eligibility::Refused {
+                composite,
+                established,
+            } => Ok(Some((composite, established))),
+        }
+    }
+
     fn station_keypair(&self) -> Keypair {
         Keypair::from_secret(self.wallet.secret_key.clone())
     }
@@ -3301,6 +3639,13 @@ impl Core {
             // Dispute writes (T1.10.5): each carries a mobile-signed record whose
             // signer must be the authenticated mobile. Reads fall through to the
             // shared, signer-less dispatch below.
+            // DTN bundle ingest (T2.2.3, ADR-0020). Unlike the other channel
+            // writes, the paired mobile here is a **courier**, not the author:
+            // the carried records may be signed by *other* members, so this
+            // deliberately does NOT bind the record signer to the authenticated
+            // mobile. The pairing gate is the DoS/accountability boundary; per-
+            // entry signatures are the integrity boundary (ADR-0020 §3).
+            "bundle_submit" => self.channel_bundle_submit(envelope),
             "submit_dispute" => self.channel_submit_dispute(envelope),
             "submit_dispute_response" => self.channel_submit_dispute_response(envelope),
             "submit_verdict" => self.channel_submit_verdict(envelope),
@@ -3380,54 +3725,25 @@ impl Core {
         }
         let now = self.clock.now();
 
-        // A Tier-2 confirmation stakes reputation (T1.8.2): gate it here, on the
-        // path a phone actually confirms through, keyed on the **authenticated
-        // mobile** (`signed.signer`) — the confirmer must clear the Member band, or
-        // the community must still be in bootstrap grace. `m_confirm` gates the
-        // operator's own CLI confirm; without this a mobile Tier-2 confirm would
-        // slip past the gate entirely.
+        // A Tier-2 confirmation stakes reputation (T1.8.2): gate it on the
+        // **authenticated mobile** (`signed.signer`) — the confirmer must clear
+        // the Member band, or the community must still be in bootstrap grace.
+        // Shared with the operator and DTN paths via `tier2_confirmation_gate`.
         let confirmer = Address::from_public_key(signed.signer);
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
-        let tier = snapshot
-            .get(&signed.payload.proposal_id)
-            .and_then(proposal_of)
-            .map(|p| p.effective_tier())
-            // An unknown proposal falls through as Tier 1; the engine below is what
-            // rejects it authoritatively with `UnknownTransaction`.
-            .unwrap_or(rrn_ledger::tier::MIN_TIER);
-        if tier >= 2 {
-            use rrn_reputation::staking::Tier2Eligibility;
-            match rrn_reputation::staking::evaluate_tier2_confirmation(&self.db, &confirmer, now)
-                .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
-            {
-                Tier2Eligibility::Allowed {
-                    stake_centi,
-                    via_grace,
-                } => {
-                    tracing::info!(
-                        tx = %hex(&signed.payload.proposal_id.to_bytes()),
-                        stake_centi,
-                        via_grace,
-                        "tier-2 confirmation (mobile): reputation staked"
-                    );
-                }
-                Tier2Eligibility::Refused {
-                    composite,
-                    established,
-                } => {
-                    let member_floor = rrn_reputation::model::BAND_MEMBER_MIN;
-                    return Err((
-                        rpc::INVALID_PARAMS,
-                        format!(
-                            "cannot confirm a Tier-2 payment: your standing is {composite:.2}, \
-                             below the Member band ({member_floor:.1}) the community now \
-                             requires ({established} members are established, so the bootstrap \
-                             grace has ended)"
-                        ),
-                    ));
-                }
-            }
+        if let Some((composite, established)) = self
+            .tier2_confirmation_gate(&signed.payload.proposal_id, &confirmer, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+        {
+            let member_floor = rrn_reputation::model::BAND_MEMBER_MIN;
+            return Err((
+                rpc::INVALID_PARAMS,
+                format!(
+                    "cannot confirm a Tier-2 payment: your standing is {composite:.2}, \
+                     below the Member band ({member_floor:.1}) the community now \
+                     requires ({established} members are established, so the bootstrap \
+                     grace has ended)"
+                ),
+            ));
         }
 
         let mut engine =
@@ -4300,6 +4616,102 @@ impl Core {
         }
         ok(&serde_json::json!({ "removed": removed }))
     }
+}
+
+// --- DTN bundle ingest helpers (T2.2.3) -------------------------------------
+
+/// Wire discriminators of the record kinds the station routes over DTN. These
+/// mirror the `pub(crate)` `*_KIND` constants in `rrn-ledger`
+/// (`transaction.rs` / `dispute.rs`); they are wire-stable and not exported, so
+/// they are restated here as the routing table's keys.
+const KIND_PROPOSAL: &str = "rrn.tx.proposal";
+const KIND_CONFIRMATION: &str = "rrn.tx.confirmation";
+const KIND_DISPUTE: &str = "rrn.tx.dispute";
+const KIND_DISPUTE_RESPONSE: &str = "rrn.tx.dispute.response";
+
+/// Why an ingest could not produce a receipt at all (as opposed to a per-record
+/// refusal, which *is* part of a receipt). A malformed bundle is the caller's
+/// fault (`invalid-params`); a storage fault is the station's (`internal`).
+enum BundleIngestError {
+    /// The bundle bytes did not decode as a valid [`Bundle`].
+    Malformed(String),
+    /// A storage failure occurred mid-ingest; no trustworthy receipt is possible.
+    Internal(String),
+}
+
+impl BundleIngestError {
+    /// Maps to the Unix-socket RPC error form.
+    fn rpc_error(self) -> rpc::RpcError {
+        match self {
+            BundleIngestError::Malformed(m) => rpc::RpcError {
+                code: rpc::INVALID_PARAMS,
+                message: format!("malformed bundle: {m}"),
+            },
+            BundleIngestError::Internal(m) => rpc::RpcError {
+                code: rpc::INTERNAL_ERROR,
+                message: m,
+            },
+        }
+    }
+
+    /// Maps to the sealed-channel `(code, message)` error form.
+    fn pair_error(self) -> (i32, String) {
+        let e = self.rpc_error();
+        (e.code, e.message)
+    }
+}
+
+/// Reads a DTN-carried record's `kind` discriminator from its canonical bytes,
+/// or `None` if the bytes are not a canonical CBOR map with a text `kind`.
+fn dtn_record_kind(bytes: &[u8]) -> Option<String> {
+    use dcbor::prelude::*;
+    let cbor = CBOR::try_from_data(bytes).ok()?;
+    match cbor.into_case() {
+        CBORCase::Map(map) => map.extract::<&str, String>("kind").ok(),
+        _ => None,
+    }
+}
+
+/// Maps a ledger admission error to the machine-stable refusal slug carried back
+/// in the receipt. `Storage` is handled by the caller (it is internal, not a
+/// refusal) and never reaches here.
+fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
+    use rrn_ledger::Error as LE;
+    match e {
+        // A signature that did not verify.
+        LE::BadSignature => RefusalReason::BadSignature,
+        // A *valid* signature by the wrong party — an authorization fault, not a
+        // verification failure, so it is not `bad-signature` (which would tell
+        // the member their signature is broken). No dedicated slug; the catch-all
+        // carries it.
+        LE::SenderMismatch | LE::ConfirmerMismatch => RefusalReason::Rejected,
+        LE::DuplicateProposal => RefusalReason::Duplicate,
+        LE::BadNonce { .. } => RefusalReason::NonceGap,
+        LE::Expired => RefusalReason::Expired,
+        LE::TierNotSupported { .. } => RefusalReason::TierUnsupported,
+        LE::DebtFloorExceeded { .. } => RefusalReason::DebtFloor,
+        // The referenced transaction is absent or not in the state the record
+        // needs — most commonly a confirmation whose proposal has not yet been
+        // admitted (couriers must keep outbox order, ADR-0020 §4).
+        LE::UnknownTransaction | LE::NotProposed => RefusalReason::NotProposed,
+        // Everything else (future-dated/inconsistent testimony, wrong dispute
+        // state, not-a-party, closed window, over-long reason, already-responded,
+        // invalid state) has no more specific slug.
+        _ => RefusalReason::Rejected,
+    }
+}
+
+/// A refused [`Outcome`] for `record_hash` with `reason`.
+fn refused(record_hash: Hash, reason: RefusalReason) -> Outcome {
+    Outcome {
+        record_hash,
+        disposition: refused_disposition(reason),
+    }
+}
+
+/// A refused [`Disposition`] with `reason`.
+fn refused_disposition(reason: RefusalReason) -> Disposition {
+    Disposition::Refused { reason }
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -5337,6 +5749,455 @@ mod tests {
             params,
         };
         core.handle_call(&req).unwrap_err()
+    }
+
+    // --- DTN bundle ingest (T2.2.3, ADR-0020) -------------------------------
+
+    use rrn_protocol::bundle::{Bundle, EntryEnvelope};
+    use rrn_protocol::outbox::{OutboxEntry, SignedOutboxEntry};
+
+    fn zero() -> Hash {
+        Hash::from_bytes([0u8; 32])
+    }
+
+    /// Wraps an already-signed application record as a signed outbox entry for
+    /// `device` (author == outer signer, as `outbox::validate` requires).
+    fn outbox_entry<T: Clone + Into<dcbor::CBOR>>(
+        device: &Keypair,
+        position: u64,
+        prev: Hash,
+        record: &SignedPayload<T>,
+        authored_at: i64,
+    ) -> SignedOutboxEntry {
+        let entry = OutboxEntry::wrapping(
+            Address::from_public_key(device.public_key()),
+            position,
+            prev,
+            record,
+            authored_at,
+        );
+        SignedPayload::sign(entry, device)
+    }
+
+    fn encode_bundle(entries: &[SignedOutboxEntry], assembled_at: i64) -> String {
+        let envs: Vec<EntryEnvelope> = entries.iter().map(EntryEnvelope::from_signed).collect();
+        hex(&Bundle::new(envs, assembled_at).encode())
+    }
+
+    /// Submits a bundle through the operator `bundle_submit` RPC and returns the
+    /// decoded, signature-verified receipt.
+    fn submit_bundle(
+        core: &mut Core,
+        entries: &[SignedOutboxEntry],
+        assembled_at: i64,
+    ) -> SignedReceipt {
+        let result = call(
+            core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": encode_bundle(entries, assembled_at) }),
+        );
+        let receipt_hex = result["receipt_hex"].as_str().unwrap();
+        let signed = receipt::decode_signed(&unhex(receipt_hex).unwrap()).unwrap();
+        assert!(signed.verify().is_ok(), "the station receipt must verify");
+        signed
+    }
+
+    fn member_proposal(
+        sender: &Keypair,
+        receiver: &Keypair,
+        amount: i64,
+        nonce: u64,
+        proposed_at: i64,
+        expires_at: i64,
+    ) -> SignedProposal {
+        let p = TransactionProposal::new(
+            Address::from_public_key(sender.public_key()),
+            Address::from_public_key(receiver.public_key()),
+            amount,
+            None,
+            nonce,
+            proposed_at,
+            expires_at,
+        );
+        SignedProposal::sign(p, sender)
+    }
+
+    fn member_confirmation(
+        receiver: &Keypair,
+        proposal: &SignedProposal,
+        confirmed_at: i64,
+    ) -> SignedConfirmation {
+        let c = TransactionConfirmation {
+            proposal_id: proposal.payload.id,
+            confirmer: Address::from_public_key(receiver.public_key()),
+            confirmed_at,
+        };
+        SignedConfirmation::sign(c, receiver)
+    }
+
+    fn tx_state(core: &Core, id: &TransactionId) -> Option<TransactionState> {
+        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+            .unwrap()
+            .get(id)
+            .cloned()
+    }
+
+    /// End-to-end via DTN only: two members sign a proposal and confirmation
+    /// offline, the station admits both from a single ingested bundle, and the
+    /// transaction settles a full window after **ingest** — never after the
+    /// (earlier) claimed `confirmed_at`. Proves the T2.1.2 admission-clock
+    /// integration: no live submission RPC is used.
+    #[test]
+    fn dtn_happy_path_admits_and_settles_from_admission() {
+        let mut core = test_core(); // clock = 1000
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+
+        // Signed offline: proposed/confirmed well before ingest (testimony only).
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let confirmation = member_confirmation(&bob, &proposal, 950);
+        let entries = [
+            outbox_entry(&alice, 0, zero(), &proposal, 900),
+            outbox_entry(&bob, 0, zero(), &confirmation, 950),
+        ];
+
+        let receipt = submit_bundle(&mut core, &entries, 1000);
+        assert!(matches!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+        assert!(matches!(
+            receipt.payload.outcomes[1].disposition,
+            Disposition::Admitted { .. }
+        ));
+        assert_eq!(receipt.payload.received_at, 1000);
+
+        // The transaction is Confirmed purely from the DTN path.
+        assert!(matches!(
+            tx_state(&core, &proposal.payload.id),
+            Some(TransactionState::Confirmed { .. })
+        ));
+
+        // Window (Tier 1: 86_400s) runs from admission (1000), NOT from the
+        // claimed confirmed_at (950). Past confirmed_at+window but before
+        // admission+window, it must still be unsettled.
+        core.clock.advance(950 + 86_400 + 10 - 1000); // clock = 87_360
+        core.do_sweep();
+        assert!(
+            matches!(
+                tx_state(&core, &proposal.payload.id),
+                Some(TransactionState::Confirmed { .. })
+            ),
+            "settling from confirmed_at would be premature — window anchors on admission"
+        );
+
+        // Past admission+window: it settles and the balances move.
+        core.clock.advance(1000 + 86_400 + 10 - 87_360); // clock = 87_410
+        core.do_sweep();
+        assert!(matches!(
+            tx_state(&core, &proposal.payload.id),
+            Some(TransactionState::Settled { .. })
+        ));
+        let alice_addr = Address::from_public_key(alice.public_key());
+        let bob_addr = Address::from_public_key(bob.public_key());
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &alice_addr).unwrap(),
+            -300
+        );
+        assert_eq!(ledger_view::balance_of(&core.db, &bob_addr).unwrap(), 300);
+    }
+
+    /// A bundle mixing a good record, a bad signature, an already-admitted
+    /// duplicate, and an unroutable kind — each answered independently, the good
+    /// record unaffected.
+    #[test]
+    fn dtn_mixed_bundle_reports_per_record_outcomes() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let charlie = Keypair::generate();
+        let dave = Keypair::generate();
+
+        // Pre-admit charlie's proposal so the mixed bundle can re-carry it as a
+        // known duplicate.
+        let dup = member_proposal(&charlie, &bob, 100, 0, 900, 900 + 1_000_000);
+        let dup_entry = outbox_entry(&charlie, 0, zero(), &dup, 900);
+        submit_bundle(&mut core, std::slice::from_ref(&dup_entry), 1000);
+
+        // The four mixed entries (distinct authors, so bundle order is trivially
+        // valid).
+        let good = member_proposal(&alice, &bob, 200, 0, 900, 900 + 1_000_000);
+        let good_entry = outbox_entry(&alice, 0, zero(), &good, 900);
+
+        let mut bad_entry = outbox_entry(
+            &bob,
+            0,
+            zero(),
+            &member_proposal(&bob, &alice, 50, 0, 900, 900 + 1_000_000),
+            900,
+        );
+        bad_entry.signature = bob.sign(b"not the entry body"); // outer sig no longer verifies
+
+        let vouch = create_vouch(
+            &dave,
+            &Address::from_public_key(bob.public_key()),
+            "c",
+            "hi",
+            0,
+        );
+        let unroutable_entry = outbox_entry(&dave, 0, zero(), &vouch, 900);
+
+        let receipt = submit_bundle(
+            &mut core,
+            &[good_entry, bad_entry, dup_entry, unroutable_entry],
+            2000,
+        );
+        let d: Vec<_> = receipt
+            .payload
+            .outcomes
+            .iter()
+            .map(|o| o.disposition)
+            .collect();
+        assert!(
+            matches!(d[0], Disposition::Admitted { .. }),
+            "good admitted"
+        );
+        assert!(
+            matches!(
+                d[1],
+                Disposition::Refused {
+                    reason: RefusalReason::BadSignature
+                }
+            ),
+            "bad signature refused"
+        );
+        assert!(matches!(d[2], Disposition::Known { .. }), "duplicate known");
+        assert!(
+            matches!(
+                d[3],
+                Disposition::Refused {
+                    reason: RefusalReason::UnroutableKind
+                }
+            ),
+            "unroutable kind refused"
+        );
+
+        // The good record really did land.
+        assert!(tx_state(&core, &good.payload.id).is_some());
+    }
+
+    /// Re-ingesting a byte-identical presentation returns the stored receipt
+    /// verbatim and admits nothing new.
+    #[test]
+    fn dtn_ingest_is_idempotent() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let entries = [outbox_entry(&alice, 0, zero(), &proposal, 900)];
+        let bundle_hex = encode_bundle(&entries, 1000);
+
+        let first = call(
+            &mut core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": bundle_hex }),
+        );
+        let len_after_first = core.tail_seq();
+
+        let second = call(
+            &mut core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": bundle_hex }),
+        );
+        assert_eq!(
+            first["receipt_hex"], second["receipt_hex"],
+            "an identical presentation returns a byte-identical receipt"
+        );
+        assert_eq!(
+            core.tail_seq(),
+            len_after_first,
+            "no record is re-admitted on re-ingest"
+        );
+    }
+
+    /// Two validly-signed entries from one author at the same position with
+    /// different content: the second is refused `outbox-fork` and both envelopes
+    /// are persisted as evidence.
+    #[test]
+    fn dtn_fork_is_refused_and_evidence_persisted() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        // Two DIFFERENT proposals equivocating at nonce 0 / outbox position 0.
+        let a = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let b = member_proposal(&alice, &bob, 700, 0, 900, 900 + 1_000_000);
+        let entry_a = outbox_entry(&alice, 0, zero(), &a, 900);
+        let entry_b = outbox_entry(&alice, 0, zero(), &b, 900);
+        assert_ne!(
+            entry_a.payload.entry_hash(),
+            entry_b.payload.entry_hash(),
+            "a genuine fork"
+        );
+
+        let receipt = submit_bundle(&mut core, &[entry_a.clone(), entry_b.clone()], 1000);
+        assert!(matches!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+        assert!(matches!(
+            receipt.payload.outcomes[1].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::OutboxFork
+            }
+        ));
+
+        // Evidence: both envelopes, verbatim.
+        let author = alice.public_key().to_bytes();
+        let fork = DtnStore::new(&core.db)
+            .fork_at(&author, 0)
+            .unwrap()
+            .expect("fork evidence persisted");
+        assert_eq!(fork.entry_hash_a, entry_a.payload.entry_hash().to_bytes());
+        assert_eq!(fork.entry_hash_b, entry_b.payload.entry_hash().to_bytes());
+        assert_eq!(
+            fork.envelope_a,
+            to_canonical_bytes(EntryEnvelope::from_signed(&entry_a))
+        );
+        assert_eq!(
+            fork.envelope_b,
+            to_canonical_bytes(EntryEnvelope::from_signed(&entry_b))
+        );
+    }
+
+    /// A gap in an author's carried positions does not refuse the entry; the
+    /// contiguous head simply does not advance past the gap, and a later ingest
+    /// that fills the gap advances it across every position already seen.
+    #[test]
+    fn dtn_gap_holds_head_then_fills() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        // A 3-entry chain wrapping unroutable records (vouches): this test is
+        // about outbox positions, not admission. Correctly linked so each entry
+        // validates.
+        let subj = Address::from_public_key(Keypair::generate().public_key());
+        let v0 = create_vouch(&alice, &subj, "c", "a", 0);
+        let e0 = outbox_entry(&alice, 0, zero(), &v0, 900);
+        let v1 = create_vouch(&alice, &subj, "c", "b", 1);
+        let e1 = outbox_entry(&alice, 1, e0.payload.entry_hash(), &v1, 901);
+        let v2 = create_vouch(&alice, &subj, "c", "d", 2);
+        let e2 = outbox_entry(&alice, 2, e1.payload.entry_hash(), &v2, 902);
+
+        let author = alice.public_key().to_bytes();
+
+        // Carry positions 0 and 2 (gap at 1): both processed, head stays at 0.
+        submit_bundle(&mut core, &[e0.clone(), e2.clone()], 1000);
+        assert_eq!(
+            DtnStore::new(&core.db)
+                .head(&author)
+                .unwrap()
+                .unwrap()
+                .position,
+            0
+        );
+
+        // Position 1 arrives later → the head jumps across the now-contiguous run
+        // to 2.
+        submit_bundle(&mut core, std::slice::from_ref(&e1), 1100);
+        assert_eq!(
+            DtnStore::new(&core.db)
+                .head(&author)
+                .unwrap()
+                .unwrap()
+                .position,
+            2
+        );
+    }
+
+    /// Within a bundle, a confirmation admitted after its proposal admits both;
+    /// the reversed order refuses the confirmation `not-proposed` (couriers must
+    /// keep outbox order — the proposal has not been admitted first).
+    #[test]
+    fn dtn_confirmation_needs_its_proposal_admitted_first() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let confirmation = member_confirmation(&bob, &proposal, 950);
+        let p_entry = outbox_entry(&alice, 0, zero(), &proposal, 900);
+        let c_entry = outbox_entry(&bob, 0, zero(), &confirmation, 950);
+
+        // Reversed: confirmation before proposal in the same bundle.
+        let receipt = submit_bundle(&mut core, &[c_entry, p_entry], 1000);
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::NotProposed
+                }
+            ),
+            "a confirmation whose proposal is not yet admitted is refused not-proposed"
+        );
+        assert!(
+            matches!(
+                receipt.payload.outcomes[1].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the proposal still admits"
+        );
+        // The transaction is Proposed (not Confirmed) — the confirmation did not
+        // land. A courier that keeps outbox order (proposal first) would settle
+        // it; that forward path is the happy-path test.
+        assert!(matches!(
+            tx_state(&core, &proposal.payload.id),
+            Some(TransactionState::Proposed { .. })
+        ));
+    }
+
+    /// A Tier-2 confirmation carried over DTN is held to the **same** reputation-
+    /// staking bar the live paths enforce (T1.8.2): once bootstrap grace has
+    /// ended, a confirmer below the Member band is refused `tier2-stake` — the
+    /// DTN path is not a way around the gate. Pins the shared
+    /// `tier2_confirmation_gate`.
+    #[test]
+    fn dtn_tier2_confirmation_is_held_to_the_staking_bar() {
+        let mut core = established_core(); // clock = TEN_MONTHS
+        let now = core.clock.now();
+        // End bootstrap grace: three established members exist.
+        gov_established_members(&core.db, 3, now);
+
+        let sender = Keypair::generate();
+        let alice = Keypair::generate(); // fresh — below the Member band; the confirmer
+                                         // A Tier-2 payment (10 Commons ≥ 5) to alice, signed offline.
+        let proposal = member_proposal(&sender, &alice, 1000, 0, now - 1000, now + 1_000_000);
+        assert_eq!(proposal.payload.effective_tier(), 2, "a Tier-2 amount");
+        let confirmation = member_confirmation(&alice, &proposal, now - 500);
+        let entries = [
+            outbox_entry(&sender, 0, zero(), &proposal, now - 1000),
+            outbox_entry(&alice, 0, zero(), &confirmation, now - 500),
+        ];
+
+        let receipt = submit_bundle(&mut core, &entries, now);
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the proposal admits"
+        );
+        assert!(
+            matches!(
+                receipt.payload.outcomes[1].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::Tier2Stake
+                }
+            ),
+            "the confirmation is gated by the Tier-2 staking bar, not bypassed"
+        );
+        // The confirmation did not land — the transaction stays Proposed.
+        assert!(matches!(
+            tx_state(&core, &proposal.payload.id),
+            Some(TransactionState::Proposed { .. })
+        ));
     }
 
     /// The params a `rrn list` invocation sends for a plain Goods listing.

@@ -49,6 +49,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "outbox_entries",
         sql: include_str!("../migrations/0005_outbox_entries.sql"),
     },
+    Migration {
+        version: 6,
+        name: "dtn_station_state",
+        sql: include_str!("../migrations/0006_dtn_station_state.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -140,11 +145,15 @@ mod tests {
             "attestations",
             "balances",
             "identities",
+            "issued_receipts",
             "kv",
             "listings_index",
             "log_entries",
             "outbox_entries",
+            "outbox_forks",
             "reputation_snapshots",
+            "seen_outbox_entries",
+            "seen_outbox_heads",
             "transactions",
         ]
         .iter()

@@ -22,9 +22,13 @@
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::{PublicKey, Signature};
+use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use serde::{Deserialize, Serialize};
+
+use crate::{Error, Result};
 
 /// Discriminant carried in the `kind` field of a receipt's canonical CBOR.
 pub(crate) const RECEIPT_KIND: &str = "rrn.dtn.receipt";
@@ -47,6 +51,28 @@ pub enum RefusalReason {
     UnroutableKind,
     /// The entry is one side of an outbox fork (ADR-0020 §2 / ADR-0021).
     OutboxFork,
+    /// A record content-identical to one already in the log was re-presented as
+    /// a *new* admission (the ledger's own duplicate guard fired). Distinct from
+    /// the idempotent `known` outcome, which is the benign re-carriage of an
+    /// already-admitted record; this is the engine refusing a second admission.
+    Duplicate,
+    /// The record's oracle tier is above what this phase admits (ADR-0011): the
+    /// amount is too large, and is *blocked*, never clamped.
+    TierUnsupported,
+    /// The referenced transaction is absent or not in the state the record needs
+    /// (e.g. a confirmation whose proposal has not been admitted — couriers must
+    /// keep outbox order, ADR-0020 §4).
+    NotProposed,
+    /// The confirmer of a Tier-2 payment does not clear the Member band and the
+    /// community is past bootstrap grace, so the reputation-staking gate (T1.8.2)
+    /// refuses the confirmation. An eligibility fault, not a signature or state
+    /// fault — a courier's owner can tell "raise your standing" from a generic
+    /// rejection.
+    Tier2Stake,
+    /// The engine refused the record for a reason without a more specific slug
+    /// (a state-machine or plausibility fault). A machine-stable catch-all so the
+    /// closed set need not grow a variant per ledger error.
+    Rejected,
 }
 
 impl RefusalReason {
@@ -59,6 +85,11 @@ impl RefusalReason {
             RefusalReason::Expired => "expired",
             RefusalReason::UnroutableKind => "unroutable-kind",
             RefusalReason::OutboxFork => "outbox-fork",
+            RefusalReason::Duplicate => "duplicate",
+            RefusalReason::TierUnsupported => "tier-unsupported",
+            RefusalReason::NotProposed => "not-proposed",
+            RefusalReason::Tier2Stake => "tier2-stake",
+            RefusalReason::Rejected => "rejected",
         }
     }
 
@@ -73,6 +104,11 @@ impl RefusalReason {
             "expired" => Some(RefusalReason::Expired),
             "unroutable-kind" => Some(RefusalReason::UnroutableKind),
             "outbox-fork" => Some(RefusalReason::OutboxFork),
+            "duplicate" => Some(RefusalReason::Duplicate),
+            "tier-unsupported" => Some(RefusalReason::TierUnsupported),
+            "not-proposed" => Some(RefusalReason::NotProposed),
+            "tier2-stake" => Some(RefusalReason::Tier2Stake),
+            "rejected" => Some(RefusalReason::Rejected),
             _ => None,
         }
     }
@@ -249,6 +285,71 @@ impl TryFrom<CBOR> for DeliveryReceipt {
 /// A [`DeliveryReceipt`] signed by the issuing station.
 pub type SignedReceipt = SignedPayload<DeliveryReceipt>;
 
+/// Encodes a signed receipt as portable **receipt-envelope bytes**: the
+/// `{signer, sig, body}` triple as canonical dCBOR, where `body` is the
+/// canonical bytes of the [`DeliveryReceipt`] the station signed. This mirrors
+/// [`crate::bundle::EntryEnvelope`] field-for-field — a [`SignedPayload`] is a
+/// serde envelope, not a dCBOR value, so it needs an explicit framing to travel
+/// as bytes over a carrier (or hex over RPC).
+///
+/// This is the exact byte format an offline receiver decodes and verifies the
+/// station signature over (the mobile FFI's `receipt_parse`, T2.4.2). Because
+/// the signature covers only the payload's canonical bytes (ADR-0002), the
+/// envelope may be re-framed freely without invalidating it.
+pub fn encode_signed(signed: &SignedReceipt) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("signer", CBOR::to_byte_string(signed.signer.to_bytes()));
+    m.insert("sig", CBOR::to_byte_string(signed.signature.to_bytes()));
+    m.insert(
+        "body",
+        CBOR::to_byte_string(to_canonical_bytes(signed.payload.clone())),
+    );
+    CBOR::from(m).to_cbor_data()
+}
+
+/// Decodes portable receipt-envelope bytes (see [`encode_signed`]) back into a
+/// [`SignedReceipt`].
+///
+/// This does **not** verify the station signature — call [`SignedPayload::verify`]
+/// on the result. It only reconstructs the typed envelope, failing if the bytes
+/// are not a canonical `{signer, sig, body}` map whose `body` is a canonical
+/// [`DeliveryReceipt`].
+pub fn decode_signed(bytes: &[u8]) -> Result<SignedReceipt> {
+    let cbor = CBOR::try_from_data(bytes).map_err(|e| Error::Cbor(e.to_string()))?;
+    let map = match cbor.into_case() {
+        CBORCase::Map(map) => map,
+        _ => return Err(Error::Cbor("receipt envelope is not a CBOR map".into())),
+    };
+    let signer_bytes: [u8; 32] = map
+        .extract::<&str, CBOR>("signer")
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .try_into_byte_string()
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Cbor("signer is not 32 bytes".into()))?;
+    let sig_bytes: [u8; 64] = map
+        .extract::<&str, CBOR>("sig")
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .try_into_byte_string()
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Cbor("sig is not 64 bytes".into()))?;
+    let body = map
+        .extract::<&str, CBOR>("body")
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .try_into_byte_string()
+        .map_err(|e| Error::Cbor(e.to_string()))?;
+    let payload: DeliveryReceipt = from_canonical_bytes(body.as_slice())?;
+    Ok(SignedPayload {
+        payload,
+        signer: PublicKey::from_bytes(signer_bytes)
+            .map_err(|_| Error::Cbor("bad signer".into()))?,
+        signature: Signature::from_bytes(sig_bytes).map_err(|_| Error::Cbor("bad sig".into()))?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,10 +438,40 @@ mod tests {
             RefusalReason::Expired,
             RefusalReason::UnroutableKind,
             RefusalReason::OutboxFork,
+            RefusalReason::Duplicate,
+            RefusalReason::TierUnsupported,
+            RefusalReason::NotProposed,
+            RefusalReason::Tier2Stake,
+            RefusalReason::Rejected,
         ] {
             assert_eq!(RefusalReason::from_slug(reason.as_slug()), Some(reason));
         }
         assert_eq!(RefusalReason::from_slug("not-a-reason"), None);
+    }
+
+    #[test]
+    fn signed_envelope_roundtrips_and_carries_the_signature() {
+        let kp = Keypair::generate();
+        let receipt = DeliveryReceipt {
+            station: Address::from_public_key(kp.public_key()),
+            ..sample()
+        };
+        let signed = SignedReceipt::sign(receipt, &kp);
+        let bytes = encode_signed(&signed);
+        let decoded = decode_signed(&bytes).unwrap();
+        assert_eq!(decoded, signed);
+        // The reconstructed envelope still verifies against the station key.
+        assert!(decoded.verify().is_ok());
+        // Re-encoding is byte-stable (canonical framing).
+        assert_eq!(encode_signed(&decoded), bytes);
+    }
+
+    #[test]
+    fn decode_signed_rejects_garbage_and_wrong_shapes() {
+        assert!(decode_signed(&[0xff, 0x00, 0x13]).is_err());
+        // A bare (unframed) receipt body is not a `{signer,sig,body}` envelope.
+        let bare = to_canonical_bytes(sample());
+        assert!(decode_signed(&bare).is_err());
     }
 
     #[test]
