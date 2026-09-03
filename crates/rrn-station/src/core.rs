@@ -161,6 +161,12 @@ pub enum Command {
         /// Count of disputes resolved (upheld, rejected, or lapsed) this pass.
         reply: oneshot::Sender<usize>,
     },
+    /// Prune DTN receipt-delivery rows past their retention (ADR-0020 §3, T2.2.4);
+    /// reply with the number removed.
+    PruneReceipts {
+        /// Count of delivery rows pruned this pass.
+        reply: oneshot::Sender<usize>,
+    },
     /// Report this station's own address and current log tail seq (for the peer
     /// handshake).
     Handshake {
@@ -348,6 +354,16 @@ impl CoreHandle {
         rx.await.unwrap_or(0)
     }
 
+    /// Triggers the DTN receipt-delivery prune sweep; returns the number of rows
+    /// removed (T2.2.4).
+    pub async fn prune_receipts(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::PruneReceipts { reply }).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
     /// Returns `(our_address, log_tail_seq)`.
     pub async fn handshake(&self) -> Option<(String, u64)> {
         let (reply, rx) = oneshot::channel();
@@ -498,7 +514,23 @@ pub struct Core {
     /// absent loses browse until the next boot and loses no marketplace *data*
     /// ever.
     listings: SearchIndex,
+    /// How long a *confirmed* DTN delivery receipt is retained before the prune
+    /// sweep removes it, in seconds (ADR-0020 §3, T2.2.4). Unconfirmed receipts
+    /// are kept `RETENTION_UNCONFIRMED_MULTIPLIER`× longer. Set from `[dtn]
+    /// receipt_retention_secs`.
+    dtn_receipt_retention_secs: i64,
 }
+
+/// Default DTN receipt retention (30 days), matching `[dtn]
+/// receipt_retention_secs`'s default — the value a [`Core`] built without an
+/// explicit [`with_receipt_retention_secs`](Core::with_receipt_retention_secs)
+/// uses (the test cores).
+const DEFAULT_RECEIPT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// The most distinct receipts one `receipts_fetch` returns (ADR-0020 §3,
+/// T2.2.4). A courier paging the queue sees `truncated: true` and fetches again;
+/// the author's own device confirms only what a page actually returned.
+const MAX_RECEIPTS_PER_FETCH: usize = 256;
 
 impl Core {
     /// Builds a core over an opened `db`, decrypted `wallet`, the persisted
@@ -523,7 +555,16 @@ impl Core {
             pending: BTreeMap::new(),
             tail_tx,
             listings,
+            dtn_receipt_retention_secs: DEFAULT_RECEIPT_RETENTION_SECS,
         }
+    }
+
+    /// Sets the confirmed DTN receipt-retention window (seconds), from `[dtn]
+    /// receipt_retention_secs`. Builder-style, mirroring the engine's
+    /// `with_credit_config`; a core left unset keeps [`DEFAULT_RECEIPT_RETENTION_SECS`].
+    pub fn with_receipt_retention_secs(mut self, secs: i64) -> Self {
+        self.dtn_receipt_retention_secs = secs;
+        self
     }
 
     /// Spawns the core on a dedicated thread and returns a handle to it.
@@ -572,6 +613,10 @@ impl Core {
                 }
                 Command::ResolveDisputes { reply } => {
                     let n = self.do_resolve_disputes();
+                    let _ = reply.send(n);
+                }
+                Command::PruneReceipts { reply } => {
+                    let n = self.do_prune_receipts();
                     let _ = reply.send(n);
                 }
                 Command::Handshake { reply } => {
@@ -709,6 +754,11 @@ impl Core {
             // carried record through the same engine front doors the live path
             // uses and answers with one signed delivery receipt.
             "bundle_submit" => self.m_bundle_submit(req),
+            // DTN receipt pickup (T2.2.4, ADR-0020 §3): a courier fetches pending
+            // receipts to carry back (bumps fetched count, never confirms), and
+            // the operator confirms delivery of its own-wallet records' receipts.
+            "receipts_fetch" => self.m_receipts_fetch(req),
+            "receipts_ack" => self.m_receipts_ack(req),
             other => Err(rpc::RpcError {
                 code: rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
@@ -3071,6 +3121,98 @@ impl Core {
         Ok(serde_json::json!({ "receipt_hex": hex(&receipt) }))
     }
 
+    /// `receipts_fetch` (operator / Unix socket): a **courier** picks up pending
+    /// delivery receipts to carry back to their authors (ADR-0020 §3, T2.2.4).
+    ///
+    /// This is deliberately the courier path: it bumps each returned receipt's
+    /// `fetched_count` but never marks it confirmed — a courier is not the record's
+    /// author (only the author's own authenticated device confirms, via
+    /// [`channel_receipts_fetch`](Self::channel_receipts_fetch), and the operator's
+    /// own-wallet author path via [`receipts_ack`](Self::m_receipts_ack)). An empty
+    /// `authors` list fetches the whole pending queue.
+    fn m_receipts_fetch(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::ReceiptsFetchParams = parse_params(req)?;
+        let authors = parse_author_keys(&params.authors)?;
+        let now = self.clock.now();
+        let mut dtn = DtnStore::new(&self.db);
+        let pending = dtn
+            .pending_receipts_for(&authors, params.since, MAX_RECEIPTS_PER_FETCH)
+            .map_err(internal)?;
+        dtn.bump_fetched(&pending.record_hashes, now)
+            .map_err(internal)?;
+        ok(&rpc::ReceiptsFetchResult {
+            receipts_hex: pending.receipts.iter().map(|r| hex(r)).collect(),
+            truncated: pending.truncated,
+        })
+    }
+
+    /// `receipts_ack` (operator / Unix socket): the operator confirms delivery of
+    /// the receipts for records authored on this station's **own wallet** — the
+    /// author-path counterpart to the courier `receipts_fetch`, so the retention
+    /// sweep may reclaim those rows (ADR-0020 §3, T2.2.4). Confirming an unknown or
+    /// already-confirmed record hash is a no-op, not an error.
+    fn m_receipts_ack(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::ReceiptsAckParams = parse_params(req)?;
+        let hashes = params
+            .record_hashes
+            .iter()
+            .map(|s| parse_record_hash(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let now = self.clock.now();
+        let acked = DtnStore::new(&self.db)
+            .mark_confirmed(&hashes, now)
+            .map_err(internal)?;
+        ok(&rpc::ReceiptsAckResult {
+            acked: acked as u64,
+        })
+    }
+
+    /// `receipts_fetch` (paired mobile / sealed channel): the **author** picks up
+    /// the delivery receipts for their *own* records and, by doing so, confirms
+    /// delivery (ADR-0020 §3, T2.2.4).
+    ///
+    /// Unlike the operator/courier [`m_receipts_fetch`](Self::m_receipts_fetch),
+    /// this is strictly scoped to the authenticated identity: it ignores any
+    /// `authors` param and fetches only receipts for `envelope.signer`'s records,
+    /// then marks exactly the returned rows confirmed. (This is the sealed-channel
+    /// stand-in for the ticket's `GET /receipts`: the mobile surface is the signed,
+    /// sealed RPC channel, not plain REST — so an authenticated *method* carries
+    /// it, keyed to the signer, as every other mobile write is.)
+    fn channel_receipts_fetch(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let since = serde_json::from_str::<rpc::ReceiptsFetchParams>(&envelope.params)
+            .ok()
+            .and_then(|p| p.since);
+        let author = envelope.signer.to_bytes();
+        let now = self.clock.now();
+        let mut dtn = DtnStore::new(&self.db);
+        let pending = dtn
+            .pending_receipts_for(&[author], since, MAX_RECEIPTS_PER_FETCH)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        dtn.mark_confirmed(&pending.record_hashes, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({
+            "receipts_hex": pending.receipts.iter().map(|r| hex(r)).collect::<Vec<_>>(),
+            "truncated": pending.truncated,
+        }))
+    }
+
+    /// Prunes DTN receipt-delivery rows past their retention (ADR-0020 §3,
+    /// T2.2.4); returns the number removed. Driven by the daemon's prune timer and
+    /// directly by tests.
+    fn do_prune_receipts(&self) -> usize {
+        let now = self.clock.now();
+        match DtnStore::new(&self.db).prune_delivered(now, self.dtn_receipt_retention_secs) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "dtn receipt prune failed");
+                0
+            }
+        }
+    }
+
     /// Ingests a DTN bundle (ADR-0020 §3-§4): decode it, then for each carried
     /// outbox entry in bundle order — validate signatures, track the author's
     /// chain (detecting forks and gaps), and route the embedded record through
@@ -3128,6 +3270,13 @@ impl Core {
         }
 
         let mut outcomes = Vec::with_capacity(entries.len());
+        // Delivery-tracking candidates (record_hash, author), queued after the
+        // receipt is signed (T2.2.4). Only entries that passed `outbox::validate`
+        // are added: validation enforces `author == outer signer`, so their author
+        // is cryptographically attested. A bad-signature entry's `author` field is
+        // attacker-controlled — never enqueue a delivery row under it, or a courier
+        // could inject junk "refused" receipts into any victim's pending queue.
+        let mut deliveries: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(entries.len());
         for pe in &entries {
             let entry = &pe.signed.payload;
             let record_hash = pe.record_hash;
@@ -3145,6 +3294,10 @@ impl Core {
             // carry partial chains, ADR-0020 §2) — the store simply does not
             // advance the contiguous head past it.
             let author = entry.author.public_key().to_bytes();
+            // The author is attested from here on (validate passed), so this record
+            // is a legitimate delivery-tracking candidate whatever its outcome
+            // below (fork, known, admitted, or a routing refusal).
+            deliveries.push((record_hash.to_bytes(), author));
             let entry_hash = entry.entry_hash().to_bytes();
             {
                 let mut dtn = DtnStore::new(&self.db);
@@ -3234,9 +3387,27 @@ impl Core {
         };
         let signed = SignedReceipt::sign(receipt, &self.station_keypair());
         let receipt_bytes = receipt::encode_signed(&signed);
-        DtnStore::new(&self.db)
-            .put_receipt(&presentation_hash.to_bytes(), &receipt_bytes, now)
-            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        {
+            let mut dtn = DtnStore::new(&self.db);
+            dtn.put_receipt(&presentation_hash.to_bytes(), &receipt_bytes, now)
+                .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+            // Queue a delivery row per reported record with an *attested* author so
+            // the receipt can travel back by the same carriers (ADR-0020 §3,
+            // T2.2.4). `deliveries` holds only entries that passed validation (see
+            // its construction above), so a bad-signature entry's spoofable author
+            // never gets a row. Must follow `put_receipt`: the row's foreign key
+            // references the receipt just stored. Idempotent on `record_hash` — a
+            // re-ingest keeps the first row and its delivery progress.
+            for (record_hash, author) in &deliveries {
+                dtn.record_receipt_delivery(
+                    record_hash,
+                    author,
+                    &presentation_hash.to_bytes(),
+                    now,
+                )
+                .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+            }
+        }
         Ok(receipt_bytes)
     }
 
@@ -3646,6 +3817,10 @@ impl Core {
             // mobile. The pairing gate is the DoS/accountability boundary; per-
             // entry signatures are the integrity boundary (ADR-0020 §3).
             "bundle_submit" => self.channel_bundle_submit(envelope),
+            // DTN receipt pickup by the author (T2.2.4, ADR-0020 §3): scoped to the
+            // authenticated identity, and confirms delivery of the returned rows —
+            // the sealed-channel stand-in for the ticket's `GET /receipts`.
+            "receipts_fetch" => self.channel_receipts_fetch(envelope),
             "submit_dispute" => self.channel_submit_dispute(envelope),
             "submit_dispute_response" => self.channel_submit_dispute_response(envelope),
             "submit_verdict" => self.channel_submit_verdict(envelope),
@@ -4747,6 +4922,24 @@ fn parse_tx_id(s: &str) -> Result<TransactionId, rpc::RpcError> {
         .try_into()
         .map_err(|_| invalid_params("tx id must be 32 bytes"))?;
     Ok(TransactionId(Hash::from_bytes(arr)))
+}
+
+/// Parses a `rrn1…` address list into 32-byte author public keys — the `author`
+/// column of `receipt_deliveries` (T2.2.4). Each must be a valid address.
+fn parse_author_keys(addrs: &[String]) -> Result<Vec<[u8; 32]>, rpc::RpcError> {
+    addrs
+        .iter()
+        .map(|s| Ok(parse_addr(s)?.public_key().to_bytes()))
+        .collect()
+}
+
+/// Parses a hex record hash into 32 bytes (a `receipts_ack` argument; T2.2.4).
+fn parse_record_hash(s: &str) -> Result<[u8; 32], rpc::RpcError> {
+    let bytes = unhex(s).ok_or_else(|| invalid_params(format!("invalid record hash {s:?}")))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_params("record hash must be 32 bytes"))
 }
 
 /// Decodes an optional hex evidence hash from a dispute raise/response. An absent
@@ -6110,6 +6303,198 @@ mod tests {
                 .unwrap()
                 .position,
             2
+        );
+    }
+
+    /// The T2.2.4 receipt round trip (ADR-0020 §3): Bob signs a proposal offline;
+    /// a **courier** (neither transacting party) submits the bundle and fetches
+    /// the receipt to carry home — bumping the fetch count but leaving it
+    /// unconfirmed; Bob's own device then fetches over the authenticated channel
+    /// and confirms; and the prune sweep reclaims the row only once the confirmed
+    /// retention has elapsed. The receipt travels back byte-identical.
+    #[test]
+    fn dtn_receipt_travels_back_by_courier_then_author_confirms() {
+        let mut core = test_core(); // clock = 1000, default 30-day retention
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+
+        // Bob signs a proposal offline; it is bundled and admitted at ingest 1000.
+        let proposal = member_proposal(&bob, &alice, 200, 0, 900, 900 + 1_000_000);
+        let entry = outbox_entry(&bob, 0, zero(), &proposal, 900);
+        let issued = submit_bundle(&mut core, std::slice::from_ref(&entry), 1000);
+        let record_hash = issued.payload.outcomes[0].record_hash.to_bytes();
+        let bob_addr = Address::from_public_key(bob.public_key()).to_string();
+
+        // A courier fetches Bob's pending receipt (operator/Unix-socket surface).
+        // The receipt travels back verbatim — the exact bytes the station signed.
+        let fetched = call(
+            &mut core,
+            "receipts_fetch",
+            serde_json::json!({ "authors": [bob_addr] }),
+        );
+        let receipts = fetched["receipts_hex"].as_array().unwrap();
+        assert_eq!(receipts.len(), 1, "the courier picks up Bob's receipt");
+        assert_eq!(fetched["truncated"], false);
+        assert_eq!(
+            receipts[0].as_str().unwrap(),
+            hex(&receipt::encode_signed(&issued)),
+            "the receipt travels back byte-identical"
+        );
+
+        // A courier fetch bumps the count but does NOT confirm — a courier is not
+        // the author (ADR-0020 §3). The row is still pending.
+        let row = DtnStore::new(&core.db)
+            .delivery_of(&record_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.fetched_count, 1);
+        assert!(
+            !row.confirmed_delivered,
+            "a courier fetch never confirms delivery"
+        );
+
+        // Bob's own device fetches over the authenticated channel — scoped to his
+        // identity, and this confirms delivery.
+        let env = envelope(&bob, "receipts_fetch", serde_json::json!({}));
+        let mine = core.route_channel_method(&env).unwrap();
+        assert_eq!(mine["receipts_hex"].as_array().unwrap().len(), 1);
+        let row = DtnStore::new(&core.db)
+            .delivery_of(&record_hash)
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.confirmed_delivered,
+            "the author's own fetch confirms delivery"
+        );
+
+        // Now confirmed, the receipt no longer shows as pending to a courier.
+        let after = call(
+            &mut core,
+            "receipts_fetch",
+            serde_json::json!({ "authors": [] }),
+        );
+        assert!(
+            after["receipts_hex"].as_array().unwrap().is_empty(),
+            "a confirmed receipt is no longer pending"
+        );
+
+        // The prune sweep keeps the confirmed row until its retention elapses...
+        core.clock.advance(DEFAULT_RECEIPT_RETENTION_SECS - 100); // still within
+        assert_eq!(core.do_prune_receipts(), 0, "kept before retention");
+        assert!(DtnStore::new(&core.db)
+            .delivery_of(&record_hash)
+            .unwrap()
+            .is_some());
+
+        // ...and reclaims it once past retention (measured from first issue, 1000).
+        core.clock.advance(200);
+        assert_eq!(core.do_prune_receipts(), 1, "pruned after retention");
+        assert!(DtnStore::new(&core.db)
+            .delivery_of(&record_hash)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The operator's own-wallet author path: `receipts_ack` confirms a receipt by
+    /// record hash, the CLI counterpart to the mobile author fetch (T2.2.4).
+    #[test]
+    fn dtn_receipts_ack_confirms_by_record_hash() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let proposal = member_proposal(&alice, &bob, 150, 0, 900, 900 + 1_000_000);
+        let entry = outbox_entry(&alice, 0, zero(), &proposal, 900);
+        let issued = submit_bundle(&mut core, std::slice::from_ref(&entry), 1000);
+        let record_hash = issued.payload.outcomes[0].record_hash;
+
+        // Ack by hash confirms exactly that delivery row.
+        let acked = call(
+            &mut core,
+            "receipts_ack",
+            serde_json::json!({ "record_hashes": [hex(&record_hash.to_bytes())] }),
+        );
+        assert_eq!(acked["acked"], 1);
+        let row = DtnStore::new(&core.db)
+            .delivery_of(&record_hash.to_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(row.confirmed_delivered);
+
+        // A second ack is a no-op (already confirmed), and an unknown hash counts
+        // for nothing.
+        let again = call(
+            &mut core,
+            "receipts_ack",
+            serde_json::json!({ "record_hashes": [hex(&record_hash.to_bytes()), hex(&[9u8; 32])] }),
+        );
+        assert_eq!(again["acked"], 0);
+    }
+
+    /// A bad-signature entry is refused and seeds **no** delivery row: its `author`
+    /// field is not attested (validation, which enforces author == signer, failed),
+    /// so it must never inject a receipt into a claimed author's pending queue.
+    #[test]
+    fn dtn_bad_signature_entry_seeds_no_delivery_row() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let mut bad = outbox_entry(
+            &bob,
+            0,
+            zero(),
+            &member_proposal(&bob, &alice, 50, 0, 900, 900 + 1_000_000),
+            900,
+        );
+        // Break the outer signature so validation fails — `author` is now unproven.
+        bad.signature = bob.sign(b"not the entry body");
+        let record_hash = bad.payload.record_hash().to_bytes();
+
+        let receipt = submit_bundle(&mut core, std::slice::from_ref(&bad), 1000);
+        assert!(matches!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::BadSignature
+            }
+        ));
+        // No delivery row, and nothing pending for anyone.
+        assert!(
+            DtnStore::new(&core.db)
+                .delivery_of(&record_hash)
+                .unwrap()
+                .is_none(),
+            "a bad-signature entry must not seed a delivery row"
+        );
+        let pending = DtnStore::new(&core.db)
+            .pending_receipts_for(&[], None, 256)
+            .unwrap();
+        assert!(pending.receipts.is_empty());
+    }
+
+    /// The authenticated channel fetch is scoped to the signer: a member cannot
+    /// confirm delivery of *another* member's records by fetching over the channel.
+    #[test]
+    fn dtn_channel_fetch_cannot_confirm_another_members_records() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let carol = Keypair::generate();
+        let proposal = member_proposal(&bob, &alice, 200, 0, 900, 900 + 1_000_000);
+        let entry = outbox_entry(&bob, 0, zero(), &proposal, 900);
+        let issued = submit_bundle(&mut core, std::slice::from_ref(&entry), 1000);
+        let record_hash = issued.payload.outcomes[0].record_hash.to_bytes();
+
+        // Carol fetches over the channel — scoped to her own identity, so she gets
+        // nothing, and Bob's row is left unconfirmed.
+        let env = envelope(&carol, "receipts_fetch", serde_json::json!({}));
+        let carol_result = core.route_channel_method(&env).unwrap();
+        assert!(carol_result["receipts_hex"].as_array().unwrap().is_empty());
+        assert!(
+            !DtnStore::new(&core.db)
+                .delivery_of(&record_hash)
+                .unwrap()
+                .unwrap()
+                .confirmed_delivered,
+            "Carol's fetch must not confirm Bob's record"
         );
     }
 

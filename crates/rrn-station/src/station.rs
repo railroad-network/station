@@ -161,6 +161,7 @@ impl Station {
             paired,
             listings,
         )
+        .with_receipt_retention_secs(config.dtn.receipt_retention_secs as i64)
         .spawn();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -297,6 +298,13 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
+        // DTN receipt-delivery prune timer (T2.2.4).
+        tasks.push(tokio::spawn(dtn_prune_timer(
+            Duration::from_secs(config.timers.dtn_prune_interval_secs.max(1)),
+            core.clone(),
+            shutdown_rx.clone(),
+        )));
+
         Ok(Station {
             core,
             shutdown_tx,
@@ -374,6 +382,13 @@ impl Station {
     /// waiting on the hourly timer.
     pub async fn resolve_disputes(&self) -> usize {
         self.core.resolve_disputes().await
+    }
+
+    /// Forces an immediate DTN receipt-delivery prune sweep; returns the number of
+    /// rows removed. Lets a driver advance the clock past a receipt's retention and
+    /// see the row reclaimed without waiting on the timer (T2.2.4).
+    pub async fn prune_receipts(&self) -> usize {
+        self.core.prune_receipts().await
     }
 
     /// Signals all tasks to stop, stops the core thread, awaits the tasks, and
@@ -584,6 +599,35 @@ async fn dispute_resolution_timer(
                 let n = core.resolve_disputes().await;
                 if n > 0 {
                     tracing::info!(resolved = n, "dispute resolution sweep");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+/// Periodically prunes DTN receipt-delivery rows past their retention (ADR-0020
+/// §3, T2.2.4): confirmed receipts older than `[dtn] receipt_retention_secs`, and
+/// unconfirmed ones older than four times that. Pure housekeeping on a bounded
+/// queue — a missed tick is caught up on the next, since the sweep removes every
+/// row now past retention, not just the newest.
+async fn dtn_prune_timer(
+    interval: Duration,
+    core: CoreHandle,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick, as the other timers do.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let n = core.prune_receipts().await;
+                if n > 0 {
+                    tracing::info!(pruned = n, "dtn receipt prune sweep");
                 }
             }
             _ = shutdown.changed() => {

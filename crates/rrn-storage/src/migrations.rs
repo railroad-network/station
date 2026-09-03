@@ -54,6 +54,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "dtn_station_state",
         sql: include_str!("../migrations/0006_dtn_station_state.sql"),
     },
+    Migration {
+        version: 7,
+        name: "receipt_deliveries",
+        sql: include_str!("../migrations/0007_receipt_deliveries.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -151,6 +156,7 @@ mod tests {
             "log_entries",
             "outbox_entries",
             "outbox_forks",
+            "receipt_deliveries",
             "reputation_snapshots",
             "seen_outbox_entries",
             "seen_outbox_heads",
@@ -169,6 +175,7 @@ mod tests {
             "idx_transactions_receiver",
             "idx_transactions_sender",
             "idx_transactions_state",
+            "receipt_deliveries_author_pending",
             "listings_index_browse",
             "listings_index_expiry",
             "listings_index_provider",

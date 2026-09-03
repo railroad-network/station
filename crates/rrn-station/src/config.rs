@@ -53,6 +53,10 @@ pub struct StationConfig {
     /// Background-loop intervals (optional; defaults to the daemon cadence).
     #[serde(default)]
     pub timers: TimersSection,
+    /// Delay-tolerant-networking tuning (optional; defaults to the protocol
+    /// receipt-retention window, ADR-0020 §3).
+    #[serde(default)]
+    pub dtn: DtnSection,
 }
 
 /// `[peers]` — who to gossip with.
@@ -164,6 +168,30 @@ impl Default for CreditSection {
     }
 }
 
+/// `[dtn]` — delay-tolerant-networking retention (ADR-0020 §3).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnSection {
+    /// How long a *confirmed* delivery receipt is retained before the prune sweep
+    /// removes it, in seconds. Defaults to 30 days. An unconfirmed receipt — one
+    /// no author has picked up — is kept far longer (four times this), since a
+    /// courier may take weeks to carry it home
+    /// (`rrn_storage::dtn::RETENTION_UNCONFIRMED_MULTIPLIER`).
+    #[serde(default = "default_receipt_retention_secs")]
+    pub receipt_retention_secs: u64,
+}
+
+fn default_receipt_retention_secs() -> u64 {
+    30 * 24 * 60 * 60
+}
+
+impl Default for DtnSection {
+    fn default() -> Self {
+        Self {
+            receipt_retention_secs: default_receipt_retention_secs(),
+        }
+    }
+}
+
 /// `[timers]` — how often the background loops fire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimersSection {
@@ -221,6 +249,16 @@ pub struct TimersSection {
     /// [`resolve_disputes`](crate::core::CoreHandle::resolve_disputes).
     #[serde(default = "default_dispute_resolution_interval")]
     pub dispute_resolution_interval_secs: u64,
+    /// DTN receipt-delivery prune interval in seconds (default: 3600 — hourly).
+    ///
+    /// Each tick removes delivery-tracking rows past their retention (ADR-0020 §3,
+    /// T2.2.4): confirmed receipts older than `[dtn] receipt_retention_secs`, and
+    /// unconfirmed ones older than four times that. Pure housekeeping on a queue,
+    /// with days-to-weeks-long retentions, so a coarse cadence is ample; a test
+    /// drives it directly through
+    /// [`prune_receipts`](crate::core::CoreHandle::prune_receipts).
+    #[serde(default = "default_dtn_prune_interval")]
+    pub dtn_prune_interval_secs: u64,
 }
 
 fn default_tier1_window_seconds() -> u64 {
@@ -253,6 +291,9 @@ fn default_governance_implementation_interval() -> u64 {
 fn default_dispute_resolution_interval() -> u64 {
     3600
 }
+fn default_dtn_prune_interval() -> u64 {
+    3600
+}
 
 impl Default for SettlementSection {
     fn default() -> Self {
@@ -275,6 +316,7 @@ impl Default for TimersSection {
             contract_charge_interval_secs: default_contract_charge_interval(),
             governance_implementation_interval_secs: default_governance_implementation_interval(),
             dispute_resolution_interval_secs: default_dispute_resolution_interval(),
+            dtn_prune_interval_secs: default_dtn_prune_interval(),
         }
     }
 }
@@ -351,6 +393,7 @@ impl StationConfig {
             settlement: SettlementSection::default(),
             credit: CreditSection::default(),
             timers: TimersSection::default(),
+            dtn: DtnSection::default(),
         }
     }
 }
@@ -399,6 +442,9 @@ mod tests {
         );
         assert_eq!(cfg.timers.sweep_interval_secs, 30);
         assert_eq!(cfg.timers.gossip_interval_secs, 5);
+        // DTN retention/prune fall back to their protocol defaults.
+        assert_eq!(cfg.timers.dtn_prune_interval_secs, 3600);
+        assert_eq!(cfg.dtn.receipt_retention_secs, 30 * 24 * 60 * 60);
         // A config written before [mobile] existed still parses, and advertises
         // on all interfaces with a derived name.
         assert_eq!(cfg.mobile.listen, "0.0.0.0:7500");
@@ -424,6 +470,23 @@ mod tests {
             Some("Railroad Station — Blue Ridge")
         );
         assert!(!cfg.mobile.advertise);
+    }
+
+    #[test]
+    fn dtn_section_overrides_defaults() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [dtn]
+            receipt_retention_secs = 120
+
+            [timers]
+            dtn_prune_interval_secs = 15
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.dtn.receipt_retention_secs, 120);
+        assert_eq!(cfg.timers.dtn_prune_interval_secs, 15);
     }
 
     #[test]
