@@ -15,8 +15,9 @@
 //! signed content. Nothing in the header is trusted. Integrity is enforced two
 //! ways, neither of which relies on the header being honest:
 //!
-//! - a **CRC-32** over each chunk's payload catches carrier bit-flips cheaply and
-//!   is verified before a chunk is ever stored;
+//! - a **CRC-32** over each frame's header fields and body catches carrier
+//!   bit-flips cheaply and is verified before a chunk is ever stored — so a
+//!   corrupted header is a rejected frame, never a poisoned in-flight payload;
 //! - the **payload id is `Blake3(payload)`**, verified over the fully reassembled
 //!   bytes — the authoritative check. A payload only reassembles if its bytes hash
 //!   to the id every chunk claimed.
@@ -29,13 +30,14 @@
 //! # Header layout ([`HEADER_LEN`] = 76 bytes, big-endian)
 //!
 //! ```text
-//! magic "RRNF"      4     payload_len   u32     chunk_len     u16
-//! version u8 (=1)   1     chunk_index   u16     payload_crc32 u32
-//! payload_id [u8;32] 32   chunk_count   u16     reserved      [u8;25]
+//! magic "RRNF"      4     payload_len   u32     chunk_len   u16
+//! version u8 (=1)   1     chunk_index   u16     frame_crc32 u32
+//! payload_id [u8;32] 32   chunk_count   u16     reserved    [u8;25]
 //! ```
 //!
 //! Then `chunk_len` payload bytes follow the header. Every chunk of a payload is
-//! `max_frame_bytes - HEADER_LEN` bytes except the last.
+//! `min(max_frame_bytes - HEADER_LEN, 65535)` bytes except the last. `frame_crc32`
+//! covers the header fields and the body (see [`frame_crc`]).
 
 use rrn_crypto::hash::Hash;
 
@@ -113,9 +115,9 @@ pub enum FramingError {
         /// The version byte found.
         found: u8,
     },
-    /// The chunk's CRC-32 did not match its payload — carrier corruption. The
-    /// frame is rejected and nothing is stored.
-    #[error("chunk CRC mismatch (carrier corruption)")]
+    /// The frame's CRC-32 (over its header fields and body) did not match —
+    /// carrier corruption. The frame is rejected and nothing is stored.
+    #[error("frame CRC mismatch (carrier corruption)")]
     ChunkCrc,
     /// A header field was self-inconsistent, or inconsistent with an earlier frame
     /// for the same payload (a corrupted `chunk_count`/`payload_len`/`chunk_index`).
@@ -131,10 +133,9 @@ pub enum FramingError {
     PayloadHashMismatch,
 }
 
-/// CRC-32 (IEEE 802.3 / zlib polynomial `0xEDB88320`) of `data`. Inlined — a
-/// dozen lines — so this wire-format crate takes no CRC dependency.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
+/// Folds `data` into a running CRC-32 (IEEE 802.3 / zlib polynomial
+/// `0xEDB88320`). Seed with `0xFFFF_FFFF`; the caller finalises with `!`.
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
@@ -142,7 +143,19 @@ fn crc32(data: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    !crc
+    crc
+}
+
+/// The CRC-32 a frame carries: over the **header fields** (`frame[0..OFF_CRC]` —
+/// magic through `chunk_len`) and the chunk **body**, skipping the 4 CRC bytes
+/// themselves and the always-zero reserved padding. Covering the header (not just
+/// the body, as an earlier draft did) means a carrier bit-flip anywhere in a
+/// field is caught cheaply and the frame rejected — it can never poison an
+/// in-flight payload's shape (a liveness bug on a high-header-overhead carrier
+/// like LoRa). Reserved bytes are unused and ignored on decode, so leaving them
+/// out is harmless.
+fn frame_crc(header_prefix: &[u8], body: &[u8]) -> u32 {
+    !crc32_update(crc32_update(0xFFFF_FFFF, header_prefix), body)
 }
 
 /// The decoded fields of a chunk header.
@@ -153,7 +166,8 @@ struct ChunkHeader {
     chunk_index: u16,
     chunk_count: u16,
     chunk_len: u16,
-    payload_crc32: u32,
+    /// CRC-32 over the header fields and body (see [`frame_crc`]).
+    frame_crc32: u32,
 }
 
 impl ChunkHeader {
@@ -167,7 +181,7 @@ impl ChunkHeader {
         buf[OFF_CHUNK_INDEX..OFF_CHUNK_COUNT].copy_from_slice(&self.chunk_index.to_be_bytes());
         buf[OFF_CHUNK_COUNT..OFF_CHUNK_LEN].copy_from_slice(&self.chunk_count.to_be_bytes());
         buf[OFF_CHUNK_LEN..OFF_CRC].copy_from_slice(&self.chunk_len.to_be_bytes());
-        buf[OFF_CRC..OFF_RESERVED].copy_from_slice(&self.payload_crc32.to_be_bytes());
+        buf[OFF_CRC..OFF_RESERVED].copy_from_slice(&self.frame_crc32.to_be_bytes());
         // reserved [OFF_RESERVED..HEADER_LEN] stays zero.
         buf
     }
@@ -201,7 +215,7 @@ impl ChunkHeader {
             chunk_index: u16_at(OFF_CHUNK_INDEX),
             chunk_count: u16_at(OFF_CHUNK_COUNT),
             chunk_len: u16_at(OFF_CHUNK_LEN),
-            payload_crc32: u32_at(OFF_CRC),
+            frame_crc32: u32_at(OFF_CRC),
         })
     }
 }
@@ -227,7 +241,11 @@ pub fn chunk(payload: &[u8], max_frame_bytes: usize) -> Result<Vec<Vec<u8>>, Fra
             max: u32::MAX as usize,
         });
     }
-    let cap = max_frame_bytes - HEADER_LEN; // ≥ 1
+    // A chunk body is `chunk_len: u16`, so cap it at u16::MAX even when the
+    // carrier's frame budget is far larger (e.g. a TCP profile advertising MiB):
+    // a huge budget simply means more, u16-sized chunks, never a silent
+    // truncation of `chunk_len` that would make every frame fail its CRC.
+    let cap = (max_frame_bytes - HEADER_LEN).min(u16::MAX as usize); // 1..=65535
     let chunk_count = payload.len().div_ceil(cap).max(1);
     if chunk_count > MAX_CHUNKS {
         return Err(FramingError::TooManyChunks {
@@ -248,11 +266,15 @@ pub fn chunk(payload: &[u8], max_frame_bytes: usize) -> Result<Vec<Vec<u8>>, Fra
             chunk_index: index as u16,
             chunk_count: chunk_count as u16,
             chunk_len: body.len() as u16,
-            payload_crc32: crc32(body),
+            frame_crc32: 0, // filled in below, once the header bytes exist
         };
         let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
         frame.extend_from_slice(&header.encode());
         frame.extend_from_slice(body);
+        // CRC over the header fields (crc field still zero, and excluded) plus the
+        // body, then patch it into the frame.
+        let crc = frame_crc(&frame[OFF_MAGIC..OFF_CRC], body);
+        frame[OFF_CRC..OFF_RESERVED].copy_from_slice(&crc.to_be_bytes());
         frames.push(frame);
     }
     Ok(frames)
@@ -265,10 +287,13 @@ pub struct ReassemblerConfig {
     /// refused. Defaults to [`crate::bundle::MAX_BUNDLE_BYTES`] (4 MiB).
     pub max_payload_bytes: usize,
     /// Most payloads reassembled concurrently. Adding one beyond this evicts the
-    /// oldest in-flight payload (bounding memory under a flood of new ids).
+    /// oldest in-flight payload (bounding memory under a flood of new ids). A value
+    /// of 0 is treated as 1 (one payload is always assemblable).
     pub max_inflight_payloads: usize,
-    /// A partial payload untouched for this many seconds is pruned. Defaults to 7
-    /// days — a courier may take a long time to carry every chunk.
+    /// A partial payload whose *first* chunk arrived more than this many seconds
+    /// ago is pruned — the clock runs from first sight, not last activity, so an
+    /// attacker cannot keep a partial alive indefinitely by dribbling chunks.
+    /// Defaults to 7 days — a courier may take a long time to carry every chunk.
     pub ttl_secs: i64,
 }
 
@@ -293,6 +318,11 @@ struct Partial {
     /// One slot per chunk index; `Some` once that chunk's bytes have arrived.
     chunks: Vec<Option<Vec<u8>>>,
     seen_count: usize,
+    /// Running total of stored chunk-body bytes. Kept so a chunk that would push
+    /// the total past `payload_len` is refused *before* it is stored — the guard
+    /// that actually bounds per-payload memory to `payload_len` (an unbounded
+    /// `chunk_len × chunk_count` would otherwise dwarf the claimed length).
+    stored_bytes: usize,
     /// Admission-clock reading when the first chunk arrived (for TTL/LRU).
     first_seen_at: i64,
 }
@@ -334,9 +364,11 @@ impl Reassembler {
             });
         }
         let body = &frame[HEADER_LEN..body_end];
-        // Cheap corruption guard first: a bad CRC means carrier damage; drop the
-        // frame before it can touch reassembly state.
-        if crc32(body) != header.payload_crc32 {
+        // Cheap corruption guard first: verify the CRC over the header fields and
+        // body before the frame can touch any reassembly state. Covering the
+        // header means a bit-flip in chunk_count/payload_len/chunk_index is caught
+        // here, not left to poison a partial.
+        if frame_crc(&frame[OFF_MAGIC..OFF_CRC], body) != header.frame_crc32 {
             return Err(FramingError::ChunkCrc);
         }
         // A late duplicate of a payload already delivered: ignore, do not rebuild.
@@ -345,6 +377,7 @@ impl Reassembler {
         }
         // Structural validation of the (untrusted) header.
         let count = header.chunk_count as usize;
+        let payload_len = header.payload_len as usize;
         if count == 0 || count > MAX_CHUNKS {
             return Err(FramingError::HeaderInconsistent("chunk_count out of range"));
         }
@@ -353,11 +386,24 @@ impl Reassembler {
                 "chunk_index >= chunk_count",
             ));
         }
-        if header.payload_len as usize > self.config.max_payload_bytes {
+        if payload_len > self.config.max_payload_bytes {
             return Err(FramingError::PayloadTooLarge {
-                found: header.payload_len as usize,
+                found: payload_len,
                 max: self.config.max_payload_bytes,
             });
+        }
+        // A real split never produces more chunks than payload_len + 1 (each of
+        // the first count-1 chunks holds ≥ 1 byte; the empty-payload case is
+        // count 1, len 0). Refusing the inverse bounds the `vec![None; count]`
+        // slot vector to the payload's own size — a tiny payload can no longer
+        // claim 4096 chunks. A single chunk can never exceed the whole payload.
+        if count as u64 > payload_len as u64 + 1 {
+            return Err(FramingError::HeaderInconsistent(
+                "chunk_count > payload_len + 1",
+            ));
+        }
+        if header.chunk_len as usize > payload_len {
+            return Err(FramingError::HeaderInconsistent("chunk_len > payload_len"));
         }
 
         // Locate or create the partial, checking cross-frame consistency so a
@@ -382,6 +428,7 @@ impl Reassembler {
                     chunk_count: header.chunk_count,
                     chunks: vec![None; count],
                     seen_count: 0,
+                    stored_bytes: 0,
                     first_seen_at: now,
                 },
             );
@@ -398,8 +445,17 @@ impl Reassembler {
             Some(existing) if existing.as_slice() == body => return Ok(None),
             Some(_) => return Err(FramingError::ChunkConflict),
             None => {
+                // Refuse a chunk that would push the stored total past the claimed
+                // payload_len — the guard that bounds per-payload memory (a forged
+                // header could otherwise store chunk_count × chunk_len ≫ payload_len).
+                if partial.stored_bytes + body.len() > payload_len {
+                    return Err(FramingError::HeaderInconsistent(
+                        "stored chunk bytes exceed payload_len",
+                    ));
+                }
                 *slot = Some(body.to_vec());
                 partial.seen_count += 1;
+                partial.stored_bytes += body.len();
             }
         }
 
@@ -407,16 +463,21 @@ impl Reassembler {
             return Ok(None);
         }
 
-        // Complete: concatenate in index order and verify the authoritative hash.
-        let mut assembled = Vec::with_capacity(partial.payload_len as usize);
+        // Complete. Every slot is full; the stored bytes must tile the payload
+        // exactly (the per-chunk guard caps the total, so a short-fall here means a
+        // forged set of undersized chunks) — discard if not, before allocating.
+        if partial.stored_bytes != payload_len {
+            self.partials.remove(&header.payload_id);
+            return Err(FramingError::PayloadHashMismatch);
+        }
+        let mut assembled = Vec::with_capacity(partial.stored_bytes);
         for chunk in &partial.chunks {
             assembled.extend_from_slice(chunk.as_deref().expect("all chunks present"));
         }
-        if assembled.len() != partial.payload_len as usize
-            || Hash::of(&assembled).to_bytes() != header.payload_id
-        {
-            // A chunk landed at the wrong index (its own CRC passed) or lengths do
-            // not add up: discard so a clean carriage rebuilds it.
+        // Blake3 over the reassembled bytes is the authoritative check: a chunk
+        // that landed at a forged index (with a re-computed valid CRC) is caught
+        // here. Discard on mismatch so a clean carriage rebuilds it.
+        if Hash::of(&assembled).to_bytes() != header.payload_id {
             self.partials.remove(&header.payload_id);
             return Err(FramingError::PayloadHashMismatch);
         }
@@ -461,9 +522,10 @@ impl Reassembler {
         self.partials.len()
     }
 
-    /// Removes the oldest-started in-flight payload (by `first_seen_at`). An O(n)
-    /// scan, but `n` is bounded by `max_inflight_payloads` (default 64), so even a
-    /// prune that must evict several is trivially cheap — no ordered index needed.
+    /// Removes the oldest-started in-flight payload (by `first_seen_at`; ties break
+    /// on `HashMap` iteration order, which is fine for a memory cap). An O(n) scan,
+    /// but `n` is bounded by `max_inflight_payloads` (default 64), so even a prune
+    /// that must evict several is trivially cheap — no ordered index needed.
     fn evict_oldest(&mut self) {
         if let Some(oldest) = self
             .partials
@@ -523,7 +585,7 @@ mod tests {
             chunk_index: 1,
             chunk_count: 3,
             chunk_len: 2,
-            payload_crc32: 0xDEAD_BEEF,
+            frame_crc32: 0xDEAD_BEEF,
         };
         let expected = {
             let mut s = String::new();
@@ -621,9 +683,9 @@ mod tests {
         let mut forged = frames[0].clone();
         let last = forged.len() - 1;
         forged[last] ^= 0xFF;
-        // Fix the CRC so we reach the conflict check, not the CRC check.
-        let body = &forged[HEADER_LEN..];
-        let crc = crc32(body);
+        // Recompute the frame CRC so we reach the conflict check, not the CRC
+        // check (a malicious re-framer, not a dumb carrier, can do this).
+        let crc = frame_crc(&forged[OFF_MAGIC..OFF_CRC], &forged[HEADER_LEN..]);
         forged[OFF_CRC..OFF_RESERVED].copy_from_slice(&crc.to_be_bytes());
         assert_eq!(r.accept(&forged, 0), Err(FramingError::ChunkConflict));
 
@@ -722,20 +784,30 @@ mod tests {
         assert_eq!(r.inflight(), 0);
     }
 
+    /// Re-points a frame's `chunk_index`, fixing up the frame CRC so it still
+    /// verifies — a *malicious* re-framer (a dumb carrier can't recompute the CRC).
+    fn reindex(frame: &[u8], new_index: u16) -> Vec<u8> {
+        let mut f = frame.to_vec();
+        f[OFF_CHUNK_INDEX..OFF_CHUNK_COUNT].copy_from_slice(&new_index.to_be_bytes());
+        let crc = frame_crc(&f[OFF_MAGIC..OFF_CRC], &f[HEADER_LEN..]);
+        f[OFF_CRC..OFF_RESERVED].copy_from_slice(&crc.to_be_bytes());
+        f
+    }
+
     #[test]
     fn a_misindexed_chunk_fails_the_hash_and_discards() {
-        // Two 4-byte chunks. Forge the second frame's index to 0 (a header
-        // corruption its own CRC cannot catch), so index 1 never fills and index 0
-        // holds the wrong bytes → at completion the Blake3 fails.
+        // A mis-index that the CRC cannot catch is only reachable by a malicious
+        // re-framer that recomputes the CRC; Blake3 over the whole is the backstop.
         let payload: Vec<u8> = (0..8).collect();
         let frames = chunk(&payload, HEADER_LEN + 4).unwrap();
         let mut r = Reassembler::new(ReassemblerConfig::default());
         r.accept(&frames[0], 0).unwrap();
         // Re-point frame[1] to index 0 with different content → conflict (index 0
         // already filled), which keeps the first and refuses the frame.
-        let mut mis = frames[1].clone();
-        mis[OFF_CHUNK_INDEX..OFF_CHUNK_COUNT].copy_from_slice(&0u16.to_be_bytes());
-        assert_eq!(r.accept(&mis, 0), Err(FramingError::ChunkConflict));
+        assert_eq!(
+            r.accept(&reindex(&frames[1], 0), 0),
+            Err(FramingError::ChunkConflict)
+        );
 
         // A cleaner mis-index case: a *fresh* payload where index 1's frame claims
         // index 0, so the real index-0 slot is filled with index-1 bytes and index
@@ -743,12 +815,90 @@ mod tests {
         let payload2: Vec<u8> = (100..108).collect();
         let f2 = chunk(&payload2, HEADER_LEN + 4).unwrap();
         let mut r2 = Reassembler::new(ReassemblerConfig::default());
-        let mut swapped = f2[1].clone();
-        swapped[OFF_CHUNK_INDEX..OFF_CHUNK_COUNT].copy_from_slice(&0u16.to_be_bytes());
-        assert_eq!(r2.accept(&swapped, 0).unwrap(), None); // fills slot 0 wrongly
-                                                           // The true index-1 frame fills slot 1; both slots now full → hash checked.
+        assert_eq!(r2.accept(&reindex(&f2[1], 0), 0).unwrap(), None); // fills slot 0 wrongly
+                                                                      // The true index-1 frame fills slot 1; both slots now full → hash checked.
         assert_eq!(r2.accept(&f2[1], 0), Err(FramingError::PayloadHashMismatch));
         // The partial was discarded, so a clean carriage can rebuild.
         assert_eq!(r2.inflight(), 0);
+    }
+
+    /// Builds a frame with the given header fields and body plus a correct frame
+    /// CRC — for exercising forged-but-well-CRC'd headers.
+    fn forge_frame(
+        payload_id: [u8; 32],
+        payload_len: u32,
+        chunk_index: u16,
+        chunk_count: u16,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let header = ChunkHeader {
+            payload_id,
+            payload_len,
+            chunk_index,
+            chunk_count,
+            chunk_len: body.len() as u16,
+            frame_crc32: 0,
+        };
+        let mut frame = header.encode().to_vec();
+        frame.extend_from_slice(body);
+        let crc = frame_crc(&frame[OFF_MAGIC..OFF_CRC], body);
+        frame[OFF_CRC..OFF_RESERVED].copy_from_slice(&crc.to_be_bytes());
+        frame
+    }
+
+    /// #1 (memory bound): a header whose chunks would store far more than the
+    /// claimed `payload_len` is refused, so per-payload memory stays ≤ payload_len.
+    #[test]
+    fn forged_oversize_chunks_are_refused_before_storing() {
+        let mut r = Reassembler::new(ReassemblerConfig::default());
+        // Claim a 100-byte payload but ship a 200-byte chunk body.
+        let big_body = vec![7u8; 200];
+        let f = forge_frame([1u8; 32], 100, 0, 1, &big_body);
+        assert_eq!(
+            r.accept(&f, 0),
+            Err(FramingError::HeaderInconsistent("chunk_len > payload_len"))
+        );
+        // Claim a 2-byte payload but 4096 chunks (a slot-vector amplification).
+        let f2 = forge_frame([2u8; 32], 2, 0, 4096, b"x");
+        assert_eq!(
+            r.accept(&f2, 0),
+            Err(FramingError::HeaderInconsistent(
+                "chunk_count > payload_len + 1"
+            ))
+        );
+        // Two in-range chunks that together overrun payload_len: the second, which
+        // would push stored_bytes past the claim, is refused (the first is stored).
+        let id = [3u8; 32];
+        let a = forge_frame(id, 6, 0, 2, b"aaaa"); // 4 stored, ok (≤ 6)
+        let b = forge_frame(id, 6, 1, 2, b"bbbb"); // 4 + 4 = 8 > 6 → refused
+        assert_eq!(r.accept(&a, 0).unwrap(), None);
+        assert_eq!(
+            r.accept(&b, 0),
+            Err(FramingError::HeaderInconsistent(
+                "stored chunk bytes exceed payload_len"
+            ))
+        );
+        // Nothing under this id ever exceeded the claimed 6 bytes.
+        assert_eq!(r.missing(&id), Some(vec![1]));
+    }
+
+    /// #2 (u16 clamp): a carrier advertising a frame budget past u16 chunks the
+    /// payload into u16-sized bodies instead of truncating `chunk_len`.
+    #[test]
+    fn large_frame_budget_clamps_chunk_len_to_u16() {
+        let payload: Vec<u8> = (0..70_000u32).map(|i| i as u8).collect();
+        let frames = chunk(&payload, HEADER_LEN + 70_000).unwrap();
+        assert_eq!(frames.len(), 2); // 65535 + 4465, not one truncated chunk
+        assert_eq!(ChunkHeader::decode(&frames[0]).unwrap().chunk_len, u16::MAX);
+        let mut r = Reassembler::new(ReassemblerConfig::default());
+        assert_eq!(r.accept(&frames[0], 0).unwrap(), None);
+        assert_eq!(r.accept(&frames[1], 0).unwrap(), Some(payload));
+    }
+
+    /// Pins the CRC-32 variant (standard IEEE/zlib) by its check value.
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(!crc32_update(0xFFFF_FFFF, b"123456789"), 0xCBF4_3926);
+        assert_eq!(!crc32_update(0xFFFF_FFFF, b""), 0);
     }
 }

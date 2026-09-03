@@ -120,7 +120,6 @@ pub mod mock {
     use std::sync::Mutex;
 
     use super::{Endpoint, FrameTransport, TransportError, TransportProfile};
-    use crate::framing::HEADER_LEN;
 
     /// A tiny deterministic PRNG (SplitMix64). Not cryptographic — a reproducible
     /// fault generator whose sequence is pinned forever by its seed, so a mock's
@@ -165,6 +164,10 @@ pub mod mock {
     /// [`LoopbackTransport`] handle attached to it is one node; `send` enqueues on
     /// the recipient's inbox and `poll_recv` drains this node's inbox in order.
     /// The "pair" the ticket calls for is just two handles on one net.
+    ///
+    /// A test mock: `send` to any name succeeds (so it never reports
+    /// [`TransportError::Unreachable`]), and frames sent to an endpoint that is
+    /// never polled accumulate in its inbox for the life of the net.
     #[derive(Clone)]
     pub struct LoopbackNet {
         inner: std::sync::Arc<Mutex<Inner>>,
@@ -246,8 +249,9 @@ pub mod mock {
         pub drop_prob: f64,
         /// Probability a delivered frame is duplicated (an extra identical copy).
         pub dup_prob: f64,
-        /// Probability a delivered frame's *payload* has one byte flipped (a
-        /// carrier bit-flip; caught by the chunk CRC — see [`crate::framing`]).
+        /// Probability a delivered frame has one byte flipped, anywhere in the
+        /// frame (a carrier bit-flip; caught by the frame CRC — see
+        /// [`crate::framing`]).
         pub corrupt_prob: f64,
         /// Frames are shuffled within sliding windows of this size (`0` or `1`
         /// disables reordering).
@@ -316,11 +320,12 @@ pub mod mock {
                 }
                 let mut frame = frame;
                 if rng.next_f64() < self.config.corrupt_prob {
-                    // Flip a byte in the *payload* region only (index >= HEADER_LEN),
-                    // so the chunk CRC — which covers the payload — reliably catches
-                    // it. A frame with no payload byte to flip is left intact.
-                    if frame.len() > HEADER_LEN {
-                        let i = HEADER_LEN + rng.below(frame.len() - HEADER_LEN);
+                    // Flip a byte anywhere in the frame — header or body. The frame
+                    // CRC covers the header fields and body (see `framing`), so a
+                    // corrupted frame is reliably rejected; a flip in the unused
+                    // reserved padding is inert. Models a real carrier bit-flip.
+                    if !frame.is_empty() {
+                        let i = rng.below(frame.len());
                         frame[i] ^= 1 << (rng.below(8) as u8);
                     }
                 }

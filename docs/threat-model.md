@@ -962,7 +962,7 @@ and the carrier-agnostic chunking/reassembly above it
 ([`framing`](../crates/rrn-protocol/src/framing.rs)) that lets a bundle far larger
 than a carrier's frame (LoRa ≈ 250 B) cross it in pieces and reassemble. A frame
 is a fixed 76-byte header (`magic | version | payload_id | payload_len |
-chunk_index | chunk_count | chunk_len | payload_crc32 | reserved`) plus chunk
+chunk_index | chunk_count | chunk_len | frame_crc32 | reserved`) plus chunk
 bytes. This is **plumbing, not signed content** — the header is a plain
 big-endian struct, never dCBOR, and nothing in it is trusted.
 
@@ -973,28 +973,38 @@ reorder, and duplication.
 
 - *Tampering — a forged or corrupted frame.* A carrier (the seam assumes a
   *dumb, untrusted* one, ADR-0013) may flip bits, forge a header, or inject
-  frames. Integrity does not rest on the header: a **CRC-32 over each chunk's
-  payload** is verified before the chunk is ever stored (cheap catch for carrier
-  bit-flips → `ChunkCrc`, frame dropped), and the **payload id is `Blake3(payload)`,
-  verified over the fully reassembled bytes** — the authoritative check. A payload
-  only reassembles if its bytes hash to the id every chunk claimed; a chunk that
-  slips past the CRC at a forged index (its own payload CRC still valid) is caught
-  at completion (`PayloadHashMismatch`), and the partial is discarded so a clean
-  carriage rebuilds it. Beyond all this, the records *inside* the payload carry
-  their own author signatures (ADR-0020) — three independent layers, none relying
-  on the framing header being honest. A forged header can therefore at most waste
-  bounded reassembly memory or get a frame rejected; it can never manufacture a
-  payload that passes as real.
+  frames. Integrity does not rest on the header being honest: a **CRC-32 over the
+  frame's header fields and body** is verified before the frame touches any
+  reassembly state (a cheap catch for carrier bit-flips → `ChunkCrc`, frame
+  dropped), so a corrupted `chunk_count`/`payload_len`/`chunk_index` is a rejected
+  frame, never a *poisoned* in-flight payload. The **payload id is
+  `Blake3(payload)`, verified over the fully reassembled bytes** is the
+  authoritative check: a chunk placed at a *malicious* forged index (one where the
+  attacker recomputed a valid CRC — a dumb carrier cannot) is caught at completion
+  (`PayloadHashMismatch`), and the partial is discarded so a clean carriage
+  rebuilds it. Beyond this, the records *inside* the payload carry their own author
+  signatures (ADR-0020) — independent layers, none relying on the framing header.
+  A forged header can therefore at most waste bounded memory or get a frame
+  rejected; it can never manufacture a payload that passes as real.
 - *Denial of service — reassembly memory.* A hostile carrier streams chunks for
   many distinct `payload_id`s, or partial payloads it never completes, to exhaust
-  memory. `Reassembler` is bounded on every axis: `max_payload_bytes` (default
-  4 MiB, matching the bundle cap) refuses an over-large `payload_len`;
-  `max_inflight_payloads` (default 64) evicts the oldest in-flight payload — both
-  at insert time and on `prune` — so concurrent partials are capped; `ttl_secs`
-  (default 7 days, courier-generous) prunes stale partials; `chunk_count` is
-  capped at `MAX_CHUNKS` (4096); and a bounded `recent_completed` LRU (1024) makes
-  a late duplicate of a delivered payload a no-op instead of a rebuild. Per-frame
-  work is O(chunk) — a CRC and a slot write.
+  memory. `Reassembler` is bounded on every axis. The key guard is a per-payload
+  **running byte total**: a chunk that would push the stored bytes past the
+  claimed `payload_len` is refused *before* it is stored (`chunk_len` and
+  `chunk_count` are independent header fields, so without this a forged header
+  could store `chunk_count × chunk_len ≫ payload_len`), and `chunk_count` is
+  additionally capped at `payload_len + 1`, bounding the slot vector. So one
+  partial holds ≤ `payload_len` ≤ `max_payload_bytes` (default 4 MiB) bytes.
+  `max_inflight_payloads` (default 64) caps concurrent partials — evicting the
+  oldest both at insert time and on `prune`; `ttl_secs` (default 7 days,
+  courier-generous, measured from first sight) prunes stale partials; `MAX_CHUNKS`
+  (4096) caps split count; and a bounded `recent_completed` LRU (1024) makes a
+  late duplicate of a delivered payload a no-op. Per-frame work is O(chunk) — a
+  CRC and a slot write. *Residual:* insert-time eviction is oldest-first, so a
+  carrier that floods 64 cheap forged ids can evict honest in-flight partials
+  (which are then the oldest); this is inherent to a dumb carrier that can already
+  drop frames at will — the retransmit driver simply re-requests, and no
+  *admitted* state is affected.
 - *Tampering — the chunk-conflict tripwire.* Two *different* payloads arriving for
   one already-filled `(payload_id, chunk_index)` slot is refused (`ChunkConflict`)
   and the first kept — a carrier cannot overwrite a delivered chunk with different
