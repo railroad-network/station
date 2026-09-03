@@ -23,7 +23,9 @@ use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_protocol::bundle::{Bundle, EntryEnvelope};
 use rrn_protocol::outbox::{self, OutboxEntry};
-use rrn_protocol::receipt::{DeliveryReceipt, Disposition, Outcome, RefusalReason, SignedReceipt};
+use rrn_protocol::receipt::{
+    self, DeliveryReceipt, Disposition, Outcome, RefusalReason, SignedReceipt,
+};
 use serde::{Deserialize, Serialize};
 
 /// A stand-in application record (a proposal/vote/… would go here in reality),
@@ -86,6 +88,10 @@ struct ReceiptVector {
     canonical_hex: String,
     /// The station's Ed25519 signature over `canonical_hex`.
     signature_hex: String,
+    /// The portable **receipt-envelope bytes** (`{signer, sig, body}` canonical
+    /// dCBOR) an offline receiver decodes and verifies — the exact format the
+    /// mobile FFI's `receipt_parse` (T2.4.2) consumes.
+    envelope_hex: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,12 +197,16 @@ fn build_receipt_vector() -> ReceiptVector {
     let canonical = to_canonical_bytes(receipt.clone());
     let signed = SignedReceipt::sign(receipt, &station);
     assert!(signed.verify().is_ok());
+    // The portable envelope must decode back to the same signed receipt.
+    let envelope = receipt::encode_signed(&signed);
+    assert_eq!(receipt::decode_signed(&envelope).unwrap(), signed);
     ReceiptVector {
         station_seed: hex::encode(station.secret_key().to_bytes()),
         station_pubkey: hex::encode(station.public_key().to_bytes()),
         received_at: "1700001000".to_string(),
         canonical_hex: hex::encode(&canonical),
         signature_hex: hex::encode(signed.signature.to_bytes()),
+        envelope_hex: hex::encode(envelope),
     }
 }
 
@@ -313,4 +323,9 @@ fn committed_bytes_match_the_typed_encoders() {
         fx.receipt.signature_hex
     );
     assert!(signed_receipt.verify().is_ok());
+    // The portable receipt-envelope bytes reproduce byte-identically too.
+    assert_eq!(
+        hex::encode(receipt::encode_signed(&signed_receipt)),
+        fx.receipt.envelope_hex
+    );
 }

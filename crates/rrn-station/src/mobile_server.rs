@@ -18,16 +18,24 @@
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use rrn_protocol::bundle::MAX_BUNDLE_BYTES;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::core::{CoreHandle, SubscribeOutcome};
 use crate::pairing::{PairError, PairRequest, PairResponse};
 use crate::rpc_envelope::ChannelError;
+
+/// Request-body ceiling for the sealed channel. A `bundle_submit` (T2.2.3)
+/// carries a DTN bundle up to [`MAX_BUNDLE_BYTES`] hex-encoded (≈ 2×) inside a
+/// signed, sealed envelope, so the axum default (2 MiB) would 413 a legitimate
+/// full bundle before the seal is ever opened. Sized to that worst case plus
+/// headroom for the envelope/seal framing; every other request is far smaller.
+const MOBILE_BODY_LIMIT: usize = MAX_BUNDLE_BYTES * 2 + 256 * 1024;
 
 /// Router state: the core handle plus how long a `/subscribe` is held open.
 #[derive(Clone)]
@@ -40,8 +48,17 @@ struct AppState {
 fn app(core: CoreHandle, subscribe_hold: Duration) -> Router {
     Router::new()
         .route("/pair", post(pair))
-        .route("/rpc", post(rpc))
-        .route("/subscribe", post(subscribe))
+        // `/rpc` carries `bundle_submit`, whose sealed body can approach
+        // `MOBILE_BODY_LIMIT`; `/subscribe` shares the ceiling for symmetry.
+        // `/pair` keeps the small default (its body is a fixed-size handshake).
+        .route(
+            "/rpc",
+            post(rpc).route_layer(DefaultBodyLimit::max(MOBILE_BODY_LIMIT)),
+        )
+        .route(
+            "/subscribe",
+            post(subscribe).route_layer(DefaultBodyLimit::max(MOBILE_BODY_LIMIT)),
+        )
         .with_state(AppState {
             core,
             subscribe_hold,

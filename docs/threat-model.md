@@ -2092,6 +2092,116 @@ pipeline enforces (T1.3.4).
   fetch events without carrying a transacting key; that is a future cross-repo
   change, out of scope for Phase 1.
 
+### DTN bundle ingest (station, ADR-0020)
+
+*Implemented in T2.2.3.* The station is the **DTN admission point**: it accepts a
+[`Bundle`](spec/) of signed outbox entries from any carrier — an operator over
+the Unix socket (`bundle_submit`), a paired mobile courier over the sealed
+`/rpc` channel (`bundle_submit`, T2.4.2 FFI later) — validates each entry, tracks
+each author's chain (fork/gap), routes each embedded record through the **same**
+engine front door the live path uses, and answers with one station-signed
+[`DeliveryReceipt`](spec/). Admission order is arrival order; no claimed timestamp
+enters any window (ADR-0022). Ingest is idempotent. Station-role bookkeeping
+(seen chains, fork evidence, issued receipts) lives in `rrn-storage::dtn`
+(`seen_outbox_*`, `outbox_forks`, `issued_receipts`) — caches and evidence, never
+community-log state; the log stays the single source of truth (ADR-0020 §1).
+
+**Assets:** the single-writer log's integrity under multi-carrier submission; the
+debt-floor and every other front-door invariant applying identically to
+DTN-carried records; the idempotency guarantee (no record admitted twice, no
+duplicate settlement); fork evidence for the ADR-0021 equivocation work; the
+availability of the single-threaded core.
+
+#### Spoofing / Tampering — a forged or altered bundle
+
+- *Threat:* a courier (or anyone on the LAN) fabricates a bundle, alters a
+  carried entry, or re-frames records into a bundle of their choosing, hoping to
+  admit a record its purported author never signed.
+- *Mitigation:* a `Bundle` is an **unsigned dumb-carrier** envelope (ADR-0008/
+  0013) — integrity rides on each entry, never on the bundle. Ingest runs
+  `rrn_protocol::outbox::validate` on every entry (outer entry signature, author
+  == outer signer, inner record signature) and refuses a failure with
+  `bad-signature` before any routing; the engine then **re-verifies** the record
+  signature and re-checks sender/party identity at its own front door. A tampered
+  entry fails one of these checks. Re-framing is harmless: receipts key on each
+  record's content hash (`record_hash`), never on the bundle, so a record's fate
+  is identical however it was bundled. The paired mobile that POSTs a bundle is a
+  **courier, not the author** — `channel_bundle_submit` deliberately does *not*
+  bind the record signer to the authenticated mobile (unlike `submit_proposal`),
+  because ADR-0020 §3 lets any device carry any bundle; the pairing gate is the
+  DoS/accountability boundary, the per-entry signatures the integrity boundary.
+
+#### Tampering — outbox forks and gaps (equivocation)
+
+- *Threat:* an author equivocates — signs two different records at the same
+  outbox position — or a courier drops entries, hoping to double-spend or to
+  suppress a member's records undetectably.
+- *Mitigation:* the station records each `(author, position)` it sees. A second
+  validly-signed entry at a seen position with **different** content is an outbox
+  fork: the later side is refused `outbox-fork` and both envelopes are persisted
+  verbatim to `outbox_forks` as the equivocation evidence T2.3.3 consumes; the
+  bundle continues. A **gap** (a position beyond the contiguous head) does not
+  refuse the entry — couriers legitimately carry partial chains (ADR-0020 §2) —
+  but the contiguous head does not advance past the gap, so a suppressed entry
+  leaves a detectable hole that a later carriage can fill (advancing the head
+  across the now-contiguous run). Neither a fork nor a gap can cause a double
+  *admission*: the log's content-hash dedup (`AppendLog::admission_of`) answers an
+  already-admitted record `known`, and the debt floor is checked at the one front
+  door in arrival order (ADR-0018/0021).
+
+#### Repudiation / replay — receipts and re-ingest
+
+- *Threat:* a captured bundle or receipt is replayed, hoping to double-admit a
+  record or to make the station contradict a receipt it already issued.
+- *Mitigation:* re-ingesting a byte-identical **presentation** (the ordered
+  record-hash list, Blake3-keyed in `issued_receipts`) returns the stored receipt
+  **verbatim** — deterministic re-issue is harmless by design, admitting nothing.
+  A *different* bundle re-carrying already-admitted records yields `known`
+  outcomes via the log dedup, equally safe. A receipt is transport state, never
+  appended to the log (ADR-0020 §3), so replaying one changes no community state.
+  Over the mobile channel a replayed *request* additionally dies at the sealed
+  channel's monotonic nonce check before ingest even runs.
+
+#### Denial of service — bundle spam on a single-threaded core
+
+- *Threat:* an attacker floods the station with large or numerous bundles. The
+  core is single-threaded, and validating a full bundle (up to
+  `MAX_BUNDLE_ENTRIES` entries × two Ed25519 verifies each, plus engine routing
+  and receipt signing) is far costlier than a read — abuse stalls admission for
+  everyone.
+- *Mitigation:* `Bundle::decode` enforces documented caps before the CBOR is
+  walked — `MAX_BUNDLE_BYTES` (4 MiB) and `MAX_BUNDLE_ENTRIES` (512) — bounding
+  per-request work. The mobile route is **pairing-gated exactly like every other
+  authenticated request** (sealed, signed, nonce-checked), so only paired members
+  can POST a bundle, and the axum body limit is raised precisely to the bundle
+  worst case (`MOBILE_BODY_LIMIT`) so an oversize body is rejected at the edge,
+  not after buffering unboundedly. The operator Unix-socket path is local-trust.
+- *Residual risk (backlog):* there is **no per-member rate limit** yet — a paired
+  member can still submit many well-formed bundles in a loop, and the pairing gate
+  bounds *who*, not *how often*. Rate limiting is tracked as backlog (the same gap
+  the read-path DoS note calls out); at 20-member pilot scale the pairing gate is
+  the accepted bound. The `seen_outbox_entries`/`outbox_forks` tables also grow
+  with carried volume (one row per distinct seen position, plus retained fork
+  envelopes) — unbounded pruning is deferred; the local-plaintext-state posture
+  matches the outbox store above (at-rest encryption is T2.9.x).
+
+#### Elevation of privilege — the Tier-2 confirmation staking gate
+
+- *Threat:* a Tier-2 confirmation carried over DTN could bypass the reputation-
+  band **staking eligibility gate** (T1.8.2) that governs who may confirm a
+  Tier-2 payment once bootstrap grace has ended — the gate historically lived in
+  the channel/operator handler, not in the engine front door the DTN path shares,
+  so an ineligible confirmer could have used DTN as a way around it.
+- *Mitigation:* the gate is lifted into one shared pre-engine check,
+  `Core::tier2_confirmation_gate`, invoked identically by all three admission
+  paths — the operator CLI (`m_confirm`), the mobile channel
+  (`channel_submit_confirmation`), and DTN ingest (`route_dtn_record`). A DTN
+  confirmation of a Tier-2 proposal by a below-band confirmer past grace is
+  refused `tier2-stake`, exactly as the live paths refuse it — no bypass, and no
+  admission logic duplicated (all three call the one helper). The engine's own
+  admission (signature, state, debt floor, expiry) applies to DTN confirmations
+  as well. Covered by `dtn_tier2_confirmation_is_held_to_the_staking_bar`.
+
 ### Vouching surface (M1.4)
 
 *Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its
