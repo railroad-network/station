@@ -65,6 +65,40 @@ pub enum NoteOutcome {
     },
 }
 
+/// How much longer an *unconfirmed* delivery row is kept than a confirmed one:
+/// a courier may take weeks to carry a receipt home, so a receipt no author has
+/// picked up survives `retention_secs` × this multiplier before it is pruned
+/// ([`DtnStore::prune_delivered`]).
+pub const RETENTION_UNCONFIRMED_MULTIPLIER: i64 = 4;
+
+/// One queued receipt-delivery row ([`DtnStore::delivery_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryRow {
+    /// The record's author (32-byte public key).
+    pub author: [u8; 32],
+    /// The presentation hash of the receipt that reported this record.
+    pub receipt_presentation: [u8; 32],
+    /// How many times a receipt for this record has been handed out.
+    pub fetched_count: i64,
+    /// Whether the record's own author has confirmed delivery.
+    pub confirmed_delivered: bool,
+}
+
+/// A page of pending delivery receipts for one fetch ([`DtnStore::pending_receipts_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReceipts {
+    /// The distinct receipt-envelope bytes, oldest first, at most the requested
+    /// `limit`. Each is a `SignedReceipt` envelope (`rrn_protocol::receipt`), an
+    /// opaque blob to this layer.
+    pub receipts: Vec<Vec<u8>>,
+    /// The delivery rows this fetch acted on — the record hashes (matching the
+    /// author filter) covered by the returned receipts. The caller bumps or
+    /// confirms exactly these, so a receipt truncated out by `limit` is untouched.
+    pub record_hashes: Vec<[u8; 32]>,
+    /// Whether more distinct pending receipts existed than `limit` returned.
+    pub truncated: bool,
+}
+
 /// One persisted outbox-fork evidence row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkRow {
@@ -257,6 +291,209 @@ impl<'a> DtnStore<'a> {
         Ok(())
     }
 
+    // --- receipt delivery tracking (ADR-0020 §3; T2.2.4) -------------------
+    //
+    // The outbound counterpart of the ingest state above: once a receipt is
+    // issued (`put_receipt`), one row per reported record is queued here so the
+    // receipt can travel back to each record's author by the same dumb carriers.
+
+    /// Queues a delivery row for `record_hash` (authored by `author`), pointing at
+    /// the `issued_receipts` row keyed by `presentation_hash`. Idempotent on
+    /// `record_hash`: a record re-carried in a *later* bundle (a fresh
+    /// presentation) keeps its first delivery row — including any `fetched_count`
+    /// and `confirmed_delivered` already accrued — so re-ingest never resets a
+    /// record's delivery progress. The referenced `issued_receipts` row must exist
+    /// (the caller persists the receipt first; ADR-0020 §3).
+    pub fn record_receipt_delivery(
+        &mut self,
+        record_hash: &[u8; 32],
+        author: &[u8; 32],
+        presentation_hash: &[u8; 32],
+        now: i64,
+    ) -> Result<()> {
+        self.db.conn().execute(
+            "INSERT INTO receipt_deliveries \
+             (record_hash, author, receipt_presentation, first_issued_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(record_hash) DO NOTHING",
+            rusqlite::params![
+                record_hash.as_slice(),
+                author.as_slice(),
+                presentation_hash.as_slice(),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The pending (not-yet-confirmed) receipts covering records authored by any
+    /// of `authors`, deduplicated by receipt, oldest first, capped at `limit`.
+    ///
+    /// An empty `authors` slice means *all* authors — the bulk-courier fetch. A
+    /// `since` bound (exclusive, on `first_issued_at`) lets a caller page past
+    /// receipts it has already carried. Because a single receipt covers a whole
+    /// bundle — possibly records from several authors — the returned
+    /// [`PendingReceipts::record_hashes`] are exactly the delivery rows this
+    /// fetch acted on (matching the author filter and belonging to a returned
+    /// receipt); the caller passes them to [`bump_fetched`](Self::bump_fetched)
+    /// (courier) or [`mark_confirmed`](Self::mark_confirmed) (the author's own
+    /// device). Rows truncated out by `limit` are not among them, so they are
+    /// neither counted nor confirmed until a later fetch returns them.
+    pub fn pending_receipts_for(
+        &self,
+        authors: &[[u8; 32]],
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<PendingReceipts> {
+        // Pull the candidate rows in a stable oldest-first order, then group into
+        // distinct receipts in Rust — the author filter and the per-receipt cap
+        // are simpler to express there than in dynamic SQL, and at pilot scale the
+        // pending queue is small (it is swept on the retention timer).
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT record_hash, author, receipt_presentation, first_issued_at \
+             FROM receipt_deliveries \
+             WHERE confirmed_delivered = 0 AND first_issued_at > ?1 \
+             ORDER BY first_issued_at ASC, record_hash ASC",
+        )?;
+        let rows = stmt.query_map([since.unwrap_or(i64::MIN)], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+
+        let wants = |author: &[u8; 32]| authors.is_empty() || authors.contains(author);
+
+        // Distinct receipts in first-seen (oldest) order, and the delivery rows
+        // (matching the author filter) that fall under each.
+        let mut order: Vec<[u8; 32]> = Vec::new();
+        let mut grouped: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (record_hash, author, presentation) = row?;
+            let author = to_hash("receipt_deliveries.author", author)?;
+            if !wants(&author) {
+                continue;
+            }
+            let record_hash = to_hash("receipt_deliveries.record_hash", record_hash)?;
+            let presentation = to_hash("receipt_deliveries.receipt_presentation", presentation)?;
+            if !grouped.contains_key(&presentation) {
+                order.push(presentation);
+            }
+            grouped.entry(presentation).or_default().push(record_hash);
+        }
+
+        let truncated = order.len() > limit;
+        let mut receipts = Vec::new();
+        let mut record_hashes = Vec::new();
+        for presentation in order.into_iter().take(limit) {
+            let envelope = self.receipt_for(&presentation)?.ok_or_else(|| {
+                // A queued delivery row must reference a stored receipt (FK), so a
+                // missing envelope is corruption, not an empty result.
+                Error::Corrupt(format!(
+                    "receipt_deliveries references a missing issued_receipts row {}",
+                    hex_short(&presentation)
+                ))
+            })?;
+            receipts.push(envelope);
+            if let Some(mut hashes) = grouped.remove(&presentation) {
+                record_hashes.append(&mut hashes);
+            }
+        }
+        Ok(PendingReceipts {
+            receipts,
+            record_hashes,
+            truncated,
+        })
+    }
+
+    /// Bumps `fetched_count` on each named delivery row (a courier picked up a
+    /// receipt). Never confirms — a courier is not the author (ADR-0020 §3).
+    pub fn bump_fetched(&mut self, record_hashes: &[[u8; 32]], _now: i64) -> Result<()> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "UPDATE receipt_deliveries SET fetched_count = fetched_count + 1 \
+             WHERE record_hash = ?1",
+        )?;
+        for h in record_hashes {
+            stmt.execute([h.as_slice()])?;
+        }
+        Ok(())
+    }
+
+    /// Marks each named delivery row confirmed-delivered (the record's own author
+    /// fetched its receipt). Also bumps `fetched_count`, since a confirm is a
+    /// fetch. Returns how many rows were newly confirmed. Idempotent: a row
+    /// already confirmed is left as-is and not recounted.
+    pub fn mark_confirmed(&mut self, record_hashes: &[[u8; 32]], _now: i64) -> Result<usize> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "UPDATE receipt_deliveries \
+             SET confirmed_delivered = 1, fetched_count = fetched_count + 1 \
+             WHERE record_hash = ?1 AND confirmed_delivered = 0",
+        )?;
+        let mut changed = 0;
+        for h in record_hashes {
+            changed += stmt.execute([h.as_slice()])?;
+        }
+        Ok(changed)
+    }
+
+    /// Prunes delivered-receipt rows the station no longer needs to keep: a
+    /// confirmed row older than `retention_secs`, or an *unconfirmed* row older
+    /// than `retention_secs` × [`RETENTION_UNCONFIRMED_MULTIPLIER`] (a courier may
+    /// take weeks to carry a receipt home, so unconfirmed rows are kept far
+    /// longer). Returns the number of rows removed. The `issued_receipts` rows the
+    /// deliveries pointed at are left intact — they remain the idempotency cache
+    /// for a byte-identical re-ingest (ADR-0020 §3).
+    pub fn prune_delivered(&mut self, now: i64, retention_secs: i64) -> Result<usize> {
+        let confirmed_cutoff = now.saturating_sub(retention_secs);
+        let unconfirmed_cutoff =
+            now.saturating_sub(retention_secs.saturating_mul(RETENTION_UNCONFIRMED_MULTIPLIER));
+        let removed = self.db.conn().execute(
+            "DELETE FROM receipt_deliveries WHERE \
+             (confirmed_delivered = 1 AND first_issued_at < ?1) OR \
+             (confirmed_delivered = 0 AND first_issued_at < ?2)",
+            rusqlite::params![confirmed_cutoff, unconfirmed_cutoff],
+        )?;
+        Ok(removed)
+    }
+
+    /// The queued [`DeliveryRow`] for `record_hash`, if any. Test/introspection
+    /// helper.
+    pub fn delivery_of(&self, record_hash: &[u8; 32]) -> Result<Option<DeliveryRow>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT author, receipt_presentation, fetched_count, confirmed_delivered \
+                 FROM receipt_deliveries WHERE record_hash = ?1",
+                [record_hash.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(author, presentation, fetched, confirmed)| {
+                Ok(DeliveryRow {
+                    author: to_hash("receipt_deliveries.author", author)?,
+                    receipt_presentation: to_hash(
+                        "receipt_deliveries.receipt_presentation",
+                        presentation,
+                    )?,
+                    fetched_count: fetched,
+                    confirmed_delivered: confirmed != 0,
+                })
+            })
+            .transpose()
+    }
+
     /// The `(entry_hash, envelope)` recorded at `(author, position)`, if seen.
     fn entry_at(&self, author: &[u8; 32], position: u64) -> Result<Option<([u8; 32], Vec<u8>)>> {
         self.db
@@ -316,6 +553,11 @@ fn to_hash(col: &str, bytes: Vec<u8>) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| Error::Corrupt(format!("{col} is {len} bytes, expected 32")))
+}
+
+/// A short hex prefix of a hash, for diagnostic messages only.
+fn hex_short(hash: &[u8; 32]) -> String {
+    hash[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -439,5 +681,147 @@ mod tests {
         // A second put for the same presentation keeps the first verbatim.
         s.put_receipt(&ph, b"different", 11).unwrap();
         assert_eq!(s.receipt_for(&ph).unwrap(), Some(b"receipt-bytes".to_vec()));
+    }
+
+    // --- receipt delivery tracking (T2.2.4) --------------------------------
+
+    /// Persists a receipt and queues a delivery row for `record_hash` by `author`
+    /// against it, in one step (the receipt must exist first for the FK).
+    fn queue(
+        s: &mut DtnStore,
+        presentation: [u8; 32],
+        record_hash: [u8; 32],
+        author: [u8; 32],
+        at: i64,
+    ) {
+        s.put_receipt(&presentation, &[b"rcpt-", &presentation[..1]].concat(), at)
+            .unwrap();
+        s.record_receipt_delivery(&record_hash, &author, &presentation, at)
+            .unwrap();
+    }
+
+    #[test]
+    fn delivery_is_queued_and_idempotent_on_record_hash() {
+        let db = store_db();
+        let mut s = DtnStore::new(&db);
+        queue(&mut s, h(1), h(10), h(100), 500);
+        let row = s.delivery_of(&h(10)).unwrap().unwrap();
+        assert_eq!(row.author, h(100));
+        assert_eq!(row.receipt_presentation, h(1));
+        assert_eq!(row.fetched_count, 0);
+        assert!(!row.confirmed_delivered);
+
+        // Re-carrying the same record in a *later* presentation keeps the first
+        // delivery row (and any progress on it) — no reset, no second row.
+        s.bump_fetched(&[h(10)], 501).unwrap();
+        s.put_receipt(&h(2), b"rcpt-2", 600).unwrap();
+        s.record_receipt_delivery(&h(10), &h(100), &h(2), 600)
+            .unwrap();
+        let row = s.delivery_of(&h(10)).unwrap().unwrap();
+        assert_eq!(row.receipt_presentation, h(1), "first receipt kept");
+        assert_eq!(
+            row.fetched_count, 1,
+            "fetched_count preserved across re-ingest"
+        );
+    }
+
+    #[test]
+    fn pending_for_author_filters_and_confirm_excludes() {
+        let db = store_db();
+        let mut s = DtnStore::new(&db);
+        // Receipt 1 covers records by authors A and B; receipt 2 by C only.
+        queue(&mut s, h(1), h(10), h(0xA), 100);
+        s.record_receipt_delivery(&h(11), &h(0xB), &h(1), 100)
+            .unwrap();
+        queue(&mut s, h(2), h(20), h(0xC), 200);
+
+        // A bulk (empty authors) fetch sees both receipts, oldest first.
+        let all = s.pending_receipts_for(&[], None, 256).unwrap();
+        assert_eq!(all.receipts.len(), 2);
+        assert!(!all.truncated);
+
+        // A fetch scoped to author A returns only receipt 1, and only A's row.
+        let a = s.pending_receipts_for(&[h(0xA)], None, 256).unwrap();
+        assert_eq!(a.receipts.len(), 1);
+        assert_eq!(a.record_hashes, vec![h(10)]);
+
+        // An author with no pending receipts gets nothing.
+        let none = s.pending_receipts_for(&[h(0xF)], None, 256).unwrap();
+        assert!(none.receipts.is_empty());
+        assert!(none.record_hashes.is_empty());
+
+        // Confirming A's record leaves B's still pending on the same receipt.
+        assert_eq!(s.mark_confirmed(&[h(10)], 300).unwrap(), 1);
+        let a_again = s.pending_receipts_for(&[h(0xA)], None, 256).unwrap();
+        assert!(a_again.receipts.is_empty(), "A's row now confirmed");
+        let b = s.pending_receipts_for(&[h(0xB)], None, 256).unwrap();
+        assert_eq!(b.record_hashes, vec![h(11)], "B still pending on receipt 1");
+    }
+
+    #[test]
+    fn pending_caps_and_reports_truncation_by_receipt() {
+        let db = store_db();
+        let mut s = DtnStore::new(&db);
+        // Three distinct receipts, one record each, ascending issue time.
+        queue(&mut s, h(1), h(11), h(0xA), 100);
+        queue(&mut s, h(2), h(22), h(0xA), 200);
+        queue(&mut s, h(3), h(33), h(0xA), 300);
+
+        let page = s.pending_receipts_for(&[], None, 2).unwrap();
+        assert_eq!(page.receipts.len(), 2, "capped at the limit");
+        assert!(page.truncated, "a third receipt was held back");
+        // Oldest first: the two returned rows are the earliest presentations, and
+        // the truncated one is not among the acted-on record hashes.
+        assert_eq!(page.record_hashes, vec![h(11), h(22)]);
+
+        // `since` pages past the receipts already carried.
+        let rest = s.pending_receipts_for(&[], Some(200), 256).unwrap();
+        assert_eq!(rest.record_hashes, vec![h(33)]);
+        assert!(!rest.truncated);
+    }
+
+    #[test]
+    fn bump_fetched_counts_without_confirming() {
+        let db = store_db();
+        let mut s = DtnStore::new(&db);
+        queue(&mut s, h(1), h(10), h(0xA), 100);
+        s.bump_fetched(&[h(10)], 150).unwrap();
+        s.bump_fetched(&[h(10)], 160).unwrap();
+        let row = s.delivery_of(&h(10)).unwrap().unwrap();
+        assert_eq!(row.fetched_count, 2);
+        assert!(!row.confirmed_delivered, "a courier fetch never confirms");
+        // Still pending after courier fetches.
+        assert_eq!(
+            s.pending_receipts_for(&[h(0xA)], None, 256)
+                .unwrap()
+                .receipts
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn prune_keeps_unconfirmed_far_longer_than_confirmed() {
+        let db = store_db();
+        let mut s = DtnStore::new(&db);
+        let retention = 100;
+        // A confirmed row and an unconfirmed row, both issued at t=0.
+        queue(&mut s, h(1), h(10), h(0xA), 0);
+        queue(&mut s, h(2), h(20), h(0xB), 0);
+        s.mark_confirmed(&[h(10)], 0).unwrap();
+
+        // Just past the confirmed retention but well within unconfirmed×4: the
+        // confirmed row is pruned, the unconfirmed one kept.
+        assert_eq!(s.prune_delivered(retention + 1, retention).unwrap(), 1);
+        assert!(s.delivery_of(&h(10)).unwrap().is_none(), "confirmed pruned");
+        assert!(s.delivery_of(&h(20)).unwrap().is_some(), "unconfirmed kept");
+
+        // Past retention×4 the unconfirmed row is finally pruned too.
+        let past = retention * RETENTION_UNCONFIRMED_MULTIPLIER + 1;
+        assert_eq!(s.prune_delivered(past, retention).unwrap(), 1);
+        assert!(
+            s.delivery_of(&h(20)).unwrap().is_none(),
+            "unconfirmed pruned"
+        );
     }
 }

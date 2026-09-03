@@ -2202,6 +2202,85 @@ availability of the single-threaded core.
   admission (signature, state, debt floor, expiry) applies to DTN confirmations
   as well. Covered by `dtn_tier2_confirmation_is_held_to_the_staking_bar`.
 
+#### Receipt pickup and relay (T2.2.4)
+
+*Implemented in T2.2.4.* The outbound half of the DTN loop (ADR-0020 §3:
+"receipts travel back by the same carriers"). Once a bundle is ingested, the
+station queues one **receipt-delivery** row per reported record
+(`receipt_deliveries`, migration 0007), keyed by record hash and pointing at the
+already-stored `issued_receipts` row. Two fetch surfaces then let those receipts
+travel home: a **courier fetch** — the operator/Unix-socket `receipts_fetch`, or
+a bulk empty-`authors` fetch — hands out pending receipts for records authored by
+*anyone*, so a device syncing at the station can carry another member's receipt
+back to the valley; and an **author fetch** — the paired mobile's sealed-channel
+`receipts_fetch`, scoped to the authenticated signer, and the operator's own
+`receipts_ack` — which additionally *confirms* delivery. A confirmed row is
+pruned after `[dtn] receipt_retention_secs` (30 days default); an unconfirmed one
+is kept four times longer (`RETENTION_UNCONFIRMED_MULTIPLIER`), since a courier
+may take weeks. Like all of `rrn-storage::dtn` this is station-role local state,
+never community-log state (ADR-0020 §1).
+
+**Assets:** the eventual, lossless delivery of every receipt to its author under
+a delay-tolerant, courier-carried network; the availability of the
+single-threaded core under fetch traffic; the confidentiality boundary of what a
+receipt discloses.
+
+- *Disclosure — an anonymous courier reads receipts for others.* A courier fetch
+  returns full receipts for records it did not author (record hashes + admitted/
+  known/refused outcomes). A delivery row is only ever queued for a record whose
+  author is **cryptographically attested** — the ingest queues a row solely for
+  an entry that passed `outbox::validate` (author == outer signer; a
+  bad-signature entry gets a refusal and *no* row), so a courier can never seed a
+  spoofed receipt into a victim's queue, and every disclosed outcome is a fact
+  about a record its author genuinely signed. For admitted/known records the
+  outcome is also derivable from the log every member replicates; a receipt is a
+  station signature over facts, not a secret. The courier is a dumb carrier by
+  design (ADR-0008/0013) — it moves bytes it cannot forge or alter (the station
+  signature covers the receipt; ADR-0002). *Residual:* receipts are **not
+  sealed** to the author, so a courier learns who transacted with whom at the
+  hash level; sealed/encrypted receipts are explicitly out of scope for T2.2.4
+  and tracked as backlog. At 20-member pilot scale, with all state already
+  local-plaintext (at-rest encryption is T2.9.x), this is the accepted posture.
+- *Repudiation — a malicious courier drops a receipt it carried.* A courier that
+  fetches a receipt and never delivers it, or discards it, cannot suppress it:
+  the delivery row stays **unconfirmed** (only the author's own authenticated
+  fetch, or the operator's `receipts_ack`, sets `confirmed_delivered`), a courier
+  fetch merely bumps a diagnostic counter, and the unconfirmed row is retained
+  four times longer precisely so a later carrier re-fetches and re-delivers it.
+  The mechanism is lossless in the limit; a dropped receipt also has a
+  belt-and-suspenders backstop, since the author's re-submission of the record
+  returns a `known` outcome, telling them it was already admitted.
+- *Denial of service — fetch flooding.* `receipts_fetch` is far cheaper than
+  ingest (no signature verification, no engine routing), but it still reads and
+  updates rows on the single-threaded core. Each response is capped at
+  `MAX_RECEIPTS_PER_FETCH` (256) distinct receipts with a `truncated` flag and an
+  oldest-first `since` cursor, bounding per-request work and response size; the
+  paired-mobile surface is sealed, signed, and nonce-checked exactly like every
+  other channel request, and the operator Unix-socket surface is local-trust.
+  *Residual:* as with the ingest path there is **no per-member rate limit** yet —
+  a paired member can fetch in a loop; rate limiting stays the same tracked
+  backlog. The `receipt_deliveries` table grows with carried volume, but unlike
+  `seen_outbox_*` it is **actively pruned** on the retention timer
+  (`dtn_prune_timer`), so its footprint is bounded by the retention window rather
+  than unbounded. A second residual is *bulk-courier pagination*: a page caps at
+  256 distinct receipts, and the only cursor is `since` (exclusive on
+  `first_issued_at`, which is not unique). The **author** fetch self-heals — it
+  confirms what it returns, so the next page surfaces — but a non-confirming bulk
+  courier facing more than 256 simultaneously-pending receipts (only reachable
+  after a long partition) cannot drain past the first page, and receipts sharing
+  the boundary second can be skipped. At pilot scale the pending queue is far
+  below the cap; a tuple `(first_issued_at, record_hash)` cursor is tracked as
+  backlog.
+- *Tampering — forging a confirmation to force early pruning.* Marking a row
+  confirmed only shortens its retention (30 days vs. 120); it never deletes a
+  record from the log or drops a not-yet-admitted record. The author fetch is
+  scoped to the sealed channel's authenticated signer, so a member can only
+  confirm **their own** records' receipts (`envelope.signer`); the operator
+  `receipts_ack` is the local-trust Unix socket. A confirmation is idempotent and
+  only ever advances a row toward pruning a receipt whose facts remain
+  reconstructible from the log — no integrity loss, only the accepted risk that a
+  receipt an author wrongly confirmed is reclaimed early and must be re-derived.
+
 ### Vouching surface (M1.4)
 
 *Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its

@@ -140,6 +140,54 @@ pub struct BundleSubmitResult {
     pub receipt_hex: String,
 }
 
+/// `receipts_fetch` params (T2.2.4, ADR-0020 §3): pick up pending delivery
+/// receipts to carry back. Over the operator/Unix-socket surface this is a
+/// **courier** fetch — it bumps each receipt's fetched count but never confirms
+/// delivery (a courier is not the author).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReceiptsFetchParams {
+    /// The `rrn1…` addresses whose pending receipts to fetch. Empty = *all*
+    /// pending receipts (a bulk courier syncing the whole queue).
+    #[serde(default)]
+    pub authors: Vec<String>,
+    /// Only receipts first issued strictly after this admission-clock reading — a
+    /// cursor to page past receipts already carried. `None` = from the beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+}
+
+/// `receipts_fetch` result: the pending receipts, each as its portable
+/// signed-receipt envelope bytes ([`rrn_protocol::receipt::encode_signed`]),
+/// hex-encoded, oldest first and capped. `truncated` is `true` when more pending
+/// receipts remain than were returned — fetch again (optionally with `since`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceiptsFetchResult {
+    /// The signed-receipt envelope bytes, hex-encoded, oldest first.
+    pub receipts_hex: Vec<String>,
+    /// Whether pending receipts beyond this page remain.
+    pub truncated: bool,
+}
+
+/// `receipts_ack` params (T2.2.4): the operator, acting as the **author** of
+/// records on this station's own wallet, confirms it has received the delivery
+/// receipts for the named records — so the retention sweep may reclaim them. The
+/// courier `receipts_fetch` never confirms; this is the operator's author-path
+/// counterpart to the mobile author fetch (which confirms implicitly).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceiptsAckParams {
+    /// The record hashes (hex, Blake3 of each record's canonical bytes) to
+    /// confirm as delivered.
+    pub record_hashes: Vec<String>,
+}
+
+/// `receipts_ack` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceiptsAckResult {
+    /// How many delivery rows were newly confirmed (already-confirmed or unknown
+    /// record hashes do not count).
+    pub acked: u64,
+}
+
 /// `propose` result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProposeResult {
