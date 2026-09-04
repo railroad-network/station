@@ -954,8 +954,73 @@ ingest path against oversized carriage.
   A delivery receipt is transport state, never appended to the community log, so
   it cannot be replayed into ledger state.
 
-**Residual / out of scope:** transport-level authentication and encryption
-(carrier framing is T2.2.5; Reticulum sidecar T2.6.x), ingest rate-limiting and
+#### Carrier framing and reassembly (T2.2.5)
+
+*Implemented in T2.2.5.* The pluggable transport seam
+([`transport::FrameTransport`](../crates/rrn-protocol/src/transport.rs), ADR-0013)
+and the carrier-agnostic chunking/reassembly above it
+([`framing`](../crates/rrn-protocol/src/framing.rs)) that lets a bundle far larger
+than a carrier's frame (LoRa ≈ 250 B) cross it in pieces and reassemble. A frame
+is a fixed 76-byte header (`magic | version | payload_id | payload_len |
+chunk_index | chunk_count | chunk_len | frame_crc32 | reserved`) plus chunk
+bytes. This is **plumbing, not signed content** — the header is a plain
+big-endian struct, never dCBOR, and nothing in it is trusted.
+
+**Assets:** the integrity of a reassembled payload (which then faces the full
+signed-envelope checks of ADR-0008/0020 above it); the bounded memory of a
+reassembler fed by a hostile carrier; the correctness of chunking under loss,
+reorder, and duplication.
+
+- *Tampering — a forged or corrupted frame.* A carrier (the seam assumes a
+  *dumb, untrusted* one, ADR-0013) may flip bits, forge a header, or inject
+  frames. Integrity does not rest on the header being honest: a **CRC-32 over the
+  frame's header fields and body** is verified before the frame touches any
+  reassembly state (a cheap catch for carrier bit-flips → `ChunkCrc`, frame
+  dropped), so a corrupted `chunk_count`/`payload_len`/`chunk_index` is a rejected
+  frame, never a *poisoned* in-flight payload. The **payload id is
+  `Blake3(payload)`, verified over the fully reassembled bytes** is the
+  authoritative check: a chunk placed at a *malicious* forged index (one where the
+  attacker recomputed a valid CRC — a dumb carrier cannot) is caught at completion
+  (`PayloadHashMismatch`), and the partial is discarded so a clean carriage
+  rebuilds it. Beyond this, the records *inside* the payload carry their own author
+  signatures (ADR-0020) — independent layers, none relying on the framing header.
+  A forged header can therefore at most waste bounded memory or get a frame
+  rejected; it can never manufacture a payload that passes as real.
+- *Denial of service — reassembly memory.* A hostile carrier streams chunks for
+  many distinct `payload_id`s, or partial payloads it never completes, to exhaust
+  memory. `Reassembler` is bounded on every axis. The key guard is a per-payload
+  **running byte total**: a chunk that would push the stored bytes past the
+  claimed `payload_len` is refused *before* it is stored (`chunk_len` and
+  `chunk_count` are independent header fields, so without this a forged header
+  could store `chunk_count × chunk_len ≫ payload_len`), and `chunk_count` is
+  additionally capped at `payload_len + 1`, bounding the slot vector. So one
+  partial holds ≤ `payload_len` ≤ `max_payload_bytes` (default 4 MiB) bytes.
+  `max_inflight_payloads` (default 64) caps concurrent partials — evicting the
+  oldest both at insert time and on `prune`; `ttl_secs` (default 7 days,
+  courier-generous, measured from first sight) prunes stale partials; `MAX_CHUNKS`
+  (4096) caps split count; and a bounded `recent_completed` LRU (1024) makes a
+  late duplicate of a delivered payload a no-op. Per-frame work is O(chunk) — a
+  CRC and a slot write. *Residual:* insert-time eviction is oldest-first, so a
+  carrier that floods 64 cheap forged ids can evict honest in-flight partials
+  (which are then the oldest); this is inherent to a dumb carrier that can already
+  drop frames at will — the retransmit driver simply re-requests, and no
+  *admitted* state is affected.
+- *Tampering — the chunk-conflict tripwire.* Two *different* payloads arriving for
+  one already-filled `(payload_id, chunk_index)` slot is refused (`ChunkConflict`)
+  and the first kept — a carrier cannot overwrite a delivered chunk with different
+  bytes to steer reassembly; a byte-identical repeat is idempotent.
+- *Repudiation / identity.* An `Endpoint` is a carrier-local routing handle, never
+  an RRN identity (ADR-0013 "bind, do not collapse"): the seam carries no identity
+  claim, so nothing here can be repudiated or impersonated at the identity layer —
+  that lives entirely in the signed records above. The mocks
+  ([`transport::mock`](../crates/rrn-protocol/src/transport.rs)) are deterministic
+  test carriers (a seeded inline PRNG), not a network surface.
+
+**Residual / out of scope:** transport-level authentication and encryption of the
+carrier itself (the sealed-envelope boundary above it is the security guarantee;
+the Reticulum sidecar is T2.6.x), a per-carrier *retransmit protocol* (`missing()`
+is the primitive; the loop is the carrier's, T2.6.2/T2.7.1), airtime-budget
+enforcement (T2.6.2 consumes `sustained_bytes_per_sec`), ingest rate-limiting and
 persistence (T2.2.3/T2.4.1), and the federation surface (Phase 3).
 
 ### `rrn-station` / `rrn-cli`

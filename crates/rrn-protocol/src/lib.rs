@@ -49,8 +49,10 @@
 #![forbid(unsafe_code)]
 
 pub mod bundle;
+pub mod framing;
 pub mod outbox;
 pub mod receipt;
+pub mod transport;
 
 use rrn_crypto::hash::Hash;
 
