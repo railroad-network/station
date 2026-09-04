@@ -759,6 +759,13 @@ impl Core {
             // the operator confirms delivery of its own-wallet records' receipts.
             "receipts_fetch" => self.m_receipts_fetch(req),
             "receipts_ack" => self.m_receipts_ack(req),
+            // Headroom certificates (T2.3.1, ADR-0021): reserve offline-spending
+            // headroom for the station wallet ahead of a partition, and list a
+            // member's outstanding certificates. The request is signed by this
+            // station's own wallet, as `propose`/`vouch` are; a member signing on
+            // a phone is T2.4.2's mobile FFI path.
+            "cert_request" => self.m_cert_request(req),
+            "cert_list" => self.m_cert_list(req),
             other => Err(rpc::RpcError {
                 code: rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
@@ -915,6 +922,76 @@ impl Core {
             .map_err(internal)?;
         let nonce = snapshot.next_nonce(&who.public_key().to_bytes());
         ok(&rpc::NextNonceResult { nonce })
+    }
+
+    /// `cert_request` — reserve a headroom certificate for the station wallet
+    /// (T2.3.1, ADR-0021). Signs a [`CertificateRequest`] with the station wallet
+    /// (the operator's identity on this socket), issues it through the engine, and
+    /// returns the certificate's terms.
+    fn m_cert_request(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::CertRequestParams = parse_params(req)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+
+        // The next nonce for this identity — certificate requests share the
+        // member's proposal nonce sequence (ADR-0021 §1).
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+        let nonce = snapshot.next_nonce(&self.wallet.address.public_key().to_bytes());
+
+        let request = rrn_ledger::escrow::CertificateRequest::new(
+            self.wallet.address,
+            params.cap_centi,
+            nonce,
+            now,
+        );
+        let signed = rrn_ledger::escrow::SignedCertificateRequest::sign(request, &station);
+
+        let mut engine = Engine::new(&self.db, station).with_credit_config(self.credit);
+        let certificate = engine
+            .submit_certificate_request(signed, now)
+            .map_err(ledger_err)?;
+        let c = &certificate.payload;
+
+        ok(&rpc::CertRequestResult {
+            cert_id: hex(&c.cert_id.to_bytes()),
+            cap_centi: c.cap_centi,
+            issued_at: c.issued_at,
+            expires_at: c.expires_at,
+        })
+    }
+
+    /// `cert_list` — a member's outstanding headroom certificates (T2.3.1). A
+    /// derived read: outstanding certs with caps, expiries, and remaining
+    /// allowance, in content-id order.
+    fn m_cert_list(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::CertListParams = parse_params(req)?;
+        let who = match params.address {
+            Some(s) => parse_addr(&s)?,
+            None => self.wallet.address,
+        };
+        let now = self.clock.now();
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+        // Only *live* certificates — an expired one reserves nothing, so listing
+        // it with a full remaining allowance would mislead (matches the reservation
+        // and the issuance count).
+        let certificates = snapshot
+            .live_certs_of(&who, now, &self.credit)
+            .into_iter()
+            .map(|state| {
+                let c = &state.certificate.payload;
+                rpc::CertRow {
+                    cert_id: hex(&c.cert_id.to_bytes()),
+                    cap_centi: c.cap_centi,
+                    consumed_centi: state.consumed_centi,
+                    remaining_centi: c.cap_centi.saturating_sub(state.consumed_centi),
+                    issued_at: c.issued_at,
+                    expires_at: c.expires_at,
+                }
+            })
+            .collect();
+        ok(&rpc::CertListResult { certificates })
     }
 
     fn m_vouch(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -5942,6 +6019,64 @@ mod tests {
             params,
         };
         core.handle_call(&req).unwrap_err()
+    }
+
+    // --- headroom certificates (T2.3.1, ADR-0021) ---------------------------
+
+    #[test]
+    fn cert_request_and_list_over_rpc() {
+        let mut core = test_core(); // station wallet, default −2000 floor
+        let station_addr = core.wallet.address.to_string();
+
+        // Reserve a 10-Common (1000 centi) certificate for the station wallet.
+        let issued = call(
+            &mut core,
+            "cert_request",
+            serde_json::json!({ "cap_centi": 1_000 }),
+        );
+        assert_eq!(issued["cap_centi"], 1_000);
+        let cert_id = issued["cert_id"].as_str().unwrap().to_string();
+
+        // It lists as outstanding with the full remaining allowance.
+        let list = call(
+            &mut core,
+            "cert_list",
+            serde_json::json!({ "address": station_addr }),
+        );
+        let certs = list["certificates"].as_array().unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0]["cert_id"], cert_id);
+        assert_eq!(certs[0]["remaining_centi"], 1_000);
+
+        // The reservation shrank spendable headroom: a 1500 proposal — which would
+        // fit under the −2000 floor on its own — is now refused (0 − 1000 − 1500 =
+        // −2500 < −2000).
+        let other = Address::from_public_key(Keypair::generate().public_key()).to_string();
+        let err = call_err(
+            &mut core,
+            "propose",
+            serde_json::json!({ "receiver": other, "amount_centi": 1_500 }),
+        );
+        assert!(
+            err.message.to_lowercase().contains("floor"),
+            "expected a debt-floor error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn cert_request_above_the_max_cap_is_rejected_over_rpc() {
+        let mut core = test_core(); // default cert_max_cap_centi = 1000
+        let err = call_err(
+            &mut core,
+            "cert_request",
+            serde_json::json!({ "cap_centi": 1_001 }),
+        );
+        assert!(
+            err.message.contains("cap"),
+            "expected a cap error, got: {}",
+            err.message
+        );
     }
 
     // --- DTN bundle ingest (T2.2.3, ADR-0020) -------------------------------

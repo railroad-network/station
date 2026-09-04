@@ -131,6 +131,7 @@ fn tiers_settle_on_their_own_windows() {
     let mut engine =
         Engine::new(&db, station.clone()).with_credit_config(rrn_ledger::credit::CreditConfig {
             debt_floor_centi: -10_000,
+            ..rrn_ledger::credit::CreditConfig::default()
         });
     // The real production defaults — 24h Tier 1, 48h Tier 2.
     let mut settler = Settler::new(&db, station.clone(), SettlementConfig::default());

@@ -795,6 +795,62 @@ transition; the derivability of all state from the log.
   a community does about a *departed* member's bounded debt remains a
   governance question the floor caps but does not answer.
 
+#### Elevation of privilege — offline overspend and reserved headroom (ADR-0021)
+
+Headroom certificates (`rrn-ledger::escrow`, T2.3.1) extend the debt floor to
+survive a partition: a member reserves capacity to commit *while connected*, so a
+later cert-backed spend can be admitted under partition without a fresh floor
+check. This ticket delivers issuance, return, and the reservation arithmetic;
+cert-backed *spending* and the equivocation path are T2.3.2/T2.3.3.
+
+- *Threat: a certificate reserving headroom the member does not have.* A member
+  requests certificates whose caps jointly exceed their floor headroom, so the
+  escrow promises spending the floor should forbid.
+- *Mitigation:* issuance is an ordinary front-door debit against the committed
+  position. `committed_debits_centi` counts every *outstanding* certificate's
+  remaining cap for its member exactly as a pending signed debit, so a request
+  whose cap would take the projected position below the floor is refused — stacked
+  requests can no more breach the floor than stacked proposals can. The
+  per-member outstanding cap (`cert_max_outstanding`, default 4) and the
+  per-certificate cap (`cert_max_cap_centi`, default 10 Commons) bound both idle
+  escrow and the honest-receiver worst-case incident exposure.
+- *Threat: reserved headroom that never releases (a self-inflicted denial of
+  credit, or a lever to strand headroom forever).* An expired or returned
+  certificate keeps its cap reserved, permanently shrinking the member's credit.
+- *Mitigation:* the reservation releases the instant a spend against the
+  certificate could no longer be admitted — `escrow::spend_admissible_until`
+  (`expires_at` + DTN delivery grace + clock-skew tolerance), the **single shared
+  boundary** the T2.3.2 admission bound will also enforce. Deriving both from one
+  function is the coupling that prevents over-reservation (headroom held after
+  spends are refused) and under-reservation (a spend admitted after the headroom
+  released, which could breach the floor); a dedicated boundary test asserts they
+  coincide one second either side. An early `CertificateReturn` releases the
+  remainder sooner. Because expiry is judged by the *admission clock* (ADR-0022),
+  a member cannot backdate their way past the boundary.
+- *Threat: forging or replaying a request/certificate/return.* Requesting or
+  returning a certificate as another member; replaying a request to consume its
+  headroom twice; a stranger's gossiped return releasing someone's escrow.
+- *Mitigation:* every record is a `SignedPayload`; the engine checks
+  `member == signer` on requests and returns, and replay re-checks that a return's
+  member is the certificate's member before honoring it. Requests share the
+  member's monotonic proposal nonce sequence, so a replayed request is a duplicate
+  nonce and refused. A certificate is station-signed and content-addressed, and
+  replay rejects a certificate whose request is not already on the log
+  (`Error::Invalid`) — a certificate without provable member consent cannot
+  reserve headroom.
+- *Residual risk:* the two log appends at issuance (request then certificate) are
+  not atomic. A crash between them leaves a dangling request, which reserves
+  nothing and is harmless — the member simply requests again (the ADR-0005
+  settlement-crash-window discipline). The certificate cap default is per-station
+  config until governance can tune it, so an operator can raise a community's
+  offline exposure up to the Tier-2 ceiling the station enforces. Deliberate,
+  *bounded* offline overspend — burning standing to double-commit one
+  certificate's cap — is not preventable without connectivity; making it provable
+  equivocation and a reputation event is T2.3.3, and until then the cap is the
+  only bound. The receiver's offline verification is only as good as the spend
+  history a spender presents (ADR-0021 Consequences); the cap still bounds the
+  damage.
+
 #### Oracle tiering and the reputation stake
 
 The scrutiny a transaction receives scales with its value across two Phase-1

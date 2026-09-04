@@ -148,8 +148,60 @@ impl Station {
                 config.credit.debt_floor_centi
             );
         }
+        // Certificate parameters (ADR-0021). The cap is hard-bounded to the
+        // Tier-2 single-transaction ceiling (§1: offline trade is Tier-1/2
+        // commerce, not exceptional transfers); a cap above the debt-floor
+        // magnitude is unreachable at zero balance, so it only warns.
+        if config.credit.cert_validity_seconds <= 0 {
+            anyhow::bail!(
+                "config: [credit] cert_validity_seconds must be > 0 (got {})",
+                config.credit.cert_validity_seconds
+            );
+        }
+        if config.credit.cert_delivery_grace_seconds < 0 {
+            anyhow::bail!(
+                "config: [credit] cert_delivery_grace_seconds must be >= 0 (got {})",
+                config.credit.cert_delivery_grace_seconds
+            );
+        }
+        if config.credit.cert_max_cap_centi <= 0 {
+            anyhow::bail!(
+                "config: [credit] cert_max_cap_centi must be > 0 (got {})",
+                config.credit.cert_max_cap_centi
+            );
+        }
+        // A cap of exactly TIER_3_FLOOR_CENTI is already a Tier-3 (blocked) amount
+        // — the Tier-2 band is half-open (`magnitude < TIER_3_FLOOR_CENTI`, see
+        // `tier::tier_floor`), so the ceiling is strict.
+        if config.credit.cert_max_cap_centi >= rrn_ledger::tier::TIER_3_FLOOR_CENTI {
+            anyhow::bail!(
+                "config: [credit] cert_max_cap_centi must be < the Tier-3 floor of {} \
+                 centicommons (ADR-0021 §1: certificates are Tier-1/2 commerce, not \
+                 exceptional transfers); got {}",
+                rrn_ledger::tier::TIER_3_FLOOR_CENTI,
+                config.credit.cert_max_cap_centi
+            );
+        }
+        if config.credit.cert_max_outstanding == 0 {
+            anyhow::bail!(
+                "config: [credit] cert_max_outstanding must be >= 1 (0 refuses every \
+                 certificate request)"
+            );
+        }
+        if config.credit.cert_max_cap_centi > config.credit.debt_floor_centi.saturating_abs() {
+            tracing::warn!(
+                cert_max_cap_centi = config.credit.cert_max_cap_centi,
+                debt_floor_centi = config.credit.debt_floor_centi,
+                "config: [credit] cert_max_cap_centi exceeds the debt-floor magnitude; a \
+                 member at zero balance cannot reserve a full certificate at this cap"
+            );
+        }
         let credit = rrn_ledger::credit::CreditConfig {
             debt_floor_centi: config.credit.debt_floor_centi,
+            cert_validity_seconds: config.credit.cert_validity_seconds,
+            cert_max_cap_centi: config.credit.cert_max_cap_centi,
+            cert_delivery_grace_seconds: config.credit.cert_delivery_grace_seconds,
+            cert_max_outstanding: config.credit.cert_max_outstanding,
         };
 
         let core = Core::new(
