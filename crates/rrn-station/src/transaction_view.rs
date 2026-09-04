@@ -147,6 +147,8 @@ pub(crate) fn row_for(state: &TransactionState, member: &Address) -> Option<Tran
         // falls back to the memo).
         listing_id: proposal.listing_id.map(|ListingRef(b)| hex(&b)),
         listing_title: None,
+        // Present iff this was a cert-backed offline spend (ADR-0021 §3).
+        cert_id: proposal.cert_id.map(|c| hex(&c.to_bytes())),
         state: state_str.to_string(),
         oracle_tier: proposal.effective_tier(),
         timestamp: proposal.proposed_at,

@@ -217,9 +217,48 @@ pub enum Error {
     #[error("certificate not found")]
     UnknownCertificate,
     /// The certificate is not `Outstanding` (already returned), so it cannot be
-    /// returned again — returning is idempotent (ADR-0021 §2).
+    /// returned again — returning is idempotent (ADR-0021 §2). Also the outcome
+    /// of a cert-backed spend against a certificate its member has since returned
+    /// (ADR-0021 §3, the "cert status Outstanding" admission check).
     #[error("certificate is not outstanding (already returned)")]
     CertificateNotOutstanding,
+    /// A proposal names a certificate but is not a spend the certificate can back:
+    /// its amount is not strictly positive. A cert-backed record must debit its
+    /// signer (the certificate holder must be the debtor) — a payment request
+    /// (a `<= 0` amount, which would debit the *receiver*) cannot ride an escrow
+    /// (ADR-0021 §3–§4).
+    #[error("certificate misuse: a cert-backed proposal must be a positive-amount spend")]
+    CertificateMisuse,
+    /// A cert-backed proposal names a certificate whose member is not the
+    /// proposal's sender — a member may only spend against their own certificate
+    /// (ADR-0021 §3).
+    #[error("certificate belongs to a different member than the proposal's sender")]
+    CertificateWrongMember,
+    /// A cert-backed proposal arrived after the certificate's spend-admissibility
+    /// boundary — its validity plus the DTN delivery grace and clock skew
+    /// ([`escrow::spend_admissible_until`](crate::escrow::spend_admissible_until)),
+    /// judged by the admission clock (ADR-0021 §4, ADR-0022). Past it the
+    /// certificate's reservation has already released, so the spend can never be
+    /// honored.
+    #[error("certificate has expired (past its spend-admissibility boundary)")]
+    CertificateExpired,
+    /// A cert-backed spend would push the certificate's cumulative admitted spend
+    /// past its cap (ADR-0021 §5). The excess spend is refused; the conjunction of
+    /// the admitted spends and this refused one is a self-contained proof of
+    /// equivocation that T2.3.3 assembles at ingest — so this error carries the
+    /// three amounts *structurally* (never string-matched) for that evidence.
+    #[error(
+        "certificate overspent: cap {cap_centi}, already consumed {consumed_centi}, \
+         this spend of {attempted_centi} exceeds the remaining allowance"
+    )]
+    CertificateOverspent {
+        /// The certificate's reserved cap, in centicommons.
+        cap_centi: i64,
+        /// Cumulative admitted cert-backed spend before this one, in centicommons.
+        consumed_centi: i64,
+        /// The amount this refused spend attempted, in centicommons.
+        attempted_centi: i64,
+    },
     /// A derived [`state::TransactionState`] failed its internal integrity check
     /// (e.g. an embedded signature did not verify).
     #[error("invalid transaction state: {0}")]

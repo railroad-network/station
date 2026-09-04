@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-platform headroom-certificate wire fixtures for T2.3.1 (ADR-0021). One fully-populated vector per signed record kind: member certificate request, station headroom certificate, member certificate return. `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); `signature_hex` is the Ed25519 signature over those bytes. request_id/cert_id are the Blake3 content addresses (omitted from the CBOR, recomputed on decode). Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
+  "_comment": "Cross-platform headroom-certificate wire fixtures for T2.3.1/T2.3.2 (ADR-0021). One fully-populated vector per signed record kind: member certificate request, station headroom certificate, member certificate return, and a member-signed cert-backed spend (a TransactionProposal carrying the additive `cert_id` — T2.3.2). `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); `signature_hex` is the Ed25519 signature over those bytes. request_id/cert_id/proposal_id are the Blake3 content addresses (omitted from the CBOR, recomputed on decode). Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
   "request": {
     "member_seed": "c8ba659c85ffda049570d8949c784921f08bda94f9309fce001a6bb767fb5859",
     "member_pubkey": "8e21daa3ded2ae6b82cb4ca74bedbb41bef5053e0221d5939c1cd8094c996d4a",
@@ -28,5 +28,17 @@
     "returned_at": "1700050000",
     "canonical_hex": "a4646b696e647672726e2e6372656469742e636572745f72657475726e666d656d62657258208e21daa3ded2ae6b82cb4ca74bedbb41bef5053e0221d5939c1cd8094c996d4a67636572745f6964582029191e635f656a35542a7bfaa3c24cad526eed4d9e4a0730de69ff88371590206b72657475726e65645f61741a6554b450",
     "signature_hex": "ed796956cfd110926e3ca0ad37bd13ef454419eebe497f53234cf651ed7f79a2d0324bc810e94fb3c8b84c6951ec5fc82b9f21049946c3c999a97ed79161e70c"
+  },
+  "cert_backed_proposal": {
+    "sender_pubkey": "8e21daa3ded2ae6b82cb4ca74bedbb41bef5053e0221d5939c1cd8094c996d4a",
+    "receiver_pubkey": "8319a44ccc46a0cbb2762c0a10e5cb60e24ae02820a52acace695f06c28f79f2",
+    "amount_centi": "300",
+    "cert_id": "29191e635f656a35542a7bfaa3c24cad526eed4d9e4a0730de69ff8837159020",
+    "nonce": "4",
+    "proposed_at": "1700000200",
+    "expires_at": "1700700000",
+    "canonical_hex": "a9646b696e646f72726e2e74782e70726f706f73616c646d656d6ff6656e6f6e6365046673656e64657258208e21daa3ded2ae6b82cb4ca74bedbb41bef5053e0221d5939c1cd8094c996d4a67636572745f6964582029191e635f656a35542a7bfaa3c24cad526eed4d9e4a0730de69ff883715902068726563656976657258208319a44ccc46a0cbb2762c0a10e5cb60e24ae02820a52acace695f06c28f79f26a657870697265735f61741a655e9f606b70726f706f7365645f61741a6553f1c86c616d6f756e745f63656e746919012c",
+    "signature_hex": "845ad06f56ad7c5756edf5fc9ce0e139bc96a7bfec66dc528613d6bd6ec33a82196c9dd2282ace19071e809f817fa3249714b0cbc55eda3ad09d17bca53a770e",
+    "proposal_id": "089dec3c8467a701c69a96f8bd7ee41c764be3e8dbf260f238004af554a477ea"
   }
 }

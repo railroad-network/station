@@ -2358,6 +2358,7 @@ mod tests {
             memo: Some("Fresh eggs · #a63d8d06".into()),
             listing_id: Some("3c3738c4".into()),
             listing_title: Some("Fresh eggs".into()),
+            cert_id: None,
             state: "settled".into(),
             oracle_tier: 1,
             timestamp: 1_000,

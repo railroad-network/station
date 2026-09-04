@@ -25,6 +25,7 @@ use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::escrow::{CertificateRequest, CertificateReturn, HeadroomCertificate};
+use rrn_ledger::transaction::TransactionProposal;
 use serde::{Deserialize, Serialize};
 
 fn keypair(label: &str) -> Keypair {
@@ -70,12 +71,35 @@ struct ReturnVector {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CertBackedProposalVector {
+    /// The member (sender) who signs the cert-backed spend — the certificate's
+    /// holder, reused from the `request`/`certificate` vectors above.
+    sender_pubkey: String,
+    receiver_pubkey: String,
+    amount_centi: String,
+    /// The certificate this spend draws against — `certificate.cert_id` above.
+    cert_id: String,
+    nonce: String,
+    proposed_at: String,
+    expires_at: String,
+    /// Canonical dCBOR of the `TransactionProposal` body carrying the `cert_id`
+    /// key (== `From<..> for CBOR`). Proves the additive omit-when-`None` field
+    /// encodes byte-identically across platforms.
+    canonical_hex: String,
+    /// The sender's Ed25519 signature over `canonical_hex`.
+    signature_hex: String,
+    /// Content address (Blake3 of the canonical bytes), hex.
+    proposal_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Fixture {
     #[serde(rename = "_comment")]
     comment: String,
     request: RequestVector,
     certificate: CertificateVector,
     certificate_return: ReturnVector,
+    cert_backed_proposal: CertBackedProposalVector,
 }
 
 const CAP_CENTI: i64 = 1_000;
@@ -84,6 +108,14 @@ const REQUESTED_AT: i64 = 1_700_000_000;
 const ISSUED_AT: i64 = 1_700_000_100;
 const VALIDITY: i64 = 604_800;
 const RETURNED_AT: i64 = 1_700_050_000;
+// A cert-backed spend against the fixture certificate: a positive amount well
+// within the cap, signed by the member. `expires_at` is set past the
+// certificate's own expiry, as a real wallet does for a cert-backed proposal
+// (ADR-0021 §4). Its nonce follows the request's in the shared sequence.
+const SPEND_CENTI: i64 = 300;
+const SPEND_NONCE: u64 = 4;
+const SPEND_PROPOSED_AT: i64 = 1_700_000_200;
+const SPEND_EXPIRES_AT: i64 = 1_700_700_000;
 
 fn build_fixture() -> Fixture {
     let member = keypair("rrn-cert-fixture:v1:member:");
@@ -117,14 +149,32 @@ fn build_fixture() -> Fixture {
     let signed_return = SignedPayload::sign(return_record.clone(), &member);
     assert!(signed_return.verify().is_ok());
 
+    // A cert-backed spend against it, signed by the member (the sender).
+    let receiver = keypair("rrn-cert-fixture:v1:receiver:");
+    let receiver_addr = Address::from_public_key(receiver.public_key());
+    let spend = TransactionProposal::new(
+        member_addr,
+        receiver_addr,
+        SPEND_CENTI,
+        None,
+        SPEND_NONCE,
+        SPEND_PROPOSED_AT,
+        SPEND_EXPIRES_AT,
+    )
+    .with_certificate(cert_id);
+    let proposal_id = spend.id;
+    let signed_spend = SignedPayload::sign(spend.clone(), &member);
+    assert!(signed_spend.verify().is_ok());
+
     Fixture {
-        comment: "Cross-platform headroom-certificate wire fixtures for T2.3.1 (ADR-0021). One \
-            fully-populated vector per signed record kind: member certificate request, station \
-            headroom certificate, member certificate return. `canonical_hex` is each record's \
-            canonical dCBOR (== From<T> for CBOR); `signature_hex` is the Ed25519 signature over \
-            those bytes. request_id/cert_id are the Blake3 content addresses (omitted from the \
-            CBOR, recomputed on decode). Deterministic (blake3-derived seeds, RFC 8032); \
-            regenerate with RRN_REGEN=1."
+        comment: "Cross-platform headroom-certificate wire fixtures for T2.3.1/T2.3.2 (ADR-0021). \
+            One fully-populated vector per signed record kind: member certificate request, station \
+            headroom certificate, member certificate return, and a member-signed cert-backed \
+            spend (a TransactionProposal carrying the additive `cert_id` — T2.3.2). \
+            `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); \
+            `signature_hex` is the Ed25519 signature over those bytes. request_id/cert_id/\
+            proposal_id are the Blake3 content addresses (omitted from the CBOR, recomputed on \
+            decode). Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1."
             .to_string(),
         request: RequestVector {
             member_seed: hex::encode(member.secret_key().to_bytes()),
@@ -154,6 +204,18 @@ fn build_fixture() -> Fixture {
             returned_at: RETURNED_AT.to_string(),
             canonical_hex: hex::encode(to_canonical_bytes(return_record)),
             signature_hex: hex::encode(signed_return.signature.to_bytes()),
+        },
+        cert_backed_proposal: CertBackedProposalVector {
+            sender_pubkey: hex::encode(member.public_key().to_bytes()),
+            receiver_pubkey: hex::encode(receiver.public_key().to_bytes()),
+            amount_centi: SPEND_CENTI.to_string(),
+            cert_id: cert_id.0.to_hex(),
+            nonce: SPEND_NONCE.to_string(),
+            proposed_at: SPEND_PROPOSED_AT.to_string(),
+            expires_at: SPEND_EXPIRES_AT.to_string(),
+            canonical_hex: hex::encode(to_canonical_bytes(spend)),
+            signature_hex: hex::encode(signed_spend.signature.to_bytes()),
+            proposal_id: proposal_id.0.to_hex(),
         },
     }
 }
@@ -220,4 +282,21 @@ fn committed_bytes_match_the_typed_encoders() {
         return_record.cert_id.0.to_hex(),
         fx.certificate_return.cert_id
     );
+
+    // The cert-backed proposal's canonical bytes carry the `cert_id` key, decode
+    // back to a proposal that names the fixture certificate, and recompute the
+    // same content id (the omit-and-recompute discipline extended to `cert_id`).
+    let spend_bytes = hex::decode(&fx.cert_backed_proposal.canonical_hex).unwrap();
+    assert!(
+        spend_bytes
+            .windows(b"cert_id".len())
+            .any(|w| w == b"cert_id"),
+        "cert-backed proposal must carry the cert_id key"
+    );
+    let spend: TransactionProposal = from_canonical_bytes(&spend_bytes).unwrap();
+    assert_eq!(
+        spend.cert_id.map(|c| c.0.to_hex()),
+        Some(fx.cert_backed_proposal.cert_id.clone())
+    );
+    assert_eq!(spend.id.0.to_hex(), fx.cert_backed_proposal.proposal_id);
 }

@@ -69,6 +69,25 @@ pub enum RefusalReason {
     /// fault — a courier's owner can tell "raise your standing" from a generic
     /// rejection.
     Tier2Stake,
+    /// A cert-backed proposal is not a spend its certificate can back — its
+    /// amount is not a positive debit of the holder (ADR-0021 §3–§4).
+    CertMisuse,
+    /// A cert-backed proposal (or a certificate return) names a certificate the
+    /// station has never issued (ADR-0021 §3).
+    CertUnknown,
+    /// A cert-backed proposal (or a return) names a certificate its member has
+    /// already returned (ADR-0021 §2–§3).
+    CertReturned,
+    /// A cert-backed proposal names a certificate belonging to a different member
+    /// than the proposal's sender (ADR-0021 §3).
+    CertWrongMember,
+    /// A cert-backed proposal arrived past its certificate's spend-admissibility
+    /// boundary (validity + delivery grace + skew — ADR-0021 §4).
+    CertExpired,
+    /// A cert-backed spend would push the certificate's cumulative admitted spend
+    /// past its cap (ADR-0021 §5) — the excess is refused (and is equivocation
+    /// evidence, T2.3.3).
+    CertOverspent,
     /// The engine refused the record for a reason without a more specific slug
     /// (a state-machine or plausibility fault). A machine-stable catch-all so the
     /// closed set need not grow a variant per ledger error.
@@ -89,6 +108,12 @@ impl RefusalReason {
             RefusalReason::TierUnsupported => "tier-unsupported",
             RefusalReason::NotProposed => "not-proposed",
             RefusalReason::Tier2Stake => "tier2-stake",
+            RefusalReason::CertMisuse => "cert-misuse",
+            RefusalReason::CertUnknown => "cert-unknown",
+            RefusalReason::CertReturned => "cert-returned",
+            RefusalReason::CertWrongMember => "cert-wrong-member",
+            RefusalReason::CertExpired => "cert-expired",
+            RefusalReason::CertOverspent => "cert-overspent",
             RefusalReason::Rejected => "rejected",
         }
     }
@@ -108,6 +133,12 @@ impl RefusalReason {
             "tier-unsupported" => Some(RefusalReason::TierUnsupported),
             "not-proposed" => Some(RefusalReason::NotProposed),
             "tier2-stake" => Some(RefusalReason::Tier2Stake),
+            "cert-misuse" => Some(RefusalReason::CertMisuse),
+            "cert-unknown" => Some(RefusalReason::CertUnknown),
+            "cert-returned" => Some(RefusalReason::CertReturned),
+            "cert-wrong-member" => Some(RefusalReason::CertWrongMember),
+            "cert-expired" => Some(RefusalReason::CertExpired),
+            "cert-overspent" => Some(RefusalReason::CertOverspent),
             "rejected" => Some(RefusalReason::Rejected),
             _ => None,
         }
@@ -442,6 +473,12 @@ mod tests {
             RefusalReason::TierUnsupported,
             RefusalReason::NotProposed,
             RefusalReason::Tier2Stake,
+            RefusalReason::CertMisuse,
+            RefusalReason::CertUnknown,
+            RefusalReason::CertReturned,
+            RefusalReason::CertWrongMember,
+            RefusalReason::CertExpired,
+            RefusalReason::CertOverspent,
             RefusalReason::Rejected,
         ] {
             assert_eq!(RefusalReason::from_slug(reason.as_slug()), Some(reason));

@@ -175,8 +175,19 @@ outside this table, so the set is also the length bound:
 | `nonce-gap` | the sender's per-sender nonce was a gap or duplicate |
 | `debt-floor` | admitting the record would commit its signer below the debt floor (ADR-0018) |
 | `expired` | the proposal had expired by the admission clock (ADR-0022 §4) |
-| `unroutable-kind` | the record's `kind` is not one the station admits over DTN |
+| `unroutable-kind` | the record's `kind` is not one the station admits over DTN (e.g. a certificate *request*, which needs a live signed reply — ADR-0021 §1) |
 | `outbox-fork` | the entry is one side of an outbox fork (ADR-0020 §2 / ADR-0021) |
+| `duplicate` | a record content-identical to one already on the log was re-presented as a *new* admission (distinct from the benign `known` outcome) |
+| `tier-unsupported` | the record's oracle tier is above what this phase admits — blocked, never clamped (ADR-0011) |
+| `not-proposed` | the referenced transaction is absent or not in the state the record needs (couriers must keep outbox order, ADR-0020 §4) |
+| `tier2-stake` | a Tier-2 confirmer does not clear the Member band past bootstrap grace (T1.8.2) |
+| `cert-misuse` | a cert-backed proposal is not a positive-amount spend — a payment request cannot ride an escrow (ADR-0021 §3–§4) |
+| `cert-unknown` | a cert-backed proposal (or return) names a certificate the station never issued (ADR-0021 §3) |
+| `cert-returned` | a cert-backed proposal (or return) names a certificate already returned (ADR-0021 §2–§3) |
+| `cert-wrong-member` | a cert-backed proposal names a certificate belonging to another member than its sender (ADR-0021 §3) |
+| `cert-expired` | a cert-backed proposal arrived past its certificate's spend-admissibility boundary (validity + grace + skew — ADR-0021 §4) |
+| `cert-overspent` | a cert-backed spend would exceed its certificate's cap (ADR-0021 §5); the excess is refused and is equivocation evidence (T2.3.3) |
+| `rejected` | a state-machine or plausibility fault with no more specific slug (machine-stable catch-all) |
 
 A reader that does not recognise a slug treats the outcome as an unknown refusal
 (the decoder rejects an unknown slug rather than guessing).
