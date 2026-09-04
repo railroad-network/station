@@ -27,7 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use rrn_ledger::credit::DEFAULT_DEBT_FLOOR_CENTI;
+use rrn_ledger::credit::{
+    DEFAULT_CERT_DELIVERY_GRACE_SECS, DEFAULT_CERT_MAX_CAP_CENTI, DEFAULT_CERT_MAX_OUTSTANDING,
+    DEFAULT_CERT_VALIDITY_SECS, DEFAULT_DEBT_FLOOR_CENTI,
+};
 use rrn_ledger::settlement::{DEFAULT_TIER1_WINDOW_SECONDS, DEFAULT_TIER2_WINDOW_SECONDS};
 
 /// The parsed `config.toml`.
@@ -143,7 +146,9 @@ pub struct SettlementSection {
     pub tier2_window_seconds: u64,
 }
 
-/// `[credit]` — how far into debt a member may sign themselves (ADR-0018).
+/// `[credit]` — how far into debt a member may sign themselves (ADR-0018) and
+/// the offline-certificate parameters that reserve headroom ahead of a partition
+/// (ADR-0021).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreditSection {
     /// The lowest projected balance, in centicommons, a member may commit
@@ -154,16 +159,52 @@ pub struct CreditSection {
     /// personal one.
     #[serde(default = "default_debt_floor_centi")]
     pub debt_floor_centi: i64,
+    /// How long a newly issued headroom certificate stays valid, in seconds.
+    /// Defaults to [`DEFAULT_CERT_VALIDITY_SECS`] (7 days). Must be > 0.
+    #[serde(default = "default_cert_validity_seconds")]
+    pub cert_validity_seconds: i64,
+    /// The largest cap, in centicommons, one certificate may reserve. Defaults to
+    /// [`DEFAULT_CERT_MAX_CAP_CENTI`] (1,000 = 10 Commons). Must be > 0 and, per
+    /// ADR-0021 §1, no larger than the Tier-2 single-transaction ceiling
+    /// ([`rrn_ledger::tier::TIER_3_FLOOR_CENTI`]); the station also warns if it
+    /// exceeds the debt-floor magnitude (unreachable at zero balance).
+    #[serde(default = "default_cert_max_cap_centi")]
+    pub cert_max_cap_centi: i64,
+    /// The DTN delivery grace beyond expiry, in seconds, within which a
+    /// cert-backed spend is still admissible (ADR-0021 §4). Defaults to
+    /// [`DEFAULT_CERT_DELIVERY_GRACE_SECS`] (14 days). Must be ≥ 0.
+    #[serde(default = "default_cert_delivery_grace_seconds")]
+    pub cert_delivery_grace_seconds: i64,
+    /// The maximum number of simultaneously outstanding certificates one member
+    /// may hold. Defaults to [`DEFAULT_CERT_MAX_OUTSTANDING`] (4).
+    #[serde(default = "default_cert_max_outstanding")]
+    pub cert_max_outstanding: u32,
 }
 
 fn default_debt_floor_centi() -> i64 {
     DEFAULT_DEBT_FLOOR_CENTI
+}
+fn default_cert_validity_seconds() -> i64 {
+    DEFAULT_CERT_VALIDITY_SECS
+}
+fn default_cert_max_cap_centi() -> i64 {
+    DEFAULT_CERT_MAX_CAP_CENTI
+}
+fn default_cert_delivery_grace_seconds() -> i64 {
+    DEFAULT_CERT_DELIVERY_GRACE_SECS
+}
+fn default_cert_max_outstanding() -> u32 {
+    DEFAULT_CERT_MAX_OUTSTANDING
 }
 
 impl Default for CreditSection {
     fn default() -> Self {
         Self {
             debt_floor_centi: default_debt_floor_centi(),
+            cert_validity_seconds: default_cert_validity_seconds(),
+            cert_max_cap_centi: default_cert_max_cap_centi(),
+            cert_delivery_grace_seconds: default_cert_delivery_grace_seconds(),
+            cert_max_outstanding: default_cert_max_outstanding(),
         }
     }
 }
@@ -445,6 +486,18 @@ mod tests {
         // DTN retention/prune fall back to their protocol defaults.
         assert_eq!(cfg.timers.dtn_prune_interval_secs, 3600);
         assert_eq!(cfg.dtn.receipt_retention_secs, 30 * 24 * 60 * 60);
+        // Credit/certificate parameters fall back to the protocol defaults.
+        assert_eq!(cfg.credit.debt_floor_centi, DEFAULT_DEBT_FLOOR_CENTI);
+        assert_eq!(cfg.credit.cert_validity_seconds, DEFAULT_CERT_VALIDITY_SECS);
+        assert_eq!(cfg.credit.cert_max_cap_centi, DEFAULT_CERT_MAX_CAP_CENTI);
+        assert_eq!(
+            cfg.credit.cert_delivery_grace_seconds,
+            DEFAULT_CERT_DELIVERY_GRACE_SECS
+        );
+        assert_eq!(
+            cfg.credit.cert_max_outstanding,
+            DEFAULT_CERT_MAX_OUTSTANDING
+        );
         // A config written before [mobile] existed still parses, and advertises
         // on all interfaces with a derived name.
         assert_eq!(cfg.mobile.listen, "0.0.0.0:7500");
@@ -470,6 +523,47 @@ mod tests {
             Some("Railroad Station — Blue Ridge")
         );
         assert!(!cfg.mobile.advertise);
+    }
+
+    #[test]
+    fn credit_section_overrides_certificate_defaults() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [credit]
+            debt_floor_centi = -3000
+            cert_validity_seconds = 86400
+            cert_max_cap_centi = 2500
+            cert_delivery_grace_seconds = 172800
+            cert_max_outstanding = 2
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.credit.debt_floor_centi, -3000);
+        assert_eq!(cfg.credit.cert_validity_seconds, 86400);
+        assert_eq!(cfg.credit.cert_max_cap_centi, 2500);
+        assert_eq!(cfg.credit.cert_delivery_grace_seconds, 172800);
+        assert_eq!(cfg.credit.cert_max_outstanding, 2);
+    }
+
+    #[test]
+    fn credit_section_partial_override_keeps_other_cert_defaults() {
+        // A file written before the certificate keys existed (only debt_floor)
+        // still parses, and the certificate keys take their protocol defaults.
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [credit]
+            debt_floor_centi = -1000
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.credit.debt_floor_centi, -1000);
+        assert_eq!(cfg.credit.cert_max_cap_centi, DEFAULT_CERT_MAX_CAP_CENTI);
+        assert_eq!(
+            cfg.credit.cert_max_outstanding,
+            DEFAULT_CERT_MAX_OUTSTANDING
+        );
     }
 
     #[test]

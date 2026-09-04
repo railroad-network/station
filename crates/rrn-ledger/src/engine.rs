@@ -26,6 +26,10 @@ use rrn_identity::address::Address;
 
 use crate::credit::{committed_debits_centi, CreditConfig};
 use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
+use crate::escrow::{
+    CertificateStatus, HeadroomCertificate, SignedCertificateRequest, SignedCertificateReturn,
+    SignedHeadroomCertificate,
+};
 use crate::settlement::{BalanceView, SettlementConfig};
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
 use crate::transaction::{SignedConfirmation, SignedProposal, TransactionId};
@@ -75,7 +79,7 @@ impl<'db> Engine<'db> {
     ) -> Result<()> {
         let settled = BalanceView::new(self.db).balance_of(debtor)?;
         let projected = settled
-            .saturating_sub(committed_debits_centi(snapshot, debtor, now))
+            .saturating_sub(committed_debits_centi(snapshot, debtor, now, &self.credit))
             .saturating_sub(debit_centi);
         if projected < self.credit.debt_floor_centi {
             return Err(Error::DebtFloorExceeded {
@@ -225,6 +229,147 @@ impl<'db> Engine<'db> {
         let proposal_id = c.proposal_id;
         AppendLog::new(self.db).append(confirmation, now)?;
         tracing::info!(tx = ?proposal_id, "confirmation accepted");
+        Ok(())
+    }
+
+    /// Issues a headroom certificate for a member-signed request, reserving its
+    /// full cap against the member's debt-floor headroom (ADR-0021 §1–§2).
+    ///
+    /// Front-door checks, in order, each with a typed error and **nothing written
+    /// on failure**: the request signature verifies; the signer is the named
+    /// member; `cap_centi` is `1..=cert_max_cap_centi`; the nonce is exactly the
+    /// member's next (certificate requests share the member's proposal nonce
+    /// sequence); `requested_at` is not future-dated beyond skew; the member holds
+    /// fewer than `cert_max_outstanding` certificates; and the cap fits the
+    /// headroom — settled balance minus committed debits (which already counts the
+    /// member's *other* outstanding certificates) minus this cap stays at or above
+    /// the debt floor.
+    ///
+    /// On success it appends the request (at `now`), then builds a
+    /// station-signed [`HeadroomCertificate`] (`issued_at = now`,
+    /// `expires_at = now + cert_validity_seconds`), appends it (at `now`), and
+    /// returns it. The two appends are not atomic: if the second fails after the
+    /// first, replay tolerates the dangling request — a request alone reserves
+    /// nothing (only certificates do), so no headroom is stranded and the member
+    /// simply requests again (the ADR-0005 settlement-crash-window discipline).
+    pub fn submit_certificate_request(
+        &mut self,
+        request: SignedCertificateRequest,
+        now: i64,
+    ) -> Result<SignedHeadroomCertificate> {
+        request.verify().map_err(|_| Error::BadSignature)?;
+        let r = &request.payload;
+
+        // The signer must be the member the request debits headroom for.
+        if &request.signer != r.member.public_key() {
+            return Err(Error::MemberMismatch);
+        }
+
+        // Cap bounds: strictly positive and within the configured ceiling.
+        if r.cap_centi <= 0 || r.cap_centi > self.credit.cert_max_cap_centi {
+            return Err(Error::InvalidCertificateCap {
+                cap_centi: r.cap_centi,
+                max: self.credit.cert_max_cap_centi,
+            });
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+
+        // Nonce ordering: exactly the member's next, shared with proposals.
+        let expected = snapshot.next_nonce(&r.member.public_key().to_bytes());
+        if r.nonce != expected {
+            return Err(Error::BadNonce {
+                expected,
+                got: r.nonce,
+            });
+        }
+
+        // `requested_at` is plausibility-bounded testimony (ADR-0022 §3): it may
+        // not be dated into the future beyond skew, but arbitrarily old is legal.
+        if r.requested_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::FutureDated);
+        }
+
+        // Bound per-member idle-escrow sprawl. Only *live* certificates count —
+        // one past its admissibility boundary reserves nothing, so it must not
+        // block new issuance (mirrors how an expired proposal stops counting).
+        let outstanding = snapshot.live_certs_of(&r.member, now, &self.credit).len() as u32;
+        if outstanding >= self.credit.cert_max_outstanding {
+            return Err(Error::TooManyCertificates {
+                outstanding,
+                max: self.credit.cert_max_outstanding,
+            });
+        }
+
+        // Headroom: reserving this cap must not commit the member below the floor.
+        // `committed_debits_centi` already counts the member's other outstanding
+        // certificates, so stacking requests can never jointly breach the floor.
+        self.check_debt_floor(&snapshot, &r.member, r.cap_centi, now)?;
+
+        // Append the member's request first, then the station's grant — replay
+        // must be able to prove consent and grant independently (ADR-0021 §1).
+        AppendLog::new(self.db).append(request.clone(), now)?;
+        let certificate = HeadroomCertificate::new(
+            r.member,
+            r.cap_centi,
+            r.request_id,
+            now,
+            now.saturating_add(self.credit.cert_validity_seconds),
+        );
+        let signed = SignedHeadroomCertificate::sign(certificate, &self.station);
+        AppendLog::new(self.db).append(signed.clone(), now)?;
+        tracing::info!(
+            member = ?r.member,
+            cert = ?signed.payload.cert_id,
+            cap_centi = r.cap_centi,
+            expires_at = signed.payload.expires_at,
+            "headroom certificate issued"
+        );
+        Ok(signed)
+    }
+
+    /// Returns an outstanding headroom certificate early, releasing its reserved
+    /// remainder once admitted (ADR-0021 §2).
+    ///
+    /// Checks, each with a typed error and nothing written on failure: the return
+    /// signature verifies; the signer is the named member; the certificate exists,
+    /// its member matches, and it is still `Outstanding`. Returning is idempotent
+    /// — a second return of the same certificate is refused here as
+    /// already-returned ([`Error::CertificateNotOutstanding`]); unlike a request
+    /// it needs no nonce, because there is nothing to reorder.
+    pub fn submit_certificate_return(
+        &mut self,
+        return_record: SignedCertificateReturn,
+        now: i64,
+    ) -> Result<()> {
+        return_record.verify().map_err(|_| Error::BadSignature)?;
+        let r = &return_record.payload;
+
+        if &return_record.signer != r.member.public_key() {
+            return Err(Error::MemberMismatch);
+        }
+
+        // `returned_at` is plausibility-bounded testimony (ADR-0022 §3): it may
+        // not be dated into the future beyond skew. It anchors no window, so an
+        // arbitrarily old value is fine.
+        if r.returned_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+            return Err(Error::FutureDated);
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let state = snapshot
+            .certificate(&r.cert_id)
+            .ok_or(Error::UnknownCertificate)?;
+        if state.certificate.payload.member != r.member {
+            return Err(Error::MemberMismatch);
+        }
+        if !matches!(state.status, CertificateStatus::Outstanding) {
+            return Err(Error::CertificateNotOutstanding);
+        }
+
+        let cert_id = r.cert_id;
+        AppendLog::new(self.db).append(return_record, now)?;
+        tracing::info!(cert = ?cert_id, "headroom certificate returned");
         Ok(())
     }
 
@@ -697,6 +842,7 @@ mod tests {
         let mut engine =
             Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
                 debt_floor_centi: -500,
+                ..crate::credit::CreditConfig::default()
             });
 
         // 5 Commons (500 centi) down to exactly the floor: allowed.
@@ -736,6 +882,7 @@ mod tests {
         let mut engine =
             Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
                 debt_floor_centi: -500,
+                ..crate::credit::CreditConfig::default()
             });
 
         // Alice requests 501 from Bob (negative amount = receiver pays). The
@@ -774,6 +921,7 @@ mod tests {
         let mut engine =
             Engine::new(&db, station.clone()).with_credit_config(crate::credit::CreditConfig {
                 debt_floor_centi: -500,
+                ..crate::credit::CreditConfig::default()
             });
 
         // Alice pays Bob 300 and it settles: her settled balance is -300.
@@ -810,6 +958,7 @@ mod tests {
         let mut engine =
             Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
                 debt_floor_centi: -500,
+                ..crate::credit::CreditConfig::default()
             });
 
         let p = signed_proposal(&alice, &bob, 0, 100, 100_000); // 300 centi
@@ -844,6 +993,7 @@ mod tests {
         let mut engine =
             Engine::new(&db, station).with_credit_config(crate::credit::CreditConfig {
                 debt_floor_centi: -500,
+                ..crate::credit::CreditConfig::default()
             });
 
         // Alice signs 500 down to exactly the floor; Bob never confirms.
@@ -1408,6 +1558,394 @@ mod tests {
         assert!(matches!(
             engine.respond_to_dispute(signed_response(id, &bob, 400), 400),
             Err(Error::NotDisputed)
+        ));
+    }
+
+    // --- Headroom certificates (T2.3.1, ADR-0021) ---------------------------
+
+    use crate::credit::CreditConfig;
+    use crate::escrow::{CertId, CertificateRequest, CertificateReturn};
+
+    fn signed_cert_request(
+        member: &Keypair,
+        cap_centi: i64,
+        nonce: u64,
+        requested_at: i64,
+    ) -> SignedCertificateRequest {
+        let r = CertificateRequest::new(addr(member), cap_centi, nonce, requested_at);
+        SignedCertificateRequest::sign(r, member)
+    }
+
+    fn signed_cert_return(
+        member: &Keypair,
+        cert_id: CertId,
+        returned_at: i64,
+    ) -> SignedCertificateReturn {
+        let r = CertificateReturn {
+            member: addr(member),
+            cert_id,
+            returned_at,
+        };
+        SignedCertificateReturn::sign(r, member)
+    }
+
+    #[test]
+    fn issuing_a_certificate_reserves_its_cap() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // A 1000-cap request at now=1000 → certificate with the default 7-day
+        // validity, Outstanding.
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 1_000, 0, 1_000), 1_000)
+            .unwrap();
+        assert_eq!(
+            cert.payload.expires_at,
+            1_000 + crate::credit::DEFAULT_CERT_VALIDITY_SECS
+        );
+        assert_eq!(cert.payload.member, addr(&alice));
+        assert!(engine
+            .get_state(&TransactionId(rrn_crypto::hash::Hash::of(b"never")))
+            .unwrap()
+            .is_none()); // sanity: unrelated id absent
+
+        // The cap shrank Alice's spendable headroom: a 1500 proposal that would
+        // have fit before (0 − 1500 = −1500 ≥ −2000) is now refused, since the
+        // 1000 cap is committed too (−2500 < −2000). The request consumed nonce
+        // 0, so the proposal must carry nonce 1.
+        let over =
+            TransactionProposal::new(addr(&alice), addr(&bob), 1_500, None, 1, 1_000, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(over, &alice), 1_000),
+            Err(Error::DebtFloorExceeded {
+                floor_centi: -2_000,
+                projected_centi: -2_500,
+            })
+        ));
+    }
+
+    #[test]
+    fn certificate_cap_bounds_are_enforced() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        // Above the default max cap (1000).
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 1_001, 0, 100), 100),
+            Err(Error::InvalidCertificateCap {
+                cap_centi: 1_001,
+                max: 1_000
+            })
+        ));
+        // Zero and negative caps.
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 0, 0, 100), 100),
+            Err(Error::InvalidCertificateCap { cap_centi: 0, .. })
+        ));
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, -5, 0, 100), 100),
+            Err(Error::InvalidCertificateCap { cap_centi: -5, .. })
+        ));
+        // Nothing was written: nonce 0 is still free.
+        engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_certificate_request_by_a_stranger_is_rejected() {
+        let db = fresh_db();
+        let (alice, mallory, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // Mallory signs a request that names Alice as the member.
+        let r = CertificateRequest::new(addr(&alice), 500, 0, 100);
+        let forged = SignedCertificateRequest::sign(r, &mallory);
+        assert!(matches!(
+            engine.submit_certificate_request(forged, 100),
+            Err(Error::MemberMismatch)
+        ));
+    }
+
+    #[test]
+    fn certificate_requests_share_the_proposal_nonce_sequence() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // A bad nonce (skipping 0) is refused.
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 100, 2, 100), 100),
+            Err(Error::BadNonce {
+                expected: 0,
+                got: 2
+            })
+        ));
+
+        // Interleave: request(0) → proposal(1) → request(2), each taking the next
+        // shared nonce.
+        engine
+            .submit_certificate_request(signed_cert_request(&alice, 100, 0, 100), 100)
+            .unwrap();
+        let p = signed_proposal(&alice, &bob, 1, 100, 100_000);
+        engine.submit_proposal(p, 100).unwrap();
+        engine
+            .submit_certificate_request(signed_cert_request(&alice, 100, 2, 100), 100)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_outstanding_certificate_limit_is_enforced() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        // Four small certificates fit (4 × 100 = 400 ≤ 2000 headroom); the fifth
+        // hits the default cap of 4 outstanding.
+        for nonce in 0..4 {
+            engine
+                .submit_certificate_request(signed_cert_request(&alice, 100, nonce, 100), 100)
+                .unwrap();
+        }
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 100, 4, 100), 100),
+            Err(Error::TooManyCertificates {
+                outstanding: 4,
+                max: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn a_certificate_that_would_breach_the_floor_is_refused() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        // Default floor −2000, but a cap ceiling high enough that the *floor*, not
+        // the cap bound, is what refuses the second request.
+        let mut engine = Engine::new(&db, station).with_credit_config(CreditConfig {
+            cert_max_cap_centi: 2_000,
+            ..CreditConfig::default()
+        });
+
+        // First a 1000-cap certificate (projected −1000, fits).
+        engine
+            .submit_certificate_request(signed_cert_request(&alice, 1_000, 0, 100), 100)
+            .unwrap();
+        // A second request for 1001 would project to −2001 (the first cap counts
+        // against headroom already): refused with the exact projected value.
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 1_001, 1, 100), 100),
+            Err(Error::DebtFloorExceeded {
+                floor_centi: -2_000,
+                projected_centi: -2_001,
+            })
+        ));
+    }
+
+    #[test]
+    fn returning_a_certificate_releases_its_headroom() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 1_000, 0, 100), 100)
+            .unwrap();
+        let cert_id = cert.payload.cert_id;
+
+        // With 1000 reserved, a 1500 proposal (nonce 1) is refused.
+        let blocked =
+            TransactionProposal::new(addr(&alice), addr(&bob), 1_500, None, 1, 100, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(blocked, &alice), 100),
+            Err(Error::DebtFloorExceeded { .. })
+        ));
+
+        // Returning the certificate releases its cap; the same proposal now fits.
+        engine
+            .submit_certificate_return(signed_cert_return(&alice, cert_id, 200), 200)
+            .unwrap();
+        let fits = TransactionProposal::new(addr(&alice), addr(&bob), 1_500, None, 1, 100, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(fits, &alice), 200)
+            .unwrap();
+    }
+
+    #[test]
+    fn expiry_and_grace_release_a_certificates_headroom() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        let cfg = CreditConfig::default();
+
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 1_000, 0, 100), 100)
+            .unwrap();
+        let boundary = crate::escrow::spend_admissible_until(&cert.payload, &cfg);
+
+        // Just before the boundary, the 1000 cap is still committed: a 1500
+        // proposal is refused.
+        let blocked =
+            TransactionProposal::new(addr(&alice), addr(&bob), 1_500, None, 1, 100, i64::MAX);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(blocked, &alice), boundary - 1),
+            Err(Error::DebtFloorExceeded { .. })
+        ));
+        // One second past it, the reservation has released — the same proposal
+        // fits, with no return record written.
+        let fits =
+            TransactionProposal::new(addr(&alice), addr(&bob), 1_500, None, 1, 100, i64::MAX);
+        engine
+            .submit_proposal(SignedProposal::sign(fits, &alice), boundary + 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_future_dated_request_is_refused() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        // `requested_at` beyond `now + skew` is a forgery or a broken clock.
+        let future = 100 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 500, 0, future), 100),
+            Err(Error::FutureDated)
+        ));
+    }
+
+    #[test]
+    fn a_future_dated_return_is_refused() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+        let future = 200 + CLOCK_SKEW_TOLERANCE_SECS + 1;
+        assert!(matches!(
+            engine.submit_certificate_return(
+                signed_cert_return(&alice, cert.payload.cert_id, future),
+                200
+            ),
+            Err(Error::FutureDated)
+        ));
+    }
+
+    #[test]
+    fn an_expired_certificate_frees_the_outstanding_slot() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+        let cfg = CreditConfig::default();
+
+        // Fill the four-certificate limit (4 × 100 ≤ 2000, so the count binds, not
+        // the floor), all issued at now=100 with the same validity.
+        for nonce in 0..4 {
+            engine
+                .submit_certificate_request(signed_cert_request(&alice, 100, nonce, 100), 100)
+                .unwrap();
+        }
+        // A fifth is refused while all four are live.
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 100, 4, 100), 100),
+            Err(Error::TooManyCertificates { .. })
+        ));
+
+        // The boundary is a pure function of expires_at (= 100 + validity), the
+        // same for all four. Past it they are no longer live, so a fifth request
+        // is admitted — no return needed.
+        let probe = HeadroomCertificate::new(
+            addr(&alice),
+            100,
+            crate::escrow::RequestId(rrn_crypto::hash::Hash::of(b"probe")),
+            100,
+            100 + cfg.cert_validity_seconds,
+        );
+        let boundary = crate::escrow::spend_admissible_until(&probe, &cfg);
+        engine
+            .submit_certificate_request(
+                signed_cert_request(&alice, 100, 4, boundary + 1),
+                boundary + 1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_return_is_refused() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+        let cert_id = cert.payload.cert_id;
+        engine
+            .submit_certificate_return(signed_cert_return(&alice, cert_id, 200), 200)
+            .unwrap();
+        assert!(matches!(
+            engine.submit_certificate_return(signed_cert_return(&alice, cert_id, 300), 300),
+            Err(Error::CertificateNotOutstanding)
+        ));
+    }
+
+    #[test]
+    fn returning_an_unknown_certificate_is_refused() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        let missing = CertId(rrn_crypto::hash::Hash::of(b"missing"));
+        assert!(matches!(
+            engine.submit_certificate_return(signed_cert_return(&alice, missing, 100), 100),
+            Err(Error::UnknownCertificate)
+        ));
+    }
+
+    #[test]
+    fn a_return_by_a_non_owner_is_refused() {
+        let db = fresh_db();
+        let (alice, mallory, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+        // Mallory signs a return naming themselves as member for Alice's cert.
+        assert!(matches!(
+            engine.submit_certificate_return(
+                signed_cert_return(&mallory, cert.payload.cert_id, 200),
+                200
+            ),
+            Err(Error::MemberMismatch)
         ));
     }
 }

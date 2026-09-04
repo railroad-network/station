@@ -21,12 +21,12 @@ use rrn_station::governance_view::{CharterView, ProposalDetail, ProposalSummary,
 use rrn_station::history::fmt_commons;
 use rrn_station::marketplace_view::CATEGORIES;
 use rrn_station::rpc::{
-    AnnounceNeedResult, BackupExportResult, BalanceResult, CloseListingResult, ConfirmResult,
-    ContractStateResult, CreateListingResult, DisputeEscalateResult, DisputeEscalationVoteResult,
-    DisputeRaiseResult, DisputeResolveResult, DisputeRuleResult, EditListingResult,
-    GovCharterResult, GovCosignResult, GovProposeResult, HistoryResult, InquireResult,
-    InquiryStateResult, ProposeResult, RecoverImportResult, TransactionRow, TransactionsResult,
-    VouchResult, WhoamiResult,
+    AnnounceNeedResult, BackupExportResult, BalanceResult, CertListResult, CertRequestResult,
+    CloseListingResult, ConfirmResult, ContractStateResult, CreateListingResult,
+    DisputeEscalateResult, DisputeEscalationVoteResult, DisputeRaiseResult, DisputeResolveResult,
+    DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult, GovProposeResult,
+    HistoryResult, InquireResult, InquiryStateResult, ProposeResult, RecoverImportResult,
+    TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -382,6 +382,29 @@ enum Command {
     Dispute {
         #[command(subcommand)]
         cmd: DisputeCmd,
+    },
+    /// Offline spending certificates: reserve debt-floor headroom before a
+    /// partition, and list your outstanding certificates (M2.3, ADR-0021).
+    Cert {
+        #[command(subcommand)]
+        cmd: CertCmd,
+    },
+}
+
+/// The `rrn cert …` subcommands (T2.3.1).
+#[derive(Subcommand)]
+enum CertCmd {
+    /// Reserve a headroom certificate for your own wallet, ahead of going
+    /// offline. Its cap is held against your debt-floor headroom until it
+    /// expires or you return it.
+    Request {
+        /// Cap to reserve, in Commons, e.g. `10` or `2.50`.
+        cap: String,
+    },
+    /// List outstanding certificates (defaults to your own).
+    List {
+        /// The `rrn1…` address to query; omitted means your own.
+        address: Option<String>,
     },
 }
 
@@ -1008,6 +1031,52 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Governance { cmd } => cmd_governance(&client, fmt, color, cmd).await,
         Command::Dispute { cmd } => cmd_dispute(&client, fmt, color, cmd).await,
+        Command::Cert { cmd } => cmd_cert(&client, fmt, cmd).await,
+    }
+}
+
+/// The `rrn cert …` command family (T2.3.1, ADR-0021).
+async fn cmd_cert(client: &UnixClient, fmt: Format, cmd: CertCmd) -> Result<()> {
+    match cmd {
+        CertCmd::Request { cap } => {
+            let cap_centi = parse_amount(&cap)?;
+            let v = client
+                .call("cert_request", json!({ "cap_centi": cap_centi }))
+                .await?;
+            emit(fmt, &v, || {
+                let r: CertRequestResult = parse(&v)?;
+                Ok(format!(
+                    "{}  cap {}  expires {}",
+                    r.cert_id,
+                    fmt_commons(r.cap_centi),
+                    r.expires_at
+                ))
+            })
+        }
+        CertCmd::List { address } => {
+            let mut params = json!({});
+            if let Some(a) = address {
+                params["address"] = json!(a);
+            }
+            let v = client.call("cert_list", params).await?;
+            emit(fmt, &v, || {
+                let r: CertListResult = parse(&v)?;
+                if r.certificates.is_empty() {
+                    return Ok("(no outstanding certificates)".to_string());
+                }
+                let mut out = String::new();
+                for c in &r.certificates {
+                    out.push_str(&format!(
+                        "{}  remaining {} of {}  expires {}\n",
+                        c.cert_id,
+                        fmt_commons(c.remaining_centi),
+                        fmt_commons(c.cap_centi),
+                        c.expires_at
+                    ));
+                }
+                Ok(out.trim_end().to_string())
+            })
+        }
     }
 }
 

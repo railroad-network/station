@@ -21,10 +21,16 @@ use std::collections::BTreeMap;
 
 use dcbor::prelude::*;
 use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_identity::address::Address;
 use rrn_storage::log::{AppendLog, LogEntry};
 use serde::{Deserialize, Serialize};
 
+use crate::credit::CreditConfig;
 use crate::dispute::{DisputeRecord, SignedDispute};
+use crate::escrow::{
+    spend_admissible_until, CertId, CertificateRequest, CertificateReturn, CertificateState,
+    CertificateStatus, HeadroomCertificate, RequestId, SignedHeadroomCertificate,
+};
 use crate::settlement::SettlementRecord;
 use crate::transaction::{
     SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId, TransactionProposal,
@@ -334,10 +340,21 @@ pub struct AdmissionTimes {
 pub struct LedgerSnapshot {
     states: BTreeMap<TransactionId, TransactionState>,
     /// Highest proposal nonce seen per sender (keyed by raw 32-byte pubkey).
+    /// Certificate requests share this sequence (ADR-0021 §1), so replay bumps it
+    /// for them too — one monotonic nonce per key keeps replay protection
+    /// single-tracked across proposals and certificate requests.
     max_nonce: BTreeMap<[u8; 32], u64>,
     /// Admission metadata per transaction (ADR-0022), captured during replay
     /// from the admitting log entry of each lifecycle record.
     admissions: BTreeMap<TransactionId, AdmissionTimes>,
+    /// Headroom certificates by content address (ADR-0021), each with its live
+    /// status and consumed amount.
+    certificates: BTreeMap<CertId, CertificateState>,
+    /// The member and cap of each admitted certificate *request*, keyed by
+    /// request id — so a certificate record can be checked at replay to name a
+    /// request that a genuinely earlier entry admitted from the same member
+    /// *and for the same cap* (consent is to a specific amount).
+    cert_requests: BTreeMap<RequestId, (Address, i64)>,
 }
 
 impl LedgerSnapshot {
@@ -345,7 +362,7 @@ impl LedgerSnapshot {
     pub fn derive(log: &AppendLog) -> Result<Self> {
         let mut snapshot = LedgerSnapshot::default();
         for entry in log.iter_from(1) {
-            snapshot.apply(&entry?);
+            snapshot.apply(&entry?)?;
         }
         Ok(snapshot)
     }
@@ -354,7 +371,14 @@ impl LedgerSnapshot {
     /// vouches written by `rrn-identity`) are ignored. Alongside each applied
     /// lifecycle record, captures the entry's admission metadata — its `seq`
     /// and `created_at` (ADR-0022) — for the transaction it advances.
-    fn apply(&mut self, entry: &LogEntry) {
+    ///
+    /// Returns `Err` only for a structurally impossible entry in a well-formed
+    /// log — currently a headroom certificate whose request is not already on the
+    /// log (ADR-0021 §1 requires request-before-certificate, and the station is
+    /// the sole writer, so this can only mean a corrupted or tampered log). Every
+    /// other precondition miss (a confirmation for an unknown proposal, a return
+    /// of an unknown certificate) is tolerated by skipping, as before.
+    fn apply(&mut self, entry: &LogEntry) -> Result<()> {
         let stored = &entry.payload;
         let bytes = &stored.bytes;
 
@@ -379,7 +403,7 @@ impl LedgerSnapshot {
                     ..AdmissionTimes::default()
                 },
             );
-            return;
+            return Ok(());
         }
 
         if let Ok(confirmation) = from_canonical_bytes::<TransactionConfirmation>(bytes) {
@@ -405,7 +429,7 @@ impl LedgerSnapshot {
                     admission.confirmation_admitted_at = Some(entry.created_at);
                 }
             }
-            return;
+            return Ok(());
         }
 
         if let Ok(dispute) = from_canonical_bytes::<DisputeRecord>(bytes) {
@@ -440,7 +464,7 @@ impl LedgerSnapshot {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
         if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
@@ -469,7 +493,7 @@ impl LedgerSnapshot {
                     },
                 );
             }
-            return;
+            return Ok(());
         }
 
         if let Ok(cancellation) = from_canonical_bytes::<CancellationRecord>(bytes) {
@@ -499,7 +523,73 @@ impl LedgerSnapshot {
                     },
                 );
             }
+            return Ok(());
         }
+
+        // A certificate request records member consent and bumps the member's
+        // shared proposal/certificate nonce (ADR-0021 §1). It reserves nothing on
+        // its own — only the certificate that honors it does — so a dangling
+        // request (the issuance crash window) is harmless at replay.
+        if let Ok(request) = from_canonical_bytes::<CertificateRequest>(bytes) {
+            let nonce_key = request.member.public_key().to_bytes();
+            let slot = self.max_nonce.entry(nonce_key).or_insert(request.nonce);
+            *slot = (*slot).max(request.nonce);
+            self.cert_requests
+                .insert(request.request_id, (request.member, request.cap_centi));
+            return Ok(());
+        }
+
+        // A headroom certificate opens an Outstanding reservation. It must name a
+        // request already admitted from the same member and for the same cap
+        // (ADR-0021 §1) — a certificate without its request, or one that inflates
+        // the consented cap, cannot exist in a well-formed single-writer log, so
+        // it is a hard derive error rather than a silent skip. Signatures are
+        // trusted here as everywhere in replay (the log is append-only and
+        // station-written; `verify` re-checks on demand).
+        if let Ok(certificate) = from_canonical_bytes::<HeadroomCertificate>(bytes) {
+            match self.cert_requests.get(&certificate.request_id) {
+                Some((member, cap))
+                    if *member == certificate.member && *cap == certificate.cap_centi => {}
+                _ => {
+                    return Err(Error::Invalid(
+                        "headroom certificate references an unknown or mismatched request".into(),
+                    ))
+                }
+            }
+            let signed: SignedHeadroomCertificate = SignedHeadroomCertificate {
+                payload: certificate.clone(),
+                signer: stored.signer,
+                signature: stored.signature,
+            };
+            self.certificates.insert(
+                certificate.cert_id,
+                CertificateState {
+                    certificate: signed,
+                    status: CertificateStatus::Outstanding,
+                    consumed_centi: 0,
+                },
+            );
+            return Ok(());
+        }
+
+        // A certificate return retires an Outstanding certificate. Replay
+        // re-checks the one structural invariant that matters — the return's
+        // member is the certificate's member — so a stranger's gossiped return
+        // cannot release someone else's escrow. A duplicate return keeps the
+        // first (tolerated at replay; refused at the engine); a return of an
+        // unknown certificate is ignored.
+        if let Ok(return_record) = from_canonical_bytes::<CertificateReturn>(bytes) {
+            if let Some(state) = self.certificates.get_mut(&return_record.cert_id) {
+                if return_record.member == state.certificate.payload.member
+                    && matches!(state.status, CertificateStatus::Outstanding)
+                {
+                    state.status = CertificateStatus::Returned { at_seq: entry.seq };
+                }
+            }
+            return Ok(());
+        }
+
+        Ok(())
     }
 
     /// The state of one transaction, if it appears in the log.
@@ -526,6 +616,47 @@ impl LedgerSnapshot {
     /// Iterates every transaction's current state.
     pub fn iter(&self) -> impl Iterator<Item = (&TransactionId, &TransactionState)> {
         self.states.iter()
+    }
+
+    /// The derived state of one headroom certificate, if it appears in the log
+    /// (ADR-0021).
+    pub fn certificate(&self, id: &CertId) -> Option<&CertificateState> {
+        self.certificates.get(id)
+    }
+
+    /// Every certificate held by `member` whose status is `Outstanding`
+    /// (unreturned), in content-id order, **regardless of expiry**. This is the
+    /// structural set; callers that care about time reach for
+    /// [`live_certs_of`](Self::live_certs_of) instead.
+    pub fn outstanding_certs_of(&self, member: &Address) -> Vec<&CertificateState> {
+        self.certificates
+            .values()
+            .filter(|c| {
+                c.certificate.payload.member == *member
+                    && matches!(c.status, CertificateStatus::Outstanding)
+            })
+            .collect()
+    }
+
+    /// Every *live* certificate held by `member` as of `now`: outstanding
+    /// (unreturned) **and** still within the window in which a spend against it
+    /// could be admitted ([`spend_admissible_until`](crate::escrow::spend_admissible_until)).
+    ///
+    /// This is the set that both reserves headroom
+    /// ([`crate::credit::committed_debits_centi`]) and counts toward the issuance
+    /// limit (`cert_max_outstanding`): a certificate past its admissibility
+    /// boundary reserves nothing, so it must not block new issuance or appear as
+    /// usable — exactly as an expired proposal stops counting (ADR-0018 point 2).
+    pub fn live_certs_of(
+        &self,
+        member: &Address,
+        now: i64,
+        config: &CreditConfig,
+    ) -> Vec<&CertificateState> {
+        self.outstanding_certs_of(member)
+            .into_iter()
+            .filter(|c| now <= spend_admissible_until(&c.certificate.payload, config))
+            .collect()
     }
 }
 
@@ -756,5 +887,175 @@ mod tests {
         let bytes = to_canonical_bytes(rec.clone());
         let decoded: CancellationRecord = from_canonical_bytes(&bytes).unwrap();
         assert_eq!(rec, decoded);
+    }
+
+    #[test]
+    fn certificate_request_cert_return_replays_to_returned() {
+        use rrn_crypto::signed::SignedPayload;
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let alice = Keypair::generate();
+        let member = Address::from_public_key(alice.public_key());
+
+        let req = CertificateRequest::new(member, 500, 0, 100);
+        let request_id = req.request_id;
+        let cert = HeadroomCertificate::new(member, 500, request_id, 100, 100 + 604_800);
+        let cert_id = cert.cert_id;
+        let ret = CertificateReturn {
+            member,
+            cert_id,
+            returned_at: 200,
+        };
+
+        {
+            let mut log = AppendLog::new(&db);
+            log.append(SignedPayload::sign(req, &alice), 100).unwrap();
+            log.append(SignedPayload::sign(cert, &station), 100)
+                .unwrap();
+            log.append(SignedPayload::sign(ret, &alice), 200).unwrap();
+        }
+
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let state = snapshot.certificate(&cert_id).expect("certificate present");
+        assert!(matches!(state.status, CertificateStatus::Returned { .. }));
+        // A returned certificate is not counted among the outstanding ones.
+        assert!(snapshot.outstanding_certs_of(&member).is_empty());
+        // The request also advanced the member's shared nonce sequence.
+        assert_eq!(snapshot.next_nonce(&alice.public_key().to_bytes()), 1);
+    }
+
+    #[test]
+    fn a_certificate_without_its_request_is_a_derive_error() {
+        use rrn_crypto::signed::SignedPayload;
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let alice = Keypair::generate();
+        let member = Address::from_public_key(alice.public_key());
+
+        // A certificate naming a request that was never appended: impossible in a
+        // well-formed single-writer log, so replay must reject it rather than
+        // silently reserve headroom against phantom consent.
+        let cert = HeadroomCertificate::new(
+            member,
+            500,
+            RequestId(rrn_crypto::hash::Hash::of(b"ghost")),
+            100,
+            700_000,
+        );
+        {
+            let mut log = AppendLog::new(&db);
+            log.append(SignedPayload::sign(cert, &station), 100)
+                .unwrap();
+        }
+        assert!(matches!(
+            LedgerSnapshot::derive(&AppendLog::new(&db)),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_certificate_with_a_mismatched_cap_is_a_derive_error() {
+        use rrn_crypto::signed::SignedPayload;
+        let db = fresh_db();
+        let (station, alice) = (Keypair::generate(), Keypair::generate());
+        let member = Address::from_public_key(alice.public_key());
+
+        // The request consents to 500, but the certificate names 999 for the same
+        // request id: consent is to a specific amount, so replay rejects it.
+        let req = CertificateRequest::new(member, 500, 0, 100);
+        let request_id = req.request_id;
+        let cert = HeadroomCertificate::new(member, 999, request_id, 100, 700_000);
+        {
+            let mut log = AppendLog::new(&db);
+            log.append(SignedPayload::sign(req, &alice), 100).unwrap();
+            log.append(SignedPayload::sign(cert, &station), 100)
+                .unwrap();
+        }
+        assert!(matches!(
+            LedgerSnapshot::derive(&AppendLog::new(&db)),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_dangling_request_replays_cleanly_and_reserves_nothing() {
+        use rrn_crypto::signed::SignedPayload;
+        let db = fresh_db();
+        let alice = Keypair::generate();
+        let member = Address::from_public_key(alice.public_key());
+
+        // The issuance crash window: a request landed but its certificate did not.
+        let req = CertificateRequest::new(member, 500, 0, 100);
+        {
+            let mut log = AppendLog::new(&db);
+            log.append(SignedPayload::sign(req, &alice), 100).unwrap();
+        }
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        // No certificate exists, so nothing is reserved…
+        assert!(snapshot.outstanding_certs_of(&member).is_empty());
+        assert_eq!(
+            crate::credit::committed_debits_centi(
+                &snapshot,
+                &member,
+                200,
+                &crate::credit::CreditConfig::default()
+            ),
+            0
+        );
+        // …but the request still advanced the member's shared nonce sequence.
+        assert_eq!(snapshot.next_nonce(&alice.public_key().to_bytes()), 1);
+    }
+
+    #[test]
+    fn duplicate_and_non_owner_returns_are_tolerated_at_derive() {
+        use rrn_crypto::signed::SignedPayload;
+        let db = fresh_db();
+        let (station, alice, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let member = Address::from_public_key(alice.public_key());
+
+        let req = CertificateRequest::new(member, 500, 0, 100);
+        let request_id = req.request_id;
+        let cert = HeadroomCertificate::new(member, 500, request_id, 100, 700_000);
+        let cert_id = cert.cert_id;
+
+        // A stranger's return (member = mallory) must not flip the status; the
+        // owner's first return (seq 4) wins over a duplicate (seq 5).
+        let stranger_return = CertificateReturn {
+            member: Address::from_public_key(mallory.public_key()),
+            cert_id,
+            returned_at: 150,
+        };
+        let first_return = CertificateReturn {
+            member,
+            cert_id,
+            returned_at: 200,
+        };
+        let second_return = CertificateReturn {
+            member,
+            cert_id,
+            returned_at: 300,
+        };
+        {
+            let mut log = AppendLog::new(&db);
+            log.append(SignedPayload::sign(req, &alice), 100).unwrap(); // seq 1
+            log.append(SignedPayload::sign(cert, &station), 100)
+                .unwrap(); // seq 2
+            log.append(SignedPayload::sign(stranger_return, &mallory), 150)
+                .unwrap(); // seq 3, ignored
+            log.append(SignedPayload::sign(first_return, &alice), 200)
+                .unwrap(); // seq 4, wins
+            log.append(SignedPayload::sign(second_return, &alice), 300)
+                .unwrap(); // seq 5, ignored (already returned)
+        }
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let state = snapshot.certificate(&cert_id).expect("certificate present");
+        assert!(matches!(
+            state.status,
+            CertificateStatus::Returned { at_seq: 4 }
+        ));
     }
 }

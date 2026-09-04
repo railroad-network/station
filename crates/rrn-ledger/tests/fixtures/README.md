@@ -30,3 +30,28 @@ RRN_REGEN=1 cargo test -p rrn-ledger --test cross_platform_signed_payload
 cp crates/rrn-ledger/tests/fixtures/cross_platform_signed_payload.json \
    ../mobile/__tests__/fixtures/cross_platform_signed_payload.json
 ```
+
+## `cross_platform_certificates.json` — headroom-certificate wire parity (T2.3.1)
+
+Locks the three new signed record kinds ADR-0021 adds — a member
+`CertificateRequest`, the station `HeadroomCertificate`, and a member
+`CertificateReturn` — so the mobile repo (T2.4.2) can verify it builds
+byte-identical canonical dCBOR and signatures (ADR-0002). One fully-populated
+vector per kind: `canonical_hex` is the record's canonical dCBOR
+(== `From<T> for CBOR`), `signature_hex` the Ed25519 signature over those bytes,
+and `request_id`/`cert_id` the Blake3 content addresses (omitted from the CBOR,
+recomputed on decode). Numeric fields are decimal **strings** to survive the JSON
+hop into JavaScript doubles.
+
+Unlike `cross_platform_signed_payload.json` this vector does **not** drive the
+mobile FFI (the certificate signing FFI is T2.4.2); it is a pure typed-encoder
+vector, generated and verified by
+[`tests/cross_platform_certificates.rs`](../cross_platform_certificates.rs).
+Deterministic (blake3 seeds + RFC 8032 Ed25519), reproducible bit-for-bit.
+Regenerate:
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-ledger --test cross_platform_certificates
+cp crates/rrn-ledger/tests/fixtures/cross_platform_certificates.json \
+   ../mobile/__tests__/fixtures/cross_platform_certificates.json
+```

@@ -25,6 +25,11 @@
 //! - [`credit`] — the debt floor (ADR-0018): the engine refuses a debit whose
 //!   signer would be committed below a bounded negative balance, counting both
 //!   the settled balance and every pending debit they have already signed.
+//! - [`escrow`] — headroom certificates (ADR-0021): station-signed, expiring,
+//!   amount-capped instruments a member reserves *before* going offline. An
+//!   outstanding certificate's remaining cap counts against its member's
+//!   committed position exactly like a pending debit, so a cert-backed spend can
+//!   later be admitted under partition without a fresh floor check.
 //!
 //! # The log is the source of truth
 //!
@@ -60,6 +65,7 @@ pub mod contract;
 pub mod credit;
 pub mod dispute;
 pub mod engine;
+pub mod escrow;
 pub mod settlement;
 pub mod state;
 pub mod tier;
@@ -182,6 +188,38 @@ pub enum Error {
     /// respond at most once (bounds log growth from a frozen transaction).
     #[error("this party has already responded to the dispute")]
     AlreadyResponded,
+    /// A certificate request or return was not signed by, or does not name, the
+    /// member it debits headroom for — only that member may request or return
+    /// their own certificate (ADR-0021).
+    #[error("certificate signer does not match the named member")]
+    MemberMismatch,
+    /// A certificate request's `cap_centi` is out of range: it must be strictly
+    /// positive and no larger than the configured `cert_max_cap_centi`
+    /// (ADR-0021 §1).
+    #[error("certificate cap {cap_centi} is invalid (must be 1..={max} centicommons)")]
+    InvalidCertificateCap {
+        /// The cap the request asked for.
+        cap_centi: i64,
+        /// The configured maximum ([`credit::CreditConfig::cert_max_cap_centi`]).
+        max: i64,
+    },
+    /// The member already holds the maximum number of outstanding certificates
+    /// ([`credit::CreditConfig::cert_max_outstanding`]); they must return or let
+    /// one expire before requesting another (ADR-0021 §1).
+    #[error("too many outstanding certificates: {outstanding} held, max {max}")]
+    TooManyCertificates {
+        /// How many the member currently holds outstanding.
+        outstanding: u32,
+        /// The configured ceiling.
+        max: u32,
+    },
+    /// No headroom certificate with the given id exists in the log.
+    #[error("certificate not found")]
+    UnknownCertificate,
+    /// The certificate is not `Outstanding` (already returned), so it cannot be
+    /// returned again — returning is idempotent (ADR-0021 §2).
+    #[error("certificate is not outstanding (already returned)")]
+    CertificateNotOutstanding,
     /// A derived [`state::TransactionState`] failed its internal integrity check
     /// (e.g. an embedded signature did not verify).
     #[error("invalid transaction state: {0}")]

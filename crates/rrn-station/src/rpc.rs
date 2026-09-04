@@ -752,6 +752,70 @@ pub struct NextNonceResult {
     pub nonce: u64,
 }
 
+// --- Headroom certificates (T2.3.1, ADR-0021) -------------------------------
+//
+// The operator-facing half of offline spending certificates. `cert_request` is
+// signed by the **station's own wallet**, the precedent `propose`/`vouch` set —
+// the operator reserves headroom for the station's own identity ahead of a
+// partition. A member signing their own request on a phone is T2.4.2's mobile
+// FFI path, deliberately not built here. `cert_list` is a derived read of a
+// member's outstanding certificates.
+
+/// `cert_request` params — reserve a headroom certificate for the station wallet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertRequestParams {
+    /// The cap to reserve, in centicommons. Must be `1..=cert_max_cap_centi` and
+    /// fit the wallet's current debt-floor headroom.
+    pub cap_centi: i64,
+}
+
+/// `cert_request` result — the issued certificate's terms.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertRequestResult {
+    /// The certificate's content address, hex-encoded.
+    pub cert_id: String,
+    /// The reserved cap, in centicommons.
+    pub cap_centi: i64,
+    /// Admission-clock seconds at issuance.
+    pub issued_at: i64,
+    /// Admission-clock seconds the certificate expires.
+    pub expires_at: i64,
+}
+
+/// `cert_list` params. An absent/empty `address` means the station's own wallet.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CertListParams {
+    /// The `rrn1…` address whose outstanding certificates to list, or `None` for
+    /// the station's own identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+/// One outstanding certificate in a `cert_list` result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertRow {
+    /// The certificate's content address, hex-encoded.
+    pub cert_id: String,
+    /// The reserved cap, in centicommons.
+    pub cap_centi: i64,
+    /// Cumulative admitted cert-backed spend so far, in centicommons (always 0
+    /// until T2.3.2 lands cert-backed spends).
+    pub consumed_centi: i64,
+    /// The still-reservable remainder (`cap_centi − consumed_centi`).
+    pub remaining_centi: i64,
+    /// Admission-clock seconds at issuance.
+    pub issued_at: i64,
+    /// Admission-clock seconds the certificate expires.
+    pub expires_at: i64,
+}
+
+/// `cert_list` result — a member's outstanding certificates, in content-id order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertListResult {
+    /// The outstanding certificates.
+    pub certificates: Vec<CertRow>,
+}
+
 // --- Governance (T1.9.7b) ---------------------------------------------------
 
 /// `governance_init_charter` params — publish a community's genesis Charter.
