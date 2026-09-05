@@ -56,24 +56,30 @@ use crate::Result;
 /// decay. Protocol-locked (ADR-0009): 10 lifetime events reach [`DIMENSION_MAX`].
 const EVENT_INCREMENT: f32 = 0.5;
 
-/// Penalty weight a proven equivocation levies on the attestation-accuracy
-/// dimension (ADR-0021 §5, ADR-0009).
+/// Penalty weight a proven equivocation levies on **each** of the two dimensions
+/// it dents (ADR-0021 §5, ADR-0009). **Maintainer-ratified 2026-09-04** (ADR-0025).
 ///
-/// ⚠️ PENDING HUMAN RATIFICATION (T2.3.3): starter value, ADR-0009 discipline.
+/// ADR-0009's scoring is additive/linear and floors each dimension at zero, so it
+/// has no signed negative-weight table to scale. Rather than a fixed small
+/// subtraction — which is regressive (invisible on a newcomer, trivial on a
+/// veteran) and, at any value that keeps a maxed member's composite ≥ the Member
+/// band, leaves the equivocator established with their vote and jury seat intact —
+/// the penalty is [`DIMENSION_MAX`], which **zeroes** whichever dimension it is
+/// applied to. That is the heaviest expressible consequence within the locked,
+/// floored formula, and the only one with a governance effect (de-establishment).
+/// It is fully reversible: the penalty is derived on replay and lifted the instant
+/// a jury `Overturn` verdict lands (ADR-0021 §5). While it stands the dimension is
+/// pinned at zero (a deliberate, proportional cost for a proven, deliberate act);
+/// the newcomer-with-no-history case is covered out-of-formula by an
+/// equivocation → cert-issuance disqualification gate (ADR-0025 / T2.3.4).
 ///
-/// ADR-0009's scoring is additive/linear and floors each dimension at zero, so
-/// it has no signed negative-weight table to double. The severest existing
-/// negative input is the upheld-dispute penalty of one [`EVENT_INCREMENT`]
-/// (0.5); the ticket's "most severe existing negative weight × 2" resolves, in
-/// this structure, to **twice that increment (1.0)** — the heaviest single
-/// penalty the model can express against one dimension (a larger value only
-/// re-floors the same dimension at zero, since the composite cannot go negative).
-/// Applied to attestation accuracy — the dimension ADR-0009 reserves for
-/// dishonesty "proven wrong," where the upheld-dispute penalty already lands —
-/// because an equivocation is a member proven to have signed conflicting
-/// commitments. The value, the dimension, and this interpretation are all subject
-/// to explicit human ratification before this ships.
-pub const EQUIVOCATION_WEIGHT: f32 = 2.0 * EVENT_INCREMENT;
+/// Equivocation is dented on **both** live dimensions — a signed statement proven
+/// false (attestation accuracy, ADR-0009's "proven wrong" slot) *and* the paradigm
+/// disputed-against trade (trade reliability, its reserved negative slot, and the
+/// highest-weighted dimension a counterparty reads before accepting an offline
+/// spend). It is two proven-wrong facts (a false headroom claim and a failed
+/// settlement), not one event double-counted.
+pub const EQUIVOCATION_WEIGHT: f32 = DIMENSION_MAX;
 
 /// Computes reputation profiles by replaying the log behind a borrowed database.
 pub struct ReputationScorer<'db> {
@@ -226,6 +232,10 @@ impl<'db> ReputationScorer<'db> {
                 EquivocationBasis::OutboxFork => None,
             };
             if record.verify_evidence(cap) {
+                // Zero both live dimensions (ADR-0025): a false headroom claim
+                // (trade reliability, the dimension a counterparty reads) and a
+                // signed statement proven false (attestation accuracy).
+                trade.penalize_by(EQUIVOCATION_WEIGHT);
                 attestation.penalize_by(EQUIVOCATION_WEIGHT);
             }
         }
@@ -586,33 +596,60 @@ mod tests {
         }
     }
 
+    /// Gives `member` a two-trade, three-vouch baseline (trade 1.0, attestation
+    /// 1.5) so the equivocation penalty can be seen to zero **both** live
+    /// dimensions. `member` is the *sender* of both trades, so the trades give no
+    /// attestation credit (the receiver confirms), keeping the two dimensions
+    /// independent.
+    fn seed_trade_and_attestation_baseline(db: &Database, member: &Keypair, at: i64) {
+        let other = Keypair::generate();
+        append_settled(db, member, &other, &Keypair::generate(), 0, at);
+        append_settled(db, member, &other, &Keypair::generate(), 1, at);
+        seed_attestation_baseline(db, member, at);
+    }
+
     #[test]
-    fn a_proven_equivocation_dents_attestation_accuracy() {
+    fn a_proven_equivocation_zeroes_both_live_dimensions() {
         let db = fresh_db();
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_attestation_baseline(&db, &mallory, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
         let base = ReputationScorer::new(&db)
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         assert!(
+            approx(base.trade_reliability, 1.0),
+            "trade base {}",
+            base.trade_reliability
+        );
+        assert!(
             approx(base.attestation_accuracy, 1.5),
-            "baseline {}",
+            "attn base {}",
             base.attestation_accuracy
         );
 
-        let cert = append_certificate(&db, &mallory, &station, 500, 0, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         append_equivocation(&db, &mallory, &station, cert, t);
 
         let after = ReputationScorer::new(&db)
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
-        // 1.5 − EQUIVOCATION_WEIGHT (1.0) = 0.5.
+        // Both live dimensions floor at zero — the equivocator is de-established.
         assert!(
-            approx(after.attestation_accuracy, 1.5 - EQUIVOCATION_WEIGHT),
-            "dented {}",
+            approx(after.trade_reliability, 0.0),
+            "trade {}",
+            after.trade_reliability
+        );
+        assert!(
+            approx(after.attestation_accuracy, 0.0),
+            "attn {}",
             after.attestation_accuracy
+        );
+        assert!(
+            approx(after.composite(), 0.0),
+            "composite {}",
+            after.composite()
         );
     }
 
@@ -622,18 +659,23 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_attestation_baseline(&db, &mallory, t);
-        let cert = append_certificate(&db, &mallory, &station, 500, 0, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         let id = append_equivocation(&db, &mallory, &station, cert, t);
         append_overturn(&db, &station, id, t);
 
         let after = ReputationScorer::new(&db)
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
-        // The overturn lifts the penalty: back to the clean 1.5 baseline.
+        // The overturn lifts the penalty on both dimensions: clean baseline.
+        assert!(
+            approx(after.trade_reliability, 1.0),
+            "trade {}",
+            after.trade_reliability
+        );
         assert!(
             approx(after.attestation_accuracy, 1.5),
-            "restored {}",
+            "attn {}",
             after.attestation_accuracy
         );
     }
@@ -644,8 +686,8 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_attestation_baseline(&db, &mallory, t);
-        let cert = append_certificate(&db, &mallory, &station, 500, 0, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
 
         // A station-signed record whose evidence has been tampered: one embedded
         // signature no longer verifies, so `verify_evidence` rejects it.
@@ -666,10 +708,15 @@ mod tests {
             .append(SignedPayload::sign(record, &station), 0)
             .unwrap();
 
-        // No penalty: the baseline stands.
+        // No penalty: both baselines stand.
         let after = ReputationScorer::new(&db)
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
+        assert!(
+            approx(after.trade_reliability, 1.0),
+            "trade {}",
+            after.trade_reliability
+        );
         assert!(
             approx(after.attestation_accuracy, 1.5),
             "bogus record must not dent: {}",
@@ -685,18 +732,18 @@ mod tests {
         let db = fresh_db();
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
-        seed_attestation_baseline(&db, &mallory, t);
-        let cert = append_certificate(&db, &mallory, &station, 500, 0, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         let id = append_equivocation(&db, &mallory, &station, cert, t);
 
         let replay = || {
-            ReputationScorer::new(&db)
+            let p = ReputationScorer::new(&db)
                 .score_raw_at(&addr(&mallory), t)
-                .unwrap()
-                .attestation_accuracy
+                .unwrap();
+            (p.trade_reliability, p.attestation_accuracy)
         };
         assert_eq!(replay(), replay(), "two replays agree (penalty present)");
-        assert!(approx(replay(), 0.5));
+        assert_eq!(replay(), (0.0, 0.0));
 
         append_overturn(&db, &station, id, t);
         assert_eq!(
@@ -704,7 +751,8 @@ mod tests {
             replay(),
             "two replays agree (penalty neutralized)"
         );
-        assert!(approx(replay(), 1.5));
+        let (trade, attn) = replay();
+        assert!(approx(trade, 1.0) && approx(attn, 1.5));
     }
 
     #[test]
@@ -713,13 +761,12 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_attestation_baseline(&db, &mallory, t);
-        let cert = append_certificate(&db, &mallory, &station, 500, 0, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         // The equivocation is recorded a month after the baseline activity.
         append_equivocation(&db, &mallory, &station, cert, t + MONTH);
 
-        // Scored before the record exists: no penalty (decay aside, the dimension
-        // is undented at `t`).
+        // Scored before the record exists: no penalty.
         let before = ReputationScorer::new(&db)
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
@@ -729,14 +776,18 @@ mod tests {
             before.attestation_accuracy
         );
 
-        // Scored at the record's instant: the penalty applies (no decay yet).
+        // Scored at the record's instant: both dimensions are zeroed.
         let at = ReputationScorer::new(&db)
             .score_raw_at(&addr(&mallory), t + MONTH)
             .unwrap();
-        // 1.5 baseline decays 0.1 over the month, then −1.0 penalty → 0.4.
         assert!(
-            approx(at.attestation_accuracy, 0.4),
-            "at record {}",
+            approx(at.trade_reliability, 0.0),
+            "trade {}",
+            at.trade_reliability
+        );
+        assert!(
+            approx(at.attestation_accuracy, 0.0),
+            "attn {}",
             at.attestation_accuracy
         );
     }

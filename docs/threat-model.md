@@ -903,8 +903,10 @@ Offline double-commitment cannot be *prevented* under a partition, only made
 provable, attributable, and costly. When the station refuses a cert overspend or
 an outbox-chain fork, it appends a station-signed `EquivocationRecord`
 (`rrn-ledger::escrow`) bundling the member-signed artifacts that jointly prove
-the conflict; the record is a negative reputation input (ADR-0009) and, in a
-follow-up ticket, auto-opens a jury case.
+the conflict. A verified record **zeroes both of the equivocator's live
+reputation dimensions** (trade reliability and attestation accuracy — ADR-0009),
+de-establishing them, and in a follow-up ticket (T2.3.4) auto-opens a jury case
+and disqualifies them from issuing new certificates until overturned (ADR-0025).
 
 - *Threat: a malicious or buggy station fabricating an equivocation to destroy a
   member's standing.* A station appends an `EquivocationRecord` naming an honest
@@ -950,13 +952,16 @@ follow-up ticket, auto-opens a jury case.
   before appending, so a repeated attempt is refused without a second record
   (tested). A refused spend is never admitted, so it also cannot re-enter via the
   log-dedup path.
-- *Design note — the deliberate default inversion.* An equivocation case, unlike a
-  transaction dispute (ADR-0014, which fails **open** to the confirmed status quo),
-  is designed to fail to the **evidence**: an unruled or lapsed case leaves the
-  recorded proof standing (`Confirm`), because the status quo here *is*
-  cryptographic proof of double-commitment, not a contested he-said-she-said. Only
-  an affirmative `Overturn` neutralizes it. This inverts ADR-0014's status-quo
-  default by design (ADR-0021 §5).
+- *Design note — the lapse default (ADR-0025).* The reputation penalty applies at
+  **record verification**, not at verdict, so the status quo after a verified
+  record is already "penalty applied." A jury case therefore has three
+  log-derived terminal states — `Confirmed`, `Overturned` (penalty lifts), and
+  `Lapsed` (window closed with no ruling, penalty stands and the case is
+  re-seatable). A lapse leaving the penalty standing **is ADR-0014's fail-open with
+  the status quo correctly identified, not an inversion of it**; it is recorded as
+  `Lapsed`, never as a `Confirm` no juror signed, so any consequence heavier than
+  the reputation penalty that the jury path later gains requires an affirmative
+  `Confirmed`.
 - *Known limitation (T2.3.3 scope):* the **jury path itself is not yet built** —
   the `EquivocationRecord`, its verification, the station's detection/append
   wiring, and the reputation input ship now; the sortition/panel/verdict machinery
