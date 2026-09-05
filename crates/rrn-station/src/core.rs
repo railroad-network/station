@@ -45,7 +45,7 @@ use rrn_identity::wallet::WalletContents;
 use rrn_ledger::contract::{ContractCharge, ContractRef};
 use rrn_ledger::dispute::{DisputeRecord, DisputeResponse, SignedDispute, SignedDisputeResponse};
 use rrn_ledger::engine::Engine;
-use rrn_ledger::escrow::CertificateReturn;
+use rrn_ledger::escrow::{CertificateReturn, EquivocationBasis, EquivocationRecord, EvidenceItem};
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::TransactionState;
 use rrn_ledger::transaction::{
@@ -3429,6 +3429,20 @@ impl Core {
                             position = entry.position,
                             "outbox fork detected; refusing the conflicting entry (ADR-0021)"
                         );
+                        // Provable equivocation (ADR-0021 §5): the two member-signed
+                        // entries at one position are a self-contained fork proof.
+                        // Record it once per `(author, position)`. Reconstruct the
+                        // stored entry from its persisted envelope; a decode failure
+                        // (should never happen — it validated when first admitted)
+                        // simply forgoes the record, the fork is still refused.
+                        if let Some(stored_signed) = from_canonical_bytes::<
+                            rrn_protocol::bundle::EntryEnvelope,
+                        >(&stored_envelope)
+                        .ok()
+                        .and_then(|env| env.to_signed().ok())
+                        {
+                            self.record_fork_equivocation(&stored_signed, &pe.signed, now)?;
+                        }
                         outcomes.push(refused(record_hash, RefusalReason::OutboxFork));
                         continue;
                     }
@@ -3594,6 +3608,36 @@ impl Core {
             _ => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
         };
 
+        // A refused cert-backed spend is provable equivocation (ADR-0021 §5): the
+        // admitted spends for the certificate plus this refused one are a
+        // self-contained proof of deliberate double-commitment. Record it (once
+        // per certificate) before the refusal is mapped — the spend is refused
+        // either way, whether carried by DTN here or submitted over live RPC.
+        //
+        // Both `CertificateOverspent` and `CertificateExpired` are considered: the
+        // engine checks the admissibility boundary *before* the cap, so a member
+        // who lets the over-cap spend arrive late (past validity + DTN grace) would
+        // otherwise be refused `CertificateExpired` and escape the proof. The
+        // dishonesty — signing spends that jointly exceed the cap — is
+        // timing-independent, and `record_cert_overspend_equivocation` self-gates on
+        // `verify_evidence`, so a late spend that is *within* cap records nothing.
+        if matches!(
+            result,
+            Err(rrn_ledger::Error::CertificateOverspent { .. }
+                | rrn_ledger::Error::CertificateExpired)
+        ) {
+            if let Ok(refused) = from_canonical_bytes::<TransactionProposal>(bytes) {
+                self.record_cert_overspend_equivocation(
+                    &SignedProposal {
+                        payload: refused,
+                        signer,
+                        signature,
+                    },
+                    now,
+                )?;
+            }
+        }
+
         match result {
             Ok(()) => match AppendLog::new(&self.db)
                 .admission_of(&entry.record_hash())
@@ -3611,6 +3655,144 @@ impl Core {
             Err(rrn_ledger::Error::Storage(e)) => Err(BundleIngestError::Internal(e.to_string())),
             Err(e) => Ok(refused_disposition(map_refusal(&e))),
         }
+    }
+
+    /// Records a station-signed cert-overspend [`EquivocationRecord`] for a
+    /// cert-backed spend the engine refused as `CertificateOverspent` **or**
+    /// `CertificateExpired` (ADR-0021 §5, T2.3.3) — unless one already stands for
+    /// that certificate. The spend is refused regardless; this only appends the
+    /// proof, and only when `verify_evidence` confirms a genuine overspend (so a
+    /// within-cap late spend records nothing).
+    ///
+    /// Evidence is the admitted cert-backed spends for the certificate plus the
+    /// refused one. If that would exceed the [`MAX_EVIDENCE_ITEMS`] DoS bound, the
+    /// largest admitted spends that still carry the running sum past the cap are
+    /// kept — a minimal proof — with the refused spend always included. A lone
+    /// spend that exceeds the cap on its own (no prior admitted spend) is a
+    /// refusal, not equivocation: there is no second commitment to conflict with,
+    /// so no record is appended.
+    ///
+    /// [`MAX_EVIDENCE_ITEMS`]: rrn_ledger::escrow::MAX_EVIDENCE_ITEMS
+    fn record_cert_overspend_equivocation(
+        &self,
+        refused: &SignedProposal,
+        now: i64,
+    ) -> Result<(), BundleIngestError> {
+        let Some(cert_id) = refused.payload.cert_id else {
+            return Ok(());
+        };
+        let member = refused.payload.sender;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        // One record per certificate: a repeated overspend attempt is refused
+        // without appending a second record.
+        if snapshot.has_cert_equivocation(&cert_id) {
+            return Ok(());
+        }
+        // The cap the admitted+refused spends jointly breach.
+        let Some(cap) = snapshot
+            .certificate(&cert_id)
+            .map(|c| c.certificate.payload.cap_centi)
+        else {
+            return Ok(());
+        };
+        let attempted = refused.payload.amount_centi;
+        // Assemble a minimal proof: the largest admitted spends until the running
+        // total plus the refused amount clears the cap, bounded by the evidence-count
+        // DoS cap (one slot reserved for the refused spend). Each admitted spend is
+        // pushed *before* the "proven" test, so a genuine double-commitment whose
+        // refused half alone exceeds the cap still carries a prior admitted spend.
+        let mut admitted = snapshot.cert_backed_spends(&cert_id);
+        admitted.sort_by_key(|p| std::cmp::Reverse(p.payload.amount_centi));
+        let mut evidence = Vec::with_capacity(admitted.len() + 1);
+        let mut acc: i64 = 0;
+        for sp in admitted {
+            if evidence.len() + 1 >= rrn_ledger::escrow::MAX_EVIDENCE_ITEMS {
+                break; // reserve the final slot for the refused spend
+            }
+            acc = acc.saturating_add(sp.payload.amount_centi);
+            evidence.push(EvidenceItem::from_signed(&sp));
+            if acc.saturating_add(attempted) > cap {
+                break; // the spends gathered already prove the overspend
+            }
+        }
+        evidence.push(EvidenceItem::from_signed(refused));
+        let record = EquivocationRecord::new(
+            member,
+            EquivocationBasis::CertOverspend,
+            Some(cert_id),
+            evidence,
+            now,
+        );
+        // Append only a record that actually proves the overspend. `verify_evidence`
+        // is the single authoritative gate: it rejects a lone over-cap spend (fewer
+        // than two commitments), an overspend too fragmented to prove within the
+        // evidence-count cap, and — critically — evidence too large to embed (an
+        // admitted spend whose memo pushed it past `MAX_EVIDENCE_ITEM_BYTES`). Not
+        // appending such a record avoids a station-signed record no replica can
+        // verify, and keeps the one-record dedup slot open. The refused spend is
+        // refused either way.
+        if !record.verify_evidence(Some(cap)) {
+            tracing::debug!(
+                member = %member,
+                cert = ?cert_id,
+                "cert overspend refused but no self-contained proof assembled; no record"
+            );
+            return Ok(());
+        }
+        let signed = SignedPayload::sign(record, &self.station_keypair());
+        AppendLog::new(&self.db)
+            .append(signed, now)
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        tracing::warn!(
+            member = %member,
+            cert = ?cert_id,
+            "recorded cert-overspend equivocation (ADR-0021 §5)"
+        );
+        Ok(())
+    }
+
+    /// Records a station-signed outbox-fork [`EquivocationRecord`] for two
+    /// conflicting entries the same author signed at one chain position (ADR-0021
+    /// §5, ADR-0020 §2) — unless one already stands for that `(author, position)`.
+    fn record_fork_equivocation(
+        &self,
+        stored: &outbox::SignedOutboxEntry,
+        incoming: &outbox::SignedOutboxEntry,
+        now: i64,
+    ) -> Result<(), BundleIngestError> {
+        let member = incoming.payload.author;
+        let position = incoming.payload.position;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        if snapshot.has_fork_equivocation(&member, position) {
+            return Ok(());
+        }
+        let evidence = vec![
+            EvidenceItem::from_signed(stored),
+            EvidenceItem::from_signed(incoming),
+        ];
+        let record =
+            EquivocationRecord::new(member, EquivocationBasis::OutboxFork, None, evidence, now);
+        // Append only a self-verifying proof: `verify_evidence` re-checks
+        // `is_fork` and both authors, and rejects an entry too large to embed
+        // (`MAX_EVIDENCE_ITEM_BYTES`) — so a fork whose entry carries an oversized
+        // record produces no unverifiable station-signed record. The fork is
+        // refused either way.
+        if !record.verify_evidence(None) {
+            tracing::debug!(author = %member, position, "outbox fork not self-verifying; no record");
+            return Ok(());
+        }
+        let signed = SignedPayload::sign(record, &self.station_keypair());
+        AppendLog::new(&self.db)
+            .append(signed, now)
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        tracing::warn!(
+            author = %member,
+            position,
+            "recorded outbox-fork equivocation (ADR-0021 §5)"
+        );
+        Ok(())
     }
 
     /// The Tier-2 confirmation staking gate (T1.8.2), shared by every path that
@@ -3974,11 +4156,26 @@ impl Core {
         }
         let now = self.clock.now();
         let tx_id = signed.payload.id;
-        let mut engine =
-            Engine::new(&self.db, self.station_keypair()).with_credit_config(self.credit);
-        engine
-            .submit_proposal(signed, now)
-            .map_err(ledger_err_pair)?;
+        // Keep a copy: a member self-serving an overspend over live RPC is equally
+        // provable equivocation (ADR-0021 §5), and the refused spend is one half of
+        // the proof.
+        let refused_copy = signed.clone();
+        let result = {
+            let mut engine =
+                Engine::new(&self.db, self.station_keypair()).with_credit_config(self.credit);
+            engine.submit_proposal(signed, now)
+        };
+        // Both overspend and (late) expiry are provable equivocation — the engine
+        // checks expiry before the cap. The helper self-gates on `verify_evidence`,
+        // so a within-cap late spend records nothing.
+        if let Err(
+            rrn_ledger::Error::CertificateOverspent { .. } | rrn_ledger::Error::CertificateExpired,
+        ) = &result
+        {
+            self.record_cert_overspend_equivocation(&refused_copy, now)
+                .map_err(BundleIngestError::pair_error)?;
+        }
+        result.map_err(ledger_err_pair)?;
         Ok(serde_json::json!({ "tx_id": hex(&tx_id.to_bytes()), "state": "Proposed" }))
     }
 
@@ -6464,6 +6661,352 @@ mod tests {
                 reason: RefusalReason::UnroutableKind
             }
         ));
+    }
+
+    /// Every equivocation record on the log, in content order.
+    fn equivocations(core: &Core) -> Vec<rrn_ledger::escrow::SignedEquivocationRecord> {
+        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+            .unwrap()
+            .equivocations()
+            .cloned()
+            .collect()
+    }
+
+    /// A cert overspend carried by DTN appends exactly one station-signed
+    /// equivocation record (ADR-0021 §5): the receipt reports `[admitted,
+    /// refused/cert-overspent]`, the record's evidence self-verifies, the
+    /// stranded receiver can see it, and re-presenting the refused spend appends
+    /// no second record.
+    #[test]
+    fn dtn_overspend_records_exactly_one_equivocation() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+
+        // 300 admits (consumes 300); 201 overspends (501 > cap 500) → refused.
+        let spend0 = cert_backed_proposal(&alice, &bob, 300, cert, 1, 900, 901_000);
+        let e0 = outbox_entry(&alice, 0, zero(), &spend0, 900);
+        let spend1 = cert_backed_proposal(&alice, &bob, 201, cert, 2, 900, 901_000);
+        let e1 = outbox_entry(&alice, 1, e0.payload.entry_hash(), &spend1, 901);
+        let receipt = submit_bundle(&mut core, &[e0, e1], 1000);
+        let d: Vec<_> = receipt
+            .payload
+            .outcomes
+            .iter()
+            .map(|o| o.disposition)
+            .collect();
+        assert!(matches!(d[0], Disposition::Admitted { .. }));
+        assert!(matches!(
+            d[1],
+            Disposition::Refused {
+                reason: RefusalReason::CertOverspent
+            }
+        ));
+
+        // Exactly one equivocation record; basis cert-overspend; it names alice;
+        // its evidence verifies against the certificate's cap.
+        let snap = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+        let recs: Vec<_> = snap.equivocations().collect();
+        assert_eq!(recs.len(), 1, "one record for the overspend");
+        let rec = &recs[0].payload;
+        assert_eq!(
+            rec.basis,
+            rrn_ledger::escrow::EquivocationBasis::CertOverspend
+        );
+        assert_eq!(rec.member, Address::from_public_key(alice.public_key()));
+        assert!(recs[0].verify().is_ok(), "station signed the record");
+        let cap = snap
+            .certificate(&cert)
+            .unwrap()
+            .certificate
+            .payload
+            .cap_centi;
+        assert!(
+            rec.verify_evidence(Some(cap)),
+            "evidence proves the overspend"
+        );
+
+        // The stranded receiver can see the proof behind their refused spend.
+        assert!(snap.equivocation_for_cert(&cert).is_some());
+
+        // Re-present the refused spend as a fresh outbox entry (a new
+        // presentation, so not idempotent-served): it is refused again, and no
+        // second equivocation record is appended.
+        let e1_again = outbox_entry(&alice, 2, zero(), &spend1, 902);
+        let receipt2 = submit_bundle(&mut core, &[e1_again], 1100);
+        assert!(matches!(
+            receipt2.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::CertOverspent
+            }
+        ));
+        assert_eq!(
+            equivocations(&core).len(),
+            1,
+            "a repeated overspend appends no second record"
+        );
+    }
+
+    /// An outbox fork carried by DTN appends one station-signed equivocation
+    /// record (ADR-0021 §5, ADR-0020 §2): the conflicting entry is refused
+    /// `outbox-fork`, the record's two-envelope evidence self-verifies, and a
+    /// further fork at the same position appends nothing new.
+    #[test]
+    fn dtn_fork_records_exactly_one_equivocation() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+
+        // Three distinct records alice could place at outbox position 0.
+        let p_a = member_proposal(&alice, &bob, 100, 0, 900, 900 + 1_000_000);
+        let p_b = member_proposal(&alice, &bob, 200, 0, 900, 900 + 1_000_000);
+        let p_c = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+
+        // The first admits and claims position 0.
+        let r_a = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &p_a, 900)],
+            1000,
+        );
+        assert!(matches!(
+            r_a.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+
+        // A different entry at position 0 forks → refused + one record.
+        let r_b = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &p_b, 901)],
+            1001,
+        );
+        assert!(matches!(
+            r_b.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::OutboxFork
+            }
+        ));
+        let recs = equivocations(&core);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].payload.basis,
+            rrn_ledger::escrow::EquivocationBasis::OutboxFork
+        );
+        assert_eq!(recs[0].payload.fork_position(), Some(0));
+        assert!(recs[0].payload.verify_evidence(None), "fork proof verifies");
+
+        // Yet another entry at position 0 forks again → refused, but the
+        // `(author, position)` is already recorded, so no second record.
+        let r_c = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &p_c, 902)],
+            1002,
+        );
+        assert!(matches!(
+            r_c.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::OutboxFork
+            }
+        ));
+        assert_eq!(
+            equivocations(&core).len(),
+            1,
+            "a second fork at the same position appends no new record"
+        );
+    }
+
+    /// An overspend whose *refused* half alone exceeds the cap is still a
+    /// double-commitment when a prior spend was admitted — the record carries the
+    /// prior spend, so the proof verifies.
+    #[test]
+    fn dtn_overspend_with_refused_half_over_cap_still_records() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+
+        let spend0 = cert_backed_proposal(&alice, &bob, 100, cert, 1, 900, 901_000);
+        let e0 = outbox_entry(&alice, 0, zero(), &spend0, 900);
+        // 600 alone exceeds cap 500, but with the admitted 100 it is a genuine
+        // 700-against-500 double-commitment.
+        let spend1 = cert_backed_proposal(&alice, &bob, 600, cert, 2, 900, 901_000);
+        let e1 = outbox_entry(&alice, 1, e0.payload.entry_hash(), &spend1, 901);
+        let receipt = submit_bundle(&mut core, &[e0, e1], 1000);
+        assert!(matches!(
+            receipt.payload.outcomes[1].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::CertOverspent
+            }
+        ));
+        let recs = equivocations(&core);
+        assert_eq!(recs.len(), 1, "the prior admitted spend makes it provable");
+        assert!(recs[0].payload.verify_evidence(Some(500)));
+    }
+
+    /// A single cert-backed spend that exceeds the cap with no prior admitted
+    /// spend is a plain refusal, not equivocation — there is no second commitment
+    /// to conflict with, so no record is appended.
+    #[test]
+    fn dtn_lone_over_cap_spend_records_nothing() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000);
+
+        let spend = cert_backed_proposal(&alice, &bob, 600, cert, 1, 900, 901_000);
+        let receipt = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &spend, 900)],
+            1000,
+        );
+        assert!(matches!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::CertOverspent
+            }
+        ));
+        assert_eq!(
+            equivocations(&core).len(),
+            0,
+            "a lone over-cap spend is not equivocation"
+        );
+    }
+
+    /// An overspend fragmented across more admitted spends than the evidence-count
+    /// DoS cap allows cannot be proven within `MAX_EVIDENCE_ITEMS`, so — rather than
+    /// append a record no replica could verify — no record is appended (a documented
+    /// residual; ADR-0021 §5's consequence is evaded at the cost of extra receipts).
+    #[test]
+    fn dtn_overspend_too_fragmented_records_nothing() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+
+        // 16 admitted 30-spends (480 consumed), then a 30-spend overspends
+        // (remaining 20). The 15 largest that fit under the cap sum to 450; with the
+        // refused 30 that is 480 ≤ 500, so no within-cap proof exists.
+        let mut entries = Vec::new();
+        let mut prev = zero();
+        for i in 0..16u64 {
+            let sp = cert_backed_proposal(&alice, &bob, 30, cert, i + 1, 900, 901_000);
+            let e = outbox_entry(&alice, i, prev, &sp, 900 + i as i64);
+            prev = e.payload.entry_hash();
+            entries.push(e);
+        }
+        let over = cert_backed_proposal(&alice, &bob, 30, cert, 17, 900, 901_000);
+        entries.push(outbox_entry(&alice, 16, prev, &over, 920));
+
+        let receipt = submit_bundle(&mut core, &entries, 1000);
+        let last = receipt.payload.outcomes.last().unwrap().disposition;
+        assert!(matches!(
+            last,
+            Disposition::Refused {
+                reason: RefusalReason::CertOverspent
+            }
+        ));
+        assert_eq!(
+            equivocations(&core).len(),
+            0,
+            "too fragmented to prove within the DoS cap → no record"
+        );
+    }
+
+    /// A member self-serving an overspend over the **live channel** (not DTN) is
+    /// equally provable equivocation: `channel_submit_proposal` records it on the
+    /// same path (ADR-0021 §5).
+    #[test]
+    fn live_rpc_overspend_records_equivocation() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+        let alice_addr = Address::from_public_key(alice.public_key());
+        let bob_addr = Address::from_public_key(bob.public_key());
+
+        // First cert-backed 300 spend over the channel → admitted.
+        let spend0 =
+            TransactionProposal::new(alice_addr, bob_addr, 300, None, 1, NOW, NOW + 86_400)
+                .with_certificate(cert);
+        let env = envelope(
+            &alice,
+            "submit_proposal",
+            serde_json::json!({ "signed_proposal": record_hex(spend0, &alice) }),
+        );
+        core.route_channel_method(&env)
+            .expect("first spend admitted");
+
+        // Second 300 spend overspends (600 > cap 500) → refused, and the station
+        // records the equivocation just as the DTN path does.
+        let spend1 =
+            TransactionProposal::new(alice_addr, bob_addr, 300, None, 2, NOW, NOW + 86_400)
+                .with_certificate(cert);
+        let env = envelope(
+            &alice,
+            "submit_proposal",
+            serde_json::json!({ "signed_proposal": record_hex(spend1, &alice) }),
+        );
+        assert!(
+            core.route_channel_method(&env).is_err(),
+            "overspend refused over live RPC"
+        );
+
+        let recs = equivocations(&core);
+        assert_eq!(recs.len(), 1, "live-RPC overspend records one equivocation");
+        assert!(recs[0].payload.verify_evidence(Some(500)));
+    }
+
+    /// An over-cap spend that arrives *after* the certificate's spend-admissibility
+    /// boundary is refused `CertExpired` (the engine checks expiry before the cap),
+    /// yet it is still provable equivocation with the admitted spend — so it is
+    /// recorded, closing the "delay the overspending bundle" evasion.
+    #[test]
+    fn dtn_late_over_cap_spend_still_records_equivocation() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+
+        // A 300 spend admits on time.
+        let spend0 = cert_backed_proposal(&alice, &bob, 300, cert, 1, 900, 901_000);
+        submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &spend0, 900)],
+            1000,
+        );
+
+        // The over-cap 300 spend arrives past the admissibility boundary. Its own
+        // window is still open (`expires_at` beyond `late`), so the refusal is
+        // `CertExpired`, not the ordinary window `Expired`.
+        let boundary = {
+            let snap =
+                rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+            let c = snap.certificate(&cert).unwrap().certificate.payload.clone();
+            rrn_ledger::escrow::spend_admissible_until(&c, &core.credit)
+        };
+        let late = boundary + 1;
+        // Admission `now` is the station clock, not the bundle's assembly time —
+        // advance it past the boundary so the engine judges the spend expired.
+        core.clock.advance(late - core.clock.now());
+        let spend1 = cert_backed_proposal(&alice, &bob, 300, cert, 2, 900, late + 1_000_000);
+        let receipt = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 1, zero(), &spend1, 900)],
+            late,
+        );
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::CertExpired
+                }
+            ),
+            "got {:?}",
+            receipt.payload.outcomes[0].disposition
+        );
+        let recs = equivocations(&core);
+        assert_eq!(recs.len(), 1, "a late over-cap spend is still recorded");
+        assert!(recs[0].payload.verify_evidence(Some(500)));
     }
 
     /// A bundle mixing a good record, a bad signature, an already-admitted
