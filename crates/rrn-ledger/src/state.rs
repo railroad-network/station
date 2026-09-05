@@ -29,7 +29,8 @@ use crate::credit::CreditConfig;
 use crate::dispute::{DisputeRecord, SignedDispute};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateRequest, CertificateReturn, CertificateState,
-    CertificateStatus, HeadroomCertificate, RequestId, SignedHeadroomCertificate,
+    CertificateStatus, EquivocationBasis, EquivocationId, EquivocationRecord, HeadroomCertificate,
+    RequestId, SignedEquivocationRecord, SignedHeadroomCertificate,
 };
 use crate::settlement::SettlementRecord;
 use crate::transaction::{
@@ -204,6 +205,17 @@ impl TransactionState {
         }
     }
 
+    /// The sender-signed proposal every state carries, whatever its stage.
+    pub fn proposal(&self) -> &SignedProposal {
+        match self {
+            TransactionState::Proposed { proposal }
+            | TransactionState::Confirmed { proposal, .. }
+            | TransactionState::Settled { proposal, .. }
+            | TransactionState::Cancelled { proposal, .. }
+            | TransactionState::Disputed { proposal, .. } => proposal,
+        }
+    }
+
     fn stage(&self) -> Stage {
         match self {
             TransactionState::Proposed { .. } => Stage::Proposed,
@@ -355,6 +367,20 @@ pub struct LedgerSnapshot {
     /// request that a genuinely earlier entry admitted from the same member
     /// *and for the same cap* (consent is to a specific amount).
     cert_requests: BTreeMap<RequestId, (Address, i64)>,
+    /// Station-signed equivocation records by content address (ADR-0021 §5,
+    /// T2.3.3). A faithful view of what the log records; scoring re-verifies each
+    /// with [`EquivocationRecord::verify_evidence`] before acting on it, so an
+    /// unverified record here is not itself a consequence.
+    equivocations: BTreeMap<EquivocationId, SignedEquivocationRecord>,
+    /// Dedup index: the equivocation already recorded against a certificate
+    /// (cert-overspend basis). One record per certificate — repeated overspend
+    /// attempts against an already-recorded cert append nothing further (the
+    /// spends are still refused). A cert belongs to one member, so the cert id
+    /// alone keys the `(member, cert)` dedup.
+    equivocation_by_cert: BTreeMap<CertId, EquivocationId>,
+    /// Dedup index: the equivocation already recorded against an author's outbox
+    /// position (outbox-fork basis), keyed by `(author pubkey, position)`.
+    equivocation_by_fork: BTreeMap<([u8; 32], u64), EquivocationId>,
 }
 
 impl LedgerSnapshot {
@@ -631,6 +657,55 @@ impl LedgerSnapshot {
             return Ok(());
         }
 
+        // A station-signed equivocation record (ADR-0021 §5). Replay **re-verifies
+        // the evidence** before indexing it (re-derive, never re-enforce — ADR-0018):
+        // a record whose embedded member-signed artifacts do not actually prove the
+        // conflict is ignored entirely, so a bogus record on a hostile or
+        // peer-gossiped log copy cannot reserve the one-record-per-offence dedup slot
+        // (which would otherwise suppress the genuine record) nor surface through the
+        // counterparty accessor. The cap for a cert-overspend is read from the
+        // certificate already folded into this snapshot. The first *verifying* record
+        // for a given `(member, cert)` / `(member, fork position)` wins.
+        if let Ok(record) = from_canonical_bytes::<EquivocationRecord>(bytes) {
+            let cap = match record.basis {
+                EquivocationBasis::CertOverspend => record
+                    .cert_id
+                    .and_then(|c| self.certificates.get(&c))
+                    .map(|c| c.certificate.payload.cap_centi),
+                EquivocationBasis::OutboxFork => None,
+            };
+            if !record.verify_evidence(cap) {
+                tracing::warn!(
+                    member = ?record.member,
+                    "equivocation record at replay does not verify; ignoring"
+                );
+                return Ok(());
+            }
+            let id = record.equivocation_id;
+            match record.basis {
+                EquivocationBasis::CertOverspend => {
+                    if let Some(cert_id) = record.cert_id {
+                        self.equivocation_by_cert.entry(cert_id).or_insert(id);
+                    }
+                }
+                EquivocationBasis::OutboxFork => {
+                    if let Some(position) = record.fork_position() {
+                        self.equivocation_by_fork
+                            .entry((record.member.public_key().to_bytes(), position))
+                            .or_insert(id);
+                    }
+                }
+            }
+            self.equivocations
+                .entry(id)
+                .or_insert(SignedEquivocationRecord {
+                    payload: record,
+                    signer: stored.signer,
+                    signature: stored.signature,
+                });
+            return Ok(());
+        }
+
         Ok(())
     }
 
@@ -699,6 +774,54 @@ impl LedgerSnapshot {
             .into_iter()
             .filter(|c| now <= spend_admissible_until(&c.certificate.payload, config))
             .collect()
+    }
+
+    /// Every admitted cert-backed spend against `cert_id`, in transaction-id
+    /// order — the admitted half of a cert-overspend equivocation proof. The
+    /// station gathers these (plus the refused spend it holds) to build an
+    /// [`EquivocationRecord`](crate::escrow::EquivocationRecord); order is
+    /// deterministic (content order) so replicas assemble identical evidence.
+    ///
+    /// Spends in *every* state are returned, including `Cancelled`/`Disputed` — this
+    /// is deliberate and matches the engine's **monotone** cert consumption (a
+    /// cancellation never replenishes the cap, ADR-0021 §5), so this set equals the
+    /// consumed set the overspend was measured against.
+    pub fn cert_backed_spends(&self, cert_id: &CertId) -> Vec<SignedProposal> {
+        self.states
+            .values()
+            .map(TransactionState::proposal)
+            .filter(|p| p.payload.cert_id == Some(*cert_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether an equivocation is already recorded against `cert_id`
+    /// (cert-overspend). The station consults this before appending so a repeated
+    /// overspend attempt refuses the spend without appending a second record.
+    pub fn has_cert_equivocation(&self, cert_id: &CertId) -> bool {
+        self.equivocation_by_cert.contains_key(cert_id)
+    }
+
+    /// Whether an equivocation is already recorded against `member`'s outbox
+    /// `position` (outbox-fork). The station's per-fork dedup guard.
+    pub fn has_fork_equivocation(&self, member: &Address, position: u64) -> bool {
+        self.equivocation_by_fork
+            .contains_key(&(member.public_key().to_bytes(), position))
+    }
+
+    /// The equivocation recorded against `cert_id`, if any — the accessor a
+    /// stranded receiver uses to see the proof behind their refused cert-backed
+    /// spend (the compensation question itself is out of scope; ADR-0021
+    /// residual).
+    pub fn equivocation_for_cert(&self, cert_id: &CertId) -> Option<&SignedEquivocationRecord> {
+        self.equivocation_by_cert
+            .get(cert_id)
+            .and_then(|id| self.equivocations.get(id))
+    }
+
+    /// Every equivocation record on the log, in content-id order.
+    pub fn equivocations(&self) -> impl Iterator<Item = &SignedEquivocationRecord> {
+        self.equivocations.values()
     }
 }
 
@@ -1099,5 +1222,75 @@ mod tests {
             state.status,
             CertificateStatus::Returned { at_seq: 4 }
         ));
+    }
+
+    #[test]
+    fn replay_ignores_an_unverifiable_equivocation_record() {
+        use crate::escrow::{EquivocationBasis, EquivocationRecord, EvidenceItem};
+        use rrn_crypto::signed::SignedPayload;
+
+        let db = fresh_db();
+        let member = Keypair::generate();
+        let station = Keypair::generate();
+        let member_addr = Address::from_public_key(member.public_key());
+        let cap = 500;
+
+        // A certificate on the log so the cap can be looked up at replay.
+        let cert_id = {
+            let mut log = AppendLog::new(&db);
+            let req = CertificateRequest::new(member_addr, cap, 0, 1_000);
+            let rid = req.request_id;
+            log.append(SignedPayload::sign(req, &member), 0).unwrap();
+            let cert = HeadroomCertificate::new(member_addr, cap, rid, 1_000, 1_000_000);
+            let cid = cert.cert_id;
+            log.append(SignedPayload::sign(cert, &station), 0).unwrap();
+            cid
+        };
+        let evidence = |amount, nonce| {
+            let p =
+                TransactionProposal::new(member_addr, member_addr, amount, None, nonce, 1, 9_000)
+                    .with_certificate(cert_id);
+            EvidenceItem::from_signed(&SignedPayload::sign(p, &member))
+        };
+
+        // A bogus record (one embedded signature tampered) is station-signed and
+        // lands on the log, but does not verify.
+        let mut ev = vec![evidence(300, 1), evidence(300, 2)];
+        let last = ev[0].bytes.len() - 1;
+        ev[0].bytes[last] ^= 0x01;
+        let bogus = EquivocationRecord::new(
+            member_addr,
+            EquivocationBasis::CertOverspend,
+            Some(cert_id),
+            ev,
+            7_000,
+        );
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(bogus, &station), 0)
+            .unwrap();
+
+        // Replay ignores it: it neither reserves the dedup slot nor surfaces.
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        assert!(
+            !snap.has_cert_equivocation(&cert_id),
+            "bogus record must not reserve the slot"
+        );
+        assert!(snap.equivocation_for_cert(&cert_id).is_none());
+        assert_eq!(snap.equivocations().count(), 0);
+
+        // A genuine record for the same certificate is then indexed normally.
+        let genuine = EquivocationRecord::new(
+            member_addr,
+            EquivocationBasis::CertOverspend,
+            Some(cert_id),
+            vec![evidence(300, 1), evidence(300, 2)],
+            8_000,
+        );
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(genuine, &station), 0)
+            .unwrap();
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        assert!(snap.has_cert_equivocation(&cert_id));
+        assert_eq!(snap.equivocations().count(), 1);
     }
 }

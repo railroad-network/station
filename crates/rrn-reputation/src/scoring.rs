@@ -13,15 +13,16 @@
 //!
 //! - **Trade reliability** — each settled transaction the address is a party to
 //!   (sender or receiver) is one positive event. Cancelled proposals are neutral
-//!   (they contribute nothing); the disputed-against slot is reserved and never
-//!   populated in Phase 1.
+//!   (they contribute nothing). Its reserved negative slot is now populated by a
+//!   proven equivocation (a false headroom claim; ADR-0021 §5), which zeroes it.
 //! - **Attestation accuracy** — each signed statement the address made about a
 //!   transaction or another member: the vouches it signed, plus the transaction
 //!   confirmations it signed as a receiver. Each counts as accurate *unless later
 //!   proven wrong*: a dispute upheld against a confirmation (ADR-0014) both strips
 //!   its positive credit and levies a penalty, dragging the dimension below
 //!   neutral — the "proven wrong" negative event ADR-0009 always reserved for this
-//!   dimension, and the forfeiture the Tier-2 stake finally pays.
+//!   dimension, and the forfeiture the Tier-2 stake finally pays. A proven
+//!   equivocation zeroes this dimension too (ADR-0021 §5 / ADR-0025).
 //!
 //! # The count-to-score mapping
 //!
@@ -33,9 +34,15 @@
 //! every station, or a reputation exported from one would not reconcile on
 //! another.
 
+use std::collections::HashSet;
+
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
+use rrn_ledger::escrow::{
+    EquivocationBasis, EquivocationId, EquivocationRecord, EquivocationVerdictRecord,
+    VerdictDecision,
+};
 use rrn_ledger::state::{CancelReason, LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionConfirmation;
 use rrn_storage::db::Database;
@@ -49,6 +56,31 @@ use crate::Result;
 /// Points one qualifying event contributes to its dimension, before capping and
 /// decay. Protocol-locked (ADR-0009): 10 lifetime events reach [`DIMENSION_MAX`].
 const EVENT_INCREMENT: f32 = 0.5;
+
+/// Penalty weight a proven equivocation levies on **each** of the two dimensions
+/// it dents (ADR-0021 §5, ADR-0009). **Maintainer-ratified 2026-09-04** (ADR-0025).
+///
+/// ADR-0009's scoring is additive/linear and floors each dimension at zero, so it
+/// has no signed negative-weight table to scale. Rather than a fixed small
+/// subtraction — which is regressive (invisible on a newcomer, trivial on a
+/// veteran) and, at any value that keeps a maxed member's composite ≥ the Member
+/// band, leaves the equivocator established with their vote and jury seat intact —
+/// the penalty is [`DIMENSION_MAX`], which **zeroes** whichever dimension it is
+/// applied to. That is the heaviest expressible consequence within the locked,
+/// floored formula, and the only one with a governance effect (de-establishment).
+/// It is fully reversible: the penalty is derived on replay and lifted the instant
+/// a jury `Overturn` verdict lands (ADR-0021 §5). While it stands the dimension is
+/// pinned at zero (a deliberate, proportional cost for a proven, deliberate act);
+/// the newcomer-with-no-history case is covered out-of-formula by an
+/// equivocation → cert-issuance disqualification gate (ADR-0025 / T2.3.4).
+///
+/// Equivocation is dented on **both** live dimensions — a signed statement proven
+/// false (attestation accuracy, ADR-0009's "proven wrong" slot) *and* the paradigm
+/// disputed-against trade (trade reliability, its reserved negative slot, and the
+/// highest-weighted dimension a counterparty reads before accepting an offline
+/// spend). It is two proven-wrong facts (a false headroom claim and a failed
+/// settlement), not one event double-counted.
+pub const EQUIVOCATION_WEIGHT: f32 = DIMENSION_MAX;
 
 /// Computes reputation profiles by replaying the log behind a borrowed database.
 pub struct ReputationScorer<'db> {
@@ -165,6 +197,51 @@ impl<'db> ReputationScorer<'db> {
             }
         }
 
+        // A proven equivocation zeroes both live dimensions — trade reliability and
+        // attestation accuracy (ADR-0021 §5 / ADR-0025). Like vouches, equivocation
+        // records are standalone station-signed log entries the ledger replay
+        // ignores, so they need a direct scan. Two guards
+        // make this a pure function of the log that convicts no one wrongly:
+        //   1. A jury `Overturn` verdict (ADR-0021 §5) neutralizes the record — its
+        //      penalty lifts. Gated on the verdict's `decided_at <= at_time` so a
+        //      profile scored before the ruling still carries the penalty and one
+        //      scored after does not (mirroring the upheld-dispute `cancelled_at`
+        //      gate). The jury *path* is a follow-up ticket; the verdict record kind
+        //      is defined now so this neutralization is exact and testable.
+        //   2. [`EquivocationRecord::verify_evidence`] re-derives the conflict from
+        //      the embedded member-signed artifacts, so a hostile log copy's bogus
+        //      record — tampered evidence, amounts within cap, a mislabeled member —
+        //      produces no penalty. The cap for a cert-overspend basis is read from
+        //      the certificate on the same log.
+        let overturned = overturned_equivocations(&log, at_time)?;
+        for entry in log.iter_from(1) {
+            let entry = entry?;
+            let Ok(record) = from_canonical_bytes::<EquivocationRecord>(&entry.payload.bytes)
+            else {
+                continue;
+            };
+            if record.member != *address || record.recorded_at > at_time {
+                continue;
+            }
+            if overturned.contains(&record.equivocation_id) {
+                continue;
+            }
+            let cap = match record.basis {
+                EquivocationBasis::CertOverspend => record
+                    .cert_id
+                    .and_then(|c| ledger.certificate(&c))
+                    .map(|c| c.certificate.payload.cap_centi),
+                EquivocationBasis::OutboxFork => None,
+            };
+            if record.verify_evidence(cap) {
+                // Zero both live dimensions (ADR-0025): a false headroom claim
+                // (trade reliability, the dimension a counterparty reads) and a
+                // signed statement proven false (attestation accuracy).
+                trade.penalize_by(EQUIVOCATION_WEIGHT);
+                attestation.penalize_by(EQUIVOCATION_WEIGHT);
+            }
+        }
+
         let mut profile = ReputationProfile::empty(*address);
         profile.trade_reliability = trade.score(at_time);
         profile.attestation_accuracy = attestation.score(at_time);
@@ -184,13 +261,41 @@ fn confirmation_of(state: &TransactionState) -> Option<&TransactionConfirmation>
     }
 }
 
-/// Running tally for one dimension: how many qualifying events, how many
-/// penalties counted against it, and when the most recent positive event
-/// happened (for decay).
+/// The set of equivocation records overturned by a jury as of `at_time` — those
+/// with an [`Overturn`](VerdictDecision::Overturn) verdict whose `decided_at` is
+/// at or before `at_time`. An overturned record levies no reputation penalty
+/// (ADR-0021 §5). A non-verdict payload is skipped.
+fn overturned_equivocations(log: &AppendLog, at_time: i64) -> Result<HashSet<EquivocationId>> {
+    let mut out = HashSet::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(&entry.payload.bytes)
+        else {
+            continue;
+        };
+        // T2.3.4: once the jury path can *produce* verdicts, gate this on the
+        // verdict's signer being the station, so a member-relayed `Overturn`
+        // cannot neutralize their own penalty. Today no such path exists — the
+        // verdict kind is `UnroutableKind` on DTN and has no RPC surface — so an
+        // overturn can only come from the station that wrote the log.
+        if verdict.decision == VerdictDecision::Overturn && verdict.decided_at <= at_time {
+            out.insert(verdict.equivocation_id);
+        }
+    }
+    Ok(out)
+}
+
+/// Running tally for one dimension: how many qualifying positive events, the
+/// total penalty weight counted against it, and when the most recent positive
+/// event happened (for decay).
 #[derive(Default)]
 struct DimensionTally {
     count: u32,
-    penalties: u32,
+    /// Total penalty weight subtracted from the dimension. An upheld dispute adds
+    /// [`EVENT_INCREMENT`]; a proven equivocation adds the heavier
+    /// [`EQUIVOCATION_WEIGHT`]. Held as a weight (not a count) so inputs of
+    /// different severities compose.
+    penalty: f32,
     last_activity: Option<i64>,
 }
 
@@ -204,16 +309,20 @@ impl DimensionTally {
         });
     }
 
-    /// Counts one penalty against the dimension — a positive contribution that
-    /// was later proven wrong (currently only an upheld dispute against a
-    /// confirmation). It subtracts a full [`EVENT_INCREMENT`], pulling the score
-    /// below where the member's clean events left it. Deliberately does *not*
-    /// touch `last_activity`: a penalty must not reset the decay clock and thereby
+    /// Counts one upheld-dispute penalty against the dimension — a positive
+    /// contribution later proven wrong (ADR-0014 §6). Subtracts a full
+    /// [`EVENT_INCREMENT`].
+    fn penalize(&mut self) {
+        self.penalize_by(EVENT_INCREMENT);
+    }
+
+    /// Subtracts `weight` from the dimension. Deliberately does *not* touch
+    /// `last_activity`: a penalty must not reset the decay clock and thereby
     /// preserve more of the positive score it is meant to erode. A dimension with
     /// no positive events stays at zero regardless — a dimension floors at zero,
     /// so there is nothing below neutral to reach.
-    fn penalize(&mut self) {
-        self.penalties += 1;
+    fn penalize_by(&mut self, weight: f32) {
+        self.penalty += weight;
     }
 
     /// The dimension's score as of `at_time`: capped linear accrual less its
@@ -224,7 +333,7 @@ impl DimensionTally {
             return 0.0;
         };
         let earned = (EVENT_INCREMENT * self.count as f32).min(DIMENSION_MAX);
-        let net = earned - EVENT_INCREMENT * self.penalties as f32;
+        let net = earned - self.penalty;
         // `decayed` floors at zero, so a net driven negative by penalties reads as
         // a bottomed-out dimension rather than an impossible negative one.
         decayed(net, last, at_time)
@@ -400,6 +509,289 @@ mod tests {
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    // --- equivocation (T2.3.3) ----------------------------------------------
+
+    use rrn_ledger::escrow::{CertId, CertificateRequest, EvidenceItem, HeadroomCertificate};
+
+    /// Puts a `cap`-centi certificate for `member` on the log (request then
+    /// station grant, request-first per ADR-0021 §1), returning its id so an
+    /// overspend proof can reference it and scoring can read the cap.
+    fn append_certificate(
+        db: &Database,
+        member: &Keypair,
+        station: &Keypair,
+        cap: i64,
+        nonce: u64,
+        at: i64,
+    ) -> CertId {
+        let mut log = AppendLog::new(db);
+        let req = CertificateRequest::new(addr(member), cap, nonce, at);
+        let rid = req.request_id;
+        log.append(SignedPayload::sign(req, member), 0).unwrap();
+        let cert = HeadroomCertificate::new(addr(member), cap, rid, at, at + 1_000_000);
+        let cid = cert.cert_id;
+        log.append(SignedPayload::sign(cert, station), 0).unwrap();
+        cid
+    }
+
+    /// A `member`-signed cert-backed spend against `cert`, as an evidence item.
+    fn cert_evidence(member: &Keypair, cert: CertId, amount: i64, nonce: u64) -> EvidenceItem {
+        let p = TransactionProposal::new(
+            addr(member),
+            addr(&Keypair::generate()),
+            amount,
+            None,
+            nonce,
+            1,
+            i64::MAX / 2,
+        )
+        .with_certificate(cert);
+        EvidenceItem::from_signed(&SignedPayload::sign(p, member))
+    }
+
+    /// Appends a station-signed cert-overspend equivocation against `member`
+    /// (two 300-spends over a 500 cap), returning its id.
+    fn append_equivocation(
+        db: &Database,
+        member: &Keypair,
+        station: &Keypair,
+        cert: CertId,
+        recorded_at: i64,
+    ) -> EquivocationId {
+        let evidence = vec![
+            cert_evidence(member, cert, 300, 1),
+            cert_evidence(member, cert, 300, 2),
+        ];
+        let record = EquivocationRecord::new(
+            addr(member),
+            EquivocationBasis::CertOverspend,
+            Some(cert),
+            evidence,
+            recorded_at,
+        );
+        let id = record.equivocation_id;
+        AppendLog::new(db)
+            .append(SignedPayload::sign(record, station), 0)
+            .unwrap();
+        id
+    }
+
+    /// Appends a station-signed `Overturn` verdict neutralizing `id`.
+    fn append_overturn(db: &Database, station: &Keypair, id: EquivocationId, decided_at: i64) {
+        let verdict = EquivocationVerdictRecord {
+            equivocation_id: id,
+            decision: VerdictDecision::Overturn,
+            decided_at,
+        };
+        AppendLog::new(db)
+            .append(SignedPayload::sign(verdict, station), 0)
+            .unwrap();
+    }
+
+    /// Gives `member` three vouch attestations (raw 1.5) as a clean baseline the
+    /// equivocation penalty can visibly erode.
+    fn seed_attestation_baseline(db: &Database, member: &Keypair, at: i64) {
+        for _ in 0..3 {
+            append_vouch(db, member, &addr(&Keypair::generate()), at);
+        }
+    }
+
+    /// Gives `member` a two-trade, three-vouch baseline (trade 1.0, attestation
+    /// 1.5) so the equivocation penalty can be seen to zero **both** live
+    /// dimensions. `member` is the *sender* of both trades, so the trades give no
+    /// attestation credit (the receiver confirms), keeping the two dimensions
+    /// independent.
+    fn seed_trade_and_attestation_baseline(db: &Database, member: &Keypair, at: i64) {
+        let other = Keypair::generate();
+        append_settled(db, member, &other, &Keypair::generate(), 0, at);
+        append_settled(db, member, &other, &Keypair::generate(), 1, at);
+        seed_attestation_baseline(db, member, at);
+    }
+
+    #[test]
+    fn a_proven_equivocation_zeroes_both_live_dimensions() {
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let base = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(
+            approx(base.trade_reliability, 1.0),
+            "trade base {}",
+            base.trade_reliability
+        );
+        assert!(
+            approx(base.attestation_accuracy, 1.5),
+            "attn base {}",
+            base.attestation_accuracy
+        );
+
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+        append_equivocation(&db, &mallory, &station, cert, t);
+
+        let after = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        // Both live dimensions floor at zero — the equivocator is de-established.
+        assert!(
+            approx(after.trade_reliability, 0.0),
+            "trade {}",
+            after.trade_reliability
+        );
+        assert!(
+            approx(after.attestation_accuracy, 0.0),
+            "attn {}",
+            after.attestation_accuracy
+        );
+        assert!(
+            approx(after.composite(), 0.0),
+            "composite {}",
+            after.composite()
+        );
+    }
+
+    #[test]
+    fn an_overturned_equivocation_is_neutralized() {
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+        let id = append_equivocation(&db, &mallory, &station, cert, t);
+        append_overturn(&db, &station, id, t);
+
+        let after = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        // The overturn lifts the penalty on both dimensions: clean baseline.
+        assert!(
+            approx(after.trade_reliability, 1.0),
+            "trade {}",
+            after.trade_reliability
+        );
+        assert!(
+            approx(after.attestation_accuracy, 1.5),
+            "attn {}",
+            after.attestation_accuracy
+        );
+    }
+
+    #[test]
+    fn a_bogus_equivocation_record_convicts_no_one() {
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+
+        // A station-signed record whose evidence has been tampered: one embedded
+        // signature no longer verifies, so `verify_evidence` rejects it.
+        let mut evidence = vec![
+            cert_evidence(&mallory, cert, 300, 1),
+            cert_evidence(&mallory, cert, 300, 2),
+        ];
+        let last = evidence[0].bytes.len() - 1;
+        evidence[0].bytes[last] ^= 0x01;
+        let record = EquivocationRecord::new(
+            addr(&mallory),
+            EquivocationBasis::CertOverspend,
+            Some(cert),
+            evidence,
+            t,
+        );
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(record, &station), 0)
+            .unwrap();
+
+        // No penalty: both baselines stand.
+        let after = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(
+            approx(after.trade_reliability, 1.0),
+            "trade {}",
+            after.trade_reliability
+        );
+        assert!(
+            approx(after.attestation_accuracy, 1.5),
+            "bogus record must not dent: {}",
+            after.attestation_accuracy
+        );
+    }
+
+    #[test]
+    fn equivocation_scoring_is_deterministic_across_replays() {
+        // Two independent replays of the same log reduce to the same score — the
+        // property `verify_history` and dispute review depend on — both with and
+        // without the overturning verdict present.
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+        let id = append_equivocation(&db, &mallory, &station, cert, t);
+
+        let replay = || {
+            let p = ReputationScorer::new(&db)
+                .score_raw_at(&addr(&mallory), t)
+                .unwrap();
+            (p.trade_reliability, p.attestation_accuracy)
+        };
+        assert_eq!(replay(), replay(), "two replays agree (penalty present)");
+        assert_eq!(replay(), (0.0, 0.0));
+
+        append_overturn(&db, &station, id, t);
+        assert_eq!(
+            replay(),
+            replay(),
+            "two replays agree (penalty neutralized)"
+        );
+        let (trade, attn) = replay();
+        assert!(approx(trade, 1.0) && approx(attn, 1.5));
+    }
+
+    #[test]
+    fn the_equivocation_penalty_applies_only_from_recorded_at_onward() {
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+        // The equivocation is recorded a month after the baseline activity.
+        append_equivocation(&db, &mallory, &station, cert, t + MONTH);
+
+        // Scored before the record exists: no penalty.
+        let before = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(
+            approx(before.attestation_accuracy, 1.5),
+            "before {}",
+            before.attestation_accuracy
+        );
+
+        // Scored at the record's instant: both dimensions are zeroed.
+        let at = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t + MONTH)
+            .unwrap();
+        assert!(
+            approx(at.trade_reliability, 0.0),
+            "trade {}",
+            at.trade_reliability
+        );
+        assert!(
+            approx(at.attestation_accuracy, 0.0),
+            "attn {}",
+            at.attestation_accuracy
+        );
     }
 
     #[test]
