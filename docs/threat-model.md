@@ -800,8 +800,10 @@ transition; the derivability of all state from the log.
 Headroom certificates (`rrn-ledger::escrow`, T2.3.1) extend the debt floor to
 survive a partition: a member reserves capacity to commit *while connected*, so a
 later cert-backed spend can be admitted under partition without a fresh floor
-check. This ticket delivers issuance, return, and the reservation arithmetic;
-cert-backed *spending* and the equivocation path are T2.3.2/T2.3.3.
+check. T2.3.1 delivered issuance, return, and the reservation arithmetic; **T2.3.2
+adds the cert-backed spend itself** — a `TransactionProposal` carrying an additive
+`cert_id` (`rrn-ledger::transaction`), admitted against the escrow — and the
+equivocation *consequences* remain T2.3.3.
 
 - *Threat: a certificate reserving headroom the member does not have.* A member
   requests certificates whose caps jointly exceed their floor headroom, so the
@@ -850,6 +852,50 @@ cert-backed *spending* and the equivocation path are T2.3.2/T2.3.3.
   only bound. The receiver's offline verification is only as good as the spend
   history a spender presents (ADR-0021 Consequences); the cap still bounds the
   damage.
+- *Threat (T2.3.2): the floor-bypass carve-out admitting an unbacked debit.* A
+  cert-backed spend is admitted **without a fresh debt-floor check** — the single
+  deliberate floor bypass in the codebase (`Engine::submit_proposal`, guarded
+  loudly with the ADR-0021 §4 reference). A forged or mismatched `cert_id`, or a
+  spend larger than the reserved cap, would let a debit slip past the floor the
+  escrow was supposed to have paid for.
+- *Mitigation:* the bypass is gated on a closed set of checks, all against the
+  signed certificate on the log, before the floor check is skipped:
+  (1) the proposal is a positive-amount spend — a payment request (which debits
+  the *receiver*) cannot ride an escrow (`CertificateMisuse`); (2) the certificate
+  exists (`UnknownCertificate`); (3) it is still `Outstanding`, not returned
+  (`CertificateNotOutstanding`); (4) its member is the proposal's sender
+  (`CertificateWrongMember`); (5) `now` is at or before the shared
+  `spend_admissible_until` boundary (`CertificateExpired`); and (6) the spend fits
+  within `cap − consumed` (`CertificateOverspent`, carrying the three amounts
+  structurally for the T2.3.3 evidence, never string-matched). Every *other*
+  proposal check (signature, sender match, tier, nonce, duplicate, and the
+  admission-clock window) still applies unchanged, so DTN is not a bypass of any of
+  them. The ADR-0021 §6 floor invariant — after every admitted operation, every
+  member's `settled − committed ≥ floor` (and hence `settled ≥ floor`) — is
+  asserted by a seeded proptest over arbitrary interleavings of issuance, plain and
+  cert-backed spends, confirmations, cancellations, returns, and settlement
+  sweeps.
+- *Threat: replenishment understating exposure.* If a cancelled cert-backed spend
+  gave its allowance back, a spender could show an offline receiver a spend history
+  that understates how much of the cap is truly committed elsewhere.
+- *Mitigation:* consumption is **monotone** — a cancelled or rejected cert-backed
+  spend stops counting as a pending debit but its amount stays `consumed` (derive
+  only ever adds; the cancellation path never subtracts). So the remaining
+  allowance a receiver is shown is a true floor on what is left, and the cap is
+  never re-spendable beyond its total once. The committed position still drops on
+  the cancel (the pending debit is gone), so headroom is not double-charged; the
+  sum of the pending cert-backed debit and the certificate's remaining reservation
+  is invariant across admission and settlement (the proptest guards against
+  double-counting).
+- *Residual risk (hidden history):* the offline receiver's check remains only as
+  good as the spend history the holder presents; a holder can conceal earlier
+  cert-backed spends from a new receiver, up to the cap. The cap bounds the damage
+  per certificate, the overspend refusal + T2.3.3 evidence convict the equivocator,
+  and T2.4.2 gives receivers a verification API. Replay tolerates a hostile log
+  copy naming an unknown certificate by counting no consumption and logging a warn
+  (replicas re-derive, never re-enforce — ADR-0018); a well-formed single-writer
+  log cannot contain such a record, because the engine admits a cert-backed spend
+  only against the signer's own outstanding certificate.
 
 #### Oracle tiering and the reputation stake
 

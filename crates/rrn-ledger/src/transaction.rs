@@ -37,6 +37,8 @@ use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use serde::{Deserialize, Serialize};
 
+use crate::escrow::CertId;
+
 /// Discriminant strings carried in the `kind` field of each record's canonical
 /// CBOR, so log replay can tell the record types apart unambiguously.
 pub(crate) const PROPOSAL_KIND: &str = "rrn.tx.proposal";
@@ -153,6 +155,18 @@ pub struct TransactionProposal {
     /// [`tier::is_valid_opt_up`]: crate::tier::is_valid_opt_up
     /// [`tier::effective_tier`]: crate::tier::effective_tier
     pub oracle_tier: Option<u8>,
+    /// The headroom certificate this spend draws against (ADR-0021 §3), when it
+    /// is a cert-backed offline spend; `None` — the common case — for an ordinary
+    /// proposal. When present, admission honors the escrow reserved at issuance
+    /// and skips the debt-floor check (see
+    /// [`Engine::submit_proposal`](crate::engine::Engine::submit_proposal)); the
+    /// spend's amount is consumed from the certificate monotonically. Like
+    /// [`listing_id`](Self::listing_id) and [`oracle_tier`](Self::oracle_tier) it
+    /// is the **third additive, content-addressed field**, so it is **OMITTED
+    /// from the CBOR when `None`** (never `null`) — keeping every proposal written
+    /// before this field existed byte-identical (ADR-0010). Set via
+    /// [`with_certificate`](Self::with_certificate).
+    pub cert_id: Option<CertId>,
     /// Per-sender monotonic nonce; the engine rejects gaps and duplicates.
     pub nonce: u64,
     /// Unix seconds when the proposal was made.
@@ -189,6 +203,9 @@ impl TransactionProposal {
             // floor. `with_tier` records a genuine lift. Absent-when-`None`, same
             // additive-field discipline as `listing_id`.
             oracle_tier: None,
+            // Not a cert-backed spend by default; `with_certificate` links one.
+            // Absent-when-`None`, same additive-field discipline as `listing_id`.
+            cert_id: None,
             nonce,
             proposed_at,
             expires_at,
@@ -220,6 +237,18 @@ impl TransactionProposal {
             self.oracle_tier = Some(tier);
             self.id = self.compute_id();
         }
+        self
+    }
+
+    /// Links this proposal to the headroom certificate it draws against
+    /// (ADR-0021 §3), recomputing its content [`id`](Self::id) with the link
+    /// included — exactly like [`with_listing`](Self::with_listing). Used when a
+    /// wallet signs an offline cert-backed spend; an ordinary send never calls
+    /// this. The certificate's cap and validity are enforced at admission, not
+    /// here (see [`Engine::submit_proposal`](crate::engine::Engine::submit_proposal)).
+    pub fn with_certificate(mut self, cert_id: CertId) -> Self {
+        self.cert_id = Some(cert_id);
+        self.id = self.compute_id();
         self
     }
 
@@ -270,6 +299,13 @@ impl From<TransactionProposal> for CBOR {
         if let Some(tier) = p.oracle_tier {
             m.insert("oracle_tier", tier);
         }
+        // Same omit-when-`None` discipline as `listing_id`/`oracle_tier` above:
+        // an ordinary (non-cert-backed) proposal carries no `cert_id` key, so it
+        // stays byte-identical to before this field existed. Only a cert-backed
+        // spend writes the key, encoded as a byte string (the 32-byte content id).
+        if let Some(cert_id) = p.cert_id {
+            m.insert("cert_id", cert_id);
+        }
         m.insert("nonce", p.nonce);
         m.insert("proposed_at", p.proposed_at);
         m.insert("expires_at", p.expires_at);
@@ -311,6 +347,14 @@ impl TryFrom<CBOR> for TransactionProposal {
         // trusted — the recomputed id then simply won't match a tampered record.
         let proposal = match map.get::<&str, u8>("oracle_tier") {
             Some(tier) => proposal.with_tier(tier),
+            None => proposal,
+        };
+        // Absent cert_id decodes to `None` (an ordinary proposal); a present byte
+        // string to a cert-backed spend — the omit-when-`None` counterpart of the
+        // encoder above. Applied after construction so the recomputed id matches
+        // the signer's.
+        let proposal = match map.get::<&str, CertId>("cert_id") {
+            Some(cert_id) => proposal.with_certificate(cert_id),
             None => proposal,
         };
         Ok(proposal)
@@ -503,6 +547,57 @@ mod tests {
             TransactionProposal::new(addr(), addr(), 500, None, 0, 1_700_000_000, 1_700_086_400);
         assert_eq!(big.oracle_tier, None);
         assert_eq!(big.effective_tier(), 2);
+    }
+
+    #[test]
+    fn cert_link_is_absent_when_uncertificated_and_leaves_the_id_stable() {
+        use crate::escrow::CertId;
+        let plain = sample_proposal(); // cert_id: None
+        assert_eq!(plain.cert_id, None);
+        let bytes = to_canonical_bytes(plain.clone());
+        // Absent, never null — same ADR-0010 guard as listing_id/oracle_tier: a
+        // proposal written before this field existed hashes (and is id'd)
+        // identically, so no confirmation or settlement referencing it breaks.
+        assert!(!contains(&bytes, b"cert_id"));
+
+        // Linking a certificate is additive content: the key appears, id changes.
+        let cert_id = CertId(Hash::of(b"cert"));
+        let backed = plain.clone().with_certificate(cert_id);
+        assert_eq!(backed.cert_id, Some(cert_id));
+        assert!(contains(&to_canonical_bytes(backed.clone()), b"cert_id"));
+        assert_ne!(backed.id, plain.id);
+    }
+
+    #[test]
+    fn a_cert_backed_proposal_round_trips() {
+        use crate::escrow::CertId;
+        let cert_id = CertId(Hash::of(b"cert-round-trip"));
+        let backed = sample_proposal().with_certificate(cert_id);
+        let bytes = to_canonical_bytes(backed.clone());
+        let decoded: TransactionProposal = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, backed);
+        assert_eq!(decoded.cert_id, Some(cert_id));
+        // The recomputed id agrees with the link included.
+        assert_eq!(decoded.id, backed.id);
+    }
+
+    #[test]
+    fn all_three_additive_fields_coexist_and_stay_stable() {
+        use crate::escrow::CertId;
+        // A proposal carrying all three additive fields round-trips and its id is
+        // stable — the fields do not interfere with one another's encoding.
+        let cert_id = CertId(Hash::of(b"c"));
+        let full = sample_proposal()
+            .with_listing(ListingRef([3u8; 32]))
+            .with_tier(2)
+            .with_certificate(cert_id);
+        let bytes = to_canonical_bytes(full.clone());
+        assert!(contains(&bytes, b"listing_id"));
+        assert!(contains(&bytes, b"oracle_tier"));
+        assert!(contains(&bytes, b"cert_id"));
+        let decoded: TransactionProposal = from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, full);
+        assert_eq!(decoded.id, full.id);
     }
 
     #[test]

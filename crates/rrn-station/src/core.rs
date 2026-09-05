@@ -45,6 +45,7 @@ use rrn_identity::wallet::WalletContents;
 use rrn_ledger::contract::{ContractCharge, ContractRef};
 use rrn_ledger::dispute::{DisputeRecord, DisputeResponse, SignedDispute, SignedDisputeResponse};
 use rrn_ledger::engine::Engine;
+use rrn_ledger::escrow::CertificateReturn;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::TransactionState;
 use rrn_ledger::transaction::{
@@ -3569,6 +3570,27 @@ impl Core {
                 ),
                 Err(_) => return Ok(refused_disposition(RefusalReason::Rejected)),
             },
+            // A certificate return releases escrow the station granted; late
+            // admission is safe (ADR-0021 §2), so it rides DTN like any member
+            // record.
+            Some(KIND_CERT_RETURN) => match from_canonical_bytes::<CertificateReturn>(bytes) {
+                Ok(payload) => engine.submit_certificate_return(
+                    SignedPayload {
+                        payload,
+                        signer,
+                        signature,
+                    },
+                    now,
+                ),
+                Err(_) => return Ok(refused_disposition(RefusalReason::Rejected)),
+            },
+            // A certificate request cannot be carried by a store-and-forward
+            // bundle: issuance is a live round-trip for the station's signed
+            // reply. Refuse it explicitly (not via the catch-all) so the reason is
+            // a deliberate `unroutable-kind`, not an incidental one.
+            Some(KIND_CERT_REQUEST) => {
+                return Ok(refused_disposition(RefusalReason::UnroutableKind))
+            }
             _ => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
         };
 
@@ -4880,6 +4902,16 @@ const KIND_PROPOSAL: &str = "rrn.tx.proposal";
 const KIND_CONFIRMATION: &str = "rrn.tx.confirmation";
 const KIND_DISPUTE: &str = "rrn.tx.dispute";
 const KIND_DISPUTE_RESPONSE: &str = "rrn.tx.dispute.response";
+/// A member-signed certificate return travels the same DTN bundles as any other
+/// member record (ADR-0021 §2): it releases escrow the station already granted,
+/// so admitting it late is safe and desirable. Cert-backed *spends* need no
+/// entry here — they are ordinary `rrn.tx.proposal`s carrying a `cert_id`.
+const KIND_CERT_RETURN: &str = "rrn.credit.cert_return";
+/// A certificate *request* is explicitly **not** DTN-routable: issuance is a live
+/// round-trip (the station signs and returns the certificate in its reply), which
+/// a store-and-forward bundle cannot carry. It is refused as `unroutable-kind`
+/// rather than falling through the catch-all, so the reason is deliberate.
+const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
 
 /// Why an ingest could not produce a receipt at all (as opposed to a per-record
 /// refusal, which *is* part of a receipt). A malformed bundle is the caller's
@@ -4946,9 +4978,20 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         // needs — most commonly a confirmation whose proposal has not yet been
         // admitted (couriers must keep outbox order, ADR-0020 §4).
         LE::UnknownTransaction | LE::NotProposed => RefusalReason::NotProposed,
+        // Certificate-backed spend / return refusals (ADR-0021 §3–§5). Each has a
+        // machine-stable slug so a courier's owner (and T2.3.3's evidence
+        // assembly) can branch on the exact cause. `UnknownCertificate` and
+        // `CertificateNotOutstanding` are shared with the return path; in the
+        // cert context they read as "no such certificate" and "already returned".
+        LE::CertificateMisuse => RefusalReason::CertMisuse,
+        LE::UnknownCertificate => RefusalReason::CertUnknown,
+        LE::CertificateNotOutstanding => RefusalReason::CertReturned,
+        LE::CertificateWrongMember => RefusalReason::CertWrongMember,
+        LE::CertificateExpired => RefusalReason::CertExpired,
+        LE::CertificateOverspent { .. } => RefusalReason::CertOverspent,
         // Everything else (future-dated/inconsistent testimony, wrong dispute
         // state, not-a-party, closed window, over-long reason, already-responded,
-        // invalid state) has no more specific slug.
+        // member mismatch on a return, invalid state) has no more specific slug.
         _ => RefusalReason::Rejected,
     }
 }
@@ -6233,6 +6276,194 @@ mod tests {
             -300
         );
         assert_eq!(ledger_view::balance_of(&core.db, &bob_addr).unwrap(), 300);
+    }
+
+    /// Issues a headroom certificate for `member` through the engine (the live,
+    /// connected path a member uses before going offline), returning its content
+    /// id. The DTN cert-backed spends below then draw against it.
+    fn issue_cert_for(
+        core: &Core,
+        member: &Keypair,
+        cap_centi: i64,
+        now: i64,
+    ) -> rrn_ledger::escrow::CertId {
+        let nonce = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+            .unwrap()
+            .next_nonce(&member.public_key().to_bytes());
+        let req = rrn_ledger::escrow::CertificateRequest::new(
+            Address::from_public_key(member.public_key()),
+            cap_centi,
+            nonce,
+            now,
+        );
+        let mut engine =
+            Engine::new(&core.db, core.station_keypair()).with_credit_config(core.credit);
+        engine
+            .submit_certificate_request(SignedPayload::sign(req, member), now)
+            .unwrap()
+            .payload
+            .cert_id
+    }
+
+    /// A cert-backed spend from `sender` drawing `amount` against `cert`.
+    fn cert_backed_proposal(
+        sender: &Keypair,
+        receiver: &Keypair,
+        amount: i64,
+        cert: rrn_ledger::escrow::CertId,
+        nonce: u64,
+        proposed_at: i64,
+        expires_at: i64,
+    ) -> SignedProposal {
+        let p = TransactionProposal::new(
+            Address::from_public_key(sender.public_key()),
+            Address::from_public_key(receiver.public_key()),
+            amount,
+            None,
+            nonce,
+            proposed_at,
+            expires_at,
+        )
+        .with_certificate(cert);
+        SignedProposal::sign(p, sender)
+    }
+
+    fn consumed_of(core: &Core, cert: &rrn_ledger::escrow::CertId) -> i64 {
+        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+            .unwrap()
+            .certificate(cert)
+            .unwrap()
+            .consumed_centi
+    }
+
+    /// The ticket's §4 acceptance: an offline-signed cert-backed proposal and its
+    /// confirmation admit from a bundle even though the sender has **no floor
+    /// headroom left** — the escrow reserved at issuance honors the spend — and
+    /// the amount is consumed from the certificate.
+    #[test]
+    fn dtn_cert_backed_spend_is_admitted_with_no_floor_headroom() {
+        let mut core = test_core(); // clock 1000, floor -2000, cert cap max 1000
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+
+        // Alice reserves a 1000 certificate (nonce 0) while connected, then a
+        // plain 1000 debit (nonce 1) takes her committed position to the -2000
+        // floor: zero online headroom remains.
+        let cert = issue_cert_for(&core, &alice, 1_000, 1000);
+        {
+            let mut engine =
+                Engine::new(&core.db, core.station_keypair()).with_credit_config(core.credit);
+            engine
+                .submit_proposal(
+                    member_proposal(&alice, &bob, 1_000, 1, 1000, 1_001_000),
+                    1000,
+                )
+                .unwrap();
+            // Any further *plain* debit now breaches the floor…
+            let over = member_proposal(&alice, &bob, 1, 2, 1000, 1_001_000);
+            assert!(matches!(
+                engine.submit_proposal(over, 1000),
+                Err(rrn_ledger::Error::DebtFloorExceeded { .. })
+            ));
+        }
+
+        // …but a cert-backed 300 spend (nonce 2), signed offline, admits over DTN
+        // together with bob's confirmation — the escrow is honored.
+        let spend = cert_backed_proposal(&alice, &bob, 300, cert, 2, 900, 901_000);
+        let confirmation = member_confirmation(&bob, &spend, 950);
+        let receipt = submit_bundle(
+            &mut core,
+            &[
+                outbox_entry(&alice, 0, zero(), &spend, 900),
+                outbox_entry(&bob, 0, zero(), &confirmation, 950),
+            ],
+            1000,
+        );
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the escrow honors the spend though no floor headroom remains"
+        );
+        assert!(matches!(
+            receipt.payload.outcomes[1].disposition,
+            Disposition::Admitted { .. }
+        ));
+        assert_eq!(consumed_of(&core, &cert), 300);
+    }
+
+    /// A member-signed certificate return rides DTN and releases the escrow;
+    /// an overspend is refused `cert-overspent`; and a certificate *request*,
+    /// which needs the station's live signed reply, is refused `unroutable-kind`.
+    #[test]
+    fn dtn_routes_cert_return_and_refuses_overspend_and_request() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+
+        // Alice's offline outbox chain: a 300 spend (admits, consumes 300), a
+        // second 300 spend (overspent — 600 > cap 500), then a return.
+        let spend0 = cert_backed_proposal(&alice, &bob, 300, cert, 1, 900, 901_000);
+        let e0 = outbox_entry(&alice, 0, zero(), &spend0, 900);
+        let spend1 = cert_backed_proposal(&alice, &bob, 300, cert, 2, 900, 901_000);
+        let e1 = outbox_entry(&alice, 1, e0.payload.entry_hash(), &spend1, 901);
+        let ret = SignedPayload::sign(
+            rrn_ledger::escrow::CertificateReturn {
+                member: Address::from_public_key(alice.public_key()),
+                cert_id: cert,
+                returned_at: 902,
+            },
+            &alice,
+        );
+        let e2 = outbox_entry(&alice, 2, e1.payload.entry_hash(), &ret, 902);
+
+        let receipt = submit_bundle(&mut core, &[e0, e1, e2], 1000);
+        let d: Vec<_> = receipt
+            .payload
+            .outcomes
+            .iter()
+            .map(|o| o.disposition)
+            .collect();
+        assert!(matches!(d[0], Disposition::Admitted { .. }), "first spend");
+        assert!(
+            matches!(
+                d[1],
+                Disposition::Refused {
+                    reason: RefusalReason::CertOverspent
+                }
+            ),
+            "overspend refused with the cert-overspent slug"
+        );
+        assert!(matches!(d[2], Disposition::Admitted { .. }), "return");
+
+        // The return took effect: the certificate is no longer outstanding.
+        assert!(
+            rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+                .unwrap()
+                .outstanding_certs_of(&Address::from_public_key(alice.public_key()))
+                .is_empty()
+        );
+
+        // A certificate *request* cannot ride a store-and-forward bundle.
+        let req = SignedPayload::sign(
+            rrn_ledger::escrow::CertificateRequest::new(
+                Address::from_public_key(bob.public_key()),
+                100,
+                0,
+                900,
+            ),
+            &bob,
+        );
+        let receipt2 = submit_bundle(&mut core, &[outbox_entry(&bob, 0, zero(), &req, 900)], 1100);
+        assert!(matches!(
+            receipt2.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::UnroutableKind
+            }
+        ));
     }
 
     /// A bundle mixing a good record, a bad signature, an already-admitted

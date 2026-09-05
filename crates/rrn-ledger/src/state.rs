@@ -387,6 +387,12 @@ impl LedgerSnapshot {
             let slot = self.max_nonce.entry(nonce_key).or_insert(proposal.nonce);
             *slot = (*slot).max(proposal.nonce);
             let id = proposal.id;
+            // A cert-backed spend consumes from its certificate monotonically
+            // (ADR-0021 §5): capture the link, spender, and amount before the
+            // payload moves.
+            let cert_spend = proposal
+                .cert_id
+                .map(|cid| (cid, proposal.sender, proposal.amount_centi));
             let signed = SignedProposal {
                 payload: proposal,
                 signer: stored.signer,
@@ -403,6 +409,42 @@ impl LedgerSnapshot {
                     ..AdmissionTimes::default()
                 },
             );
+            // Consume the spend from its certificate. Monotone: a later
+            // cancellation of this proposal does NOT replenish the cap (ADR-0021
+            // §5 arrival-order accounting) — nothing here ever subtracts, and the
+            // cancellation branch below leaves `consumed_centi` untouched, so the
+            // cancelled amount stops counting as a pending debit but stays
+            // consumed. Rationale: an offline receiver may already have been shown
+            // the spend history; replenishing would let presented history
+            // understate the member's true exposure. A cert-backed proposal is
+            // only ever admitted by the engine against the signer's own
+            // outstanding certificate, so in a well-formed single-writer log the
+            // certificate is present, its member is the sender, and the amount is
+            // positive. Replay re-checks all three anyway (re-derive, never
+            // re-enforce — ADR-0018): a hostile log copy naming an unknown or
+            // foreign certificate, or carrying a non-positive amount, counts
+            // nothing — so consumption is unconditionally monotone (it can only
+            // ever grow). An unknown-cid miss is logged for forensics.
+            if let Some((cid, sender, amount_centi)) = cert_spend {
+                match self.certificates.get_mut(&cid) {
+                    Some(cert_state)
+                        if cert_state.certificate.payload.member == sender && amount_centi > 0 =>
+                    {
+                        cert_state.consumed_centi =
+                            cert_state.consumed_centi.saturating_add(amount_centi);
+                    }
+                    Some(_) => tracing::warn!(
+                        cert = ?cid,
+                        "cert-backed proposal at replay names a certificate whose member is not \
+                         its sender, or carries a non-positive amount; counting no consumption"
+                    ),
+                    None => tracing::warn!(
+                        cert = ?cid,
+                        "cert-backed proposal names an unknown certificate at replay; \
+                         counting no consumption"
+                    ),
+                }
+            }
             return Ok(());
         }
 

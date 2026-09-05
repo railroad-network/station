@@ -27,8 +27,8 @@ use rrn_identity::address::Address;
 use crate::credit::{committed_debits_centi, CreditConfig};
 use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
 use crate::escrow::{
-    CertificateStatus, HeadroomCertificate, SignedCertificateRequest, SignedCertificateReturn,
-    SignedHeadroomCertificate,
+    spend_admissible_until, CertId, CertificateStatus, HeadroomCertificate,
+    SignedCertificateRequest, SignedCertificateReturn, SignedHeadroomCertificate,
 };
 use crate::settlement::{BalanceView, SettlementConfig};
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
@@ -90,6 +90,64 @@ impl<'db> Engine<'db> {
         Ok(())
     }
 
+    /// Validates a cert-backed spend against the certificate it names (ADR-0021
+    /// §3–§4). All checks pass ⇒ the caller admits the spend **without** a
+    /// debt-floor check: the headroom was reserved at issuance.
+    ///
+    /// The checks, in order, each with a typed error: the proposal is a
+    /// positive-amount spend (the certificate holder must be the debtor — a
+    /// payment request cannot ride an escrow); the certificate exists; it is still
+    /// `Outstanding` (not returned); its member is the proposal's sender; `now` is
+    /// at or before the shared spend-admissibility boundary
+    /// ([`spend_admissible_until`]); and this spend fits within the certificate's
+    /// remaining allowance (`cap − consumed`). The overspend error carries the
+    /// three amounts structurally — T2.3.3 reads them at ingest to assemble
+    /// equivocation evidence, never by string-matching.
+    fn check_cert_backed(
+        &self,
+        snapshot: &LedgerSnapshot,
+        p: &crate::transaction::TransactionProposal,
+        cert_id: &CertId,
+        now: i64,
+    ) -> Result<()> {
+        // A cert-backed record must debit its signer; a payment request (≤ 0,
+        // which debits the receiver) cannot ride an escrow (ADR-0021 §3–§4).
+        if p.amount_centi <= 0 {
+            return Err(Error::CertificateMisuse);
+        }
+        let state = snapshot
+            .certificate(cert_id)
+            .ok_or(Error::UnknownCertificate)?;
+        // A returned (non-outstanding) certificate reserves nothing; no spend may
+        // ride it.
+        if !matches!(state.status, CertificateStatus::Outstanding) {
+            return Err(Error::CertificateNotOutstanding);
+        }
+        let cert = &state.certificate.payload;
+        // A member may only spend against their own certificate.
+        if cert.member != p.sender {
+            return Err(Error::CertificateWrongMember);
+        }
+        // Validity + DTN delivery grace + skew — the single shared boundary the
+        // reservation-release condition also uses (ADR-0021 §2/§4). Past it the
+        // reservation has released, so the spend can never be honored.
+        if now > spend_admissible_until(cert, &self.credit) {
+            return Err(Error::CertificateExpired);
+        }
+        // Cumulative admitted spend must stay within the cap. Consumption is
+        // monotone (a cancellation never replenishes — ADR-0021 §5), so this is
+        // the honest bound on cert-backed exposure.
+        let remaining = cert.cap_centi.saturating_sub(state.consumed_centi);
+        if p.amount_centi > remaining {
+            return Err(Error::CertificateOverspent {
+                cap_centi: cert.cap_centi,
+                consumed_centi: state.consumed_centi,
+                attempted_centi: p.amount_centi,
+            });
+        }
+        Ok(())
+    }
+
     /// Submits a sender-signed proposal, enforcing replay protection.
     ///
     /// Errors (without writing) on a bad signature, a sender/signer mismatch, a
@@ -143,11 +201,23 @@ impl<'db> Engine<'db> {
             });
         }
 
-        // Debt floor: a positive amount debits the sender, and their signature
-        // on this proposal is their commitment to it. A negative amount (a
-        // payment request) debits the receiver, who has signed nothing yet —
-        // that side is checked at confirmation time instead.
-        if p.amount_centi > 0 {
+        // A cert-backed spend rides the escrow reserved at issuance, so it is
+        // admitted **without a fresh debt-floor check** — the headroom was paid
+        // for when the certificate was issued (ADR-0021 §4). This is the single
+        // deliberate bypass of the debt floor in the codebase; every other
+        // proposal check (signature, sender match, window, tier, nonce,
+        // duplicate) above still applies unchanged. Note the window check
+        // `now > expires_at + skew → Expired` still governs, which is why wallets
+        // set a cert-backed proposal's `expires_at >= cert.expires_at` when they
+        // sign it (ADR-0021 §4); the engine does not enforce a minimum.
+        if let Some(cert_id) = p.cert_id {
+            self.check_cert_backed(&snapshot, p, &cert_id, now)?;
+            // NB: check_debt_floor is intentionally NOT called here — see above.
+        } else if p.amount_centi > 0 {
+            // Ordinary spend: a positive amount debits the sender, and their
+            // signature on this proposal is their commitment to it. A negative
+            // amount (a payment request) debits the receiver, who has signed
+            // nothing yet — that side is checked at confirmation time instead.
             self.check_debt_floor(&snapshot, &p.sender, p.amount_centi, now)?;
         }
 

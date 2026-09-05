@@ -363,6 +363,12 @@ pub struct TransactionRow {
     /// when the listing is one this station has seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_title: Option<String>,
+    /// The headroom certificate this spend drew against, hex — present on a
+    /// cert-backed offline spend (ADR-0021 §3, T2.3.2), absent on an ordinary
+    /// proposal. Lets the wallet mark a payment as backed by escrow and gives
+    /// T2.4.2's receiver-side checks a row-level hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_id: Option<String>,
     /// Lifecycle: `pending` | `confirmed` | `settled` | `cancelled`.
     pub state: String,
     /// The oracle tier that governs this transaction (T1.8.1): `1` — settlement
