@@ -74,7 +74,14 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
    the subject is never eligible to judge their own case.
 4. **Verdict records.** A new `EquivocationVerdictRecord` kind (defined in
    `rrn-ledger::escrow` in T2.3.3) with decisions `Confirm | Overturn`, distinct
-   from `JurorVerdict` so no shipped wire format changes.
+   from `JurorVerdict` so no shipped wire format changes. The T2.3.3 record names a
+   single `equivocation_id` (a content address) and scoring neutralizes per record;
+   because a case is keyed by *identity* (§1), **an `Overturn` must neutralize every
+   record attached to that identity, not just the one content-address it names** —
+   T2.3.4 either keys the verdict by the case identity or emits one `Overturn` per
+   attached record. Until then the honest single-writer station holds exactly one
+   record per identity (dedup, §1), so the distinction is latent; the jury path must
+   not inherit it silently.
 5. **Three log-derived terminal states; a lapse is `Lapsed`, not a synthesized
    `Confirm`.** The reputation penalty applies at **record verification**, not at
    verdict (T2.3.3), so the status quo after a verified record is *already*
@@ -125,6 +132,17 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
   itself an equivocation.
 - Compensating the stranded receiver of a refused cert-backed spend remains out
   of scope (a governance question; ADR-0021 residual).
+- **Anchoring cascade.** Zeroing a member's dimensions drops their composite, so
+  if they were the *sole* anchor of another identity (ADR-0009 identity anchoring),
+  that identity falls back to the anchor cap until re-anchored. This is the intended
+  chain-of-trust cost of vouching for someone who then equivocates, but T2.3.4
+  should surface it (a de-anchored member is not themselves accused).
+- **Overturn signer trust (T2.3.4).** Scoring currently accepts an `Overturn` from
+  any signer (`overturned_equivocations`); safe today because no path but the
+  station can append one (the verdict kind is `UnroutableKind` on DTN with no RPC
+  surface), but a peer-gossiped member-signed `Overturn` would lift a penalty once
+  cross-station sync admits foreign records. T2.3.4 gates it on the station signer
+  (there is a `// T2.3.4:` marker in the code).
 
 ## Alternatives Considered
 

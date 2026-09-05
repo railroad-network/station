@@ -13,15 +13,16 @@
 //!
 //! - **Trade reliability** — each settled transaction the address is a party to
 //!   (sender or receiver) is one positive event. Cancelled proposals are neutral
-//!   (they contribute nothing); the disputed-against slot is reserved and never
-//!   populated in Phase 1.
+//!   (they contribute nothing). Its reserved negative slot is now populated by a
+//!   proven equivocation (a false headroom claim; ADR-0021 §5), which zeroes it.
 //! - **Attestation accuracy** — each signed statement the address made about a
 //!   transaction or another member: the vouches it signed, plus the transaction
 //!   confirmations it signed as a receiver. Each counts as accurate *unless later
 //!   proven wrong*: a dispute upheld against a confirmation (ADR-0014) both strips
 //!   its positive credit and levies a penalty, dragging the dimension below
 //!   neutral — the "proven wrong" negative event ADR-0009 always reserved for this
-//!   dimension, and the forfeiture the Tier-2 stake finally pays.
+//!   dimension, and the forfeiture the Tier-2 stake finally pays. A proven
+//!   equivocation zeroes this dimension too (ADR-0021 §5 / ADR-0025).
 //!
 //! # The count-to-score mapping
 //!
@@ -196,9 +197,10 @@ impl<'db> ReputationScorer<'db> {
             }
         }
 
-        // A proven equivocation is a negative attestation-accuracy input (ADR-0021
-        // §5). Like vouches, equivocation records are standalone station-signed log
-        // entries the ledger replay ignores, so they need a direct scan. Two guards
+        // A proven equivocation zeroes both live dimensions — trade reliability and
+        // attestation accuracy (ADR-0021 §5 / ADR-0025). Like vouches, equivocation
+        // records are standalone station-signed log entries the ledger replay
+        // ignores, so they need a direct scan. Two guards
         // make this a pure function of the log that convicts no one wrongly:
         //   1. A jury `Overturn` verdict (ADR-0021 §5) neutralizes the record — its
         //      penalty lifts. Gated on the verdict's `decided_at <= at_time` so a

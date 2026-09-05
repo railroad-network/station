@@ -3613,7 +3613,19 @@ impl Core {
         // self-contained proof of deliberate double-commitment. Record it (once
         // per certificate) before the refusal is mapped — the spend is refused
         // either way, whether carried by DTN here or submitted over live RPC.
-        if matches!(result, Err(rrn_ledger::Error::CertificateOverspent { .. })) {
+        //
+        // Both `CertificateOverspent` and `CertificateExpired` are considered: the
+        // engine checks the admissibility boundary *before* the cap, so a member
+        // who lets the over-cap spend arrive late (past validity + DTN grace) would
+        // otherwise be refused `CertificateExpired` and escape the proof. The
+        // dishonesty — signing spends that jointly exceed the cap — is
+        // timing-independent, and `record_cert_overspend_equivocation` self-gates on
+        // `verify_evidence`, so a late spend that is *within* cap records nothing.
+        if matches!(
+            result,
+            Err(rrn_ledger::Error::CertificateOverspent { .. }
+                | rrn_ledger::Error::CertificateExpired)
+        ) {
             if let Ok(refused) = from_canonical_bytes::<TransactionProposal>(bytes) {
                 self.record_cert_overspend_equivocation(
                     &SignedProposal {
@@ -3646,9 +3658,11 @@ impl Core {
     }
 
     /// Records a station-signed cert-overspend [`EquivocationRecord`] for a
-    /// refused cert-backed spend (ADR-0021 §5, T2.3.3) — unless one already stands
-    /// for that certificate. The spend is refused regardless; this only appends
-    /// the proof.
+    /// cert-backed spend the engine refused as `CertificateOverspent` **or**
+    /// `CertificateExpired` (ADR-0021 §5, T2.3.3) — unless one already stands for
+    /// that certificate. The spend is refused regardless; this only appends the
+    /// proof, and only when `verify_evidence` confirms a genuine overspend (so a
+    /// within-cap late spend records nothing).
     ///
     /// Evidence is the admitted cert-backed spends for the certificate plus the
     /// refused one. If that would exceed the [`MAX_EVIDENCE_ITEMS`] DoS bound, the
@@ -4151,7 +4165,13 @@ impl Core {
                 Engine::new(&self.db, self.station_keypair()).with_credit_config(self.credit);
             engine.submit_proposal(signed, now)
         };
-        if let Err(rrn_ledger::Error::CertificateOverspent { .. }) = &result {
+        // Both overspend and (late) expiry are provable equivocation — the engine
+        // checks expiry before the cap. The helper self-gates on `verify_evidence`,
+        // so a within-cap late spend records nothing.
+        if let Err(
+            rrn_ledger::Error::CertificateOverspent { .. } | rrn_ledger::Error::CertificateExpired,
+        ) = &result
+        {
             self.record_cert_overspend_equivocation(&refused_copy, now)
                 .map_err(BundleIngestError::pair_error)?;
         }
@@ -6933,6 +6953,59 @@ mod tests {
 
         let recs = equivocations(&core);
         assert_eq!(recs.len(), 1, "live-RPC overspend records one equivocation");
+        assert!(recs[0].payload.verify_evidence(Some(500)));
+    }
+
+    /// An over-cap spend that arrives *after* the certificate's spend-admissibility
+    /// boundary is refused `CertExpired` (the engine checks expiry before the cap),
+    /// yet it is still provable equivocation with the admitted spend — so it is
+    /// recorded, closing the "delay the overspending bundle" evasion.
+    #[test]
+    fn dtn_late_over_cap_spend_still_records_equivocation() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
+
+        // A 300 spend admits on time.
+        let spend0 = cert_backed_proposal(&alice, &bob, 300, cert, 1, 900, 901_000);
+        submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &spend0, 900)],
+            1000,
+        );
+
+        // The over-cap 300 spend arrives past the admissibility boundary. Its own
+        // window is still open (`expires_at` beyond `late`), so the refusal is
+        // `CertExpired`, not the ordinary window `Expired`.
+        let boundary = {
+            let snap =
+                rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+            let c = snap.certificate(&cert).unwrap().certificate.payload.clone();
+            rrn_ledger::escrow::spend_admissible_until(&c, &core.credit)
+        };
+        let late = boundary + 1;
+        // Admission `now` is the station clock, not the bundle's assembly time —
+        // advance it past the boundary so the engine judges the spend expired.
+        core.clock.advance(late - core.clock.now());
+        let spend1 = cert_backed_proposal(&alice, &bob, 300, cert, 2, 900, late + 1_000_000);
+        let receipt = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 1, zero(), &spend1, 900)],
+            late,
+        );
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::CertExpired
+                }
+            ),
+            "got {:?}",
+            receipt.payload.outcomes[0].disposition
+        );
+        let recs = equivocations(&core);
+        assert_eq!(recs.len(), 1, "a late over-cap spend is still recorded");
         assert!(recs[0].payload.verify_evidence(Some(500)));
     }
 

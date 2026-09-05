@@ -749,9 +749,12 @@ pub type SignedEquivocationRecord = SignedPayload<EquivocationRecord>;
 /// scoring can read a ruling deterministically from the log (a
 /// [`Overturn`](VerdictDecision::Overturn) neutralizes the equivocation as a
 /// scoring input). The jury *that produces* this record — sortition, panel,
-/// windows — is a follow-up ticket; until then the record is defined and
-/// verifiable but never appended by this codebase, and an unruled equivocation
-/// stands (the ADR-0021 §5 confirm-on-lapse default).
+/// windows — is a follow-up ticket (T2.3.4); until then the record is defined and
+/// verifiable but never appended by this codebase. An unruled case lapses to a
+/// distinct `Lapsed` state (ADR-0025 §5), **never a synthesized `Confirm`**: the
+/// reputation penalty already applies at record verification, so a lapse leaving
+/// it standing is ADR-0014's fail-open with the status quo correctly identified.
+/// A `Confirm` verdict is written only when a jury affirmatively confirms.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EquivocationVerdictRecord {
     /// The equivocation case being ruled on.
@@ -765,10 +768,10 @@ pub struct EquivocationVerdictRecord {
 /// A panel's terminal decision on an equivocation case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerdictDecision {
-    /// The evidence stands; the equivocation is confirmed. This is also the
-    /// default outcome when a panel lapses (ADR-0021 §5's deliberate inversion
-    /// of ADR-0014's fail-open-to-status-quo default: the status quo *is* the
-    /// cryptographic proof).
+    /// A jury affirmatively confirmed the evidence. This is written only on an
+    /// actual ruling — **not** synthesized when a panel lapses (a lapse is the
+    /// distinct `Lapsed` case state, ADR-0025 §5, under which the already-applied
+    /// reputation penalty simply stands).
     Confirm,
     /// The panel found the station's evidence invalid (e.g. a buggy or malicious
     /// station); the record is neutralized as a scoring input.

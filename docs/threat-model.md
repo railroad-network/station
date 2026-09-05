@@ -917,12 +917,23 @@ and disqualifies them from issuing new certificates until overturned (ADR-0025).
   cert-referenced spends whose amounts sum past the cap (read from the certificate
   on the same log); for a fork, that two entries validate under
   `outbox::is_fork` at one position by the named member. A station cannot forge
-  member signatures, so it cannot manufacture the evidence. **Reputation scoring
-  calls `verify_evidence` during replay** and ignores any record that fails it, so
-  a hostile log copy's bogus record produces no scoring consequence (tested). The
-  jury **overturn** verdict is the human backstop for the residual case a bug or a
-  key compromise could still create; until the jury path lands (see limitation
-  below) the evidence re-verification is the standing guard.
+  member signatures, so it cannot manufacture the evidence. **Both reputation
+  scoring and `LedgerSnapshot` derivation call `verify_evidence` on replay** and
+  ignore any record that fails it, so a hostile or peer-gossiped log copy's bogus
+  record produces no scoring consequence *and* cannot occupy the
+  one-record-per-offence dedup slot (which would otherwise suppress the genuine
+  record — a slot-poisoning evasion), nor surface through the counterparty accessor
+  (all tested). The jury **overturn** verdict is the human backstop for the residual
+  case a bug or a key compromise could still create; until the jury path lands (see
+  limitation below) the evidence re-verification is the standing guard.
+- *Threat: a peer-gossiped member-signed `Overturn` lifting a genuine penalty.*
+  Once cross-station sync admits foreign records, a member could relay a self-signed
+  `Overturn` to neutralize their own equivocation.
+- *Mitigation / residual:* not reachable today — the verdict kind is refused
+  (`UnroutableKind`) on DTN and has no RPC surface, so only the station can append
+  one. T2.3.4 gates `overturned_equivocations` on the station signer before the
+  jury path can produce verdicts (a `// T2.3.4:` marker flags the spot). Stated as a
+  known limitation until then.
 - *Threat: evidence-size denial of service.* A record padded with many or huge
   evidence blobs bloats the log and every replica's replay.
 - *Mitigation:* front-door caps — at most `MAX_EVIDENCE_ITEMS` (16) items, each at
