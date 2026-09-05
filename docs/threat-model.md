@@ -847,9 +847,9 @@ equivocation *consequences* remain T2.3.3.
   config until governance can tune it, so an operator can raise a community's
   offline exposure up to the Tier-2 ceiling the station enforces. Deliberate,
   *bounded* offline overspend — burning standing to double-commit one
-  certificate's cap — is not preventable without connectivity; making it provable
-  equivocation and a reputation event is T2.3.3, and until then the cap is the
-  only bound. The receiver's offline verification is only as good as the spend
+  certificate's cap — is not preventable without connectivity; T2.3.3 makes it
+  provable equivocation and a reputation event (see "Provable equivocation"
+  below), and the cap bounds the exposure. The receiver's offline verification is only as good as the spend
   history a spender presents (ADR-0021 Consequences); the cap still bounds the
   damage.
 - *Threat (T2.3.2): the floor-bypass carve-out admitting an unbacked debit.* A
@@ -896,6 +896,78 @@ equivocation *consequences* remain T2.3.3.
   (replicas re-derive, never re-enforce — ADR-0018); a well-formed single-writer
   log cannot contain such a record, because the engine admits a cert-backed spend
   only against the signer's own outstanding certificate.
+
+#### Provable equivocation (ADR-0021 §5, T2.3.3)
+
+Offline double-commitment cannot be *prevented* under a partition, only made
+provable, attributable, and costly. When the station refuses a cert overspend or
+an outbox-chain fork, it appends a station-signed `EquivocationRecord`
+(`rrn-ledger::escrow`) bundling the member-signed artifacts that jointly prove
+the conflict; the record is a negative reputation input (ADR-0009) and, in a
+follow-up ticket, auto-opens a jury case.
+
+- *Threat: a malicious or buggy station fabricating an equivocation to destroy a
+  member's standing.* A station appends an `EquivocationRecord` naming an honest
+  member, or one whose evidence does not actually conflict.
+- *Mitigation:* the record convicts no one on the station's word. `verify_evidence`
+  re-checks **every embedded member signature** and re-derives the conflict from
+  the record itself — for cert-overspend, that the member signed distinct
+  cert-referenced spends whose amounts sum past the cap (read from the certificate
+  on the same log); for a fork, that two entries validate under
+  `outbox::is_fork` at one position by the named member. A station cannot forge
+  member signatures, so it cannot manufacture the evidence. **Reputation scoring
+  calls `verify_evidence` during replay** and ignores any record that fails it, so
+  a hostile log copy's bogus record produces no scoring consequence (tested). The
+  jury **overturn** verdict is the human backstop for the residual case a bug or a
+  key compromise could still create; until the jury path lands (see limitation
+  below) the evidence re-verification is the standing guard.
+- *Threat: evidence-size denial of service.* A record padded with many or huge
+  evidence blobs bloats the log and every replica's replay.
+- *Mitigation:* front-door caps — at most `MAX_EVIDENCE_ITEMS` (16) items, each at
+  most `MAX_EVIDENCE_ITEM_BYTES` (64 KiB) — re-enforced inside `verify_evidence`,
+  so an over-cap record verifies as false rather than being processed. The station
+  builds cert-overspend evidence as a *minimal* proof (the refused spend plus the
+  largest admitted spends that carry the sum past the cap) and **appends only a
+  record that passes `verify_evidence`** — so an admitted spend bloated past the
+  64 KiB item bound (e.g. via a large `memo`, which has no front-door length cap
+  today) cannot produce a station-signed record no replica can verify, nor
+  dead-lock the one-record-per-certificate dedup slot with such a record.
+- *Residual risk (evasion, not exposure):* two count-bounded gaps let a
+  *determined* equivocator avoid the reputation consequence (never the exposure —
+  the spend is always refused, the cap always bounds the loss). (1) An overspend
+  fragmented across more than `MAX_EVIDENCE_ITEMS − 1` admitted cert spends cannot
+  be proven within the evidence-count cap, so no record is appended. (2) An
+  admitted spend carrying an oversized `memo` cannot be embedded. Both are the DoS
+  cap doing its job (a bounded record) at the cost of completeness. Closing them
+  is a front-door admission-rule change — cap the proposal `memo`/record size well
+  under 64 KiB, and/or engine-refuse a cert's `MAX_EVIDENCE_ITEMS`-th admitted
+  spend as a distinct reason so every overspend stays provable in ≤ 16 items — and
+  is deferred to T2.3.4 / a follow-up (surfaced to the maintainer, not slipped in).
+- *Threat: duplicate records amplifying one offence.* Repeated overspend attempts,
+  or repeated presentations of a fork, appending a record each time.
+- *Mitigation:* one record per `(member, certificate)` and per `(member, fork
+  position)` — the snapshot indexes existing records and the station consults it
+  before appending, so a repeated attempt is refused without a second record
+  (tested). A refused spend is never admitted, so it also cannot re-enter via the
+  log-dedup path.
+- *Design note — the deliberate default inversion.* An equivocation case, unlike a
+  transaction dispute (ADR-0014, which fails **open** to the confirmed status quo),
+  is designed to fail to the **evidence**: an unruled or lapsed case leaves the
+  recorded proof standing (`Confirm`), because the status quo here *is*
+  cryptographic proof of double-commitment, not a contested he-said-she-said. Only
+  an affirmative `Overturn` neutralizes it. This inverts ADR-0014's status-quo
+  default by design (ADR-0021 §5).
+- *Known limitation (T2.3.3 scope):* the **jury path itself is not yet built** —
+  the `EquivocationRecord`, its verification, the station's detection/append
+  wiring, and the reputation input ship now; the sortition/panel/verdict machinery
+  that *produces* an `EquivocationVerdictRecord` is a follow-up ticket (its record
+  kind is defined here so scoring's neutralize-on-overturn is exact and testable by
+  injection). In the interim an equivocation counts against reputation with no
+  jury recourse; the `verify_evidence` re-check is what bounds the malicious-station
+  threat until the overturn path exists. **Compensating the stranded receiver** of
+  a refused cert-backed spend is out of scope (a governance question; ADR-0021
+  residual) — the receiver can *see* the proof (`equivocation_for_cert`), but
+  making them whole is future work.
 
 #### Oracle tiering and the reputation stake
 

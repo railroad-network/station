@@ -29,7 +29,8 @@ use crate::credit::CreditConfig;
 use crate::dispute::{DisputeRecord, SignedDispute};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateRequest, CertificateReturn, CertificateState,
-    CertificateStatus, HeadroomCertificate, RequestId, SignedHeadroomCertificate,
+    CertificateStatus, EquivocationBasis, EquivocationId, EquivocationRecord, HeadroomCertificate,
+    RequestId, SignedEquivocationRecord, SignedHeadroomCertificate,
 };
 use crate::settlement::SettlementRecord;
 use crate::transaction::{
@@ -204,6 +205,17 @@ impl TransactionState {
         }
     }
 
+    /// The sender-signed proposal every state carries, whatever its stage.
+    pub fn proposal(&self) -> &SignedProposal {
+        match self {
+            TransactionState::Proposed { proposal }
+            | TransactionState::Confirmed { proposal, .. }
+            | TransactionState::Settled { proposal, .. }
+            | TransactionState::Cancelled { proposal, .. }
+            | TransactionState::Disputed { proposal, .. } => proposal,
+        }
+    }
+
     fn stage(&self) -> Stage {
         match self {
             TransactionState::Proposed { .. } => Stage::Proposed,
@@ -355,6 +367,20 @@ pub struct LedgerSnapshot {
     /// request that a genuinely earlier entry admitted from the same member
     /// *and for the same cap* (consent is to a specific amount).
     cert_requests: BTreeMap<RequestId, (Address, i64)>,
+    /// Station-signed equivocation records by content address (ADR-0021 §5,
+    /// T2.3.3). A faithful view of what the log records; scoring re-verifies each
+    /// with [`EquivocationRecord::verify_evidence`] before acting on it, so an
+    /// unverified record here is not itself a consequence.
+    equivocations: BTreeMap<EquivocationId, SignedEquivocationRecord>,
+    /// Dedup index: the equivocation already recorded against a certificate
+    /// (cert-overspend basis). One record per certificate — repeated overspend
+    /// attempts against an already-recorded cert append nothing further (the
+    /// spends are still refused). A cert belongs to one member, so the cert id
+    /// alone keys the `(member, cert)` dedup.
+    equivocation_by_cert: BTreeMap<CertId, EquivocationId>,
+    /// Dedup index: the equivocation already recorded against an author's outbox
+    /// position (outbox-fork basis), keyed by `(author pubkey, position)`.
+    equivocation_by_fork: BTreeMap<([u8; 32], u64), EquivocationId>,
 }
 
 impl LedgerSnapshot {
@@ -631,6 +657,39 @@ impl LedgerSnapshot {
             return Ok(());
         }
 
+        // A station-signed equivocation record (ADR-0021 §5). The snapshot indexes
+        // it for the station's one-record-per-offence dedup and for the counterparty
+        // accessor; it is stored as a faithful view of the log (scoring, not the
+        // snapshot, is where [`EquivocationRecord::verify_evidence`] gates a bogus
+        // record). The first record for a given `(member, cert)` / `(member, fork
+        // position)` wins — a later duplicate is kept out of the dedup indices, so
+        // `equivocation_for_cert` always names the original.
+        if let Ok(record) = from_canonical_bytes::<EquivocationRecord>(bytes) {
+            let id = record.equivocation_id;
+            match record.basis {
+                EquivocationBasis::CertOverspend => {
+                    if let Some(cert_id) = record.cert_id {
+                        self.equivocation_by_cert.entry(cert_id).or_insert(id);
+                    }
+                }
+                EquivocationBasis::OutboxFork => {
+                    if let Some(position) = record.fork_position() {
+                        self.equivocation_by_fork
+                            .entry((record.member.public_key().to_bytes(), position))
+                            .or_insert(id);
+                    }
+                }
+            }
+            self.equivocations
+                .entry(id)
+                .or_insert(SignedEquivocationRecord {
+                    payload: record,
+                    signer: stored.signer,
+                    signature: stored.signature,
+                });
+            return Ok(());
+        }
+
         Ok(())
     }
 
@@ -699,6 +758,49 @@ impl LedgerSnapshot {
             .into_iter()
             .filter(|c| now <= spend_admissible_until(&c.certificate.payload, config))
             .collect()
+    }
+
+    /// Every admitted cert-backed spend against `cert_id`, in transaction-id
+    /// order — the admitted half of a cert-overspend equivocation proof. The
+    /// station gathers these (plus the refused spend it holds) to build an
+    /// [`EquivocationRecord`](crate::escrow::EquivocationRecord); order is
+    /// deterministic (content order) so replicas assemble identical evidence.
+    pub fn cert_backed_spends(&self, cert_id: &CertId) -> Vec<SignedProposal> {
+        self.states
+            .values()
+            .map(TransactionState::proposal)
+            .filter(|p| p.payload.cert_id == Some(*cert_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether an equivocation is already recorded against `cert_id`
+    /// (cert-overspend). The station consults this before appending so a repeated
+    /// overspend attempt refuses the spend without appending a second record.
+    pub fn has_cert_equivocation(&self, cert_id: &CertId) -> bool {
+        self.equivocation_by_cert.contains_key(cert_id)
+    }
+
+    /// Whether an equivocation is already recorded against `member`'s outbox
+    /// `position` (outbox-fork). The station's per-fork dedup guard.
+    pub fn has_fork_equivocation(&self, member: &Address, position: u64) -> bool {
+        self.equivocation_by_fork
+            .contains_key(&(member.public_key().to_bytes(), position))
+    }
+
+    /// The equivocation recorded against `cert_id`, if any — the accessor a
+    /// stranded receiver uses to see the proof behind their refused cert-backed
+    /// spend (the compensation question itself is out of scope; ADR-0021
+    /// residual).
+    pub fn equivocation_for_cert(&self, cert_id: &CertId) -> Option<&SignedEquivocationRecord> {
+        self.equivocation_by_cert
+            .get(cert_id)
+            .and_then(|id| self.equivocations.get(id))
+    }
+
+    /// Every equivocation record on the log, in content-id order.
+    pub fn equivocations(&self) -> impl Iterator<Item = &SignedEquivocationRecord> {
+        self.equivocations.values()
     }
 }
 
