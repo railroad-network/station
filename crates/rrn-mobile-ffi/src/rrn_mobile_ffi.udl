@@ -51,6 +51,68 @@ namespace rrn_mobile_ffi {
     // identity than the request targets; `Corrupt` on malformed input.
     [Throws=RecoveryError]
     bytes respond_to_recovery(WalletContents wallet, bytes stored_shard_payload, bytes request_payload);
+
+    // ---- Delay-tolerant submission (T2.4.2, ADR-0020) --------------------
+    // Signed records cross as portable `{signer, sig, body}` envelope bytes; an
+    // outbox entry envelope returned by `outbox_next_entry` is exactly what
+    // `bundle_assemble` consumes and what the next `outbox_next_entry` takes as
+    // its `prev_entry`. The signing secret stays in Rust (`Keypair` handle).
+
+    // Builds + signs the next entry in `author`'s outbox chain, wrapping one
+    // already-signed application record (`record_envelope`, a `{signer,sig,body}`
+    // envelope, carried verbatim). Position and prev_hash come from `prev_entry`
+    // (the previously returned envelope) — position 0 / all-zero prev_hash when
+    // null. Returns the new entry as `{signer,sig,body}` envelope bytes.
+    [Throws=DtnError]
+    bytes outbox_next_entry(Keypair author, bytes? prev_entry, bytes record_envelope, i64 authored_at);
+
+    // Assembles a carriage bundle from outbox entry envelopes. The result is
+    // structurally validated against the station's own decode (size/count caps,
+    // same-author order), so it is one the station will accept.
+    [Throws=DtnError]
+    bytes bundle_assemble(sequence<bytes> entry_envelopes, i64 assembled_at);
+
+    // Decodes a bundle into per-entry display data for a courier UI (counts,
+    // authors, record hashes/kinds, validity). Applies the station's structural
+    // decode bounds.
+    [Throws=DtnError]
+    BundleInfo bundle_parse(bytes bundle_bytes);
+
+    // Verifies a station delivery receipt's signature (refusing a receipt not
+    // signed by `expected_station_pubkey`) and returns one typed outcome per
+    // presented record.
+    [Throws=DtnError]
+    sequence<ReceiptOutcome> receipt_parse(bytes receipt_bytes, bytes expected_station_pubkey);
+
+    // ---- Escrowed offline spending (T2.4.2, ADR-0021) --------------------
+
+    // Signs a member's request for a headroom certificate, returning it as
+    // `{signer,sig,body}` envelope bytes. Never throws.
+    bytes certificate_request_sign(Keypair member, i64 cap_centi, u64 nonce, i64 requested_at);
+
+    // Parses a station-signed certificate, verifying the station signature
+    // (refusing one not signed by `expected_station_pubkey`), and returns its
+    // non-secret fields.
+    [Throws=CertError]
+    CertificateInfo certificate_parse(bytes cert_envelope_bytes, bytes expected_station_pubkey);
+
+    // Signs a cert-backed offline spend against `cert_id`, returning it as
+    // `{signer,sig,body}` envelope bytes — the bytes a receiver passes to
+    // `offline_spend_verify` and that `outbox_next_entry` later wraps.
+    [Throws=CertError]
+    bytes proposal_sign_with_certificate(Keypair sender, string receiver_address, i64 amount_centi, string? memo, bytes cert_id, u64 nonce, i64 proposed_at, i64 expires_at);
+
+    // The ADR-0021 §3 receiver ritual, offline, in one call: verify the
+    // certificate's station signature, the proposal's signature and sender, that
+    // the certificate is for the sender and the proposal references it, that the
+    // spend is addressed to `receiver_address` (the verifier's own address), that
+    // the amount is a positive debit, that the proposal is not otherwise
+    // inadmissible (window/memo/tier), that the proposal and certificate are
+    // unexpired at `now` (the receiver's clock — testimony), that each
+    // presented-history entry verifies and references this certificate, and that
+    // the amount fits the allowance left (cap − Σ history). Returns a verdict;
+    // never throws.
+    OfflineSpendVerdict offline_spend_verify(bytes cert_envelope, bytes proposal_envelope, sequence<bytes> presented_history, string receiver_address, bytes station_pubkey, i64 now);
 };
 
 // Flat error surface for canonical_bytes. Mirrors the tagged-value failure modes
@@ -268,4 +330,99 @@ interface RecoveryPackage {
     // key can open the sealed shard, so it is safe over an untrusted channel.
     [Throws=RecoveryError]
     bytes shard_payload(u32 index);
+};
+
+// ---------------------------------------------------------------------------
+// Delay-tolerant submission (T2.4.2, ADR-0020). Thin marshalling over
+// rrn-protocol so the app builds/carries its own outbox chain, assembles and
+// inspects bundles, and reads station delivery receipts. See src/dtn.rs.
+
+// Flat error surface for the DTN operations. Coarse by design; the crate-local
+// detail stays in Rust.
+[Error]
+enum DtnError {
+    "MalformedEnvelope",
+    "RecordSignatureInvalid",
+    "InvalidChain",
+    "BundleTooLarge",
+    "TooManyEntries",
+    "EntriesOutOfOrder",
+    "StationSignatureInvalid",
+    "InvalidKey",
+};
+
+// One entry's display data in a parsed bundle (for a courier UI). `record_kind`
+// is the wrapped record's `kind` discriminant (e.g. "rrn.tx.proposal"), or the
+// empty string if it is not a kind-tagged map. `valid` reports whether the
+// entry's signatures check out.
+dictionary BundleEntryInfo {
+    string author;
+    u64 position;
+    string record_hash;
+    string record_kind;
+    boolean valid;
+};
+
+// Display data for a parsed bundle. Inspection only — no admission, no secret.
+dictionary BundleInfo {
+    u32 entry_count;
+    i64 assembled_at;
+    sequence<BundleEntryInfo> entries;
+};
+
+// One record's fate in a parsed delivery receipt. `seq` is present exactly for
+// the "admitted"/"known" outcomes; `reason` (a machine-stable refusal slug)
+// exactly for "refused".
+dictionary ReceiptOutcome {
+    string record_hash;
+    string outcome;
+    u64? seq;
+    string? reason;
+};
+
+// ---------------------------------------------------------------------------
+// Escrowed offline spending (T2.4.2, ADR-0021). Thin marshalling over
+// rrn-ledger's escrow / transaction types. See src/cert.rs.
+
+// Flat error surface for the fallible certificate operations.
+[Error]
+enum CertError {
+    "InvalidAddress",
+    "InvalidCertId",
+    "InvalidKey",
+    "MalformedCertificate",
+    "StationSignatureInvalid",
+};
+
+// Non-secret description of a headroom certificate, for a cert-wallet UI.
+// `cert_id` is hex; `expires_at` is the receiver-side validity boundary
+// offline_spend_verify checks.
+dictionary CertificateInfo {
+    string member;
+    i64 cap_centi;
+    i64 issued_at;
+    i64 expires_at;
+    string cert_id;
+};
+
+// The receiver's verdict on an offline cert-backed spend (ADR-0021 §3). Exactly
+// one variant is returned. `Ok.remaining_centi` is the allowance left after this
+// spend (cap − presented history − amount); every other variant is a typed
+// refusal reason.
+[Enum]
+interface OfflineSpendVerdict {
+    Ok(i64 amount_centi, i64 remaining_centi);
+    MalformedCertificate();
+    BadCertificateSignature();
+    MalformedProposal();
+    BadProposalSignature();
+    CertMemberMismatch();
+    CertNotReferenced();
+    WrongReceiver();
+    NotADebit();
+    CertExpired();
+    ProposalExpired();
+    ProposalInadmissible();
+    Overspent(i64 available_centi, i64 attempted_centi);
+    MalformedHistory();
 };
