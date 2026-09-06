@@ -26,6 +26,12 @@
 //!   reason. A receipt is transport state, not community state: it is never
 //!   appended to the community log.
 //!
+//! [`paper`] is the paper/QR *text* layer over these shapes (T2.5.1): multi-part
+//! QR chunking for bundles and receipts, and single-QR forms for certificates and
+//! offline spend vouchers. It is a carriage encoding — the bytes it moves are the
+//! same signed payloads above, and their signatures remain the only integrity
+//! boundary.
+//!
 //! # Time in these records is testimony (ADR-0022 §3)
 //!
 //! Every timestamp here (`authored_at`, `assembled_at`, `received_at`) is a
@@ -51,6 +57,7 @@
 pub mod bundle;
 pub mod framing;
 pub mod outbox;
+pub mod paper;
 pub mod receipt;
 pub mod transport;
 
