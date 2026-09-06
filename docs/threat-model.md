@@ -2225,6 +2225,96 @@ station agree byte-for-byte on addresses, signatures, and wallet files.
   pending the RN-wrapper build (ADR-0007 accepted risk); until then the wrappers
   are exercised against Rust-generated fixtures, not the live native module.
 
+### `mobile` DTN + certificate FFI surface (`rrn-mobile-ffi`, M2.4)
+
+*Implemented in M2.4 (T2.4.2).* Extends the crypto FFI above with the primitives
+the app needs to participate in delay-tolerant submission (ADR-0020) and escrowed
+offline spending (ADR-0021) while partitioned: build and carry its own outbox
+chain, assemble/inspect bundles, read station delivery receipts, hold and read
+certificates, sign cert-backed spends, and — the security-critical one — **verify
+a counterparty's certificate and spend entirely offline**. As with the rest of
+this crate there is no cryptography of its own: every function marshals bytes to
+`rrn-protocol` (`outbox`, `bundle`, `receipt`) and `rrn-ledger` (`escrow`,
+`transaction`), reached through the same code the station runs. Signed records
+cross as the portable `{signer, sig, body}` envelope, byte-identical to
+`rrn_protocol::receipt::encode_signed` and `EntryEnvelope`. This subsection covers
+that boundary; the DTN wire layer's own threats are the `rrn-protocol` section and
+the escrow arithmetic's are the `rrn-ledger` section.
+
+**Assets:** the receiver's goods, staked on an offline verification made with no
+station to consult; the parity guarantee that the receiver's offline decision and
+the station's later admission speak the same rules; the signing secret while
+carried through the DTN/cert signers.
+
+- **The offline receiver ritual is Rust's, not a mobile reimplementation.**
+  *Threat:* the app re-implements the ADR-0021 §3 receiver check and subtly
+  disagrees with the station — accepting a spend the station will refuse (goods
+  delivered against nothing) or rejecting one it would admit. *Mitigation:*
+  `offline_spend_verify` is one call into the ledger/crypto types the station
+  uses: it verifies the station signature on the certificate, the proposal's
+  signature *and that its signer is its sender*, `cert.member == sender`, that the
+  proposal references this certificate, **that the spend is addressed to the
+  verifying receiver** (a proposal naming someone else can only be confirmed by
+  that someone else, so accepting it delivers goods against nothing —
+  `WrongReceiver`), a positive-debit amount, the proposal's own payload-only
+  admissibility (window / memo / tier — the refusals the station judges before the
+  certificate carve-out, so an `Ok` cannot promise admission of a spend the
+  station would decline anyway), proposal and certificate validity at `now`, and —
+  over the presented history — the cap, mirroring the station's `submit_proposal` /
+  `check_cert_backed` receiver-facing rules. The verdict is a typed enum,
+  not a bool, so a UI states *why*. Locked by `cross_platform_dtn_certs.json`,
+  which drives this function over recorded bytes to recorded verdicts. *Residual
+  risk:* the fixtures cover the enumerated scenarios, not the whole input space;
+  the in-crate matrix tests (good / at-cap boundary / duplicated-history dedup /
+  overspend / hidden-history / cert-expired / proposal-expired / non-debit /
+  wrong-receiver / bad-proposal-signature / forged station sig / member-mismatch /
+  malformed cert or proposal / tampered-history / not-referenced) widen it.
+- **The clock is testimony, and the receiver's is the best available (ADR-0022).**
+  *Threat:* offline, there is no admission clock; a wrong device clock makes the
+  receiver accept a just-expired certificate or decline a still-valid one.
+  *Mitigation:* `offline_spend_verify` checks `now <= cert.expires_at` against the
+  receiver's own clock and documents this as the honest boundary; the station
+  applies a delivery grace beyond `expires_at`, so a spend the receiver accepts
+  slightly late can still be admitted, and the cap bounds the exposure either way.
+  *Residual risk:* a receiver whose clock is badly wrong; inherent to offline
+  verification, stated plainly.
+- **Hidden history is bounded, not prevented (ADR-0021 §3, §6).** *Threat:* a
+  spender withholds earlier cert spends from a new receiver, so `offline_spend_verify`
+  returns `Ok` for a spend that the station will ultimately refuse as an overspend.
+  *Mitigation:* this is accepted by design — the cap bounds the community's loss and
+  the overspend is provable equivocation the station refuses and records
+  (T2.3.2/T2.3.3); the FFI's `Ok` is explicitly documented as "verifies against
+  *presented* history", not "will be admitted". A receiver who needs more can demand
+  the spender's outbox-chain segment since issuance, where a suppressed entry shows
+  as a gap. *Residual risk:* the once-per-member deliberate burn ADR-0021 §6 prices
+  out; unchanged here.
+- **Receipts and certificates are only trusted from the paired station.** *Threat:*
+  an attacker forges a delivery receipt ("your spend was admitted") or a certificate
+  and feeds it to the app. *Mitigation:* `receipt_parse` and `certificate_parse`
+  take the expected 32-byte station key and refuse anything not signed by it (a
+  receipt must also name that key in its `station` field); the station signature is
+  re-verified against the re-canonicalized body, so a tampered field fails. A
+  courier is a dumb carrier — `bundle_parse` performs no admission and surfaces each
+  entry's validity for display only. *Residual risk:* the app must hold the correct
+  station key (established at pairing, out of this surface's scope).
+- **Secret never crosses the boundary (unchanged rule, new signers).** *Threat:*
+  the new signing functions (`outbox_next_entry`, `certificate_request_sign`,
+  `proposal_sign_with_certificate`) take a raw secret. *Mitigation:* they take an
+  opaque `Keypair` handle, never secret bytes (ADR-0006); signing happens inside
+  Rust and only signed envelope bytes come back — the same posture as `Keypair.sign`
+  and `WalletContents.keypair`. Records are wrapped/carried verbatim and never
+  re-signed. *Residual risk:* the decrypted secret's lifetime in native memory,
+  identical to the crypto FFI subsection above.
+- **Wider audit surface in the mobile binary.** *Threat:* depending on `rrn-ledger`
+  pulls its transitive `rrn-storage` (bundled SQLite) into the mobile binary even
+  though this crate opens no database, enlarging the compiled attack surface.
+  *Mitigation:* the alternative — re-encoding the escrow/transaction records on the
+  mobile side — is the divergent-second-implementation risk the whole FFI exists to
+  avoid, a worse trade; the pulled code is data-type and encoding logic that is not
+  exercised at runtime here (no DB is opened). *Residual risk:* dead code linked
+  into the binary; noted, and revisited if a lighter split of the ledger types is
+  warranted.
+
 ### `mobile` social-recovery UI surface (M1.2)
 
 *Implemented in M1.2 (T1.2.3).* The wallet UI for Shamir social recovery

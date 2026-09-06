@@ -27,3 +27,32 @@ cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_canonical.json \
 
 The `committed_fixture_is_in_sync` test fails if the committed JSON drifts from
 what the generator produces, so a stale fixture cannot pass CI unnoticed.
+
+## `cross_platform_dtn_certs.json` — DTN + certificate FFI (T2.4.2)
+
+Locks the wire bytes for every new envelope the mobile app encodes or decodes
+through the delay-tolerant-submission and escrowed-offline-spending FFI surface
+(ADR-0020 / ADR-0021): an outbox entry envelope and the bundle they assemble
+into, a station delivery receipt envelope, a certificate request, a
+station-signed certificate, a cert-backed proposal, and three
+`offline_spend_verify` scenarios (good spend, overspend, expired certificate).
+Every `*_envelope_hex` / `bundle_hex` is the portable `{signer, sig, body}`
+canonical dCBOR triple; `rrn_crypto::serialize` (ADR-0002) is the source of
+truth, reached through the FFI rather than reimplemented on mobile.
+
+Generated and verified by
+[`tests/cross_platform_dtn_certs.rs`](../cross_platform_dtn_certs.rs), which
+drives the FFI **decode/verify** functions (`bundle_parse`, `receipt_parse`,
+`certificate_parse`, `offline_spend_verify`) over the recorded bytes. The
+producer functions (`outbox_next_entry`, `certificate_request_sign`,
+`proposal_sign_with_certificate`) are covered by the in-crate round-trip tests;
+their byte-identity follows because every consumer re-encodes and re-verifies the
+decoded payload, so a non-canonical body could not verify. The mobile repo
+commits a copy at `__tests__/fixtures/cross_platform_dtn_certs.json`.
+Reproducible bit-for-bit (blake3 seeds, RFC 8032). Regenerate:
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test cross_platform_dtn_certs
+cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_dtn_certs.json \
+   ../mobile/__tests__/fixtures/cross_platform_dtn_certs.json
+```

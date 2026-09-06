@@ -1945,6 +1945,8 @@ dependencies = [
  "hex",
  "rrn-crypto",
  "rrn-identity",
+ "rrn-ledger",
+ "rrn-protocol",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

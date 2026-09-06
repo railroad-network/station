@@ -1,9 +1,12 @@
 //! uniffi binding surface for the Railroad Network mobile client.
 //!
-//! This crate is a thin, curated FFI wrapper over the pure-Rust `rrn-crypto`
-//! and `rrn-identity` crates (ADR-0007). It exists so those audit-boundary
-//! crates never have to carry uniffi's build machinery or its generated
-//! `unsafe` FFI scaffolding — all of that is quarantined here.
+//! This crate is a thin, curated FFI wrapper over the pure-Rust workspace crates
+//! (ADR-0007): `rrn-crypto` and `rrn-identity` for keys, wallets, and recovery;
+//! `rrn-protocol` for the delay-tolerant-submission wire layer (outbox chains,
+//! bundles, receipts — [`dtn`]); and `rrn-ledger` for escrowed offline spending
+//! (certificates, cert-backed proposals, the receiver verification — [`cert`]).
+//! It exists so those crates never have to carry uniffi's build machinery or its
+//! generated `unsafe` FFI scaffolding — all of that is quarantined here.
 //!
 //! Every type below is a newtype over the real crate type. The wrappers only
 //! marshal between FFI-friendly shapes (`Vec<u8>`, `String`, `Arc<T>`) and the
@@ -29,6 +32,20 @@ mod recovery;
 pub use recovery::{
     parse_recovery_request, parse_shard_payload, respond_to_recovery, RecoveryError,
     RecoveryPackage, RecoveryRequestInfo, ShardInfo,
+};
+
+mod envelope;
+
+mod dtn;
+pub use dtn::{
+    bundle_assemble, bundle_parse, outbox_next_entry, receipt_parse, BundleEntryInfo, BundleInfo,
+    DtnError, ReceiptOutcome,
+};
+
+mod cert;
+pub use cert::{
+    certificate_parse, certificate_request_sign, offline_spend_verify,
+    proposal_sign_with_certificate, CertError, CertificateInfo, OfflineSpendVerdict,
 };
 
 use std::collections::HashMap;
@@ -122,6 +139,14 @@ impl Keypair {
         Arc::new(PublicKey {
             inner: self.inner.public_key(),
         })
+    }
+
+    /// The underlying `rrn-crypto` keypair, for the in-crate DTN/certificate
+    /// signers ([`crate::dtn`], [`crate::cert`]). Not on the UDL surface — the
+    /// secret never crosses the FFI boundary (ADR-0006); this only lets the
+    /// sibling modules sign through the same opaque handle.
+    pub(crate) fn core(&self) -> &CoreKeypair {
+        &self.inner
     }
 
     /// Signs `message`, producing a detached signature.
