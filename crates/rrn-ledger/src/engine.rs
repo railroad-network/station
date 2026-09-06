@@ -29,6 +29,7 @@ use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateStatus, HeadroomCertificate,
     SignedCertificateRequest, SignedCertificateReturn, SignedHeadroomCertificate,
+    MAX_EVIDENCE_ITEMS,
 };
 use crate::settlement::{BalanceView, SettlementConfig};
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
@@ -145,6 +146,21 @@ impl<'db> Engine<'db> {
                 attempted_centi: p.amount_centi,
             });
         }
+        // Bound the number of admitted cert-backed spends per certificate so a
+        // cumulative overspend always stays provable within `MAX_EVIDENCE_ITEMS`
+        // evidence items (ADR-0021 §5, T2.3.4 step 9). Without this a member could
+        // fragment a cap into hundreds of tiny within-cap spends, so that proving a
+        // later overspend would need more admitted spends than one evidence bundle
+        // can carry. Capping admitted spends at `MAX_EVIDENCE_ITEMS - 1` keeps one
+        // slot for the refused overspend, so every overspend proof fits. This runs
+        // *after* the overspend check, so a genuine overspend is still reported as
+        // [`Error::CertificateOverspent`] (the refused half of its own proof); only
+        // a further *within-cap* spend beyond the limit is refused here.
+        if snapshot.cert_backed_spends(cert_id).len() >= MAX_EVIDENCE_ITEMS - 1 {
+            return Err(Error::CertBackedSpendLimit {
+                max: MAX_EVIDENCE_ITEMS - 1,
+            });
+        }
         Ok(())
     }
 
@@ -160,6 +176,15 @@ impl<'db> Engine<'db> {
         // author a debit against someone else's account.
         if &proposal.signer != p.sender.public_key() {
             return Err(Error::SenderMismatch);
+        }
+
+        // Front-door memo bound: an admitted spend must stay small enough to embed
+        // verbatim as equivocation evidence (ADR-0021 §5, T2.3.4 step 9), so no
+        // overspend is ever unprovable for want of an unembeddable admitted half.
+        if !p.memo_within_bounds() {
+            return Err(Error::MemoTooLong {
+                max: crate::transaction::MAX_MEMO_BYTES,
+            });
         }
 
         // Time window, with clock-skew tolerance on both ends.
@@ -358,6 +383,17 @@ impl<'db> Engine<'db> {
         // not be dated into the future beyond skew, but arbitrarily old is legal.
         if r.requested_at > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
             return Err(Error::FutureDated);
+        }
+
+        // Equivocation disqualification (ADR-0025 §7): a member with a verified,
+        // un-overturned equivocation gets no fresh offline credit — they
+        // double-committed the credit they already held, so a new headroom
+        // certificate is refused until a jury `Overturn` lands. A derived
+        // eligibility gate (cf. the Tier-2 stake, ADR-0011); it needs no reputation
+        // read because it covers the newcomer-with-nothing-to-lose case the
+        // reputation zeroing alone does not bite.
+        if snapshot.has_active_equivocation(&r.member) {
+            return Err(Error::EquivocationBlocked);
         }
 
         // Bound per-member idle-escrow sprawl. Only *live* certificates count —
@@ -2016,6 +2052,206 @@ mod tests {
                 200
             ),
             Err(Error::MemberMismatch)
+        ));
+    }
+
+    // --- memo bound + cert-backed spend limit + equivocation gate (T2.3.4) ----
+
+    use crate::escrow::{
+        EquivocationBasis, EquivocationRecord, EquivocationVerdictRecord, EvidenceItem,
+        VerdictDecision, MAX_EVIDENCE_ITEM_BYTES,
+    };
+    use crate::transaction::MAX_MEMO_BYTES;
+    use rrn_crypto::signed::SignedPayload;
+
+    /// A member-signed cert-backed spend against `cert`, as an evidence item.
+    fn cert_spend_item(member: &Keypair, cert: CertId, amount: i64, nonce: u64) -> EvidenceItem {
+        let p = TransactionProposal::new(
+            addr(member),
+            addr(&Keypair::generate()),
+            amount,
+            None,
+            nonce,
+            1,
+            i64::MAX / 2,
+        )
+        .with_certificate(cert);
+        EvidenceItem::from_signed(&SignedPayload::sign(p, member))
+    }
+
+    /// Appends a station-signed cert-overspend equivocation (two 300-spends over a
+    /// 500 cap) against `member`, returning its id.
+    fn append_overspend_equivocation(
+        db: &Database,
+        member: &Keypair,
+        station: &Keypair,
+        cert: CertId,
+        at: i64,
+    ) -> crate::escrow::EquivocationId {
+        let evidence = vec![
+            cert_spend_item(member, cert, 300, 1),
+            cert_spend_item(member, cert, 300, 2),
+        ];
+        let record = EquivocationRecord::new(
+            addr(member),
+            EquivocationBasis::CertOverspend,
+            Some(cert),
+            evidence,
+            at,
+        );
+        assert!(record.verify_evidence(Some(500)));
+        let id = record.equivocation_id;
+        AppendLog::new(db)
+            .append(SignedPayload::sign(record, station), at)
+            .unwrap();
+        id
+    }
+
+    /// A proposal carrying `memo`, with its content id recomputed to match.
+    fn proposal_with_memo(
+        sender: &Keypair,
+        receiver: &Keypair,
+        memo: String,
+    ) -> TransactionProposal {
+        use rrn_crypto::hash::Hash;
+        use rrn_crypto::serialize::to_canonical_bytes;
+        let mut p =
+            TransactionProposal::new(addr(sender), addr(receiver), 100, None, 0, 100, 100_000);
+        p.memo = Some(memo);
+        p.id = TransactionId(Hash::from_bytes([0u8; 32]));
+        p.id = TransactionId(Hash::of(&to_canonical_bytes(p.clone())));
+        p
+    }
+
+    #[test]
+    fn a_proposal_with_an_oversized_memo_is_refused() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+
+        // The bound sits far below the evidence-item ceiling (checked at compile
+        // time), so an admitted spend is always embeddable as equivocation evidence.
+        const _: () = assert!(MAX_MEMO_BYTES < MAX_EVIDENCE_ITEM_BYTES);
+
+        // One byte over is refused.
+        let over = proposal_with_memo(&alice, &bob, "x".repeat(MAX_MEMO_BYTES + 1));
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(over, &alice), 100),
+            Err(Error::MemoTooLong { .. })
+        ));
+
+        // Exactly at the bound is accepted.
+        let ok = proposal_with_memo(&alice, &bob, "x".repeat(MAX_MEMO_BYTES));
+        engine
+            .submit_proposal(SignedProposal::sign(ok, &alice), 100)
+            .unwrap();
+    }
+
+    #[test]
+    fn cert_backed_spends_are_capped_so_an_overspend_stays_provable() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+
+        // A generous cap so every spend is within it; the *count* limit, not the
+        // cap, is what bites.
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 1_000, 0, 100), 100)
+            .unwrap();
+        let cert_id = cert.payload.cert_id;
+
+        // MAX_EVIDENCE_ITEMS - 1 within-cap spends are admitted; the next is refused
+        // with the distinct limit error (not an overspend — it is within the cap).
+        for i in 0..(MAX_EVIDENCE_ITEMS - 1) {
+            let p = TransactionProposal::new(
+                addr(&alice),
+                addr(&Keypair::generate()),
+                1,
+                None,
+                (i + 1) as u64, // nonce 0 was the cert request
+                100,
+                i64::MAX / 2,
+            )
+            .with_certificate(cert_id);
+            engine
+                .submit_proposal(SignedProposal::sign(p, &alice), 100)
+                .unwrap();
+        }
+        let over = TransactionProposal::new(
+            addr(&alice),
+            addr(&Keypair::generate()),
+            1,
+            None,
+            MAX_EVIDENCE_ITEMS as u64,
+            100,
+            i64::MAX / 2,
+        )
+        .with_certificate(cert_id);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(over, &alice), 100),
+            Err(Error::CertBackedSpendLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unoverturned_equivocation_blocks_certificate_issuance() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station.clone());
+
+        // Alice holds a 500-cap cert (nonce 0), then equivocates against it.
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+        let id = append_overspend_equivocation(&db, &alice, &station, cert.payload.cert_id, 150);
+
+        // A fresh request (nonce 1) is refused while the equivocation stands.
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 100, 1, 200), 200),
+            Err(Error::EquivocationBlocked)
+        ));
+
+        // A station-signed Overturn lifts the gate; the request then succeeds.
+        let overturn = EquivocationVerdictRecord {
+            equivocation_id: id,
+            decision: VerdictDecision::Overturn,
+            decided_at: 250,
+        };
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(overturn, &station), 250)
+            .unwrap();
+        engine
+            .submit_certificate_request(signed_cert_request(&alice, 100, 1, 300), 300)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_member_signed_overturn_does_not_lift_the_gate() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station.clone());
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+        let id = append_overspend_equivocation(&db, &alice, &station, cert.payload.cert_id, 150);
+
+        // Alice signs her own "overturn" — the signer does not match the station
+        // that recorded the equivocation, so it is ignored and the gate stands.
+        let forged = EquivocationVerdictRecord {
+            equivocation_id: id,
+            decision: VerdictDecision::Overturn,
+            decided_at: 250,
+        };
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(forged, &alice), 250)
+            .unwrap();
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 100, 1, 300), 300),
+            Err(Error::EquivocationBlocked)
         ));
     }
 }

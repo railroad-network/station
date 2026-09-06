@@ -29,8 +29,9 @@ use crate::credit::CreditConfig;
 use crate::dispute::{DisputeRecord, SignedDispute};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateRequest, CertificateReturn, CertificateState,
-    CertificateStatus, EquivocationBasis, EquivocationId, EquivocationRecord, HeadroomCertificate,
-    RequestId, SignedEquivocationRecord, SignedHeadroomCertificate,
+    CertificateStatus, EquivocationBasis, EquivocationId, EquivocationRecord,
+    EquivocationVerdictRecord, HeadroomCertificate, RequestId, SignedEquivocationRecord,
+    SignedHeadroomCertificate, VerdictDecision,
 };
 use crate::settlement::SettlementRecord;
 use crate::transaction::{
@@ -381,6 +382,17 @@ pub struct LedgerSnapshot {
     /// Dedup index: the equivocation already recorded against an author's outbox
     /// position (outbox-fork basis), keyed by `(author pubkey, position)`.
     equivocation_by_fork: BTreeMap<([u8; 32], u64), EquivocationId>,
+    /// The terminal jury ruling on each equivocation case, once one is admitted
+    /// (ADR-0025 §5–§6). An id lands here only when a station-signed
+    /// [`EquivocationVerdictRecord`](crate::escrow::EquivocationVerdictRecord) is
+    /// admitted whose signer matches the equivocation record's own signer — so a
+    /// peer-relayed member-signed verdict cannot forge a ruling (the same
+    /// station-signer gate reputation scoring applies). An
+    /// [`Overturn`](crate::escrow::VerdictDecision::Overturn) neutralizes the record
+    /// (lifts the penalty and the issuance gate); a
+    /// [`Confirm`](crate::escrow::VerdictDecision::Confirm) records finality but
+    /// leaves both standing. The first station-signed ruling per id wins.
+    equivocation_verdict: BTreeMap<EquivocationId, VerdictDecision>,
 }
 
 impl LedgerSnapshot {
@@ -706,6 +718,29 @@ impl LedgerSnapshot {
             return Ok(());
         }
 
+        // A jury's terminal ruling on an equivocation case (ADR-0025 §5). Only a
+        // station-signed `Overturn` neutralizes the record: the equivocation record
+        // was station-signed, so an authentic terminal ruling carries the same
+        // signer. A juror-cast ballot (kind `rrn.dispute.equivocation_ballot`) is a
+        // *different* record kind and never decodes here, and a peer-relayed
+        // member-signed verdict would not match the record's station signer — so
+        // neither can lift the penalty (mirrors the gate in reputation scoring).
+        // `Confirm` and a lapse touch nothing: the penalty (and this gate) simply
+        // stand. The equivocation record precedes its verdict in the single-writer
+        // log (ADR-0020), so it is already indexed when the verdict is folded.
+        if let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(bytes) {
+            if let Some(record) = self.equivocations.get(&verdict.equivocation_id) {
+                if record.signer == stored.signer {
+                    // First station-signed ruling per id wins (the sole-writer
+                    // station appends at most one; dedup defends a hostile copy).
+                    self.equivocation_verdict
+                        .entry(verdict.equivocation_id)
+                        .or_insert(verdict.decision);
+                }
+            }
+            return Ok(());
+        }
+
         Ok(())
     }
 
@@ -822,6 +857,32 @@ impl LedgerSnapshot {
     /// Every equivocation record on the log, in content-id order.
     pub fn equivocations(&self) -> impl Iterator<Item = &SignedEquivocationRecord> {
         self.equivocations.values()
+    }
+
+    /// The station-signed terminal jury ruling on `id`, if one has been admitted
+    /// (ADR-0025 §5). `None` means the case is still open or has only lapsed (no
+    /// jury ruling); a lapse writes nothing.
+    pub fn equivocation_terminal(&self, id: &EquivocationId) -> Option<VerdictDecision> {
+        self.equivocation_verdict.get(id).copied()
+    }
+
+    /// Whether `id` has been neutralized by a station-signed jury `Overturn`
+    /// (ADR-0025 §5–§6). The equivocation then levies no consequence and no longer
+    /// blocks issuance.
+    pub fn is_equivocation_overturned(&self, id: &EquivocationId) -> bool {
+        self.equivocation_terminal(id) == Some(VerdictDecision::Overturn)
+    }
+
+    /// Whether `member` currently holds a verified, un-overturned equivocation —
+    /// the certificate-issuance disqualification gate (ADR-0025 §7). Every record
+    /// in the snapshot already verified at replay (an unverifiable record is never
+    /// indexed), so this is exactly "a proven equivocation a jury has not lifted."
+    /// A `Confirm` leaves the block standing; only an `Overturn` lifts it.
+    pub fn has_active_equivocation(&self, member: &Address) -> bool {
+        self.equivocations.values().any(|r| {
+            r.payload.member == *member
+                && !self.is_equivocation_overturned(&r.payload.equivocation_id)
+        })
     }
 }
 

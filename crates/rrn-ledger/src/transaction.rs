@@ -119,6 +119,16 @@ impl TryFrom<CBOR> for ListingRef {
     }
 }
 
+/// The maximum size of a proposal's `memo`, in bytes. Bounded so that an
+/// admitted cert-backed spend is always small enough to embed verbatim as
+/// equivocation evidence — well under
+/// [`escrow::MAX_EVIDENCE_ITEM_BYTES`](crate::escrow::MAX_EVIDENCE_ITEM_BYTES)
+/// (64 KiB), leaving ample room for the proposal's fixed fields, so every
+/// overspend stays provable (ADR-0021 §5, T2.3.4 step 9). Matches
+/// [`MAX_DISPUTE_REASON_BYTES`](crate::dispute::MAX_DISPUTE_REASON_BYTES), the
+/// other member-authored free-text field, so the front door is uniform.
+pub const MAX_MEMO_BYTES: usize = 2048;
+
 /// A proposed transaction: the sender's signed offer to move Commons.
 ///
 /// Positive `amount_centi` means the sender pays the receiver; negative means
@@ -212,6 +222,15 @@ impl TransactionProposal {
         };
         proposal.id = proposal.compute_id();
         proposal
+    }
+
+    /// Whether the proposal's `memo` is within [`MAX_MEMO_BYTES`]. A proposal
+    /// carrying an over-long memo is refused at admission
+    /// ([`Engine::submit_proposal`](crate::engine::Engine::submit_proposal) →
+    /// [`Error::MemoTooLong`](crate::Error::MemoTooLong)) so no admitted spend is
+    /// ever too large to embed as equivocation evidence (ADR-0021 §5).
+    pub fn memo_within_bounds(&self) -> bool {
+        self.memo.as_ref().map_or(0, String::len) <= MAX_MEMO_BYTES
     }
 
     /// Links this proposal to the marketplace listing it settles (T1.7.6),

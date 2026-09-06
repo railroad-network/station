@@ -259,6 +259,32 @@ pub enum Error {
         /// The amount this refused spend attempted, in centicommons.
         attempted_centi: i64,
     },
+    /// A proposal's `memo` exceeds [`transaction::MAX_MEMO_BYTES`]. Bounded at the
+    /// front door so an admitted cert-backed spend is always small enough to embed
+    /// verbatim as equivocation evidence (well under
+    /// [`escrow::MAX_EVIDENCE_ITEM_BYTES`]) — ADR-0021 §5, T2.3.4 step 9.
+    #[error("proposal memo exceeds the maximum length ({max} bytes)")]
+    MemoTooLong {
+        /// The configured maximum ([`transaction::MAX_MEMO_BYTES`]).
+        max: usize,
+    },
+    /// A cert-backed spend was refused because the certificate has already
+    /// admitted the maximum number of cert-backed spends
+    /// ([`escrow::MAX_EVIDENCE_ITEMS`] − 1). The cap keeps a cumulative overspend
+    /// provable within [`escrow::MAX_EVIDENCE_ITEMS`] evidence items (one slot
+    /// reserved for the refused spend) — ADR-0021 §5, T2.3.4 step 9. The spend is
+    /// refused; it is not itself an equivocation (there is no second commitment).
+    #[error("certificate has reached its cert-backed spend limit ({max} admitted spends)")]
+    CertBackedSpendLimit {
+        /// The per-certificate admitted-spend ceiling.
+        max: usize,
+    },
+    /// A certificate request was refused because the member has a verified,
+    /// un-overturned equivocation on the log: they double-committed offline credit,
+    /// so they get no fresh offline credit until a jury overturns it — a derived
+    /// eligibility gate in the spirit of the Tier-2 stake (ADR-0025 §7, ADR-0011).
+    #[error("member is disqualified from issuing certificates by an un-overturned equivocation")]
+    EquivocationBlocked,
     /// A derived [`state::TransactionState`] failed its internal integrity check
     /// (e.g. an embedded signature did not verify).
     #[error("invalid transaction state: {0}")]

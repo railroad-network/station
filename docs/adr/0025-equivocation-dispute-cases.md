@@ -2,18 +2,17 @@
 
 ## Status
 
-Proposed — **DRAFT, direction maintainer-ratified 2026-09-04; formally Accepted in T2.3.4.**
+Accepted — direction maintainer-ratified 2026-09-04; jury path implemented and
+mechanics finalized in T2.3.4 (2026-09-05).
 
 The `EquivocationRecord`, its evidence verification, the station's detection
-wiring, and the reputation input shipped in T2.3.3 (PR #29); the jury machinery
-this ADR governs is **not yet built**. The design below was reviewed and its key
-choices ratified by the maintainer (the reputation consequence, the `Lapsed`
-default, identity-anchored sortition, payee recusal, and the cert-issuance gate);
-the follow-up ticket T2.3.4 finalizes the details and flips this to Accepted when
-it implements the jury path. Treat the *directions* as settled and the *exact
-mechanics* as subject to T2.3.4.
+wiring, and the reputation input shipped in T2.3.3 (PR #29). T2.3.4 built the jury
+machinery this ADR governs: the juror-ballot and re-seat record kinds, the
+identity-keyed case derivation, the admission-anchored draw, payee recusal, the
+station-signed terminal ruling, and the certificate-issuance gate. The exact
+mechanics settled by T2.3.4 are recorded in *Mechanics* below.
 
-Date: 2026-09-04
+Date: 2026-09-04 (finalized 2026-09-05)
 
 ## Context
 
@@ -113,6 +112,56 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
    says otherwise. (The reputation zeroing shipped in T2.3.3; the cert-issuance
    gate is T2.3.4.)
 
+## Mechanics (finalized in T2.3.4)
+
+These fill in the details §1–§7 left to the follow-up ticket; they do not change
+any ratified direction.
+
+1. **Two new record kinds, both in `rrn-dispute`, both member-signed.** A jury is
+   cast with `rrn.dispute.equivocation_ballot`
+   `{ equivocation_id, juror, round, decision, cast_at }` (signer = juror), a
+   *distinct* kind from the station's terminal
+   `rrn.credit.equivocation_verdict`. This is deliberate: the station operator's
+   own wallet is an eligible juror, so if jurors and the station shared one record
+   kind, a station-signed *ballot* would be byte-indistinguishable from the
+   station's *terminal* ruling, and reputation's station-signer gate could not
+   tell a single operator ballot from a jury result. A separate ballot kind (which
+   reputation never decodes) removes that ambiguity, and carrying `juror`/`round`
+   keeps same-round ballots from colliding on content-address dedup. A `Lapsed`
+   case is re-seated with `rrn.dispute.equivocation_reseat`
+   `{ equivocation_id, requester, round, requested_at }` (signer = requester).
+2. **Windows reuse the transaction-dispute parameters** (`DisputeParams`): a
+   14-day case window, a 3-day juror response window with redraw-around-no-shows,
+   panel size 3, majority of 3. There is **no appeal/escalation path** for an
+   equivocation case (§4 gives it no second-instance electorate); a majority is
+   terminal immediately, and the appeal window is unused.
+3. **Rounds and re-seating.** Round 0 is anchored at the opening record's
+   admission `(seq, created_at)`. Round *k* is anchored at the *k*-th valid
+   re-seat record's own admission `(seq, created_at)` — so the seed and window of
+   every round are fixed by an admission log position the requester does not
+   choose. A re-seat is valid only if it opens the round immediately after the
+   current one, the current round has genuinely lapsed (its window closed with no
+   majority and no terminal ruling), and its requester was an established
+   non-subject member at its admission (grace electorate, ADR-0015). Re-seats are
+   not numerically capped: the lapsed-gate plus `Confirmed`/`Overturned` finality
+   bound them (one uncontrollable seed per 14-day window is strictly weaker than
+   the station's pre-existing coarse-timing influence ADR-0014 already accepts).
+4. **Terminal enactment is one verdict per attached record.** On a majority the
+   station appends one `EquivocationVerdictRecord` (`Overturn` or `Confirm`) per
+   record id attached to the case identity (§4's second option), so reputation's
+   per-record neutralization applies to every proof of the one offence. Idempotent:
+   a record already carrying a terminal ruling is skipped.
+5. **Certificate-issuance gate.** A member with any verified, un-overturned
+   equivocation is refused a new headroom certificate at the ledger front door
+   (`Engine::submit_certificate_request` → `EquivocationBlocked`), a derived
+   eligibility check over the replayed snapshot; an `Overturn` clears it.
+6. **Evidence-evasion bounds (§5 residual).** So that every overspend stays
+   provable within `MAX_EVIDENCE_ITEMS` (16) embedded items, the ledger now (a)
+   caps a proposal's `memo` at `MAX_MEMO_BYTES` (2048) at admission, and (b)
+   refuses the `MAX_EVIDENCE_ITEMS`-th admitted cert-backed spend per certificate
+   (`CertBackedSpendLimit`), reserving one evidence slot for the refused overspend.
+   Both are admission-rule refinements under ADR-0021.
+
 ## Consequences
 
 - The shipped ADR-0014 transaction-dispute path is not modified, so its
@@ -137,12 +186,13 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
   that identity falls back to the anchor cap until re-anchored. This is the intended
   chain-of-trust cost of vouching for someone who then equivocates, but T2.3.4
   should surface it (a de-anchored member is not themselves accused).
-- **Overturn signer trust (T2.3.4).** Scoring currently accepts an `Overturn` from
-  any signer (`overturned_equivocations`); safe today because no path but the
-  station can append one (the verdict kind is `UnroutableKind` on DTN with no RPC
-  surface), but a peer-gossiped member-signed `Overturn` would lift a penalty once
-  cross-station sync admits foreign records. T2.3.4 gates it on the station signer
-  (there is a `// T2.3.4:` marker in the code).
+- **Overturn signer trust (done in T2.3.4).** Both reputation scoring
+  (`overturned_equivocations`) and the ledger snapshot (`equivocation_verdict`) now
+  honor an `Overturn` only when its signer matches the signer of the equivocation
+  record it names — the station that recorded the offence. A peer-gossiped
+  member-signed `Overturn` (possible once cross-station sync admits foreign
+  records) no longer lifts a penalty, and a juror `EquivocationBallot` is a
+  distinct record kind neither path decodes.
 
 ## Alternatives Considered
 
