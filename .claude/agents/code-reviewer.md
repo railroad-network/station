@@ -7,7 +7,8 @@ description: >-
   or any "review this diff" request. Reports findings; never edits files. Pass the
   ticket/ADR context in the prompt (a fresh agent does not inherit the caller's
   conversation).
-model: fable
+model: claude-fable-5-1
+effort: high
 tools: Bash, Read, Grep, Glob
 ---
 
