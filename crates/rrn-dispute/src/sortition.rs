@@ -103,10 +103,29 @@ pub fn sortition_seed(tx_id: &TransactionId, anchor: &[u8]) -> [u8; 32] {
 /// on the log. These are recused from judging that party's dispute (the obvious
 /// collusion edge — ADR-0014 §2).
 pub fn vouchers_of(db: &Database, subject: &Address) -> Result<HashSet<Address>> {
+    vouchers_of_until(db, subject, u64::MAX)
+}
+
+/// [`vouchers_of`] restricted to vouches admitted at log sequence `until_seq` or
+/// earlier — the vouch graph *as of an admission position*, not the present.
+///
+/// The equivocation jury (ADR-0025 §3) computes recusal at the round's admission
+/// log position so a voucher cannot revoke to become seatable, nor a friend vouch
+/// to get recused, after a case's seed is fixed. The transaction path takes
+/// `u64::MAX` through [`vouchers_of`] for the whole graph. Entries arrive in `seq`
+/// order, so the scan stops at the first entry past the bound.
+pub fn vouchers_of_until(
+    db: &Database,
+    subject: &Address,
+    until_seq: u64,
+) -> Result<HashSet<Address>> {
     let log = AppendLog::new(db);
     let mut vouchers = HashSet::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
+        if entry.seq > until_seq {
+            break;
+        }
         if let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) {
             if vouch.subject == *subject {
                 vouchers.insert(Address::from_public_key(entry.payload.signer));
@@ -138,13 +157,37 @@ pub fn eligible_pool(
     at_time: i64,
     params: &DisputeParams,
 ) -> Result<Vec<(Address, u64)>> {
-    let electorate = grace_electorate(db, founders, at_time)?;
+    // The two parties are never eligible (hard recusal); their vouchers are
+    // recused too but relax first if that is the only way to seat a panel.
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
-
     let mut vouchers = vouchers_of(db, &info.sender)?;
     vouchers.extend(vouchers_of(db, &info.receiver)?);
+    eligible_pool_excluding(db, founders, at_time, params, &parties, &vouchers)
+}
 
-    // The strict pool recuses parties and their vouchers.
+/// The shared sortition pool with an explicit two-tier recusal set — the one rule
+/// both the transaction-dispute jury and the equivocation jury (ADR-0025 §2) draw
+/// from, so pool and draw stay identical across case kinds and only the *recusal
+/// set* varies.
+///
+/// `hard_excluded` are never eligible (the parties, or an equivocation's subject
+/// and injured payees). `soft_excluded` (each party's vouchers) are recused from
+/// the strict pool but dropped if the strict pool cannot fill a panel — the
+/// ADR-0014 §5 relaxation — so a small community can still seat jurors; the hard
+/// set is never relaxed. Weights are raw standing as of `at_time`, floored at 1 so
+/// a zero-standing founder seated during grace stays selectable. The returned pool
+/// may still be smaller than the panel; the caller treats an unseatable jury as a
+/// case that will lapse.
+pub fn eligible_pool_excluding(
+    db: &Database,
+    founders: &[Address],
+    at_time: i64,
+    params: &DisputeParams,
+    hard_excluded: &HashSet<Address>,
+    soft_excluded: &HashSet<Address>,
+) -> Result<Vec<(Address, u64)>> {
+    let electorate = grace_electorate(db, founders, at_time)?;
+
     let weigh = |db: &Database, addr: &Address| -> Result<(Address, u64)> {
         // Established members hold composite ≥ the Member band, so their raw
         // standing is positive; a founder seated during grace may have none, so the
@@ -155,7 +198,7 @@ pub fn eligible_pool(
 
     let mut strict = Vec::new();
     for addr in &electorate {
-        if !parties.contains(addr) && !vouchers.contains(addr) {
+        if !hard_excluded.contains(addr) && !soft_excluded.contains(addr) {
             strict.push(weigh(db, addr)?);
         }
     }
@@ -163,10 +206,10 @@ pub fn eligible_pool(
         return Ok(strict);
     }
 
-    // Relax: drop voucher-recusal, keep party-recusal, and try again.
+    // Relax: drop the soft recusal, keep the hard recusal, and try again.
     let mut relaxed = Vec::new();
     for addr in &electorate {
-        if !parties.contains(addr) {
+        if !hard_excluded.contains(addr) {
             relaxed.push(weigh(db, addr)?);
         }
     }

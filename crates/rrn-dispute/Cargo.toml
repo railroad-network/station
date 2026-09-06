@@ -23,9 +23,19 @@ rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
 # The eligible jury pool is the established-member electorate, weighted by raw
 # standing — both read from `rrn-reputation`.
 rrn-reputation = { path = "../rrn-reputation", version = "0.1" }
+# An equivocation case recuses the injured payees; for an outbox-fork basis the
+# payee sits inside the wrapped `OutboxEntry`'s `record_bytes` (ADR-0025 §3).
+rrn-protocol = { path = "../rrn-protocol", version = "0.1" }
 # Verdicts serialize to canonical CBOR so a tally is verifiable across machines.
 serde = { version = "1", features = ["derive"] }
 dcbor = "0.25"
 # Typed dispute errors, and diagnostics for the resolution sweep.
 thiserror = "1"
 tracing = "0.1"
+
+[dev-dependencies]
+# Cross-platform wire fixtures for the equivocation ballot / re-seat record kinds
+# (T2.3.4): JSON vectors the mobile repo verifies byte-identically, following the
+# repo's `cross_platform_*.json` regenerate-and-committed convention.
+serde_json = "1"
+hex = "0.4"

@@ -20,6 +20,7 @@ use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_dispute::equivocation::{equivocation_cases, resolve_equivocation, EquivResolution};
 use rrn_dispute::escalation::{
     EscalationBallot, EscalationReason, EscalationRecord, SignedEscalation, SignedEscalationBallot,
 };
@@ -47,7 +48,7 @@ use rrn_ledger::dispute::{DisputeRecord, DisputeResponse, SignedDispute, SignedD
 use rrn_ledger::engine::Engine;
 use rrn_ledger::escrow::{CertificateReturn, EquivocationBasis, EquivocationRecord, EvidenceItem};
 use rrn_ledger::settlement::{SettlementConfig, Settler};
-use rrn_ledger::state::TransactionState;
+use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::{
     ListingRef, SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionId,
     TransactionProposal,
@@ -3162,6 +3163,46 @@ impl Core {
                 }
             }
         }
+
+        // Equivocation cases (ADR-0025) resolve on the same timer, with the same
+        // founders/anchor, and enact neutralize-only: a terminal `Overturn` appends
+        // the station verdict that lifts the reputation penalty, a `Confirm` records
+        // finality, and a lapse (re-seatable) or a still-open round enacts nothing.
+        match equivocation_cases(&self.db) {
+            Ok(cases) => {
+                // One snapshot for the whole sweep: skip cases that already carry a
+                // terminal station ruling so a settled case is neither re-derived nor
+                // re-counted on every tick.
+                let snapshot = LedgerSnapshot::derive(&AppendLog::new(&self.db));
+                for case in cases {
+                    if let Ok(snap) = &snapshot {
+                        if case
+                            .attached
+                            .iter()
+                            .any(|id| snap.equivocation_terminal(id).is_some())
+                        {
+                            continue;
+                        }
+                    }
+                    match resolve_equivocation(
+                        &self.db, &founders, &station, &case, &params, &anchor, now,
+                    ) {
+                        // Only a terminal ruling counts as resolved; a lapse leaves
+                        // the case open to re-seating.
+                        Ok(EquivResolution::Confirmed) | Ok(EquivResolution::Overturned) => {
+                            resolved += 1
+                        }
+                        Ok(EquivResolution::Pending) | Ok(EquivResolution::Lapsed) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "equivocation case resolution failed");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "equivocation resolution sweep: listing cases failed");
+            }
+        }
         resolved
     }
 
@@ -5186,9 +5227,11 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         LE::CertificateWrongMember => RefusalReason::CertWrongMember,
         LE::CertificateExpired => RefusalReason::CertExpired,
         LE::CertificateOverspent { .. } => RefusalReason::CertOverspent,
-        // Everything else (future-dated/inconsistent testimony, wrong dispute
-        // state, not-a-party, closed window, over-long reason, already-responded,
-        // member mismatch on a return, invalid state) has no more specific slug.
+        // Everything else has no more specific slug: future-dated/inconsistent
+        // testimony, wrong dispute state, not-a-party, closed window, over-long
+        // reason, already-responded, member mismatch on a return, invalid state, and
+        // the T2.3.4 admission bounds (`MemoTooLong`, `CertBackedSpendLimit`,
+        // `EquivocationBlocked`) — none of which warrant a new wire slug.
         _ => RefusalReason::Rejected,
     }
 }
@@ -5494,10 +5537,20 @@ fn dispute_err(e: rrn_dispute::Error) -> rpc::RpcError {
     match e {
         Storage(_) | Reputation(_) | MissingAdmission => internal(e),
         Ledger(l) => ledger_err(l),
-        NotDisputed | BadVerdict | NotSeated | AlreadyVoted | BadEscalation | BadBallot
-        | NotEscalatable | AlreadyEscalated | NotEligible | NotEscalated => {
-            invalid_params(e.to_string())
-        }
+        NotDisputed
+        | BadVerdict
+        | NotSeated
+        | AlreadyVoted
+        | BadEscalation
+        | BadBallot
+        | NotEscalatable
+        | AlreadyEscalated
+        | NotEligible
+        | NotEscalated
+        | NoEquivocationCase
+        | BadEquivocationBallot
+        | BadReseat
+        | NotReseatable => invalid_params(e.to_string()),
     }
 }
 
@@ -6872,43 +6925,51 @@ mod tests {
         );
     }
 
-    /// An overspend fragmented across more admitted spends than the evidence-count
-    /// DoS cap allows cannot be proven within `MAX_EVIDENCE_ITEMS`, so — rather than
-    /// append a record no replica could verify — no record is appended (a documented
-    /// residual; ADR-0021 §5's consequence is evaded at the cost of extra receipts).
+    /// T2.3.4 step 9 closes the T2.3.3 "too fragmented to prove" residual: a
+    /// certificate admits at most `MAX_EVIDENCE_ITEMS - 1` cert-backed spends, so an
+    /// overspend can never be split across more admitted spends than one evidence
+    /// bundle can carry. The engine refuses the `MAX_EVIDENCE_ITEMS`-th admitted
+    /// cert-backed spend with `CertBackedSpendLimit` (a plain refusal — not itself
+    /// an equivocation, since no cap was breached), which the DTN path reports with
+    /// the generic `rejected` slug.
     #[test]
-    fn dtn_overspend_too_fragmented_records_nothing() {
+    fn dtn_cert_backed_spends_are_capped_to_keep_overspends_provable() {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
 
-        // 16 admitted 30-spends (480 consumed), then a 30-spend overspends
-        // (remaining 20). The 15 largest that fit under the cap sum to 450; with the
-        // refused 30 that is 480 ≤ 500, so no within-cap proof exists.
+        // MAX_EVIDENCE_ITEMS - 1 = 15 admitted 30-spends (450 ≤ cap 500).
         let mut entries = Vec::new();
         let mut prev = zero();
-        for i in 0..16u64 {
+        for i in 0..15u64 {
             let sp = cert_backed_proposal(&alice, &bob, 30, cert, i + 1, 900, 901_000);
             let e = outbox_entry(&alice, i, prev, &sp, 900 + i as i64);
             prev = e.payload.entry_hash();
             entries.push(e);
         }
-        let over = cert_backed_proposal(&alice, &bob, 30, cert, 17, 900, 901_000);
-        entries.push(outbox_entry(&alice, 16, prev, &over, 920));
+        // The 16th cert-backed spend is within the remaining cap, but the count cap
+        // refuses it so a later overspend can never outrun the evidence bundle.
+        let capped = cert_backed_proposal(&alice, &bob, 30, cert, 16, 900, 901_000);
+        entries.push(outbox_entry(&alice, 15, prev, &capped, 916));
 
         let receipt = submit_bundle(&mut core, &entries, 1000);
-        let last = receipt.payload.outcomes.last().unwrap().disposition;
-        assert!(matches!(
-            last,
-            Disposition::Refused {
-                reason: RefusalReason::CertOverspent
-            }
-        ));
+        for outcome in &receipt.payload.outcomes[..15] {
+            assert!(matches!(outcome.disposition, Disposition::Admitted { .. }));
+        }
+        assert!(
+            matches!(
+                receipt.payload.outcomes[15].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::Rejected
+                }
+            ),
+            "the 16th cert-backed spend is refused by the count cap"
+        );
         assert_eq!(
             equivocations(&core).len(),
             0,
-            "too fragmented to prove within the DoS cap → no record"
+            "a count-cap refusal is not an equivocation (no cap breached)"
         );
     }
 

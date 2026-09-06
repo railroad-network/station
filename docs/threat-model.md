@@ -973,17 +973,101 @@ and disqualifies them from issuing new certificates until overturned (ADR-0025).
   `Lapsed`, never as a `Confirm` no juror signed, so any consequence heavier than
   the reputation penalty that the jury path later gains requires an affirmative
   `Confirmed`.
-- *Known limitation (T2.3.3 scope):* the **jury path itself is not yet built** —
-  the `EquivocationRecord`, its verification, the station's detection/append
-  wiring, and the reputation input ship now; the sortition/panel/verdict machinery
-  that *produces* an `EquivocationVerdictRecord` is a follow-up ticket (its record
-  kind is defined here so scoring's neutralize-on-overturn is exact and testable by
-  injection). In the interim an equivocation counts against reputation with no
-  jury recourse; the `verify_evidence` re-check is what bounds the malicious-station
-  threat until the overturn path exists. **Compensating the stranded receiver** of
-  a refused cert-backed spend is out of scope (a governance question; ADR-0021
-  residual) — the receiver can *see* the proof (`equivocation_for_cert`), but
-  making them whole is future work.
+- *Design note — the jury path (T2.3.4).* The sortition/panel/verdict machinery
+  that *produces* an `EquivocationVerdictRecord` shipped in T2.3.4 (see the next
+  subsection). **Compensating the stranded receiver** of a refused cert-backed
+  spend remains out of scope (a governance question; ADR-0021 residual) — the
+  receiver can *see* the proof (`equivocation_for_cert`), but making them whole is
+  future work.
+
+#### Equivocation jury (ADR-0025, T2.3.4)
+
+A verified equivocation opens a sortition-jury case (`rrn-dispute::equivocation`)
+that reuses the ADR-0014 pool/draw/recusal primitives but has its own case
+derivation, seed, ballot kind, and enactment. Jurors cast a member-signed
+`EquivocationBallot` (`rrn.dispute.equivocation_ballot`); on a majority the station
+appends the terminal, station-signed `EquivocationVerdictRecord`; a `Lapsed` case
+is re-seatable by a member-signed `EquivocationReseat`
+(`rrn.dispute.equivocation_reseat`). Two new signed record kinds, both with
+distinct discriminators, canonical dCBOR, and cross-platform fixtures.
+
+- *Threat: the accused grinds the draw for a friendly panel.* The equivocator
+  authors the evidence (both fork entries; the spend set and its ordering), so
+  seeding the draw from the record's content address would let them re-mine their
+  second commitment until the seed draws sympathisers.
+- *Mitigation:* the seed is `Blake3(case identity ‖ **admission log seq of the
+  round's opening record** ‖ community anchor)` — the same admission-time anchoring
+  ADR-0022 / PR #19 rely on. This removes the *content-grinding* lever: the accused
+  cannot re-mine the evidence (spend set/ordering, fork entries) to move the seed,
+  because the seed ignores content. *Residual:* the admission seq is a public
+  counter, and the equivocation record is appended by the station synchronously
+  when the accused's overspend is refused, so a determined accused could pad the
+  log with cheap records to shift their record's seq toward one that draws a
+  friendlier panel — a weaker, costlier lever than content-grinding (each attempt
+  is real appended records, and padding with vouches also perturbs the electorate
+  it is trying to predict), and no worse than the coarse-timing influence ADR-0014
+  already accepts for the transaction path. A fully unforgeable draw would need
+  station-held entropy or a VRF, out of scope here. The derivation is deterministic
+  across replicas (tested).
+- *Threat: a juror or the accused forges the terminal ruling.* The station operator
+  wallet is itself an eligible juror, so a shared record kind for ballots and the
+  terminal ruling would let one station-signed ballot masquerade as the jury
+  result — and a peer-relayed member-signed `Overturn` (once cross-station sync
+  admits foreign records) could lift a member's own penalty.
+- *Mitigation:* ballots are a **distinct kind** reputation never decodes, and both
+  the reputation neutralization and the certificate-issuance gate honor only a
+  terminal `EquivocationVerdictRecord` **signed by the same key that signed the
+  equivocation record** (`overturned_equivocations` and the snapshot's
+  `equivocation_verdict` both gate `signer == the record's signer`). Because the
+  equivocation record is station-signed, that is the recording station; a member's
+  self-signed "overturn" is inert (tested at the ledger and reputation layers).
+  *Residual:* this is a **record-author** gate, not a check against a known station
+  key (neither the snapshot nor the scorer is handed the station pubkey). It is
+  airtight today — no surface admits a *foreign* `EquivocationRecord` (DTN
+  `UnroutableKind`, no RPC), so every record on the log is this station's. Once
+  cross-station sync admits foreign records, a member could self-sign a genuine
+  record of *their own* overspend (winning the first-wins dedup) and then self-sign
+  an `Overturn` both gates would honor; closing that needs the station key threaded
+  into `LedgerSnapshot::derive`/the scorer, deferred to that sync work.
+- *Threat: re-seat spam to retry the draw, or to keep a case open forever.* An
+  established member repeatedly re-seating a lapsed case to grind for a friendly
+  round.
+- *Mitigation:* a re-seat is admitted only against a **genuinely lapsed** current
+  round (window closed, no majority, no terminal), must open exactly the next
+  round, and re-anchors the seed to *its own* admission seq — so each retry costs a
+  full window and yields one seed the requester cannot choose, strictly weaker than
+  the station's pre-existing coarse-timing influence ADR-0014 already accepts. A
+  `Confirmed`/`Overturned` case is final and refuses further re-seats.
+- *Threat: an equivocator with little reputation to lose shrugs off the penalty and
+  keeps issuing offline credit.* Zeroing two already-low dimensions barely bites a
+  newcomer.
+- *Mitigation:* a verified, un-overturned equivocation also **disqualifies the
+  member from issuing new headroom certificates** (`submit_certificate_request` →
+  `EquivocationBlocked`), a derived eligibility gate cleared only by an `Overturn`
+  (tested). The anchoring cascade (zeroing a sole anchor de-establishes the
+  identities they anchored) is the intended chain-of-trust cost, surfaced here.
+- *Threat: an overspend too fragmented to prove within one evidence bundle.* A
+  member splits a cap into hundreds of tiny within-cap spends so that a later
+  overspend would need more admitted spends than `MAX_EVIDENCE_ITEMS` can carry, or
+  pads a spend's `memo` past `MAX_EVIDENCE_ITEM_BYTES` so its admitted half cannot
+  be embedded.
+- *Mitigation (T2.3.4 step 9):* the ledger caps a proposal's `memo` at
+  `MAX_MEMO_BYTES` (well under the evidence-item ceiling) and refuses the
+  `MAX_EVIDENCE_ITEMS`-th admitted cert-backed spend per certificate
+  (`CertBackedSpendLimit`), reserving one slot for the refused overspend — so every
+  overspend stays provable in ≤ `MAX_EVIDENCE_ITEMS` items (both tested). These are
+  admission-rule refinements under ADR-0021.
+- *Known limitation:* the ballot and re-seat kinds are not yet routed over DTN
+  (`UnroutableKind`) or exposed on the mobile channel; in Phase 2 the station
+  resolves cases on its timer and the operator wallet is the juror that can act.
+  Wider juror participation (mobile/DTN casting) is follow-up work.
+- *Known limitation:* the per-`(member, certificate)` / per-`(member, fork
+  position)` dedup is first-wins, so after a case is **overturned** a *later*
+  genuine overspend on the same certificate is refused by the engine (no ledger
+  loss) but records no fresh `EquivocationRecord` — hence no new penalty, gate, or
+  proof for the stranded payee. Re-recording after an overturn (a new offence vs.
+  the same one) is a policy question left to follow-up work; the debt floor and the
+  cap still bound the exposure in the interim.
 
 #### Oracle tiering and the reputation stake
 

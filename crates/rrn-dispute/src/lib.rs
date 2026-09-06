@@ -34,6 +34,7 @@
 //! question to the whole established-member electorate on a bounded sub-window that
 //! also fails open.
 
+pub mod equivocation;
 pub mod escalation;
 pub mod panel;
 pub mod resolution;
@@ -180,6 +181,24 @@ pub enum Error {
     /// There is no open escalation on this dispute to vote in.
     #[error("this dispute has not been escalated")]
     NotEscalated,
+    /// No equivocation case matches the record id a ballot or re-seat names — the
+    /// log carries no verified [`EquivocationRecord`](rrn_ledger::escrow::EquivocationRecord)
+    /// with that content address.
+    #[error("no equivocation case matches the named record")]
+    NoEquivocationCase,
+    /// An equivocation ballot's signature did not verify, or its signer is not the
+    /// named juror.
+    #[error("equivocation ballot signature is invalid or does not match the named juror")]
+    BadEquivocationBallot,
+    /// An equivocation re-seat request's signature did not verify, or its signer is
+    /// not the named requester.
+    #[error("re-seat request signature is invalid or does not match the named requester")]
+    BadReseat,
+    /// An equivocation case cannot be re-seated for the stated round right now — the
+    /// case is not in a `Lapsed` state, the requester is not an established
+    /// non-subject member, or the round does not follow the current one.
+    #[error("this equivocation case cannot be re-seated right now")]
+    NotReseatable,
 }
 
 /// Convenience alias for dispute results.

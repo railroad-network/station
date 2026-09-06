@@ -34,8 +34,9 @@
 //! every station, or a reputation exported from one would not reconcile on
 //! another.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
@@ -213,7 +214,15 @@ impl<'db> ReputationScorer<'db> {
         //      record — tampered evidence, amounts within cap, a mislabeled member —
         //      produces no penalty. The cap for a cert-overspend basis is read from
         //      the certificate on the same log.
-        let overturned = overturned_equivocations(&log, at_time)?;
+        // The station that recorded each equivocation, so an `Overturn` counts only
+        // when signed by that same station (step 8 below). The records are
+        // station-signed, and `ledger.equivocations()` already dropped any that do
+        // not verify.
+        let station_signers: HashMap<EquivocationId, PublicKey> = ledger
+            .equivocations()
+            .map(|r| (r.payload.equivocation_id, r.signer))
+            .collect();
+        let overturned = overturned_equivocations(&log, &station_signers, at_time)?;
         for entry in log.iter_from(1) {
             let entry = entry?;
             let Ok(record) = from_canonical_bytes::<EquivocationRecord>(&entry.payload.bytes)
@@ -265,7 +274,11 @@ fn confirmation_of(state: &TransactionState) -> Option<&TransactionConfirmation>
 /// with an [`Overturn`](VerdictDecision::Overturn) verdict whose `decided_at` is
 /// at or before `at_time`. An overturned record levies no reputation penalty
 /// (ADR-0021 §5). A non-verdict payload is skipped.
-fn overturned_equivocations(log: &AppendLog, at_time: i64) -> Result<HashSet<EquivocationId>> {
+fn overturned_equivocations(
+    log: &AppendLog,
+    station_signers: &HashMap<EquivocationId, PublicKey>,
+    at_time: i64,
+) -> Result<HashSet<EquivocationId>> {
     let mut out = HashSet::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
@@ -273,11 +286,20 @@ fn overturned_equivocations(log: &AppendLog, at_time: i64) -> Result<HashSet<Equ
         else {
             continue;
         };
-        // T2.3.4: once the jury path can *produce* verdicts, gate this on the
-        // verdict's signer being the station, so a member-relayed `Overturn`
-        // cannot neutralize their own penalty. Today no such path exists — the
-        // verdict kind is `UnroutableKind` on DTN and has no RPC surface — so an
-        // overturn can only come from the station that wrote the log.
+        // Gate on the station signer (T2.3.4 step 8): an `Overturn` neutralizes a
+        // record only when signed by the *same* station that recorded the
+        // equivocation. The equivocation record is station-signed, so an authentic
+        // terminal ruling carries that signer; a juror ballot (a distinct record
+        // kind) never decodes here, and a member-relayed `Overturn` — possible once
+        // cross-station sync admits foreign records — would not match and is
+        // ignored, so a member cannot neutralize their own penalty. A verdict for an
+        // unknown/unverified equivocation (absent from the map) counts for nothing.
+        let Some(expected) = station_signers.get(&verdict.equivocation_id) else {
+            continue;
+        };
+        if entry.payload.signer != *expected {
+            continue;
+        }
         if verdict.decision == VerdictDecision::Overturn && verdict.decided_at <= at_time {
             out.insert(verdict.equivocation_id);
         }
@@ -679,6 +701,47 @@ mod tests {
             approx(after.attestation_accuracy, 1.5),
             "attn {}",
             after.attestation_accuracy
+        );
+    }
+
+    #[test]
+    fn only_a_station_signed_overturn_neutralizes_the_penalty() {
+        // The overturn must be signed by the same key that signed the equivocation
+        // record (T2.3.4 step 8). Mallory self-signing an `Overturn` does not lift
+        // her own penalty; the station's does.
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+
+        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+        let id = append_equivocation(&db, &mallory, &station, cert, t);
+
+        // Mallory signs her own "overturn" — wrong signer, so the penalty stands.
+        append_overturn(&db, &mallory, id, t);
+        let after = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(
+            approx(after.trade_reliability, 0.0),
+            "trade {}",
+            after.trade_reliability
+        );
+        assert!(
+            approx(after.attestation_accuracy, 0.0),
+            "attn {}",
+            after.attestation_accuracy
+        );
+
+        // The station's overturn does lift it.
+        append_overturn(&db, &station, id, t);
+        let after = ReputationScorer::new(&db)
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(
+            approx(after.trade_reliability, 1.0),
+            "trade {}",
+            after.trade_reliability
         );
     }
 

@@ -1,0 +1,20 @@
+{
+  "_comment": "Cross-platform equivocation jury wire fixtures for T2.3.4 (ADR-0025). A juror-signed EquivocationBallot (rrn.dispute.equivocation_ballot, an overturn in round 0) and an established-member-signed EquivocationReseat (rrn.dispute.equivocation_reseat, opening round 1). canonical_hex is each record's canonical dCBOR (== From<T> for CBOR); signature_hex is the signer's Ed25519 signature over it. Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
+  "ballot": {
+    "juror_pubkey": "df0aa0e55c158d57bc84b3fe929da618e97c5123f66406127ab141b06cc0286a",
+    "equivocation_id": "aa7adf0947e58a3d9b983954e4ae62533333a9ab2b15826d1e21687d46653e30",
+    "round": 0,
+    "decision": "overturn",
+    "cast_at": "1700300000",
+    "canonical_hex": "a6646b696e64781f72726e2e646973707574652e65717569766f636174696f6e5f62616c6c6f74656a75726f725820df0aa0e55c158d57bc84b3fe929da618e97c5123f66406127ab141b06cc0286a65726f756e640067636173745f61741a655884e0686465636973696f6e686f7665727475726e6f65717569766f636174696f6e5f69645820aa7adf0947e58a3d9b983954e4ae62533333a9ab2b15826d1e21687d46653e30",
+    "signature_hex": "4e4eff4dbd136dbabdb4b5e7b8e7c0836cf607f3eeadbf0e4dd85ed4045d6faf16723f3a8adf243fca5d42159cea36abe2fc0d62e889fb868c10c36ab9b24d05"
+  },
+  "reseat": {
+    "requester_pubkey": "e532352669090d9aa63b12a591f1d5f454552ef7cce306c6c3e84945826f56ee",
+    "equivocation_id": "aa7adf0947e58a3d9b983954e4ae62533333a9ab2b15826d1e21687d46653e30",
+    "round": 1,
+    "requested_at": "1700400000",
+    "canonical_hex": "a5646b696e64781f72726e2e646973707574652e65717569766f636174696f6e5f72657365617465726f756e6401697265717565737465725820e532352669090d9aa63b12a591f1d5f454552ef7cce306c6c3e84945826f56ee6c7265717565737465645f61741a655a0b806f65717569766f636174696f6e5f69645820aa7adf0947e58a3d9b983954e4ae62533333a9ab2b15826d1e21687d46653e30",
+    "signature_hex": "9d500f9e2e1fccf26b2fbcba73376ff60dbb8e60c82559a0ce4f6aad9538eb328e12e4657713136e4080bcbf90508c5fe34fd4dcae9f6ae9f3e4c8c09fa49307"
+  }
+}
