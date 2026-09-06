@@ -2889,6 +2889,27 @@ edges of that scope.
 - **No rate limiting or resource caps** on the IPC socket or the gossip port,
   and no message-size cap; the gossip stub pulls a peer's whole log each round.
   O(N) full-log replay has no snapshotting yet. All Phase 1/2.
+- **Availability — the daemon's offline posture is now tested (T2.4.1).** The
+  `station` daemon needs no internet: it reaches its serving state, runs the full
+  Phase-1 + DTN lifecycle, and shuts down cleanly with no route to anything but
+  loopback (`tests/offline_lifecycle.rs`, a black-hole peer + a cert-backed spend
+  over `bundle_submit`, in <60s). An unreachable peer is non-fatal and bounded by
+  `PEER_DIAL_TIMEOUT` (3s), so it can neither stall a gossip round nor the daemon's
+  shutdown; a peer flipping reachable↔unreachable logs one `info`, and ordinary
+  offline rounds stay at `debug`, so an offline month does not fill the log. The
+  `status` RPC / `rrn status` exposes a derived `connectivity` block (per-peer
+  reachability, mobile-listener state, pending outbox/receipt depths) so isolation
+  is legible. The **only** deliberate non-loopback emission is mDNS advertising
+  when `[mobile] advertise = true` (best-effort, fail-open: an advertise error
+  warns once and the daemon serves regardless); the clock is a local syscall with
+  **no NTP dependency**, and the CLI reaches the daemon only over the local Unix
+  socket. The "zero non-loopback connections" claim is TCP-connect scoped.
+  *Residual:* a peer configured as a **hostname** (not an IP literal) resolves via
+  `getaddrinfo`, which Tokio runs on a blocking thread the dial timeout cannot
+  cancel; the gossip round itself stays bounded, but if the host's resolver is
+  itself dead, process *exit* can wait out the resolver's own timeout. Configuring
+  peers by IP (as offline/mesh deployments do) avoids it; a resolver bound is
+  future work.
 - **The marketplace has no admission control, and its stated requirements are
   not enforced.** Individual listings are bounded (200-byte title, 8 KiB
   description, controlled category vocabulary), but nothing bounds how *many* a

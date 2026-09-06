@@ -461,6 +461,20 @@ impl<'a> DtnStore<'a> {
         Ok(removed)
     }
 
+    /// The number of delivery-receipt rows still pending confirmation
+    /// (`confirmed_delivered = 0`) — receipts the station is holding to hand to a
+    /// courier or whose delivery the author has not yet acked. A
+    /// degradation-legibility count for the `status` connectivity block (T2.4.1).
+    /// Derived, not cached.
+    pub fn pending_receipt_count(&self) -> Result<u64> {
+        let n: i64 = self.db.conn().query_row(
+            "SELECT COUNT(*) FROM receipt_deliveries WHERE confirmed_delivered = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// The queued [`DeliveryRow`] for `record_hash`, if any. Test/introspection
     /// helper.
     pub fn delivery_of(&self, record_hash: &[u8; 32]) -> Result<Option<DeliveryRow>> {

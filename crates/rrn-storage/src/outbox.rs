@@ -222,6 +222,18 @@ impl<'a> OutboxStore<'a> {
         collect_rows(rows)
     }
 
+    /// The number of outbox entries still awaiting a delivery outcome
+    /// (`acked_outcome IS NULL`), across all authors — a degradation-legibility
+    /// count for the `status` connectivity block (T2.4.1). Derived, not cached.
+    pub fn pending_count(&self) -> Result<u64> {
+        let n: i64 = self.db.conn().query_row(
+            "SELECT COUNT(*) FROM outbox_entries WHERE acked_outcome IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Applies one delivery-receipt outcome to the row for `(author,
     /// record_hash)`.
     ///

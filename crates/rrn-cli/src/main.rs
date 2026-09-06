@@ -26,7 +26,7 @@ use rrn_station::rpc::{
     DisputeEscalateResult, DisputeEscalationVoteResult, DisputeRaiseResult, DisputeResolveResult,
     DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult, GovProposeResult,
     HistoryResult, InquireResult, InquiryStateResult, ProposeResult, RecoverImportResult,
-    TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
+    StatusResult, TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -88,6 +88,9 @@ enum Command {
     Init,
     /// Print this station's own address.
     Whoami,
+    /// Show the station's connectivity / offline posture: per-peer reachability,
+    /// the mobile listener state, and pending DTN queue depths.
+    Status,
     /// Show a balance (defaults to your own).
     Balance {
         /// The `rrn1…` address to query; omitted means your own.
@@ -610,6 +613,55 @@ async fn run(cli: Cli) -> Result<()> {
             emit(fmt, &v, || {
                 let r: WhoamiResult = parse(&v)?;
                 Ok(r.address)
+            })
+        }
+        Command::Status => {
+            let v = client.call("status", json!({})).await?;
+            emit(fmt, &v, || {
+                let r: StatusResult = parse(&v)?;
+                let c = &r.connectivity;
+                let mut out = format!("{}\n", r.address);
+                if c.peers.is_empty() {
+                    out.push_str("peers: none configured\n");
+                } else {
+                    out.push_str("peers:\n");
+                    for p in &c.peers {
+                        let state = if p.reachable {
+                            "reachable"
+                        } else {
+                            "unreachable"
+                        };
+                        match p.last_success_at {
+                            Some(t) => out.push_str(&format!(
+                                "  {} — {} (last ok @ {})\n",
+                                p.address, state, t
+                            )),
+                            None => out.push_str(&format!(
+                                "  {} — {} (never reached)\n",
+                                p.address, state
+                            )),
+                        }
+                    }
+                }
+                let mobile = if c.mobile_listener_bound {
+                    format!("bound on {}", c.mobile_listen)
+                } else {
+                    "not bound".to_string()
+                };
+                out.push_str(&format!(
+                    "mobile: {}{}\n",
+                    mobile,
+                    if c.mobile_advertising {
+                        ", advertising"
+                    } else {
+                        ""
+                    }
+                ));
+                out.push_str(&format!(
+                    "pending: {} outbox, {} receipts",
+                    c.pending_outbox, c.pending_receipts
+                ));
+                Ok(out)
             })
         }
         Command::Balance { address } => {
