@@ -521,6 +521,12 @@ pub struct Core {
     /// are kept `RETENTION_UNCONFIRMED_MULTIPLIER`× longer. Set from `[dtn]
     /// receipt_retention_secs`.
     dtn_receipt_retention_secs: i64,
+    /// Shared, in-memory connectivity snapshot the `status` RPC reports from
+    /// (T2.4.1): per-peer reachability and the mobile-listener state, written by
+    /// the daemon's gossip loop and startup path. `None` for a bare test core with
+    /// no daemon around it — `status` then reports the configured surface with no
+    /// live reachability. Purely derived degradation-legibility state.
+    connectivity: Option<std::sync::Arc<crate::gossip::ConnectivityState>>,
 }
 
 /// Default DTN receipt retention (30 days), matching `[dtn]
@@ -558,6 +564,7 @@ impl Core {
             tail_tx,
             listings,
             dtn_receipt_retention_secs: DEFAULT_RECEIPT_RETENTION_SECS,
+            connectivity: None,
         }
     }
 
@@ -566,6 +573,18 @@ impl Core {
     /// `with_credit_config`; a core left unset keeps [`DEFAULT_RECEIPT_RETENTION_SECS`].
     pub fn with_receipt_retention_secs(mut self, secs: i64) -> Self {
         self.dtn_receipt_retention_secs = secs;
+        self
+    }
+
+    /// Attaches the shared [`ConnectivityState`](crate::gossip::ConnectivityState)
+    /// the daemon's gossip loop writes, so the `status` RPC can report live peer
+    /// reachability and the mobile-listener state (T2.4.1). Builder-style; a core
+    /// left unset reports the configured surface with no live reachability.
+    pub fn with_connectivity(
+        mut self,
+        connectivity: std::sync::Arc<crate::gossip::ConnectivityState>,
+    ) -> Self {
+        self.connectivity = Some(connectivity);
         self
     }
 
@@ -689,6 +708,7 @@ impl Core {
     fn handle_call(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         match req.method.as_str() {
             "whoami" => self.m_whoami(),
+            "status" => self.m_status(),
             "balance" => self.m_balance(req),
             "propose" => self.m_propose(req),
             "confirm" => self.m_confirm(req),
@@ -794,6 +814,70 @@ impl Core {
             bootstrap_in_grace: established < threshold,
             established_members: established as u64,
             grace_threshold: threshold as u64,
+        })
+    }
+
+    /// `status` — a live, derived degradation-legibility snapshot (T2.4.1): the
+    /// identity fields `whoami` carries, plus a `connectivity` block reporting
+    /// per-peer reachability (from the gossip loop's shared state), the mobile
+    /// listener's advertised/bound state, and the pending outbox/receipt depths.
+    /// Everything is recomputed here; nothing new is stored.
+    fn m_status(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        use std::sync::atomic::Ordering;
+        let now = self.clock.now();
+        let established =
+            rrn_reputation::staking::established_member_count(&self.db, now).map_err(internal)?;
+        let threshold = rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD;
+
+        // Peer/mobile state comes from the shared connectivity snapshot the daemon
+        // populates. A bare test core has none: report the configured surface with
+        // no live reachability rather than fabricating any.
+        let (peers, mobile_listen, mobile_advertising, mobile_bound) = match &self.connectivity {
+            Some(c) => {
+                let health = c.peer_health.lock().expect("peer_health mutex");
+                let peers = c
+                    .peers
+                    .iter()
+                    .map(|p| {
+                        let h = health.get(p).copied().unwrap_or_default();
+                        rpc::PeerStatus {
+                            address: p.clone(),
+                            reachable: h.reachable,
+                            last_success_at: h.last_success_at,
+                            last_attempt_at: h.last_attempt_at,
+                        }
+                    })
+                    .collect();
+                (
+                    peers,
+                    c.mobile_listen.clone(),
+                    c.mobile_advertising,
+                    c.mobile_bound.load(Ordering::Relaxed),
+                )
+            }
+            None => (Vec::new(), String::new(), false, false),
+        };
+
+        let pending_outbox = rrn_storage::outbox::OutboxStore::new(&self.db)
+            .pending_count()
+            .map_err(internal)?;
+        let pending_receipts = DtnStore::new(&self.db)
+            .pending_receipt_count()
+            .map_err(internal)?;
+
+        ok(&rpc::StatusResult {
+            address: self.wallet.address.to_string(),
+            community: VOUCH_COMMUNITY.to_string(),
+            bootstrap_in_grace: established < threshold,
+            established_members: established as u64,
+            connectivity: rpc::ConnectivityBlock {
+                peers,
+                mobile_listen,
+                mobile_advertising,
+                mobile_listener_bound: mobile_bound,
+                pending_outbox,
+                pending_receipts,
+            },
         })
     }
 

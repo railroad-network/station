@@ -204,6 +204,16 @@ impl Station {
             cert_max_outstanding: config.credit.cert_max_outstanding,
         };
 
+        // Shared, in-memory connectivity snapshot for the `status` RPC's
+        // degradation-legibility block (T2.4.1): the gossip loop writes per-peer
+        // reachability, the mobile-bind path below records whether it bound, and
+        // the status handler reads it. Purely derived — no signed/persisted state.
+        let connectivity = Arc::new(gossip::ConnectivityState::new(
+            config.peers.list.clone(),
+            config.mobile.listen.clone(),
+            config.mobile.advertise,
+        ));
+
         let core = Core::new(
             db,
             wallet,
@@ -214,6 +224,7 @@ impl Station {
             listings,
         )
         .with_receipt_retention_secs(config.dtn.receipt_retention_secs as i64)
+        .with_connectivity(connectivity.clone())
         .spawn();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -246,6 +257,8 @@ impl Station {
             peers,
             address.clone(),
             core.clone(),
+            connectivity.clone(),
+            params.clock.clone(),
             shutdown_rx.clone(),
         )));
 
@@ -259,6 +272,9 @@ impl Station {
         match TcpListener::bind(&config.mobile.listen).await {
             Ok(mobile_listener) => {
                 tracing::info!(listen = %config.mobile.listen, "Listening for mobiles");
+                connectivity
+                    .mobile_bound
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 tasks.push(tokio::spawn(mobile_server::serve(
                     mobile_listener,
                     core.clone(),

@@ -13,7 +13,9 @@
 //! envelope is the same line-delimited JSON as the CLI protocol ([`crate::rpc`]),
 //! with its own method set (`peer_handshake`, `log_tail`, `log_range`).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -22,9 +24,85 @@ use tokio::net::{TcpListener, TcpStream};
 
 use rrn_storage::log::StoredPayload;
 
+use crate::clock::Clock;
 use crate::core::{stored_from_parts, CoreHandle};
 use crate::rpc::{self, Request, Response};
 use crate::rpc_client::request_response;
+
+/// How long a single peer exchange (TCP connect **and** the one request/response)
+/// may take before it is abandoned as unreachable. A station on a loopback-only
+/// host must never park a gossip round — or, through it, its own shutdown — on the
+/// OS TCP SYN timeout of a routable-but-dead peer (~75s macOS / ~127s Linux). The
+/// bound keeps a round proportional to `peers.len()` and shutdown prompt (ADR-0020;
+/// T2.4.1).
+pub const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The health of one peer, as last observed by the gossip loop. Derived, in-memory
+/// only (never logged/persisted state) — the `status` connectivity block reads it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PeerHealth {
+    /// Whether the most recent gossip round with this peer succeeded.
+    pub reachable: bool,
+    /// Clock time of the last successful round, if any.
+    pub last_success_at: Option<i64>,
+    /// Clock time this peer was last attempted.
+    pub last_attempt_at: Option<i64>,
+}
+
+/// Shared, in-memory connectivity snapshot the `status` RPC reports from (T2.4.1).
+/// Written by the gossip loop and the startup path; read by the status handler.
+/// Purely derived degradation-legibility state — nothing here is signed, logged,
+/// or required for correctness.
+#[derive(Debug)]
+pub struct ConnectivityState {
+    /// The configured peer addresses (static, from `[peers] list`).
+    pub peers: Vec<String>,
+    /// The configured mobile listen address (`[mobile] listen`).
+    pub mobile_listen: String,
+    /// Whether the station is advertising over mDNS (`[mobile] advertise`).
+    pub mobile_advertising: bool,
+    /// Whether the mobile HTTP listener actually bound at startup.
+    pub mobile_bound: AtomicBool,
+    /// Per-peer reachability, keyed by peer address.
+    pub peer_health: Mutex<HashMap<String, PeerHealth>>,
+}
+
+impl ConnectivityState {
+    /// A fresh snapshot for the configured peers/mobile surface; no peer has been
+    /// contacted yet.
+    pub fn new(peers: Vec<String>, mobile_listen: String, mobile_advertising: bool) -> Self {
+        Self {
+            peers,
+            mobile_listen,
+            mobile_advertising,
+            mobile_bound: AtomicBool::new(false),
+            peer_health: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records a round's outcome for `peer` and returns the reachability
+    /// *transition* (`Some(true)` newly reachable, `Some(false)` newly unreachable,
+    /// `None` unchanged) so the caller logs one `info` on a flip, not per round.
+    fn record(&self, peer: &str, ok: bool, now: i64) -> Option<bool> {
+        let mut map = self.peer_health.lock().expect("peer_health mutex");
+        let entry = map.entry(peer.to_string()).or_default();
+        let first = entry.last_attempt_at.is_none();
+        let was = entry.reachable;
+        entry.last_attempt_at = Some(now);
+        entry.reachable = ok;
+        if ok {
+            entry.last_success_at = Some(now);
+        }
+        // A flip is a transition; so is the very first observation of a reachable
+        // peer (worth one line), but not the first observation of an unreachable one
+        // (that is the silent, expected offline default).
+        if was != ok || (first && ok) {
+            Some(ok)
+        } else {
+            None
+        }
+    }
+}
 
 /// A log entry as it crosses the peer wire: the three fields of a
 /// [`StoredPayload`], each as a JSON byte array. Position in the chain
@@ -190,11 +268,18 @@ fn reply<T: Serialize>(req: &Request, value: &T) -> Response {
 // --- client side: the periodic gossip loop ----------------------------------
 
 /// Runs a gossip round against every peer every `interval`, until `shutdown`.
+///
+/// Each peer exchange is bounded by [`PEER_DIAL_TIMEOUT`], so one unreachable peer
+/// cannot stall the round (or shutdown). Outcomes update `connectivity`, and a
+/// peer flipping reachable↔unreachable logs one `info`; ordinary offline rounds
+/// stay at `debug` so an offline month does not fill the log (T2.4.1).
 pub async fn gossip_loop(
     interval: Duration,
     peers: Arc<Vec<String>>,
     our_address: String,
     core: CoreHandle,
+    connectivity: Arc<ConnectivityState>,
+    clock: Clock,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -203,8 +288,27 @@ pub async fn gossip_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 for peer in peers.iter() {
-                    if let Err(e) = gossip_with_peer(peer, &our_address, &core).await {
+                    // Bail out of a slow round the instant shutdown is signalled, so
+                    // a long peer list cannot delay a clean stop.
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    // The network work — connect and each request/response — is
+                    // bounded *inside* `peer_call` by `PEER_DIAL_TIMEOUT`, which is
+                    // what stops a black-holed peer from hanging the round. The local
+                    // apply (`append_entries`) is deliberately NOT under that budget:
+                    // pulling and verifying a large log is legitimate work, and
+                    // timing it out here would falsely report a reachable peer as
+                    // unreachable.
+                    let outcome = gossip_with_peer(peer, &our_address, &core).await;
+                    let ok = outcome.is_ok();
+                    if let Err(e) = &outcome {
                         tracing::debug!(peer = %peer, error = %e, "gossip round failed");
+                    }
+                    match connectivity.record(peer, ok, clock.now()) {
+                        Some(true) => tracing::info!(peer = %peer, "peer reachable"),
+                        Some(false) => tracing::info!(peer = %peer, "peer unreachable"),
+                        None => {}
                     }
                 }
             }
@@ -267,11 +371,59 @@ async fn peer_call<T: for<'de> Deserialize<'de>>(
         method: method.to_string(),
         params,
     };
-    let mut stream = TcpStream::connect(peer).await?;
-    let response = request_response(&mut stream, &request).await?;
+    // Bound the whole exchange — connect and the single request/response — so a
+    // black-holed peer cannot hang the round on the OS SYN timeout (T2.4.1). The
+    // caller also wraps the round in `PEER_DIAL_TIMEOUT`; this inner bound protects
+    // any direct `peer_call` and keeps the failure mode a clean typed error.
+    let response = tokio::time::timeout(PEER_DIAL_TIMEOUT, async {
+        let mut stream = TcpStream::connect(peer).await?;
+        request_response(&mut stream, &request).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("peer {peer} timed out after {PEER_DIAL_TIMEOUT:?}"))??;
     if let Some(err) = response.error {
         anyhow::bail!("peer error: {} (code {})", err.message, err.code);
     }
     let value = response.result.unwrap_or(serde_json::Value::Null);
     Ok(serde_json::from_value(value)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> ConnectivityState {
+        ConnectivityState::new(vec!["10.255.255.1:7411".into()], "127.0.0.1:0".into(), true)
+    }
+
+    #[test]
+    fn reachability_transitions_log_once_not_per_round() {
+        let s = state();
+        let peer = "10.255.255.1:7411";
+
+        // First unreachable observation is the silent offline default (no transition).
+        assert_eq!(s.record(peer, false, 100), None);
+        // Repeated failures stay silent.
+        assert_eq!(s.record(peer, false, 101), None);
+        // Becoming reachable is a transition.
+        assert_eq!(s.record(peer, true, 102), Some(true));
+        // Staying reachable is silent.
+        assert_eq!(s.record(peer, true, 103), None);
+        // Dropping is a transition.
+        assert_eq!(s.record(peer, false, 104), Some(false));
+
+        // Health reflects the last observation and the last success time.
+        let h = s.peer_health.lock().unwrap()[peer];
+        assert!(!h.reachable);
+        // Last success is the most recent reachable round (t=103), not the flip.
+        assert_eq!(h.last_success_at, Some(103));
+        assert_eq!(h.last_attempt_at, Some(104));
+    }
+
+    #[test]
+    fn first_reachable_observation_is_a_transition() {
+        // A peer that is reachable from the very first round is worth one info line.
+        let s = state();
+        assert_eq!(s.record("127.0.0.1:1", true, 1), Some(true));
+    }
 }

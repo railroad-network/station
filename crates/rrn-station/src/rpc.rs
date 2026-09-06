@@ -297,6 +297,74 @@ pub struct RecoverImportResult {
     pub restored_address: String,
 }
 
+/// `status` result — a live, entirely *derived* snapshot for degradation
+/// legibility (T2.4.1): who this station is, and a `connectivity` block. Nothing
+/// here is cached authoritative state; each field is recomputed at call time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StatusResult {
+    /// The station's own `rrn1…` address.
+    pub address: String,
+    /// The community identifier (as in [`WhoamiResult::community`]).
+    #[serde(default)]
+    pub community: String,
+    /// Whether the community is still in bootstrap grace (as in [`WhoamiResult`]).
+    #[serde(default)]
+    pub bootstrap_in_grace: bool,
+    /// How many members are currently established.
+    #[serde(default)]
+    pub established_members: u64,
+    /// The connectivity / offline-posture snapshot.
+    pub connectivity: ConnectivityBlock,
+}
+
+/// The connectivity portion of a [`StatusResult`]: peer reachability, the
+/// mobile-listener state, and pending DTN queue depths — everything an operator
+/// needs to read "am I isolated, and is anything stuck?" at a glance (T2.4.1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConnectivityBlock {
+    /// One row per configured peer, with its last-observed reachability. Empty
+    /// when no peers are configured, or all rows `reachable=false, last_success_at
+    /// absent` before the first gossip round (or in a bare test core).
+    #[serde(default)]
+    pub peers: Vec<PeerStatus>,
+    /// The configured mobile listen address (`[mobile] listen`).
+    #[serde(default)]
+    pub mobile_listen: String,
+    /// Whether this station advertises over mDNS (`[mobile] advertise`).
+    #[serde(default)]
+    pub mobile_advertising: bool,
+    /// Whether the mobile HTTP listener actually bound at startup (a `false` here
+    /// with `mobile_advertising=true` is the "advertised but unreachable" case).
+    #[serde(default)]
+    pub mobile_listener_bound: bool,
+    /// Outbox entries still awaiting a delivery outcome. This is the *device*
+    /// outbox (a wallet's own send queue) — populated by the CLI-wallet path
+    /// (T2.5.2) and the mobile wallet (T2.4.2), not by the daemon itself, so on a
+    /// station with no local wallet outbox it reads `0`. Included now so the metric
+    /// is live the moment those paths land.
+    #[serde(default)]
+    pub pending_outbox: u64,
+    /// Delivery receipts the station is still holding for a courier / an author's
+    /// ack.
+    #[serde(default)]
+    pub pending_receipts: u64,
+}
+
+/// One peer's last-observed reachability in a [`ConnectivityBlock`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// The peer's configured `host:port`.
+    pub address: String,
+    /// Whether the most recent gossip round with this peer succeeded.
+    pub reachable: bool,
+    /// Clock time (Unix seconds) of the last successful round, omitted if never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<i64>,
+    /// Clock time (Unix seconds) this peer was last attempted, omitted if never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<i64>,
+}
+
 /// `whoami` result (takes no params).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WhoamiResult {
