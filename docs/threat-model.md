@@ -201,10 +201,11 @@ of content hashes.
   depth pre-scan first and rejects input nesting deeper than `MAX_CBOR_DEPTH`
   (128 — an order of magnitude above any legitimate payload) as
   `TooDeeplyNested`, never decoding it. Every decode-from-untrusted-bytes
-  boundary in the workspace (DTN bundle/receipt, mobile-FFI envelope/DTN,
-  recovery-shard parse, OR-Set CRDT load, station record-kind sniffing) is
-  wired through it; a `proptest` asserts the pre-scan never panics on arbitrary
-  bytes and a 50 000-deep vector is refused rather than crashing.
+  boundary in the workspace (DTN bundle/receipt, paper spend-voucher, mobile-FFI
+  envelope/DTN, recovery-shard parse, wallet-plaintext decode, OR-Set CRDT load,
+  station record-kind sniffing) is wired through it; a `proptest` asserts the
+  pre-scan never panics on arbitrary bytes and a 50 000-deep vector is refused
+  rather than crashing.
 - *Residual risk:* other CBOR decode work is bounded by input length; very
   large (but shallow) inputs are a caller/transport concern (message size
   limits live in `rrn-protocol`, Phase 1+).

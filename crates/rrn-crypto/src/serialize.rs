@@ -180,7 +180,18 @@ fn ensure_depth_within_limit(data: &[u8]) -> Result<(), SerializeError> {
             // they are never mistaken for structure.
             2 | 3 => {
                 let Ok(len) = usize::try_from(value) else {
-                    return Ok(()); // absurd length -> decoder underruns; defer
+                    // A length that cannot fit in `usize` can never be satisfied
+                    // by an in-memory slice — reject, do not defer. Failing
+                    // closed matters on 32-bit targets (e.g. armeabi-v7a/x86
+                    // FFI builds): dcbor decodes with `value as usize`, which
+                    // *truncates* such a length and keeps reading, so deferring
+                    // here would let it walk — and recurse — past a point this
+                    // scan stopped counting. Rejecting is correct on every
+                    // target; on 64-bit this branch is unreachable (`usize` is
+                    // `u64`).
+                    return Err(SerializeError::NotCanonical(
+                        "CBOR string length exceeds addressable size".into(),
+                    ));
                 };
                 match pos.checked_add(len) {
                     Some(end) if end <= data.len() => pos = end,
@@ -190,6 +201,11 @@ fn ensure_depth_within_limit(data: &[u8]) -> Result<(), SerializeError> {
             // Array (4), map (5), tag (6): each is a level the decoder recurses
             // into. Opening it puts a frame at depth `stack.len() + 1`.
             4..=6 => {
+                // The check is intentionally *before* the `items > 0` test
+                // below, so an empty container at the limit is refused even
+                // though the decoder would not recurse into it. That is the
+                // safe direction and matches the "container-nesting depth"
+                // contract (not "frame count"); do not move it inside the push.
                 if stack.len() >= MAX_CBOR_DEPTH {
                     return Err(SerializeError::TooDeeplyNested {
                         max: MAX_CBOR_DEPTH,
@@ -413,20 +429,40 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn oversized_string_length_is_rejected_not_deferred_on_32bit() {
+        // Regression for the 32-bit-only hole: dcbor decodes strings with
+        // `value as usize`, which *truncates* a length above `usize::MAX` and
+        // keeps reading (and recursing). The guard must reject such a length,
+        // not defer — otherwise the deep nesting placed after a bogus-length
+        // string would reach the recursive decoder uncounted. (Cannot run on a
+        // 64-bit host, where the length fits `usize`; compiled and run only for
+        // 32-bit targets, e.g. armeabi-v7a/x86 FFI builds.)
+        let mut bytes = vec![0x82, 0x5b]; // array(2); byte string, 8-byte length
+        bytes.extend_from_slice(&(u64::from(u32::MAX) + 4).to_be_bytes()); // > usize::MAX (32-bit)
+        bytes.extend_from_slice(&[0x01, 0x02, 0x03]); // a little content
+        bytes.resize(bytes.len() + 50_000, 0x81); // deep nesting after it
+        bytes.push(0x00);
+        assert!(matches!(
+            checked_from_data(&bytes),
+            Err(SerializeError::NotCanonical(_))
+        ));
+    }
+
     #[test]
     fn byte_string_content_is_not_counted_as_nesting() {
-        // A byte string whose *content* happens to look like array headers must
-        // be skipped as opaque bytes, not walked as structure. `0x58 0x03` is a
-        // 3-byte byte string; its content `81 81 81` are three "array of one"
-        // header bytes that must NOT add depth.
-        let bytes = vec![0x58, 0x03, 0x81, 0x81, 0x81];
-        // Depth is 0 open containers here, so the guard passes; whether dcbor
-        // then accepts the exact encoding is beside the point — it must not be
-        // TooDeeplyNested.
-        assert!(!matches!(
-            checked_from_data(&bytes),
-            Err(SerializeError::TooDeeplyNested { .. })
-        ));
+        // A byte string whose *content* looks like array headers must be skipped
+        // as opaque bytes, not walked as structure — and the skip must land on
+        // the correct next byte. The look-alike content sits *inside* an array so
+        // the scan has to skip it to reach the sibling that follows:
+        // `[ bytes(300 × 0x81), 0 ]`, canonically encoded so dcbor accepts it.
+        // Without the content-skip the 300 `0x81` bytes read as 300 nested
+        // arrays and trip the limit at the 129th; with it, this is depth 1.
+        let mut bytes = vec![0x82, 0x59, 0x01, 0x2c]; // array(2), byte string(len 300)
+        bytes.resize(bytes.len() + 300, 0x81); // 300 "array of one" look-alike bytes
+        bytes.push(0x00); // second array element: integer 0
+        assert!(checked_from_data(&bytes).is_ok());
     }
 
     #[test]
