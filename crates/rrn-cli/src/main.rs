@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+mod paper;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -391,6 +393,14 @@ enum Command {
     Cert {
         #[command(subcommand)]
         cmd: CertCmd,
+    },
+    /// Paper fallback: export payloads to printable QR sheets and ingest scanned
+    /// QR text (M2.5, ADR-0020 §3 / ADR-0021 §4). The CLI consumes scanned QR
+    /// *text* — one payload string per line, from any scanner app — it does not
+    /// read camera images.
+    Paper {
+        #[command(subcommand)]
+        cmd: paper::PaperCmd,
     },
 }
 
@@ -1084,6 +1094,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Governance { cmd } => cmd_governance(&client, fmt, color, cmd).await,
         Command::Dispute { cmd } => cmd_dispute(&client, fmt, color, cmd).await,
         Command::Cert { cmd } => cmd_cert(&client, fmt, cmd).await,
+        Command::Paper { cmd } => paper::cmd_paper(&client, fmt, cmd).await,
     }
 }
 

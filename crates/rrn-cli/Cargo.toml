@@ -17,6 +17,27 @@ path = "src/main.rs"
 # note). It pulls in only the `rpc` / `rpc_client` surface.
 rrn-station = { path = "../rrn-station", version = "0.1" }
 
+# The paper tools (T2.5.2) decode and *verify* paper-carried payloads locally —
+# QR text is untrusted courier input, so `rrn paper show`/`ingest` check every
+# signature before display. This pulls the codec/verify surface only: the CLI
+# still holds no key and opens no database (offline authoring lives on the phone
+# via `rrn-mobile-ffi`, per T2.4.2). It links these crates directly, but it
+# already links all of them transitively through `rrn-station` — the "thin
+# client" property is that the CLI has no keys and no DB, not that it links few
+# crates.
+rrn-protocol = { path = "../rrn-protocol", version = "0.1" }
+rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
+rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
+rrn-identity = { path = "../rrn-identity", version = "0.1" }
+# Peeking the `kind` discriminator and decoding the house `{signer,sig,body}`
+# envelope for `paper show` — the canonical CBOR model (ADR-0002).
+dcbor = "0.25"
+# QR rendering. `default-features = false` avoids the `image` tree — the PNG and
+# PDF writers in `paper.rs` are hand-rolled over the raw module matrix so no
+# compression/imaging dependency enters the audit surface (matches the
+# no-default-features use in `rrn-station`'s recovery-shard QR).
+qrcode = { version = "0.14", default-features = false }
+
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

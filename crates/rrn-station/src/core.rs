@@ -788,6 +788,7 @@ impl Core {
             // a phone is T2.4.2's mobile FFI path.
             "cert_request" => self.m_cert_request(req),
             "cert_list" => self.m_cert_list(req),
+            "cert_export" => self.m_cert_export(req),
             other => Err(rpc::RpcError {
                 code: rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
@@ -1078,6 +1079,43 @@ impl Core {
             })
             .collect();
         ok(&rpc::CertListResult { certificates })
+    }
+
+    /// `cert_export` — the station-signed certificate for `cert_id` as portable
+    /// `{signer, sig, body}` envelope bytes, hex-encoded (T2.5.2). A read-only
+    /// derive: the CLI's paper tools put this on a `rrncert:` wallet card so a
+    /// certificate reserved online can back an offline spend. The envelope carries
+    /// the station signature, and the bytes are public (a certificate reserves the
+    /// member's *own* headroom).
+    ///
+    /// Only a **live** certificate exports — one still `Outstanding` and within its
+    /// offline-spend admission window (matching `cert_list`). A returned or expired
+    /// certificate reserves nothing and a spend against it is refused, so printing
+    /// a valid-looking card from one would mislead; the request is refused instead.
+    fn m_cert_export(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::CertExportParams = parse_params(req)?;
+        let id = rrn_ledger::escrow::CertId(Hash::from_bytes(parse_record_hash(&params.cert_id)?));
+        let now = self.clock.now();
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
+            .map_err(internal)?;
+        let state = snapshot
+            .certificate(&id)
+            .ok_or_else(|| invalid_params(format!("unknown certificate {}", params.cert_id)))?;
+        let live = matches!(
+            state.status,
+            rrn_ledger::escrow::CertificateStatus::Outstanding
+        ) && now
+            <= rrn_ledger::escrow::spend_admissible_until(&state.certificate.payload, &self.credit);
+        if !live {
+            return Err(invalid_params(format!(
+                "certificate {} is not live (returned or expired); nothing to export",
+                params.cert_id
+            )));
+        }
+        let envelope = rrn_ledger::escrow::encode_certificate_envelope(&state.certificate);
+        ok(&rpc::CertExportResult {
+            envelope_hex: hex(&envelope),
+        })
     }
 
     fn m_vouch(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {

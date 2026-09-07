@@ -2778,6 +2778,82 @@ receipt discloses.
   reconstructible from the log — no integrity loss, only the accepted risk that a
   receipt an author wrongly confirmed is reclaimed early and must be re-derived.
 
+### Paper credential layer (station + CLI, T2.5.2)
+
+*Implemented in T2.5.2.* The operator/courier side of the Class-4 paper fallback:
+the `rrn paper` command family turns station-held payloads into printable QR
+sheets (`export-receipts`, `cert`, `credential`, `render`) and turns scanned QR
+*text* back into ingested bundles (`ingest`), with an offline inspection path
+(`show`). The record codecs and DTN ingest are unchanged — this is a new
+*encoding/rendering and input* surface over `bundle_submit`/`receipts_fetch` plus
+one read-only `cert_export` RPC. It is the software realization of the
+already-recorded decision (see the mobile–station transport note above) that the
+CLI consumes QR **text**, not camera images: a headless station cannot scan, so a
+commodity scanner app produces the text and the CLI never touches an imaging
+library.
+
+**Assets:** the integrity of records admitted from paper (a courier must not be
+able to alter or forge a carried record); the availability of the single-threaded
+core against malformed scanned input; the invariant that the CLI remains a
+**keyless, DB-less** console (it must never become a second member key-holder).
+
+- *Tampering — a courier alters a sheet in transit.* Every carried record keeps
+  its author's signature end to end (ADR-0002; the bundle/entry framing is a dumb
+  carrier). `ingest` submits through the **same** `bundle_submit` front door as
+  every DTN bundle, so a tampered entry is refused `BadSignature` exactly as on
+  the radio path — paper adds no bypass. `show` verifies every signature it can
+  offline (`outbox::validate` per bundle entry; `SignedPayload::verify` for
+  receipts and certificates) before printing a word, and flags any entry whose
+  signature does not hold. *Residual:* `show` cannot cross-check a *signer's
+  identity* to a known member with no station in reach — a self-consistent
+  signature proves the bytes are as the author signed them, not who the author is;
+  the authoritative check is the station's admission. This is stated in the
+  command output.
+- *Spoofing / DoS — malformed or oversized scanned text.* Scanned lines are
+  untrusted input. Reassembly and decode run entirely through `rrn-protocol`'s
+  bounded codecs — the `MAX_CHUNKS`/`CHUNK_PAYLOAD_BYTES`/`MAX_QR_TEXT_CHARS`
+  caps, and the `checked_from_data` recursion-depth pre-scan wired into every
+  decode boundary (dCBOR recursion-depth follow-up, PR #35) — so a crafted sheet
+  cannot exhaust the stack or allocate unboundedly, and a bad chunk is a
+  per-payload error, never a process abort. Ingest of a bundle is then bounded by
+  the existing DTN ingest limits (`MAX_BUNDLE_ENTRIES`/`MAX_BUNDLE_BYTES`).
+- *Repudiation / replay — re-scanning the same sheet.* Re-ingesting an identical
+  sheet is idempotent: the station returns its stored receipt verbatim for a
+  repeated *presentation* (the DTN presentation-hash guarantee, ADR-0020 §3), and
+  a different sheet re-carrying an already-admitted record yields a `known`
+  outcome from the log's own dedup. Paper cannot double-admit.
+- *Repudiation — a dropped receipt sheet.* Paper-carried receipts are **never
+  marked delivered** at the station (`export-receipts` uses the courier fetch,
+  which only bumps a diagnostic counter). A lost sheet is a delay, not a loss:
+  the unconfirmed row is retained four times longer and re-exported, and the
+  author's re-submission of the record returns `known`. Only the author's own
+  device confirms delivery — the CLI never acks receipts it merely carried.
+- *Elevation of privilege — the CLI as a new key-holder.* The paper tools link
+  `rrn-protocol`/`rrn-ledger`/`rrn-crypto` **for decode and verification only**;
+  the CLI holds no key and opens no database, so it cannot author or sign a
+  record. Offline *signing* stays on the phone (`rrn-mobile-ffi`, ADR-0006). The
+  ticket's `export-outbox` and any CLI-side member wallet are deliberately **not**
+  built here — there is no non-mobile member wallet in the system, and creating
+  one is an identity-architecture decision deferred to T2.5.3 behind a new ADR.
+- *Disclosure — a lost sheet.* Sheets are **public information**: a bundle, a
+  receipt, or a headroom certificate carries no secret (the same posture as the
+  DTN receipt disclosure note above — a certificate reserves the member's *own*
+  headroom and is station-signed public data). A credential card is the member's
+  bare address, already public. Loss discloses who transacted at the hash level,
+  the same residual as courier-carried receipts.
+
+**Rendering surface.** The PNG (stored/uncompressed DEFLATE) and PDF writers are
+hand-rolled over the raw QR module matrix, so **no imaging or compression
+dependency enters the audit surface**. Their input is the operator's own
+already-encoded QR strings — a rendering fault damages a printout, never a signed
+payload.
+
+*Known limitation:* `show` on a spend voucher (`rrnspend:`) is a structural and
+signature check only; the full offline-spend admissibility verdict lives in the
+mobile `offline_spend_verify` (`rrn-mobile-ffi`) and is not duplicated in the CLI.
+Lifting it into `rrn-ledger` so the CLI can render the full verdict is tracked as
+backlog.
+
 ### Vouching surface (M1.4)
 
 *Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its

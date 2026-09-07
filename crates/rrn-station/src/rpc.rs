@@ -890,6 +890,26 @@ pub struct CertListResult {
     pub certificates: Vec<CertRow>,
 }
 
+/// `cert_export` params — a certificate to export as portable envelope bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertExportParams {
+    /// The certificate's content address, hex-encoded (as returned by
+    /// `cert_request`/`cert_list`).
+    pub cert_id: String,
+}
+
+/// `cert_export` result — the station-signed certificate as a portable
+/// `{signer, sig, body}` envelope (see
+/// [`rrn_ledger::escrow::encode_certificate_envelope`]), hex-encoded. This is the
+/// exact byte form the `rrncert:` QR carries and the mobile FFI's
+/// `certificate_parse` verifies, so a certificate reserved online can be printed
+/// onto a wallet card for the offline-spend flow (T2.5.2).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertExportResult {
+    /// The certificate envelope bytes, hex-encoded.
+    pub envelope_hex: String,
+}
+
 // --- Governance (T1.9.7b) ---------------------------------------------------
 
 /// `governance_init_charter` params — publish a community's genesis Charter.

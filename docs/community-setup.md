@@ -504,6 +504,59 @@ phone is on the right Wi‑Fi is what's worth investigating.
 - Update the station before the app when a release notes say they moved
   together — the app is built against a pinned station version.
 
+### Paper fallback — when there is no network at all
+
+When a member's phone cannot reach the station by any means — no Wi‑Fi, no mesh,
+no radio — a payment can still travel on **paper**. The member confirms (or
+spends) offline on their phone, which produces QR codes; those get printed or
+photographed, physically carried to the station, scanned back to text, and
+ingested. The station's delivery receipt makes the return trip the same way.
+
+What you need: a printer (any monochrome laser is plenty) and any commodity
+**QR scanner app** or webcam tool. The `rrn` CLI does **not** read camera images
+— a headless station has no camera — so scanning happens with a phone/scanner app
+and produces *text*: one QR payload string per line, saved to a file. That file
+is what you feed the CLI.
+
+The operator commands (all under `rrn paper`):
+
+```sh
+# Ingest a carried sheet: scan its QRs to text (one payload per line), then
+rrn paper ingest --in scanned.txt --out carryback/
+#   → prints each carried record's outcome (admitted / known / refused) and
+#     writes the station's delivery receipts to carryback/ for the return trip.
+
+# Inspect a sheet without ingesting (works with the daemon stopped):
+rrn paper show --in scanned.txt
+
+# Export pending receipts for a member to carry home:
+rrn paper export-receipts --author rrn1… --out receipts/
+
+# Print a member credential card (their address QR):
+rrn paper credential --address rrn1… --name "Jordan" --out cards/
+
+# Print a headroom-certificate wallet card for the station's OWN wallet, to spend
+# offline later (the cert reserves this station's debt-floor headroom):
+rrn paper cert --request 10 --out cards/            # reserve + print a 10-Common cert
+rrn paper cert --cert-id <hex> --out cards/         # print an existing live one
+
+# Re-render any exported *.txt to a printable sheet (chunk_*.png + sheet.pdf):
+rrn paper render --in receipts/receipts.txt --out sheets/
+```
+
+Each `--out` directory gets individual `chunk_NN_of_MM.png` files, a captioned
+`sheet.pdf` (every QR labelled with its payload id and index, so a dropped page
+is identifiable by eye), and a `*.txt` of the raw strings (the no-printer path).
+
+**Courier handling.** Sheets are *public information* — a bundle, a receipt, or a
+certificate carries no secret, so losing one is a **delay, not a loss of funds**.
+Re-scanning the same sheet is safe: the station recognizes it and never admits a
+payment twice. If a receipt sheet goes missing, just run `export-receipts` again;
+the receipt is proof of what actually landed. The one thing paper cannot do yet
+is originate a payment *from* the station side offline — that is the member's
+phone's job. See the end-to-end walkthrough in
+[`scripts/demo-phase-2-paper.sh`](../scripts/demo-phase-2-paper.sh).
+
 ### When a member reports a problem
 
 Every error the app hits is recorded on the phone, surviving restarts. Ask
