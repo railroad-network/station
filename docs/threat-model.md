@@ -192,10 +192,22 @@ of content hashes.
 - *Mitigations:* all parsers return `Result` and never panic on malformed
   input (off-curve keys → `InvalidEncoding`); a `cargo-fuzz` target
   (`verify_signature`) asserts no panic on arbitrary `(pubkey, sig, message)`.
-  Ed25519 verify is fixed-cost in the input size.
-- *Residual risk:* CBOR decode work is bounded by input length; very large
-  inputs are a caller/transport concern (message size limits live in
-  `rrn-protocol`, Phase 1+).
+  Ed25519 verify is fixed-cost in the input size. **CBOR nesting depth:**
+  `dcbor` decodes recursively with no depth limit of its own, so a short but
+  deeply nested payload (a few KiB of nested arrays/maps/tags) would overflow
+  the thread stack and *abort the process* before any type or signature check —
+  a stack overflow is not a catchable `Result`. `serialize::checked_from_data`
+  (and `from_canonical_bytes`, which routes through it) runs an **iterative**
+  depth pre-scan first and rejects input nesting deeper than `MAX_CBOR_DEPTH`
+  (128 — an order of magnitude above any legitimate payload) as
+  `TooDeeplyNested`, never decoding it. Every decode-from-untrusted-bytes
+  boundary in the workspace (DTN bundle/receipt, mobile-FFI envelope/DTN,
+  recovery-shard parse, OR-Set CRDT load, station record-kind sniffing) is
+  wired through it; a `proptest` asserts the pre-scan never panics on arbitrary
+  bytes and a 50 000-deep vector is refused rather than crashing.
+- *Residual risk:* other CBOR decode work is bounded by input length; very
+  large (but shallow) inputs are a caller/transport concern (message size
+  limits live in `rrn-protocol`, Phase 1+).
 
 #### Elevation of privilege
 

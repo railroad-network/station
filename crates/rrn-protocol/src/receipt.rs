@@ -23,7 +23,7 @@
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{PublicKey, Signature};
-use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use serde::{Deserialize, Serialize};
@@ -346,7 +346,7 @@ pub fn encode_signed(signed: &SignedReceipt) -> Vec<u8> {
 /// are not a canonical `{signer, sig, body}` map whose `body` is a canonical
 /// [`DeliveryReceipt`].
 pub fn decode_signed(bytes: &[u8]) -> Result<SignedReceipt> {
-    let cbor = CBOR::try_from_data(bytes).map_err(|e| Error::Cbor(e.to_string()))?;
+    let cbor = checked_from_data(bytes).map_err(|e| Error::Cbor(e.to_string()))?;
     let map = match cbor.into_case() {
         CBORCase::Map(map) => map,
         _ => return Err(Error::Cbor("receipt envelope is not a CBOR map".into())),

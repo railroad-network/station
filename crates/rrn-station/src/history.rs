@@ -9,7 +9,7 @@
 
 use dcbor::prelude::*;
 
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes};
 use rrn_identity::vouch::Vouch;
 use rrn_ledger::settlement::SettlementRecord;
 use rrn_ledger::state::CancellationRecord;
@@ -119,7 +119,7 @@ fn decode_summary(bytes: &[u8]) -> (String, String) {
 /// read without decoding the concrete type. `None` if the payload is not a CBOR
 /// map or carries no `kind`.
 fn record_kind(bytes: &[u8]) -> Option<String> {
-    let cbor = CBOR::try_from_data(bytes).ok()?;
+    let cbor = checked_from_data(bytes).ok()?;
     let CBORCase::Map(map) = cbor.into_case() else {
         return None;
     };

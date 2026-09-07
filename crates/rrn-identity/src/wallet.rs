@@ -35,7 +35,7 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use dcbor::prelude::*;
 use rand_core::{OsRng, RngCore};
 use rrn_crypto::keypair::{Keypair, SecretKey};
-use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::address::Address;
@@ -333,7 +333,7 @@ impl WalletContents {
     /// Decodes the secret-bearing fields and re-derives the address from the
     /// secret key.
     fn from_secret_cbor(bytes: &[u8]) -> Result<Self> {
-        let cbor = CBOR::try_from_data(bytes).map_err(|e| WalletError::Corrupt(e.to_string()))?;
+        let cbor = checked_from_data(bytes).map_err(|e| WalletError::Corrupt(e.to_string()))?;
         let map = match cbor.into_case() {
             CBORCase::Map(map) => map,
             _ => return Err(WalletError::Corrupt("wallet plaintext is not a map".into())),

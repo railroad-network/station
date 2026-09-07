@@ -26,7 +26,7 @@ use rand_core::OsRng;
 use zeroize::Zeroize;
 
 use rrn_crypto::keypair::{Keypair, PublicKey, SecretKey};
-use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 
 use crate::address::Address;
 use crate::wallet::WalletContents;
@@ -304,7 +304,7 @@ pub struct ParsedShard {
 /// The single parser for the `{address, threshold, total, shard}` wire format,
 /// used by the mobile holder-receive flow and the recovery ceremony alike.
 pub fn parse_shard_payload(payload: &[u8]) -> Result<ParsedShard, RecoveryError> {
-    let cbor = CBOR::try_from_data(payload)
+    let cbor = checked_from_data(payload)
         .map_err(|e| RecoveryError::Corrupt(format!("not canonical CBOR: {e}")))?;
     let map = match cbor.into_case() {
         CBORCase::Map(map) => map,

@@ -19,6 +19,7 @@
 
 use dcbor::prelude::*;
 use rrn_crypto::keypair::{PublicKey, Signature};
+use rrn_crypto::serialize::checked_from_data;
 
 /// Encodes a signed record as portable `{signer, sig, body}` envelope bytes.
 pub(crate) fn encode(signer: &PublicKey, signature: &Signature, body: Vec<u8>) -> Vec<u8> {
@@ -43,7 +44,7 @@ pub(crate) struct DecodedEnvelope {
 /// that is not a canonical three-key map with a 32-byte `signer`, 64-byte `sig`,
 /// and a byte-string `body`.
 pub(crate) fn decode(bytes: &[u8]) -> Option<DecodedEnvelope> {
-    let cbor = CBOR::try_from_data(bytes).ok()?;
+    let cbor = checked_from_data(bytes).ok()?;
     let map = match cbor.into_case() {
         CBORCase::Map(map) => map,
         _ => return None,

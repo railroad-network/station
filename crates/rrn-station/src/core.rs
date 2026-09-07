@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 
 use rrn_crypto::keypair::Keypair;
-use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 use rrn_dispute::equivocation::{equivocation_cases, resolve_equivocation, EquivResolution};
 use rrn_dispute::escalation::{
     EscalationBallot, EscalationReason, EscalationRecord, SignedEscalation, SignedEscalationBallot,
@@ -5271,7 +5271,7 @@ impl BundleIngestError {
 /// or `None` if the bytes are not a canonical CBOR map with a text `kind`.
 fn dtn_record_kind(bytes: &[u8]) -> Option<String> {
     use dcbor::prelude::*;
-    let cbor = CBOR::try_from_data(bytes).ok()?;
+    let cbor = checked_from_data(bytes).ok()?;
     match cbor.into_case() {
         CBORCase::Map(map) => map.extract::<&str, String>("kind").ok(),
         _ => None,
