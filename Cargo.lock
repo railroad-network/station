@@ -1815,6 +1815,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dcbor",
+ "qrcode",
+ "rrn-crypto",
+ "rrn-identity",
+ "rrn-ledger",
+ "rrn-protocol",
  "rrn-station",
  "serde",
  "serde_json",

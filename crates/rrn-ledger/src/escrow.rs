@@ -283,6 +283,74 @@ impl TryFrom<CBOR> for HeadroomCertificate {
 /// A [`HeadroomCertificate`] signed by the station.
 pub type SignedHeadroomCertificate = SignedPayload<HeadroomCertificate>;
 
+/// Encodes a signed headroom certificate as portable `{signer, sig, body}`
+/// envelope bytes: the same canonical-dCBOR triple
+/// [`rrn_protocol::receipt::encode_signed`] and the DTN entry envelope use,
+/// where `body` is the canonical bytes of the [`HeadroomCertificate`] the
+/// station signed. This is the exact byte form a `rrncert:` QR carries and the
+/// mobile FFI's `certificate_parse` decodes.
+///
+/// A [`SignedPayload`] is a serde envelope, not a dCBOR value, so it needs an
+/// explicit framing to travel as bytes over a carrier (or hex over RPC). Because
+/// the signature covers only the payload's canonical bytes (ADR-0002), the
+/// envelope may be re-framed freely without invalidating it.
+pub fn encode_certificate_envelope(signed: &SignedHeadroomCertificate) -> Vec<u8> {
+    use rrn_crypto::serialize::to_canonical_bytes;
+    let mut m = Map::new();
+    m.insert("signer", CBOR::to_byte_string(signed.signer.to_bytes()));
+    m.insert("sig", CBOR::to_byte_string(signed.signature.to_bytes()));
+    m.insert(
+        "body",
+        CBOR::to_byte_string(to_canonical_bytes(signed.payload.clone())),
+    );
+    CBOR::from(m).to_cbor_data()
+}
+
+/// Decodes portable certificate-envelope bytes (see
+/// [`encode_certificate_envelope`]) back into a [`SignedHeadroomCertificate`].
+///
+/// Does **not** verify the station signature — call
+/// [`SignedPayload::verify`](rrn_crypto::signed::SignedPayload::verify) on the
+/// result. Returns `None` for any input that is not a canonical
+/// `{signer, sig, body}` map whose `body` is a canonical [`HeadroomCertificate`].
+pub fn decode_certificate_envelope(bytes: &[u8]) -> Option<SignedHeadroomCertificate> {
+    use rrn_crypto::serialize::checked_from_data;
+    let cbor = checked_from_data(bytes).ok()?;
+    let map = match cbor.into_case() {
+        CBORCase::Map(map) => map,
+        _ => return None,
+    };
+    let signer_bytes: [u8; 32] = map
+        .extract::<&str, CBOR>("signer")
+        .ok()?
+        .try_into_byte_string()
+        .ok()?
+        .as_slice()
+        .try_into()
+        .ok()?;
+    let sig_bytes: [u8; 64] = map
+        .extract::<&str, CBOR>("sig")
+        .ok()?
+        .try_into_byte_string()
+        .ok()?
+        .as_slice()
+        .try_into()
+        .ok()?;
+    let body = map
+        .extract::<&str, CBOR>("body")
+        .ok()?
+        .try_into_byte_string()
+        .ok()?
+        .as_slice()
+        .to_vec();
+    let payload: HeadroomCertificate = from_canonical_bytes(&body).ok()?;
+    Some(SignedPayload {
+        payload,
+        signer: PublicKey::from_bytes(signer_bytes).ok()?,
+        signature: Signature::from_bytes(sig_bytes).ok()?,
+    })
+}
+
 /// A member's signed early return of an outstanding certificate (ADR-0021 §2),
 /// releasing the reserved remainder before expiry.
 ///
@@ -868,6 +936,25 @@ mod tests {
         let decoded: HeadroomCertificate = from_canonical_bytes(&bytes).unwrap();
         assert_eq!(cert, decoded);
         assert_eq!(decoded.cert_id, cert.cert_id);
+    }
+
+    #[test]
+    fn certificate_envelope_roundtrip_and_verifies() {
+        let station = Keypair::generate();
+        let req = CertificateRequest::new(addr(), 1_000, 0, 1_000);
+        let cert =
+            HeadroomCertificate::new(req.member, req.cap_centi, req.request_id, 1_000, 605_800);
+        let signed = SignedHeadroomCertificate::sign(cert.clone(), &station);
+
+        let envelope = encode_certificate_envelope(&signed);
+        let decoded = decode_certificate_envelope(&envelope).expect("well-formed envelope decodes");
+        assert_eq!(decoded.payload, cert);
+        assert_eq!(decoded.signer, station.public_key());
+        decoded.verify().expect("station signature verifies");
+
+        // Garbage and a bare (unframed) certificate body are both rejected.
+        assert!(decode_certificate_envelope(b"not cbor").is_none());
+        assert!(decode_certificate_envelope(&to_canonical_bytes(cert)).is_none());
     }
 
     #[test]
