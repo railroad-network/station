@@ -174,14 +174,24 @@ characters, a 720-byte slice is ≤ 960 characters of `data`, plus ≤ 22 charac
 of prefix and header fields. The normative unit is the **≤ 1000-character emitted
 string**; the 720-byte slice is derived from it.
 
+With `count ≤ 64` at 720 bytes each, the multipart form carries a **maximum of
+64 × 720 = 46,080 bytes**; `encode_chunks` refuses a larger payload
+(`TooManyChunks`). A DTN bundle (`MAX_BUNDLE_BYTES` = 4 MiB) can far exceed this
+— a cert-backed proposal envelope is ≈ 336 bytes, so only ~140 entries already
+overflow — so a producer intending paper carriage MUST assemble the bundle under
+46,080 bytes; larger bundles are electronic-only.
+
 **Reassembly.** The first chunk pins the payload's `kind`, `payload_id8`, and
 `count`; a later chunk disagreeing on any of them is refused (sheets of two
 payloads mixed together). A repeat of a chunk already held is idempotent; a
 *different* body at a held `index` is refused. Completion requires every index
 `1..=count` present **and** a full-hash match — `Blake3(concatenation)`'s first 8
 base64url characters must equal the sheets' `payload_id8`; a mis-collated set is
-refused and discarded so a clean re-scan can rebuild it. A `+`, `=`, or `/` in
-`data` (standard-base64 artifacts) is rejected as a bad alphabet.
+refused and discarded so a clean re-scan can rebuild it. A `+` or `=` in `data`
+(standard-base64 artifacts) is rejected as a bad alphabet; a `/` is refused a
+step earlier — it splits the string into too many `/`-separated fields, so the
+Rust reference reports it as a malformed chunk rather than a bad alphabet. Both
+outcomes refuse the string; a mobile parser MAY report either error class.
 
 Rust reference: `rrn_protocol::paper` (`encode_chunks`, `PaperReassembler`).
 
@@ -244,4 +254,5 @@ To be implemented in the mobile repo — see the T2.4.2 / T2.5.1 handoff. The Ru
 codecs in `rrn_protocol::paper` are canonical; the mobile parser must produce
 byte-identical strings, verified against the committed vectors in
 `crates/rrn-protocol/tests/fixtures/paper/` (`multipart_bundle.txt`,
-`certificate.txt`, `spend_voucher.txt`).
+`certificate.txt`, `spend_voucher.txt`, and `voucher_multipart.txt` — the
+`kind` `s` multipart voucher route).

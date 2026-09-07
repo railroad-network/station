@@ -1336,7 +1336,13 @@ malicious oversized single-QR string.
   a QR; `SpendVoucher::decode` bounds `history` (64 entries) and rides on dCBOR's
   non-canonical rejection. Per-payload reassembly memory is bounded by
   `count × CHUNK_PAYLOAD_BYTES` ≤ ~46 KiB. Out-of-alphabet input (`+`, `=`, `/`)
-  is rejected (`BadAlphabet`), never mis-decoded.
+  is rejected (`BadAlphabet`), never mis-decoded. *Residual:* dCBOR's decoder has
+no nesting-depth guard, so a maximally nested ~46 KiB payload (arrays inside
+arrays) can overflow the stack and abort the decoding thread — shared with every
+dCBOR decode path in the workspace (`bundle`, `receipt`, mobile-FFI envelope),
+of which the paper path is the most tightly size-bounded. The blast radius is a
+process that simply restarts, touching no persistent state; a depth-limited
+pre-scan across all decoders is tracked as a workspace-wide follow-up.
 - *Elevation / spoofing.* None available — the codec confers no authority. A paper
   payload is admitted only after the station's front-door signature checks, exactly
   as an electronically-carried one; `classify` routes strictly by known prefix and
