@@ -1309,6 +1309,62 @@ is the primitive; the loop is the carrier's, T2.6.2/T2.7.1), airtime-budget
 enforcement (T2.6.2 consumes `sustained_bytes_per_sec`), ingest rate-limiting and
 persistence (T2.2.3/T2.4.1), and the federation surface (Phase 3).
 
+#### Paper / QR text encodings (T2.5.1)
+
+*Implemented in T2.5.1.* The paper-fallback text layer
+([`paper`](../crates/rrn-protocol/src/paper.rs), `docs/spec/qr-payloads.md`
+§§5–7): multi-part QR chunking for bundles and receipts (`rrnp:`), and single-QR
+forms for certificates (`rrncert:`) and offline spend vouchers (`rrnspend:`). Like
+the framing layer, this is a **carriage encoding, not signed content** — the paper
+chunk header is human-readable plumbing and the `payload_id8` is only 8 base64url
+characters of the payload's Blake3 hash. Everything it moves is the same signed
+bytes covered above (a bundle's entries, a receipt's station signature, a
+voucher's proposal/certificate signatures), and those signatures remain the only
+integrity boundary.
+
+**Assets:** the integrity of a reassembled paper payload (which then faces the
+full signed-envelope checks above it); the confidence that sheets from two
+different documents are not silently merged; availability of the decoder against a
+malicious oversized single-QR string.
+
+- *Tampering — a mis-collated or edited sheet set.* A person may scan sheets out
+  of order, from the wrong document, or a re-printed sheet with altered bytes. The
+  reassembler pins `(kind, payload_id8, count)` from the first chunk and refuses
+  any later chunk disagreeing on them (`Mixed`) — two documents' sheets cannot
+  merge. A *different* body at an already-held index is refused (`ChunkConflict`),
+  a byte-identical repeat is idempotent. At completion the full `Blake3` over the
+  concatenation is recomputed and its `payload_id8` must match the sheets' claim
+  (`HashMismatch`), and the partial is discarded on mismatch so a clean re-scan
+  rebuilds it. A tampered `record_bytes` inside still breaks its own signature at
+  ingest/verify, independently. *Residual:* `payload_id8` is a 48-bit accidental-
+  mixing guard, not a collision-resistant integrity proof — a caller needing full
+  assurance compares the 32-byte `Blake3` of the reassembled payload against an
+  independently-known id (a `bundle_id`); the signatures inside are the real
+  guarantee, exactly as for the electronic path.
+- *Denial of service — decode.* A crafted string could claim an enormous payload.
+  `count` is capped at `MAX_CHUNKS` (64) and `encode_chunks` refuses a payload
+  needing more (`TooManyChunks`); a single-QR `rrncert:`/`rrnspend:` body over
+  `SINGLE_QR_MAX_BYTES` (740) is refused (`Oversized`) as one that could never fit
+  a QR; `SpendVoucher::decode` bounds `history` (64 entries) and rides on dCBOR's
+  non-canonical rejection. Per-payload reassembly memory is bounded by
+  `count × CHUNK_PAYLOAD_BYTES` ≤ ~46 KiB. Out-of-alphabet input (`+`, `=`, `/`)
+  is rejected (`BadAlphabet`), never mis-decoded. *Residual:* dCBOR's decoder has
+no nesting-depth guard, so a maximally nested ~46 KiB payload (arrays inside
+arrays) can overflow the stack and abort the decoding thread — shared with every
+dCBOR decode path in the workspace (`bundle`, `receipt`, mobile-FFI envelope),
+of which the paper path is the most tightly size-bounded. The blast radius is a
+process that simply restarts, touching no persistent state; a depth-limited
+pre-scan across all decoders is tracked as a workspace-wide follow-up.
+- *Elevation / spoofing.* None available — the codec confers no authority. A paper
+  payload is admitted only after the station's front-door signature checks, exactly
+  as an electronically-carried one; `classify` routes strictly by known prefix and
+  rejects (never guesses) an unknown one.
+
+*Residual / out of scope:* QR image rendering, PDF layout, and camera scanning
+(T2.5.2 CLI; mobile repo for phones); sealed/private paper forms (a `rrnspend:`
+voucher is community-public data like any other carried record — a photographed
+sheet leaks the same as an intercepted bundle, §Information-disclosure above).
+
 ### `rrn-station` / `rrn-cli`
 
 The daemon that holds an open database and decrypted wallet, runs the settlement

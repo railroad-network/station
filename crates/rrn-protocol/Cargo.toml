@@ -17,6 +17,10 @@ dcbor = "0.25"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tracing = "0.1"
+# Base64url (no-pad) for the paper/QR text encodings (T2.5.1). Same crate the
+# workspace already uses for the recovery-shard QR; the paper forms use the
+# URL-safe alphabet so a chunk string carries no `/` field-separator collision.
+base64 = "0.22"
 
 [dev-dependencies]
 proptest = "1"
