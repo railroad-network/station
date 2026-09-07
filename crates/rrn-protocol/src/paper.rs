@@ -54,6 +54,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
+use rrn_crypto::serialize::checked_from_data;
 
 /// Scheme prefix of a multi-part paper chunk (`rrnp:<kind>/<id8>/<i>/<n>/<data>`).
 pub const MULTIPART_PREFIX: &str = "rrnp:";
@@ -596,7 +597,7 @@ impl SpendVoucher {
     /// into a voucher. Refuses a wrong version, a mis-shaped map, or a history over
     /// [`MAX_VOUCHER_HISTORY`] entries.
     pub fn decode(bytes: &[u8]) -> Result<Self, PaperError> {
-        let cbor = CBOR::try_from_data(bytes).map_err(|e| PaperError::Cbor(e.to_string()))?;
+        let cbor = checked_from_data(bytes).map_err(|e| PaperError::Cbor(e.to_string()))?;
         let map = match cbor.into_case() {
             CBORCase::Map(map) => map,
             _ => return Err(PaperError::Cbor("voucher is not a CBOR map".into())),
@@ -998,6 +999,18 @@ mod tests {
         // Garbage.
         assert!(matches!(
             SpendVoucher::decode(&[0xff, 0x00, 0x13]),
+            Err(PaperError::Cbor(_))
+        ));
+    }
+
+    #[test]
+    fn spend_voucher_decode_rejects_deeply_nested_input() {
+        // A container nested far deeper than dCBOR's recursive decoder can
+        // survive must be refused via `checked_from_data`, not crash the thread.
+        let mut deep = vec![0x81u8; 50_000]; // array-of-one, nested 50k deep
+        deep.push(0x00);
+        assert!(matches!(
+            SpendVoucher::decode(&deep),
             Err(PaperError::Cbor(_))
         ));
     }

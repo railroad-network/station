@@ -43,25 +43,201 @@ pub fn to_canonical_bytes<T: Into<CBOR>>(value: T) -> Vec<u8> {
     value.into().to_cbor_data()
 }
 
+/// Maximum CBOR container-nesting depth accepted by [`checked_from_data`] and
+/// [`from_canonical_bytes`].
+///
+/// `dcbor` decodes recursively — one stack frame per array, map, or tagged
+/// level — with no depth limit of its own (verified against dcbor 0.25). So an
+/// attacker-supplied chain of nested containers (a few bytes each) can drive the
+/// decoder past the thread's stack and **abort the whole process** before any
+/// type or signature check runs — empirically tens of thousands of levels deep
+/// on a main thread, and far fewer on the smaller stacks of mobile FFI worker
+/// threads. No legitimate signed payload in this system nests beyond a handful
+/// of levels, so this bound sits an order of magnitude above real depth while
+/// keeping the decoder's stack use trivial even on constrained threads. Input
+/// deeper than this is **rejected as malformed, never truncated or decoded**.
+pub const MAX_CBOR_DEPTH: usize = 128;
+
+/// Decodes bytes to an untyped [`CBOR`] tree, first rejecting input that nests
+/// deeper than [`MAX_CBOR_DEPTH`] container levels.
+///
+/// Prefer this over calling `dcbor`'s [`CBOR::try_from_data`] directly at **any
+/// boundary that decodes untrusted bytes**: the depth pre-scan runs first, so a
+/// hostile deeply-nested payload is refused with [`SerializeError::TooDeeplyNested`]
+/// instead of overflowing the recursive decoder's stack and aborting the
+/// process. [`from_canonical_bytes`] already routes through it; call this
+/// directly when you need the untyped `CBOR` — e.g. to read a `kind`
+/// discriminator from the map before dispatching to a concrete type.
+///
+/// The pre-scan is iterative (an explicit work stack, never recursion) so it
+/// cannot itself overflow, runs in a single O(n) pass, and is deliberately
+/// lenient about every *other* canonical-form rule — non-canonical integers,
+/// unsorted keys, trailing bytes, truncation are all left for the real decoder
+/// that runs immediately after to reject. Its one job is to bound depth.
+pub fn checked_from_data(bytes: &[u8]) -> Result<CBOR, SerializeError> {
+    ensure_depth_within_limit(bytes)?;
+    CBOR::try_from_data(bytes).map_err(|e| SerializeError::NotCanonical(e.to_string()))
+}
+
 /// Deserializes a value from canonical CBOR bytes.
 ///
-/// Returns [`SerializeError::NotCanonical`] if `bytes` is not valid dCBOR
-/// (including non-canonical encodings — e.g. unsorted map keys or non-shortest
-/// integers — which are rejected, not silently accepted), and
-/// [`SerializeError::WrongShape`] if the decoded CBOR does not match `T`.
+/// Returns [`SerializeError::TooDeeplyNested`] if `bytes` nests deeper than
+/// [`MAX_CBOR_DEPTH`] (checked before decoding, see [`checked_from_data`]),
+/// [`SerializeError::NotCanonical`] if `bytes` is not valid dCBOR (including
+/// non-canonical encodings — e.g. unsorted map keys or non-shortest integers —
+/// which are rejected, not silently accepted), and [`SerializeError::WrongShape`]
+/// if the decoded CBOR does not match `T`.
 pub fn from_canonical_bytes<T>(bytes: &[u8]) -> Result<T, SerializeError>
 where
     T: TryFrom<CBOR>,
     <T as TryFrom<CBOR>>::Error: core::fmt::Display,
 {
-    let cbor =
-        CBOR::try_from_data(bytes).map_err(|e| SerializeError::NotCanonical(e.to_string()))?;
+    let cbor = checked_from_data(bytes)?;
     T::try_from(cbor).map_err(|e| SerializeError::WrongShape(e.to_string()))
+}
+
+/// Reads one CBOR item header at `data[pos..]`, returning
+/// `(major_type_bits, argument_value, header_len)`, or `None` if the header is
+/// truncated or uses an additional-info value the deterministic decoder rejects
+/// (28–30 reserved, or 31 indefinite-length). A `None` means "this is not the
+/// start of a well-formed dCBOR item"; the caller then stops scanning and lets
+/// the real decoder report the precise error — nothing deeper can be reached
+/// past a byte the decoder itself refuses. Mirrors `dcbor`'s header parsing for
+/// *length*, but skips its canonical-value checks (leniency here is safe: the
+/// real decoder re-checks).
+fn read_item_header(data: &[u8], pos: usize) -> Option<(u8, u64, usize)> {
+    let first = *data.get(pos)?;
+    let major = first >> 5;
+    let ai = first & 0x1f;
+    let (value, arg_len) = match ai {
+        0..=23 => (u64::from(ai), 0usize),
+        24 => (u64::from(*data.get(pos + 1)?), 1),
+        25 => {
+            let b = data.get(pos + 1..pos + 3)?;
+            ((u64::from(b[0]) << 8) | u64::from(b[1]), 2)
+        }
+        26 => {
+            let b = data.get(pos + 1..pos + 5)?;
+            let mut v = 0u64;
+            for &x in b {
+                v = (v << 8) | u64::from(x);
+            }
+            (v, 4)
+        }
+        27 => {
+            let b = data.get(pos + 1..pos + 9)?;
+            let mut v = 0u64;
+            for &x in b {
+                v = (v << 8) | u64::from(x);
+            }
+            (v, 8)
+        }
+        // 28,29,30 reserved; 31 indefinite-length — dCBOR rejects all of them.
+        _ => return None,
+    };
+    Some((major, value, 1 + arg_len))
+}
+
+/// Rejects CBOR whose structural nesting would drive the recursive `dcbor`
+/// decoder past [`MAX_CBOR_DEPTH`] frames. See [`checked_from_data`] for why and
+/// [`MAX_CBOR_DEPTH`] for the bound. Iterative by construction — it walks the
+/// bytes once with an explicit work stack of "items still to read at this
+/// level", so the scan itself never recurses and cannot overflow.
+fn ensure_depth_within_limit(data: &[u8]) -> Result<(), SerializeError> {
+    // Each stack entry is the number of CBOR data items still to be read at that
+    // open container level; the stack's length is the current nesting depth. A
+    // map of n pairs is flattened to 2n items; a tag is one item at a new level.
+    let mut stack: Vec<u64> = Vec::new();
+    // A well-formed document is exactly one top-level item.
+    let mut top_remaining: u64 = 1;
+    let mut pos: usize = 0;
+
+    loop {
+        // Close any containers whose items have all been read.
+        while stack.last() == Some(&0) {
+            stack.pop();
+        }
+        // Account for consuming one item at the current level (an open
+        // container, else the top level). When the top level is spent and every
+        // container is closed, the single document item has been fully read.
+        match stack.last_mut() {
+            Some(remaining) => *remaining -= 1,
+            None if top_remaining == 0 => return Ok(()),
+            None => top_remaining -= 1,
+        }
+
+        let Some((major, value, header_len)) = read_item_header(data, pos) else {
+            // Not a well-formed item start: the decoder will error here, and
+            // nothing deeper is reachable past it, so depth is already bounded.
+            return Ok(());
+        };
+        pos += header_len;
+
+        match major {
+            // Unsigned (0), negative (1), simple/float (7): no nested payload.
+            0 | 1 | 7 => {}
+            // Byte string (2), text (3): skip `value` opaque content bytes so
+            // they are never mistaken for structure.
+            2 | 3 => {
+                let Ok(len) = usize::try_from(value) else {
+                    // A length that cannot fit in `usize` can never be satisfied
+                    // by an in-memory slice — reject, do not defer. Failing
+                    // closed matters on 32-bit targets (e.g. armeabi-v7a/x86
+                    // FFI builds): dcbor decodes with `value as usize`, which
+                    // *truncates* such a length and keeps reading, so deferring
+                    // here would let it walk — and recurse — past a point this
+                    // scan stopped counting. Rejecting is correct on every
+                    // target; on 64-bit this branch is unreachable (`usize` is
+                    // `u64`).
+                    return Err(SerializeError::NotCanonical(
+                        "CBOR string length exceeds addressable size".into(),
+                    ));
+                };
+                match pos.checked_add(len) {
+                    Some(end) if end <= data.len() => pos = end,
+                    _ => return Ok(()), // underrun -> decoder rejects; defer
+                }
+            }
+            // Array (4), map (5), tag (6): each is a level the decoder recurses
+            // into. Opening it puts a frame at depth `stack.len() + 1`.
+            4..=6 => {
+                // The check is intentionally *before* the `items > 0` test
+                // below, so an empty container at the limit is refused even
+                // though the decoder would not recurse into it. That is the
+                // safe direction and matches the "container-nesting depth"
+                // contract (not "frame count"); do not move it inside the push.
+                if stack.len() >= MAX_CBOR_DEPTH {
+                    return Err(SerializeError::TooDeeplyNested {
+                        max: MAX_CBOR_DEPTH,
+                    });
+                }
+                let items = match major {
+                    4 => value,                   // array: `value` items
+                    5 => value.saturating_mul(2), // map: key + value per pair
+                    _ => 1,                       // tag: exactly one content item
+                };
+                if items > 0 {
+                    stack.push(items);
+                }
+            }
+            // `major` is `u8 >> 5`, so 0..=7; nothing else is reachable.
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// An error from canonical (de)serialization.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum SerializeError {
+    /// The bytes nest deeper than [`MAX_CBOR_DEPTH`] container levels. Rejected
+    /// *before* decoding, because dCBOR decodes recursively with no depth limit
+    /// of its own: a deeply nested payload would otherwise overflow the thread
+    /// stack and abort the process. Treated as malformed input, never decoded.
+    #[error("CBOR nests deeper than the {max}-level limit")]
+    TooDeeplyNested {
+        /// The limit that was exceeded ([`MAX_CBOR_DEPTH`]).
+        max: usize,
+    },
     /// The bytes are not valid deterministic CBOR — malformed, or encoded in a
     /// non-canonical form that dCBOR rejects (unsorted keys, non-shortest
     /// integers, indefinite-length items, trailing data, non-NFC strings).
@@ -172,6 +348,176 @@ mod tests {
         // alternate encoding of the same value.
         let err = from_canonical_bytes::<u64>(&[0x18, 0x17]).unwrap_err();
         assert!(matches!(err, SerializeError::NotCanonical(_)), "{err:?}");
+    }
+
+    /// `depth` nested single-element arrays around an innermost integer `0`.
+    /// `0x81` is "array of one item"; the trailing `0x00` is that item at the
+    /// bottom. Decoding this recurses `depth + 1` frames in `dcbor`.
+    fn nested_arrays(depth: usize) -> Vec<u8> {
+        let mut v = vec![0x81u8; depth];
+        v.push(0x00);
+        v
+    }
+
+    /// `depth` nested single-pair maps: each `0xa1` is "map of one pair", `0x00`
+    /// its key, and the value is the next map (or the innermost `0x00`).
+    fn nested_maps(depth: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(depth * 2 + 1);
+        for _ in 0..depth {
+            v.push(0xa1); // map(1)
+            v.push(0x00); // key: integer 0
+        }
+        v.push(0x00); // innermost value
+        v
+    }
+
+    #[test]
+    fn accepts_nesting_up_to_the_limit() {
+        // Exactly MAX_CBOR_DEPTH nested containers must still decode.
+        let bytes = nested_arrays(MAX_CBOR_DEPTH);
+        assert!(checked_from_data(&bytes).is_ok(), "arrays at the limit");
+        assert!(
+            checked_from_data(&nested_maps(MAX_CBOR_DEPTH)).is_ok(),
+            "maps at the limit"
+        );
+    }
+
+    #[test]
+    fn rejects_nesting_over_the_limit() {
+        for over in [MAX_CBOR_DEPTH + 1, MAX_CBOR_DEPTH + 2] {
+            assert_eq!(
+                checked_from_data(&nested_arrays(over)).unwrap_err(),
+                SerializeError::TooDeeplyNested {
+                    max: MAX_CBOR_DEPTH
+                },
+                "arrays at depth {over}"
+            );
+            assert_eq!(
+                checked_from_data(&nested_maps(over)).unwrap_err(),
+                SerializeError::TooDeeplyNested {
+                    max: MAX_CBOR_DEPTH
+                },
+                "maps at depth {over}"
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_input_is_refused_not_a_stack_overflow() {
+        // The regression this whole change exists for: a payload deep enough to
+        // overflow `dcbor`'s recursive decoder (~46k deep aborts the process)
+        // must be refused by the iterative pre-scan, which itself cannot
+        // overflow. If the guard were absent this test would abort the runner.
+        let bytes = nested_arrays(50_000);
+        assert_eq!(
+            checked_from_data(&bytes).unwrap_err(),
+            SerializeError::TooDeeplyNested {
+                max: MAX_CBOR_DEPTH
+            },
+        );
+        // Chained tags (major 6) recurse in the decoder too and are counted.
+        let deep_tags = {
+            let mut v = vec![0xc0u8; 50_000]; // tag(0), repeated
+            v.push(0x00);
+            v
+        };
+        assert_eq!(
+            checked_from_data(&deep_tags).unwrap_err(),
+            SerializeError::TooDeeplyNested {
+                max: MAX_CBOR_DEPTH
+            },
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn oversized_string_length_is_rejected_not_deferred_on_32bit() {
+        // Regression for the 32-bit-only hole: dcbor decodes strings with
+        // `value as usize`, which *truncates* a length above `usize::MAX` and
+        // keeps reading (and recursing). The guard must reject such a length,
+        // not defer — otherwise the deep nesting placed after a bogus-length
+        // string would reach the recursive decoder uncounted. (Cannot run on a
+        // 64-bit host, where the length fits `usize`; compiled and run only for
+        // 32-bit targets, e.g. armeabi-v7a/x86 FFI builds.)
+        let mut bytes = vec![0x82, 0x5b]; // array(2); byte string, 8-byte length
+        bytes.extend_from_slice(&(u64::from(u32::MAX) + 4).to_be_bytes()); // > usize::MAX (32-bit)
+        bytes.extend_from_slice(&[0x01, 0x02, 0x03]); // a little content
+        bytes.resize(bytes.len() + 50_000, 0x81); // deep nesting after it
+        bytes.push(0x00);
+        assert!(matches!(
+            checked_from_data(&bytes),
+            Err(SerializeError::NotCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn byte_string_content_is_not_counted_as_nesting() {
+        // A byte string whose *content* looks like array headers must be skipped
+        // as opaque bytes, not walked as structure — and the skip must land on
+        // the correct next byte. The look-alike content sits *inside* an array so
+        // the scan has to skip it to reach the sibling that follows:
+        // `[ bytes(300 × 0x81), 0 ]`, canonically encoded so dcbor accepts it.
+        // Without the content-skip the 300 `0x81` bytes read as 300 nested
+        // arrays and trip the limit at the 129th; with it, this is depth 1.
+        let mut bytes = vec![0x82, 0x59, 0x01, 0x2c]; // array(2), byte string(len 300)
+        bytes.resize(bytes.len() + 300, 0x81); // 300 "array of one" look-alike bytes
+        bytes.push(0x00); // second array element: integer 0
+        assert!(checked_from_data(&bytes).is_ok());
+    }
+
+    #[test]
+    fn shallow_and_empty_values_pass_the_guard() {
+        for bytes in [
+            vec![0x00],       // integer 0
+            vec![0x80],       // empty array
+            vec![0xa0],       // empty map
+            vec![0x40],       // empty byte string
+            vec![0x60],       // empty text string
+            nested_arrays(4), // a realistically shallow structure
+        ] {
+            assert!(
+                !matches!(
+                    checked_from_data(&bytes),
+                    Err(SerializeError::TooDeeplyNested { .. })
+                ),
+                "unexpected depth rejection for {bytes:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_decode_also_rejects_deep_nesting() {
+        // The typed path (`from_canonical_bytes`) must inherit the guard, not
+        // just the untyped `checked_from_data`.
+        let err = from_canonical_bytes::<Ab>(&nested_arrays(MAX_CBOR_DEPTH + 1)).unwrap_err();
+        assert_eq!(
+            err,
+            SerializeError::TooDeeplyNested {
+                max: MAX_CBOR_DEPTH
+            }
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn guard_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            // The pre-scan must terminate with Ok/Err on any input, never panic
+            // (no index-out-of-bounds, no arithmetic overflow).
+            let _ = checked_from_data(&bytes);
+        }
+
+        #[test]
+        fn nested_arrays_pass_iff_within_limit(depth in 0usize..=(MAX_CBOR_DEPTH + 32)) {
+            let res = checked_from_data(&nested_arrays(depth));
+            if depth <= MAX_CBOR_DEPTH {
+                prop_assert!(res.is_ok(), "depth {} should decode", depth);
+            } else {
+                prop_assert_eq!(
+                    res.unwrap_err(),
+                    SerializeError::TooDeeplyNested { max: MAX_CBOR_DEPTH }
+                );
+            }
+        }
     }
 
     proptest! {

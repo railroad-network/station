@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dcbor::prelude::*;
 use rand_core::{OsRng, RngCore};
+use rrn_crypto::serialize::checked_from_data;
 use rusqlite::OptionalExtension;
 
 use crate::db::Database;
@@ -165,7 +166,7 @@ where
             .optional()?;
         match row {
             Some(bytes) => {
-                let cbor = CBOR::try_from_data(&bytes)
+                let cbor = checked_from_data(&bytes)
                     .map_err(|e| Error::Corrupt(format!("or-set cbor: {e}")))?;
                 Self::from_cbor(cbor)
             }

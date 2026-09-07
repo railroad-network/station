@@ -24,7 +24,7 @@ use std::sync::Arc;
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::PublicKey;
-use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_protocol::bundle::{Bundle, EntryEnvelope};
@@ -255,7 +255,7 @@ pub fn bundle_parse(bundle_bytes: Vec<u8>) -> Result<BundleInfo, DtnError> {
 /// The `kind` discriminant of a canonical record's CBOR map, or the empty string
 /// if the bytes are not a map with a text `kind` key. Best-effort display data.
 fn record_kind(record_bytes: &[u8]) -> String {
-    let Ok(cbor) = CBOR::try_from_data(record_bytes) else {
+    let Ok(cbor) = checked_from_data(record_bytes) else {
         return String::new();
     };
     let CBORCase::Map(map) = cbor.into_case() else {

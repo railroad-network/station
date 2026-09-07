@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{PublicKey, Signature};
-use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 
 use crate::outbox::OutboxEntry;
@@ -211,9 +211,11 @@ impl Bundle {
                 max: MAX_BUNDLE_BYTES,
             });
         }
-        // `try_from_data` validates canonical form (rejects non-canonical CBOR);
-        // the resulting tree is bounded by the byte cap checked above.
-        let cbor = CBOR::try_from_data(bytes).map_err(|e| Error::Cbor(e.to_string()))?;
+        // `checked_from_data` rejects deeper-than-`MAX_CBOR_DEPTH` nesting before
+        // the recursive decoder runs, then validates canonical form (rejecting
+        // non-canonical CBOR); the resulting tree is bounded by the byte cap
+        // checked above.
+        let cbor = checked_from_data(bytes).map_err(|e| Error::Cbor(e.to_string()))?;
         let map = match cbor.into_case() {
             CBORCase::Map(map) => map,
             _ => return Err(Error::Cbor("bundle is not a CBOR map".into())),
@@ -542,6 +544,19 @@ mod tests {
                 max: MAX_BUNDLE_BYTES,
             })
         );
+    }
+
+    #[test]
+    fn deeply_nested_bytes_are_refused_not_a_stack_overflow() {
+        // A courier-supplied bundle nested far deeper than the decoder's stack
+        // can survive must be refused by the depth guard, not decoded — proving
+        // `checked_from_data` is wired into this boundary. Without the guard this
+        // input aborts the process; the byte cap does not catch it (it is a few
+        // KiB, well under MAX_BUNDLE_BYTES).
+        let mut deep = vec![0x81u8; 50_000]; // array-of-one, nested 50k deep
+        deep.push(0x00);
+        assert!(deep.len() < MAX_BUNDLE_BYTES);
+        assert!(matches!(Bundle::decode(&deep), Err(Error::Cbor(_))));
     }
 
     #[test]

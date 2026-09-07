@@ -192,10 +192,23 @@ of content hashes.
 - *Mitigations:* all parsers return `Result` and never panic on malformed
   input (off-curve keys → `InvalidEncoding`); a `cargo-fuzz` target
   (`verify_signature`) asserts no panic on arbitrary `(pubkey, sig, message)`.
-  Ed25519 verify is fixed-cost in the input size.
-- *Residual risk:* CBOR decode work is bounded by input length; very large
-  inputs are a caller/transport concern (message size limits live in
-  `rrn-protocol`, Phase 1+).
+  Ed25519 verify is fixed-cost in the input size. **CBOR nesting depth:**
+  `dcbor` decodes recursively with no depth limit of its own, so a short but
+  deeply nested payload (a few KiB of nested arrays/maps/tags) would overflow
+  the thread stack and *abort the process* before any type or signature check —
+  a stack overflow is not a catchable `Result`. `serialize::checked_from_data`
+  (and `from_canonical_bytes`, which routes through it) runs an **iterative**
+  depth pre-scan first and rejects input nesting deeper than `MAX_CBOR_DEPTH`
+  (128 — an order of magnitude above any legitimate payload) as
+  `TooDeeplyNested`, never decoding it. Every decode-from-untrusted-bytes
+  boundary in the workspace (DTN bundle/receipt, paper spend-voucher, mobile-FFI
+  envelope/DTN, recovery-shard parse, wallet-plaintext decode, OR-Set CRDT load,
+  station record-kind sniffing) is wired through it; a `proptest` asserts the
+  pre-scan never panics on arbitrary bytes and a 50 000-deep vector is refused
+  rather than crashing.
+- *Residual risk:* other CBOR decode work is bounded by input length; very
+  large (but shallow) inputs are a caller/transport concern (message size
+  limits live in `rrn-protocol`, Phase 1+).
 
 #### Elevation of privilege
 
@@ -1336,13 +1349,12 @@ malicious oversized single-QR string.
   a QR; `SpendVoucher::decode` bounds `history` (64 entries) and rides on dCBOR's
   non-canonical rejection. Per-payload reassembly memory is bounded by
   `count × CHUNK_PAYLOAD_BYTES` ≤ ~46 KiB. Out-of-alphabet input (`+`, `=`, `/`)
-  is rejected (`BadAlphabet`), never mis-decoded. *Residual:* dCBOR's decoder has
-no nesting-depth guard, so a maximally nested ~46 KiB payload (arrays inside
-arrays) can overflow the stack and abort the decoding thread — shared with every
-dCBOR decode path in the workspace (`bundle`, `receipt`, mobile-FFI envelope),
-of which the paper path is the most tightly size-bounded. The blast radius is a
-process that simply restarts, touching no persistent state; a depth-limited
-pre-scan across all decoders is tracked as a workspace-wide follow-up.
+  is rejected (`BadAlphabet`), never mis-decoded. A maximally nested payload
+  (arrays inside arrays) that would otherwise overflow dCBOR's recursive decoder
+  and abort the thread is refused before decoding: `SpendVoucher::decode` goes
+  through `rrn_crypto::serialize::checked_from_data`, whose depth pre-scan rejects
+  nesting beyond `MAX_CBOR_DEPTH` (see the `rrn-crypto` DoS section) — as does
+  every other dCBOR decode boundary in the workspace.
 - *Elevation / spoofing.* None available — the codec confers no authority. A paper
   payload is admitted only after the station's front-door signature checks, exactly
   as an electronically-carried one; `classify` routes strictly by known prefix and
