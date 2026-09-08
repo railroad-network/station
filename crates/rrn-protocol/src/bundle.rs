@@ -171,6 +171,19 @@ impl Bundle {
         to_canonical_bytes(self)
     }
 
+    /// The `kind` discriminators of the records this bundle carries, best-effort —
+    /// an envelope whose body does not decode as an [`OutboxEntry`], or whose
+    /// record has no `kind`, is skipped. Feeds
+    /// [`airtime::bundle_priority`](crate::airtime::bundle_priority): a bundle is
+    /// paced at the highest priority among these.
+    pub fn record_kinds(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|env| from_canonical_bytes::<OutboxEntry>(&env.body).ok())
+            .filter_map(|entry| entry.record_kind())
+            .collect()
+    }
+
     /// Blake3 of the bundle's encoded bytes — a carriage identifier (see the
     /// module docs; not stable under re-bundling).
     ///
@@ -403,6 +416,20 @@ mod tests {
             let back = env.to_signed().unwrap();
             assert_eq!(&back, original);
         }
+    }
+
+    #[test]
+    fn record_kinds_reads_carried_kinds_and_paces_the_bundle() {
+        let device = Keypair::generate();
+        let entries = chain(&device, 3);
+        let bundle = Bundle::new(envelopes(&entries), 1);
+        // The test record's kind is "rrn.test.record" (see the Record impl above).
+        assert_eq!(bundle.record_kinds(), vec!["rrn.test.record"; 3]);
+        // Unknown/test kinds pace as Bulk.
+        assert_eq!(
+            crate::airtime::bundle_priority(&bundle),
+            crate::airtime::Priority::Bulk
+        );
     }
 
     #[test]

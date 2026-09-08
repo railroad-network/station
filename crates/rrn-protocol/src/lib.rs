@@ -54,6 +54,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod airtime;
 pub mod bundle;
 pub mod framing;
 pub mod outbox;
