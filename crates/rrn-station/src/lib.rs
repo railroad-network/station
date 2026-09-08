@@ -51,6 +51,7 @@ pub mod paired;
 pub mod pairing;
 pub mod recovery;
 pub mod reputation_view;
+pub mod reticulum;
 pub mod rpc;
 pub mod rpc_client;
 pub mod rpc_envelope;
