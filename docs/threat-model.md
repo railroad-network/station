@@ -2945,6 +2945,69 @@ to any system that *uses* it; an operator who enables the sidecar runs
 field-restricted software. This is documented for operators, not resolved in code;
 see ADR-0026.
 
+### DTN transport over a constrained carrier (station, T2.6.2, ADR-0013/0026)
+
+*Implemented in T2.6.2.* The `DtnSyncer` moves bundles and receipts over any
+`FrameTransport` — the Reticulum sidecar via a supervised Python LXMF adapter
+(`rrn-station::reticulum`) in production — pacing outbound frames through a
+token-bucket airtime budgeter and reassembling inbound ones, with a small
+`RRNC`-framed reliability layer (request-missing / ack). It is still a **dumb
+carrier**: integrity and authenticity ride on the per-record signatures and the
+sealed envelopes the bundles carry (see *DTN bundle ingest*), never on the
+transport, the control frames, or the airtime layer.
+
+**Assets:** the app-layer integrity guarantee holding over a lossy, adversarial
+carrier; the availability of *economic* traffic (money must move even when the
+channel is saturated or jammed); the honest airtime budget on a shared link; the
+correctness of identity→destination routing.
+
+#### Tampering / spoofing — control frames and binding records
+
+- *Threat:* an attacker on the carrier forges `RRNC` control frames (fake
+  request-missing / ack) to waste airtime or make a sender drop a cache early, or
+  forges a `rrn.net.binding` to redirect a victim's traffic to a destination it
+  controls.
+- *Mitigation:* control frames move only *unsigned carriage metadata* — a forged
+  request-missing at worst causes a redundant resend (deduped, and paced as
+  economic overhead), a forged ack at worst makes the sender stop retransmitting a
+  payload the receiver can still request again; neither can forge, alter, or
+  misattribute a **record**, because a record's integrity is its own signature,
+  re-verified at the ingest front door. A `TransportBinding` is **self-signed by
+  the bound identity and log-admitted** (`binding::validate`): an attacker cannot
+  bind someone else's `rrn1…` to its destination, and redirecting to a wrong
+  destination only *denies* delivery (a connectivity event) — the misrouted bundle
+  is still sealed/signed and cannot be read or forged by whoever receives it.
+
+#### Denial of service — announce storms, jamming, and backpressure
+
+- *Threat:* Reticulum's own announces/path-requests, or a flood of low-value
+  traffic, crowd the ~250 B/s channel and starve ledger traffic; or a radio jammer
+  denies the link outright.
+- *Mitigation:* the airtime budgeter drains **strict priority** — economic
+  (tx/cert/receipt) before governance before bulk — so money keeps moving under
+  load; economic frames are never dropped (backpressure is surfaced to the caller,
+  not swallowed), while bulk yields (oldest-dropped, starvable) *by design*.
+  Reticulum's own control traffic is external load that shares the channel; it is
+  budgeted as bulk-class pressure, and **measuring its real announce cost on a
+  live LoRa link is a T2.6.3 field-test TODO** (the number here is a design
+  estimate). Radio jamming is an availability residual with no transport-layer
+  fix: the mitigation is the lower rung of the degradation ladder — **paper
+  fallback** (T2.5.x), which no jammer reaches.
+
+#### Residual — starvation and metadata
+
+- **Bulk starvation is accepted by design:** under sustained economic load, bulk
+  traffic (marketplace, reputation gossip) may not move at all on a constrained
+  link. That is the intended trade — money over merchandise — and is stated so no
+  one reads it as a bug.
+- **Metadata:** the carrier still sees traffic volume and timing between
+  destinations (initiator anonymity covers source *addresses*, not traffic
+  analysis); unchanged from the sidecar section's residual.
+- **Adapter identity at rest:** the LXMF adapter's Reticulum identity is a
+  persisted private key deciding who may *receive* for this station (not an RRN
+  key); its at-rest custody is deferred to T2.9.1, noted here as a residual until
+  then (ADR-0026 §7).
+
 ### Vouching surface (M1.4)
 
 *Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its

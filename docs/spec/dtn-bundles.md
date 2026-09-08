@@ -231,3 +231,69 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
   community member. Sealing a bundle to the station key (privacy against an
   outside courier — ADR-0008 sealed envelopes) is a later privacy upgrade, not
   built in T2.2.1.
+
+---
+
+## 7. Constrained-carrier transport (T2.6.2, ADR-0013/0026)
+
+When bundles and receipts move over a *constrained* carrier — the Reticulum
+sidecar, and behind it LoRa at ~250 B/s — three things ride on top of the framing
+layer (`rrn_protocol::framing`, T2.2.5). All of this is carrier-agnostic: it moves
+opaque frames and never inspects a sealed/signed payload.
+
+### 7.1 Payload-kind tag
+
+Every payload is prefixed with **one tag byte** before chunking, so the receiver
+routes a reassembled payload without decoding it:
+
+| Tag | Payload |
+|----|---------|
+| `0x01` | a carriage **Bundle** to ingest |
+| `0x02` | a signed **DeliveryReceipt** (proof a bundle landed) |
+
+### 7.2 Reliability control frames — `RRNC`
+
+A chunked payload over a lossy carrier loses chunks. The receiver asks for the
+ones still missing and acknowledges a completed payload; the sender keeps a
+payload's chunks until acked (or a TTL elapses). A control frame is told from a
+data chunk by its first four bytes: data chunks begin `RRNF` (framing magic),
+control frames begin `RRNC`.
+
+```
+RRNC control frame (versioned):
+  magic        4 bytes   ASCII "RRNC"
+  version      1 byte    = 1
+  type         1 byte    0x01 RequestMissing | 0x02 Ack
+  payload_id  32 bytes   blake3 of the (tagged) payload
+  — RequestMissing only —
+  count        2 bytes   u16 BE, number of missing indexes
+  indexes    count×2     u16 BE chunk indexes, ascending
+```
+
+Two flooding guards make this safe on a slow link (both were load-bearing bugs
+the round-trip test surfaced): (a) the sender **dedups** in-flight data chunks and
+outstanding `RequestMissing` frames, so a receiver re-requesting faster than the
+carrier can drain cannot pile duplicate frames into the pacer; (b) the sender
+**pokes** the first chunk of any un-acked payload on a timer, which rescues a
+payload whose only/first chunk was lost — the receiver never saw it, so it cannot
+request it. `Ack` lets the sender free its retransmit cache promptly.
+
+### 7.3 Airtime pacing
+
+Outbound frames pass through a token-bucket **`PacedSender`** at the carrier's
+sustained rate (`[lora] raw_bytes_per_sec × duty_cycle_percent`), drained in
+**strict priority**: `Economic` (tx/cert/receipt) before `Governance`
+(gov/dispute) before `Bulk` (everything else). A bundle is paced at the highest
+priority among its records, so a station assembles single-class bundles for a
+constrained carrier. Economic traffic is never dropped (backpressure is surfaced)
+and never starved; bulk yields (oldest-dropped, starvable) by design.
+
+### 7.4 Transport binding — `rrn.net.binding`
+
+So a peer can route to an RRN identity over a source-address-less carrier, the
+identity self-signs a **`TransportBinding`** mapping its `rrn1…` address to a
+Reticulum destination hash, appended to the log. A later binding (higher
+`issued_at`) supersedes an earlier one — the destination is a rotatable handle
+*under* the durable RRN identity, never merged with it (ADR-0013 "bind, do not
+collapse"). Fields: `address`, `destination` (hex), `issued_at`. Fixture:
+`tests/fixtures/cross_platform_binding.json`.
