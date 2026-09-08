@@ -390,6 +390,11 @@ impl<T: FrameTransport> DtnSyncer<T> {
         &self.transport
     }
 
+    /// Consumes the syncer and returns its transport (to shut it down cleanly).
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
     /// Frames still queued in the pacer across all classes.
     pub fn queued(&self) -> usize {
         self.sender.queued()

@@ -77,7 +77,7 @@ pub struct StationConfig {
 /// to `sustained = raw_bytes_per_sec × duty_cycle_percent / 100`, prioritizing
 /// money over governance over bulk (`rrn_protocol::airtime`). Code takes numbers;
 /// the per-geography duty-cycle table is the T2.6.3 operator runbook's job.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoraSection {
     /// Raw carrier throughput in bytes/second before the duty cycle. Defaults to
     /// 250 (the design's LoRa figure).
@@ -96,6 +96,20 @@ pub struct LoraSection {
     /// Defaults to 480 — under a typical LoRa/Reticulum MTU, and ≤ `burst_bytes`.
     #[serde(default = "default_lora_frame_bytes")]
     pub frame_bytes: usize,
+    /// Path to the Reticulum LXMF adapter script
+    /// (`scripts/reticulum/lxmf_adapter.py`). When set **and** `[sidecar]` is
+    /// enabled, the station runs the DTN transport over Reticulum (T2.6.2);
+    /// omitted → the sidecar is supervised but no DTN traffic flows over it yet.
+    #[serde(default)]
+    pub adapter_script: Option<String>,
+    /// The Python interpreter that has `rns` + `lxmf` for the adapter. Defaults to
+    /// `"python3"` on `PATH`.
+    #[serde(default = "default_adapter_python")]
+    pub adapter_python: String,
+}
+
+fn default_adapter_python() -> String {
+    "python3".to_string()
 }
 
 fn default_raw_bytes_per_sec() -> f64 {
@@ -118,6 +132,8 @@ impl Default for LoraSection {
             duty_cycle_percent: default_duty_cycle_percent(),
             burst_bytes: default_burst_bytes(),
             frame_bytes: default_lora_frame_bytes(),
+            adapter_script: None,
+            adapter_python: default_adapter_python(),
         }
     }
 }

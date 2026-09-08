@@ -348,6 +348,47 @@ impl Station {
                 connectivity.clone(),
                 shutdown_rx.clone(),
             )));
+
+            // Reticulum DTN transport (T2.6.2, ADR-0026 §3): when an adapter
+            // script is configured, spawn the supervised Python LXMF adapter and
+            // run the DtnSyncer over it — receiving bundles, ingesting them, and
+            // returning signed receipts, paced to the [lora] airtime budget. Only
+            // with a live `rnsd` + adapter does this carry traffic; failure to
+            // spawn is a connectivity event, never fatal.
+            if let Some(script) = config.lora.adapter_script.clone() {
+                let reticulum_dir = config
+                    .sidecar
+                    .config_dir
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("reticulum"));
+                let adapter_cfg = crate::reticulum::AdapterConfig {
+                    python: PathBuf::from(&config.lora.adapter_python),
+                    script: PathBuf::from(script),
+                    config_dir: reticulum_dir.clone(),
+                    identity_path: reticulum_dir.join("adapter.identity"),
+                    max_frame_bytes: config.lora.frame_bytes,
+                    sustained_bytes_per_sec: Some(
+                        config.lora.budget().sustained_bytes_per_sec as u32,
+                    ),
+                };
+                match crate::reticulum::ReticulumTransport::spawn(adapter_cfg) {
+                    Ok(transport) => {
+                        tracing::info!("Reticulum DTN transport started");
+                        tasks.push(tokio::spawn(reticulum_dtn_loop(
+                            transport,
+                            config.lora.budget(),
+                            core.clone(),
+                            params.clock.clone(),
+                            shutdown_rx.clone(),
+                        )));
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "could not start the Reticulum DTN transport; running without it"
+                    ),
+                }
+            }
         }
 
         // Settlement sweep timer.
@@ -503,6 +544,63 @@ impl Station {
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// Drives the Reticulum DTN transport (T2.6.2): each second, pump the paced
+/// sender onto the carrier and drain arrivals; ingest each completed bundle
+/// through the core's front door and send its signed receipt back; log received
+/// receipts. Stops cleanly on shutdown, tearing down the adapter co-process.
+async fn reticulum_dtn_loop(
+    transport: crate::reticulum::ReticulumTransport,
+    budget: rrn_protocol::airtime::AirtimeBudget,
+    core: CoreHandle,
+    clock: Clock,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use crate::dtn_sync::{DtnSyncer, PayloadKind, SyncConfig};
+    use rrn_protocol::airtime::Priority;
+
+    let mut syncer = DtnSyncer::new(transport, budget, SyncConfig::default(), clock.now());
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let now = clock.now();
+                match syncer.tick(now) {
+                    Ok(completed) => {
+                        for c in completed {
+                            match c.kind {
+                                PayloadKind::Bundle => {
+                                    if let Some(receipt) = core.ingest_bundle_bytes(c.bytes).await {
+                                        let _ = syncer.send(
+                                            &c.source,
+                                            PayloadKind::Receipt,
+                                            &receipt,
+                                            Priority::Economic,
+                                            now,
+                                        );
+                                    }
+                                }
+                                PayloadKind::Receipt => {
+                                    tracing::debug!(
+                                        source = %c.source.0,
+                                        "DTN delivery receipt received over Reticulum"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "Reticulum DTN transport error"),
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+    syncer.into_transport().shutdown();
+    tracing::info!("Reticulum DTN transport stopped");
 }
 
 /// Periodically asks the core to sweep settlement at the current clock time.
