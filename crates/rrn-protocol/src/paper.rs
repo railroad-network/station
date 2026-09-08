@@ -122,6 +122,51 @@ pub const MAX_SINGLE_QR_DATA_CHARS: usize = b64u_len(SINGLE_QR_MAX_BYTES);
 /// mid-size code, so every emitted string is kept at or under this.
 pub const MAX_QR_TEXT_CHARS: usize = 1000;
 
+/// GSM 03.38 single (non-concatenated) SMS capacity in GSM-7 septets (3GPP TS
+/// 23.038). Informational: the SMS carrier always sizes to the *concatenated*
+/// per-part figure below, which is the conservative case.
+pub const GSM7_SINGLE_SMS_CHARS: usize = 160;
+
+/// GSM 03.38 concatenated-SMS per-part capacity in GSM-7 septets: an 8-bit
+/// concatenation UDH costs 7 of the 160 septets, leaving 153 (3GPP TS 23.040
+/// §9.2.3.24). The SMS chunk budget ([`sms_chunk_budget_bytes`]) sizes a chunk to
+/// `max_parts × 153` characters so one chunk rides in one (concatenated) SMS.
+pub const GSM7_CONCAT_PART_CHARS: usize = 153;
+
+/// The largest a multi-part chunk header can be, in characters, so the SMS budget
+/// can subtract it: `rrnp:`(5) + kind(1) + `/`(1) + id8(8) + `/`(1) + index(≤2) +
+/// `/`(1) + count(≤2) + `/`(1). `index`/`count` are ≤ [`MAX_CHUNKS`] (64), so ≤ 2
+/// digits each — the header never exceeds this, and the data field takes the rest.
+pub const MAX_CHUNK_HEADER_CHARS: usize =
+    MULTIPART_PREFIX.len() + 1 + 1 + PAYLOAD_ID8_LEN + 1 + 2 + 1 + 2 + 1;
+
+/// The QR chunk-payload budget passed to [`encode_chunks_with_budget`] by the
+/// paper/QR path — the same [`CHUNK_PAYLOAD_BYTES`] the plain [`encode_chunks`]
+/// uses, named for symmetry with the SMS preset. Emitted QR strings are unchanged.
+pub const QR_CHUNK_BUDGET_BYTES: usize = CHUNK_PAYLOAD_BYTES;
+
+/// The raw payload bytes one SMS-carried chunk holds, given the station's
+/// `[sms] max_parts_per_message`: a chunk rides in one message of up to
+/// `max_parts` concatenated GSM-7 parts, so its whole string must fit
+/// `max_parts × 153` characters. Subtracting the worst-case header
+/// ([`MAX_CHUNK_HEADER_CHARS`]) leaves the base64url `data` budget, and base64url
+/// expands 3 bytes to 4 characters, so the raw budget is `floor(data_chars ×
+/// 3/4)`. The result is clamped to [`CHUNK_PAYLOAD_BYTES`] (the reassembler's
+/// per-chunk memory bound, [`MAX_CHUNK_DATA_CHARS`]) so an over-large `max_parts`
+/// cannot produce a chunk the receiver would refuse.
+///
+/// At the default `max_parts = 4`: `153×4 = 612` chars − 22 header = 590 data
+/// chars → `floor(590 × 3/4) = 442` bytes (pinned by a test).
+pub fn sms_chunk_budget_bytes(max_parts_per_message: usize) -> usize {
+    let parts = max_parts_per_message.max(1);
+    let text_chars = GSM7_CONCAT_PART_CHARS.saturating_mul(parts);
+    let data_chars = text_chars.saturating_sub(MAX_CHUNK_HEADER_CHARS);
+    // base64url of N bytes is ceil(N·4/3) chars, so the largest N whose encoding
+    // fits `data_chars` is floor(data_chars·3/4).
+    let bytes = data_chars.saturating_mul(3) / 4;
+    bytes.clamp(1, CHUNK_PAYLOAD_BYTES)
+}
+
 /// Length of a [`payload_id8`] — the first 8 base64url characters of the payload's
 /// 32-byte Blake3 hash. A human-checkable grouping key ("all sheets say A6k9QzTw"),
 /// not an integrity proof (see the module docs).
@@ -326,14 +371,38 @@ pub fn payload_id8(payload: &[u8]) -> String {
     full[..PAYLOAD_ID8_LEN].to_string()
 }
 
-/// Splits `payload` into ordered multi-part paper chunk strings, one per QR.
+/// Splits `payload` into ordered multi-part paper chunk strings at the QR budget
+/// ([`CHUNK_PAYLOAD_BYTES`]) — the paper/QR path. Byte-identical to what it always
+/// emitted; the cross-platform QR fixtures pin it. Thin wrapper over
+/// [`encode_chunks_with_budget`].
 ///
 /// Each string is `rrnp:<kind>/<payload_id8>/<index>/<count>/<data>` with a 1-based
 /// `index`, a shared `payload_id8`, and base64url `data`. An empty payload yields
 /// exactly one empty-`data` chunk. Refuses a payload that would need more than
 /// [`MAX_CHUNKS`] chunks ([`PaperError::TooManyChunks`]).
 pub fn encode_chunks(kind: PaperKind, payload: &[u8]) -> Result<Vec<String>, PaperError> {
-    let count = payload.len().div_ceil(CHUNK_PAYLOAD_BYTES).max(1);
+    encode_chunks_with_budget(kind, payload, CHUNK_PAYLOAD_BYTES)
+}
+
+/// Splits `payload` into ordered multi-part chunk strings at an explicit per-chunk
+/// **payload budget** in raw bytes — the same `rrnp:` grammar as [`encode_chunks`],
+/// generalized so a narrower carrier (SMS, [`sms_chunk_budget_bytes`]) can pack
+/// smaller chunks while the QR path keeps its [`CHUNK_PAYLOAD_BYTES`] budget and its
+/// byte-for-byte output. The reassembler ([`PaperReassembler`]) is budget-agnostic —
+/// it reads `count`/`index` off each chunk — so chunks made at *any* budget
+/// reassemble on the receiver without it knowing which carrier produced them.
+///
+/// `chunk_budget_bytes` is clamped to `1..=CHUNK_PAYLOAD_BYTES`: the upper bound is
+/// the reassembler's per-chunk memory cap ([`MAX_CHUNK_DATA_CHARS`]), so no budget
+/// can emit a chunk the receiver would refuse as [`PaperError::ChunkTooLarge`].
+/// Refuses a payload that would need more than [`MAX_CHUNKS`] chunks at the budget.
+pub fn encode_chunks_with_budget(
+    kind: PaperKind,
+    payload: &[u8],
+    chunk_budget_bytes: usize,
+) -> Result<Vec<String>, PaperError> {
+    let budget = chunk_budget_bytes.clamp(1, CHUNK_PAYLOAD_BYTES);
+    let count = payload.len().div_ceil(budget).max(1);
     if count > MAX_CHUNKS {
         return Err(PaperError::TooManyChunks {
             needed: count,
@@ -343,8 +412,8 @@ pub fn encode_chunks(kind: PaperKind, payload: &[u8]) -> Result<Vec<String>, Pap
     let id8 = payload_id8(payload);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let start = i * CHUNK_PAYLOAD_BYTES;
-        let end = (start + CHUNK_PAYLOAD_BYTES).min(payload.len());
+        let start = i * budget;
+        let end = (start + budget).min(payload.len());
         let data = b64u_encode(&payload[start..end]);
         out.push(format!(
             "{}{}/{}/{}/{}/{}",
@@ -1120,5 +1189,121 @@ mod tests {
         assert!(id.bytes().all(is_base64url_char));
         // Deterministic: same bytes ⇒ same id.
         assert_eq!(id, payload_id8(b"some payload bytes"));
+    }
+
+    #[test]
+    fn encode_chunks_is_byte_identical_to_the_qr_budget_wrapper() {
+        // The QR path must keep its exact output: `encode_chunks` == the general
+        // encoder at `CHUNK_PAYLOAD_BYTES` (== QR_CHUNK_BUDGET_BYTES). The
+        // cross-platform QR fixtures pin these bytes.
+        let payload: Vec<u8> = (0..4_000u32).map(|i| (i * 5) as u8).collect();
+        assert_eq!(QR_CHUNK_BUDGET_BYTES, CHUNK_PAYLOAD_BYTES);
+        assert_eq!(
+            encode_chunks(PaperKind::Bundle, &payload).unwrap(),
+            encode_chunks_with_budget(PaperKind::Bundle, &payload, CHUNK_PAYLOAD_BYTES).unwrap()
+        );
+    }
+
+    #[test]
+    fn sms_chunk_budget_is_pinned_and_fits_one_message() {
+        // The default `[sms] max_parts_per_message = 4`: 153×4 = 612 chars, minus
+        // the 22-char worst-case header, is 590 base64url data chars, so the raw
+        // budget is floor(590 × 3/4) = 442 bytes. Pinned so the SMS spec's math and
+        // the code cannot drift apart.
+        assert_eq!(MAX_CHUNK_HEADER_CHARS, 22);
+        assert_eq!(sms_chunk_budget_bytes(4), 442);
+        // And every emitted SMS chunk string fits one 4-part concatenated message.
+        let limit = GSM7_CONCAT_PART_CHARS * 4;
+        let budget = sms_chunk_budget_bytes(4);
+        // A payload spanning several chunks, incl. a full-size chunk (2-digit count).
+        let payload: Vec<u8> = (0..(budget * 12 + 7) as u32)
+            .map(|i| (i * 3) as u8)
+            .collect();
+        let chunks = encode_chunks_with_budget(PaperKind::Bundle, &payload, budget).unwrap();
+        assert!(chunks.len() >= 12);
+        for c in &chunks {
+            assert!(
+                c.chars().count() <= limit,
+                "SMS chunk {} chars over the {}-char 4-part budget",
+                c.chars().count(),
+                limit
+            );
+        }
+        // A tiny `max_parts` still yields a usable (clamped ≥ 1) budget.
+        assert!(sms_chunk_budget_bytes(1) >= 1);
+        // A large `max_parts` is clamped to the reassembler's per-chunk cap.
+        assert_eq!(sms_chunk_budget_bytes(100), CHUNK_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn sms_budget_chunks_reassemble_via_the_shared_reassembler() {
+        // Chunks packed at the SMS budget reassemble with the same budget-agnostic
+        // PaperReassembler the QR path uses — byte-identical payload out.
+        let payload: Vec<u8> = (0..3_333u32).map(|i| (i ^ 0xA5) as u8).collect();
+        let chunks =
+            encode_chunks_with_budget(PaperKind::Receipt, &payload, sms_chunk_budget_bytes(4))
+                .unwrap();
+        assert!(chunks.len() > 1, "expected a multi-chunk payload");
+        let mut r = PaperReassembler::new();
+        let mut got = None;
+        for c in &chunks {
+            if let Some(out) = r.accept(c).unwrap() {
+                got = Some(out);
+            }
+        }
+        assert_eq!(got, Some((PaperKind::Receipt, payload)));
+    }
+
+    /// The GSM 03.38 basic-alphabet ASCII characters (3GPP TS 23.038): every one is
+    /// a single GSM-7 septet, needing no escape. Deliberately excludes the
+    /// extension-table ASCII characters (`` ` ^ [ \ ] { | } ~ ``), which cost two
+    /// septets — the audit proves the chunk grammar never emits one of those.
+    const GSM7_BASIC_ASCII: &str =
+        " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
+    #[test]
+    fn gsm7_alphabet_audit_every_emittable_char_is_a_basic_septet() {
+        // The full set of characters the `rrnp:` chunk grammar can put on the wire:
+        // the prefix, kind letters, the `/` separator, decimal digits, and the
+        // base64url alphabet (id8 and data). The ticket's finding: `_` (and `-`) ARE
+        // in the GSM-7 basic set, so no SMS-specific alphabet variant is needed.
+        let mut emittable: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
+        for c in "rrnp:".chars().chain("/".chars()) {
+            emittable.insert(c);
+        }
+        for k in [
+            PaperKind::Bundle,
+            PaperKind::Receipt,
+            PaperKind::SpendVoucher,
+        ] {
+            emittable.insert(k.letter());
+        }
+        for c in ('0'..='9')
+            .chain('A'..='Z')
+            .chain('a'..='z')
+            .chain(['-', '_'])
+        {
+            emittable.insert(c);
+        }
+        for c in &emittable {
+            assert!(
+                GSM7_BASIC_ASCII.contains(*c),
+                "grammar emits {c:?}, which is NOT a GSM-7 basic septet"
+            );
+        }
+        // Belt-and-braces: encode a real chunk over a payload covering every byte
+        // value and assert every character it emits is a basic septet too.
+        let payload: Vec<u8> = (0u32..=255).map(|b| b as u8).collect();
+        for chunk in
+            encode_chunks_with_budget(PaperKind::Bundle, &payload, sms_chunk_budget_bytes(4))
+                .unwrap()
+        {
+            for c in chunk.chars() {
+                assert!(
+                    GSM7_BASIC_ASCII.contains(c),
+                    "emitted {c:?} is not GSM-7 basic"
+                );
+            }
+        }
     }
 }

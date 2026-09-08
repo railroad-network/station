@@ -416,6 +416,26 @@ impl Station {
             }
         }
 
+        // SMS carrier (T2.7.1): the wire codec, the [`crate::sms`] seam + relay
+        // engine, and the [`sms_gateway_loop`] bridge all ship here — but the
+        // modem/HTTP-provider backend that drives them is T2.7.2. An enabled `[sms]`
+        // without that backend is therefore supervised-but-idle, mirroring
+        // `[sidecar]` enabled without `[lora] adapter_script`; log the state so the
+        // operator sees it rather than silence.
+        if config.sms.enabled {
+            match config.sms.station_msisdn.as_deref() {
+                Some(msisdn) => tracing::info!(
+                    station_msisdn = msisdn,
+                    allowed_senders = ?config.sms.allowed_senders,
+                    "SMS carrier enabled; awaiting a gateway backend (T2.7.2 wires the modem)"
+                ),
+                None => tracing::warn!(
+                    "SMS carrier enabled but [sms] station_msisdn is unset; \
+                     set it before a gateway backend is wired (T2.7.2)"
+                ),
+            }
+        }
+
         // Settlement sweep timer.
         tasks.push(tokio::spawn(sweep_timer(
             Duration::from_secs(config.timers.sweep_interval_secs.max(1)),
@@ -569,6 +589,74 @@ impl Station {
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// The SMS gateway bridge (T2.7.1): drives an [`crate::sms::SmsRelay`] over a real
+/// [`crate::sms::SmsGateway`] the way [`run_dtn_syncer`] drives the Reticulum
+/// carrier. Each second it fetches the log-derived sender registry (only in
+/// `"paired"` mode), polls inbound texts, ingests each completed bundle through the
+/// core's front door, and queues the signed delivery receipt back over SMS — paced
+/// money-first. Ingest stays the core's job (ADR-0020 single writer); this only
+/// carries bytes. Never fatal to the daemon.
+///
+/// The modem/HTTP-provider [`SmsGateway`](crate::sms::SmsGateway) this drives is
+/// T2.7.2 (`Station::open` does not spawn this loop until that backend exists);
+/// T2.7.1 exercises the bridge with [`crate::sms::MockSmsGateway`].
+pub async fn sms_gateway_loop<G: crate::sms::SmsGateway + 'static>(
+    mut relay: crate::sms::SmsRelay<G>,
+    paired_mode: bool,
+    core: CoreHandle,
+    clock: Clock,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use crate::sms::BoundSenders;
+    use rrn_protocol::airtime::Priority;
+    use rrn_protocol::paper::PaperKind;
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let now = clock.now();
+                // The registry is consulted only in "paired" mode; "open" processes
+                // any sender (still signature-gated at ingest).
+                let bound: BoundSenders = if paired_mode {
+                    core.sms_bound_senders().await
+                } else {
+                    BoundSenders::new()
+                };
+                match relay.poll(now, &bound) {
+                    Ok(completed) => {
+                        for c in completed {
+                            if c.kind == PaperKind::Bundle {
+                                if let Some(receipt) = core.ingest_bundle_bytes(c.bytes).await {
+                                    let _ = relay.queue_payload(
+                                        &c.from,
+                                        PaperKind::Receipt,
+                                        &receipt,
+                                        Priority::Economic,
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    from = %c.from,
+                                    kind = ?c.kind,
+                                    "inbound SMS payload is not a bundle; ignored"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "SMS gateway poll failed"),
+                }
+                relay.pump(now);
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+    tracing::info!("SMS gateway loop stopped");
 }
 
 /// Manages the Reticulum DTN transport (T2.6.2): waits for the sidecar to be
