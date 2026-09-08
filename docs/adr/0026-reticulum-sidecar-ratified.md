@@ -3,7 +3,8 @@
 ## Status
 
 Accepted — ratified 2026-09-07 (maintainer delegated the decision review to a
-Fable reviewer, which returned ACCEPT with caveats; the caveats are folded in:
+Fable reviewer, which returned ACCEPT with caveats, and then confirmed the
+outcome; the caveats are folded in:
 §4's license wording softened to "denied by our current allowlist" — EPL-2.0
 revisitable like MPL-2.0, AGPL not — and §7 records the conditions carried into
 T2.6.2: propagation-node (`PROPAGATED`) delivery and an LXMF-stamp stance as
