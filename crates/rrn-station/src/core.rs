@@ -833,31 +833,44 @@ impl Core {
         // Peer/mobile state comes from the shared connectivity snapshot the daemon
         // populates. A bare test core has none: report the configured surface with
         // no live reachability rather than fabricating any.
-        let (peers, mobile_listen, mobile_advertising, mobile_bound) = match &self.connectivity {
-            Some(c) => {
-                let health = c.peer_health.lock().expect("peer_health mutex");
-                let peers = c
-                    .peers
-                    .iter()
-                    .map(|p| {
-                        let h = health.get(p).copied().unwrap_or_default();
-                        rpc::PeerStatus {
-                            address: p.clone(),
-                            reachable: h.reachable,
-                            last_success_at: h.last_success_at,
-                            last_attempt_at: h.last_attempt_at,
-                        }
-                    })
-                    .collect();
-                (
-                    peers,
-                    c.mobile_listen.clone(),
-                    c.mobile_advertising,
-                    c.mobile_bound.load(Ordering::Relaxed),
-                )
-            }
-            None => (Vec::new(), String::new(), false, false),
-        };
+        let (peers, mobile_listen, mobile_advertising, mobile_bound, sidecar) =
+            match &self.connectivity {
+                Some(c) => {
+                    let health = c.peer_health.lock().expect("peer_health mutex");
+                    let peers = c
+                        .peers
+                        .iter()
+                        .map(|p| {
+                            let h = health.get(p).copied().unwrap_or_default();
+                            rpc::PeerStatus {
+                                address: p.clone(),
+                                reachable: h.reachable,
+                                last_success_at: h.last_success_at,
+                                last_attempt_at: h.last_attempt_at,
+                            }
+                        })
+                        .collect();
+                    let (state, version, reason) = c.sidecar_snapshot().describe();
+                    (
+                        peers,
+                        c.mobile_listen.clone(),
+                        c.mobile_advertising,
+                        c.mobile_bound.load(Ordering::Relaxed),
+                        rpc::SidecarStatus {
+                            state: state.to_string(),
+                            version,
+                            reason,
+                        },
+                    )
+                }
+                None => (
+                    Vec::new(),
+                    String::new(),
+                    false,
+                    false,
+                    rpc::SidecarStatus::default(),
+                ),
+            };
 
         let pending_outbox = rrn_storage::outbox::OutboxStore::new(&self.db)
             .pending_count()
@@ -878,6 +891,7 @@ impl Core {
                 mobile_listener_bound: mobile_bound,
                 pending_outbox,
                 pending_receipts,
+                sidecar,
             },
         })
     }

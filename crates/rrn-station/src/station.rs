@@ -317,6 +317,38 @@ impl Station {
             }
         }
 
+        // Supervised Reticulum sidecar (T2.6.1, ADR-0013). Off unless the
+        // operator opts in; when on, it runs `rnsd` as an appliance-style managed
+        // child. A carrier only — its failures degrade to "sidecar unavailable"
+        // inside the supervisor and never keep the station down.
+        if config.sidecar.enabled {
+            let config_dir = config
+                .sidecar
+                .config_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("reticulum"));
+            let sidecar_cfg = crate::sidecar::SidecarConfig {
+                rnsd_path: PathBuf::from(&config.sidecar.rnsd_path),
+                config_dir,
+                pinned_version: config.sidecar.pinned_version.clone(),
+                allow_version_drift: config.sidecar.allow_version_drift,
+                restart_backoff: Duration::from_secs(config.sidecar.restart_backoff_secs.max(1)),
+                tcp_listen: config.sidecar.tcp_listen.clone(),
+                tcp_peers: config.sidecar.tcp_peers.clone(),
+            };
+            tracing::info!(
+                rnsd = %config.sidecar.rnsd_path,
+                pinned = %config.sidecar.pinned_version,
+                "Starting the supervised Reticulum sidecar"
+            );
+            tasks.push(tokio::spawn(crate::sidecar::supervise(
+                sidecar_cfg,
+                connectivity.clone(),
+                shutdown_rx.clone(),
+            )));
+        }
+
         // Settlement sweep timer.
         tasks.push(tokio::spawn(sweep_timer(
             Duration::from_secs(config.timers.sweep_interval_secs.max(1)),

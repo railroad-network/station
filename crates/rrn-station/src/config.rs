@@ -60,6 +60,10 @@ pub struct StationConfig {
     /// receipt-retention window, ADR-0020 §3).
     #[serde(default)]
     pub dtn: DtnSection,
+    /// The supervised Reticulum daemon (`rnsd`) sidecar (optional; disabled by
+    /// default, ADR-0013).
+    #[serde(default)]
+    pub sidecar: SidecarSection,
 }
 
 /// `[peers]` — who to gossip with.
@@ -229,6 +233,92 @@ impl Default for DtnSection {
     fn default() -> Self {
         Self {
             receipt_retention_secs: default_receipt_retention_secs(),
+        }
+    }
+}
+
+/// `[sidecar]` — the supervised Reticulum daemon (`rnsd`), ADR-0013.
+///
+/// Reticulum is a *carrier only*: the sidecar moves opaque, already-signed
+/// bundles and never becomes the identity, integrity, or encryption boundary
+/// (ADR-0013's non-goals). It is off by default — a station carries traffic over
+/// Reticulum only where an operator opts in — and, when on, is run as an
+/// appliance-style managed child (version-pinned, restarted with backoff, killed
+/// cleanly on shutdown). Its loss is a connectivity event, never a reason the
+/// daemon exits (T2.4.1 posture).
+///
+/// The generated Reticulum config (in [`config_dir`](SidecarSection::config_dir))
+/// is templated from [`tcp_listen`](SidecarSection::tcp_listen) and
+/// [`tcp_peers`](SidecarSection::tcp_peers) only; the RNode/LoRa interface
+/// template lands in T2.6.3, and the `FrameTransport` impl over the sidecar in
+/// T2.6.2. This ticket (T2.6.1) delivers the supervisor and the integration
+/// spike, not the transport wiring.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SidecarSection {
+    /// Whether to run the sidecar at all. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to (or name of) the `rnsd` binary. Defaults to `"rnsd"`, found on
+    /// `PATH`.
+    #[serde(default = "default_rnsd_path")]
+    pub rnsd_path: String,
+    /// Directory the generated Reticulum config lives in. When omitted, defaults
+    /// to `<data_dir>/reticulum` (resolved at [`Station::open`](crate::station::Station::open)
+    /// time, since the data dir is not known here).
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    /// The pinned `rnsd` version this station is validated against, as a
+    /// dotted-prefix match: `"1.5"` accepts any `1.5.x`, `"1.5.2"` only that
+    /// point release, and a trailing `x`/`*` component (`"1.5.x"`) is an explicit
+    /// wildcard. The supervisor refuses to run a mismatched `rnsd` (running
+    /// degraded *without* the sidecar) unless
+    /// [`allow_version_drift`](SidecarSection::allow_version_drift) is set —
+    /// appliance discipline, never a silently-unpinned carrier. Defaults to
+    /// [`DEFAULT_PINNED_RNSD_VERSION`](crate::sidecar::DEFAULT_PINNED_RNSD_VERSION).
+    #[serde(default = "default_pinned_rnsd_version")]
+    pub pinned_version: String,
+    /// Development escape hatch: run against an `rnsd` whose version does not
+    /// match [`pinned_version`](SidecarSection::pinned_version) anyway (warns
+    /// loudly). Off by default.
+    #[serde(default)]
+    pub allow_version_drift: bool,
+    /// Base restart backoff in seconds after the sidecar exits. Doubles on each
+    /// consecutive failure, capped at 300 (five minutes); resets once the child
+    /// has stayed up past the healthy threshold. Defaults to 5.
+    #[serde(default = "default_restart_backoff_secs")]
+    pub restart_backoff_secs: u64,
+    /// A TCP *server* interface for the generated Reticulum config: the
+    /// `host:port` `rnsd` listens on for inbound Reticulum links. Omitted → no
+    /// server stanza is templated.
+    #[serde(default)]
+    pub tcp_listen: Option<String>,
+    /// TCP *client* interfaces for the generated Reticulum config: `host:port`
+    /// targets `rnsd` dials out to. Each becomes one `TCPClientInterface` stanza.
+    #[serde(default)]
+    pub tcp_peers: Vec<String>,
+}
+
+fn default_rnsd_path() -> String {
+    "rnsd".to_string()
+}
+fn default_pinned_rnsd_version() -> String {
+    crate::sidecar::DEFAULT_PINNED_RNSD_VERSION.to_string()
+}
+fn default_restart_backoff_secs() -> u64 {
+    5
+}
+
+impl Default for SidecarSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rnsd_path: default_rnsd_path(),
+            config_dir: None,
+            pinned_version: default_pinned_rnsd_version(),
+            allow_version_drift: false,
+            restart_backoff_secs: default_restart_backoff_secs(),
+            tcp_listen: None,
+            tcp_peers: Vec::new(),
         }
     }
 }
@@ -435,6 +525,7 @@ impl StationConfig {
             credit: CreditSection::default(),
             timers: TimersSection::default(),
             dtn: DtnSection::default(),
+            sidecar: SidecarSection::default(),
         }
     }
 }
@@ -581,6 +672,61 @@ mod tests {
         let cfg = StationConfig::parse(text, &p()).unwrap();
         assert_eq!(cfg.dtn.receipt_retention_secs, 120);
         assert_eq!(cfg.timers.dtn_prune_interval_secs, 15);
+    }
+
+    #[test]
+    fn sidecar_defaults_to_disabled() {
+        // A config written before [sidecar] existed still parses, and the
+        // sidecar is off with the pinned defaults.
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert!(!cfg.sidecar.enabled);
+        assert_eq!(cfg.sidecar.rnsd_path, "rnsd");
+        assert_eq!(cfg.sidecar.config_dir, None);
+        assert_eq!(
+            cfg.sidecar.pinned_version,
+            crate::sidecar::DEFAULT_PINNED_RNSD_VERSION
+        );
+        assert!(!cfg.sidecar.allow_version_drift);
+        assert_eq!(cfg.sidecar.restart_backoff_secs, 5);
+        assert_eq!(cfg.sidecar.tcp_listen, None);
+        assert!(cfg.sidecar.tcp_peers.is_empty());
+    }
+
+    #[test]
+    fn sidecar_section_overrides_defaults() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [sidecar]
+            enabled = true
+            rnsd_path = "/opt/reticulum/bin/rnsd"
+            config_dir = "/var/lib/rrn/reticulum"
+            pinned_version = "0.9.6"
+            allow_version_drift = true
+            restart_backoff_secs = 10
+            tcp_listen = "0.0.0.0:4242"
+            tcp_peers = ["203.0.113.7:4242", "198.51.100.9:4242"]
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert!(cfg.sidecar.enabled);
+        assert_eq!(cfg.sidecar.rnsd_path, "/opt/reticulum/bin/rnsd");
+        assert_eq!(
+            cfg.sidecar.config_dir.as_deref(),
+            Some("/var/lib/rrn/reticulum")
+        );
+        assert_eq!(cfg.sidecar.pinned_version, "0.9.6");
+        assert!(cfg.sidecar.allow_version_drift);
+        assert_eq!(cfg.sidecar.restart_backoff_secs, 10);
+        assert_eq!(cfg.sidecar.tcp_listen.as_deref(), Some("0.0.0.0:4242"));
+        assert_eq!(
+            cfg.sidecar.tcp_peers,
+            vec!["203.0.113.7:4242", "198.51.100.9:4242"]
+        );
     }
 
     #[test]

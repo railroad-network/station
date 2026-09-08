@@ -348,6 +348,36 @@ pub struct ConnectivityBlock {
     /// ack.
     #[serde(default)]
     pub pending_receipts: u64,
+    /// The supervised Reticulum sidecar's posture (T2.6.1, ADR-0013). Defaults to
+    /// `disabled` on a station with no sidecar configured (or a bare test core).
+    #[serde(default)]
+    pub sidecar: SidecarStatus,
+}
+
+/// The Reticulum sidecar's state in a [`ConnectivityBlock`] (T2.6.1). Purely
+/// derived degradation-legibility state — the sidecar is a dumb carrier
+/// (ADR-0013), so nothing here is signed or authoritative.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SidecarStatus {
+    /// One of `disabled`, `running`, `degraded`, `restarting`.
+    pub state: String,
+    /// The managed `rnsd` version, present only while `running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Why the sidecar is not carrying traffic (degraded reason, or the restart
+    /// backoff); present only when `degraded` or `restarting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for SidecarStatus {
+    fn default() -> Self {
+        SidecarStatus {
+            state: "disabled".to_string(),
+            version: None,
+            reason: None,
+        }
+    }
 }
 
 /// One peer's last-observed reachability in a [`ConnectivityBlock`].

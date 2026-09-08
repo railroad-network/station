@@ -2854,6 +2854,91 @@ mobile `offline_spend_verify` (`rrn-mobile-ffi`) and is not duplicated in the CL
 Lifting it into `rrn-ledger` so the CLI can render the full verdict is tracked as
 backlog.
 
+### Reticulum transport sidecar (station, ADR-0013 / ADR-0026)
+
+*Supervisor implemented in T2.6.1; the `FrameTransport` wiring over it is T2.6.2,
+the RNode/LoRa interface T2.6.3.* The station may run the Python Reticulum daemon
+(`rnsd`) as an **external, supervised, version-pinned OS service** to carry
+federation and collapse-mode traffic (ADR-0013). It is off by default
+(`[sidecar] enabled = false`); when on, `rrn-station::sidecar` runs it as an
+appliance-style managed child — version-pinned, output captured to `tracing`,
+restarted with backoff, killed cleanly (SIGTERM→SIGKILL) on shutdown — and mirrors
+its posture into the `status` connectivity block (T2.4.1). The foundational
+property, restated so nothing downstream forgets it: **Reticulum is a dumb
+carrier**. It moves opaque bytes that are already sealed and signed at the app
+layer (ADR-0002/0008/0020); it is never the identity, integrity, or encryption
+boundary (ADR-0013 non-goals). The spike that ratified this path is
+`crates/rrn-station/tests/reticulum_spike.rs`.
+
+**Assets:** the availability and clean lifecycle of the daemon (a failed or
+failing sidecar must never take the station down); the app-layer integrity
+guarantee holding **regardless** of what the carrier does; the absence of any
+Reticulum identity leaking into RRN identity or trust; the operator's host, which
+now runs a second, unaudited runtime and process.
+
+#### Elevation / process compromise — an attacker who owns `rnsd`
+
+- *Threat:* an attacker compromises the `rnsd` process (a bug in the unaudited
+  transport, a supply-chained `rns`/`lxmf` wheel, or host-level access) and hopes
+  to forge, alter, or attribute community records, or to pivot into the station.
+- *Mitigation (what they cannot do):* `rnsd` never holds an RRN key and never sees
+  plaintext of anything that matters — the bundles it carries are signed per-entry
+  and (on the sealed channels) encrypted at the app layer, so a carrier compromise
+  **cannot forge a record, alter one undetectably, or impersonate a signer**; a
+  tampered byte stream fails `rrn_protocol::outbox::validate` and the engine's
+  re-verification at the one front door (see *DTN bundle ingest* above), exactly as
+  a hostile courier's bundle does. The station and `rnsd` are separate processes:
+  the station drives `rnsd`, never the reverse, and `rnsd` has no RPC into the
+  station.
+- *Residual (what they can do):* a carrier compromise is a **carrier** compromise
+  — drop, delay, reorder, duplicate, or *observe the metadata of* traffic (who is
+  talking to whom, when, and how much), and consume host resources. This is the
+  same residual as a hostile LAN or a malicious courier, and the same mitigation
+  bounds it: availability degrades to a connectivity event, never a correctness
+  one. Owning `rnsd` also means owning its Reticulum identity/destinations, but
+  those are disposable reachability handles bound under — never collapsed into —
+  the RRN identity (ADR-0013 "bind, do not collapse"), so re-binding after a
+  compromise costs a signed statement, not recovery.
+
+#### Denial of service — supervisor and announce budget
+
+- *Threat:* the sidecar crash-loops (bad config, a wedged `rnsd`, a version the
+  station will not manage), or Reticulum's own control traffic (announces, path
+  requests) starves the shared link — acute on a ~250 B/s LoRa channel under
+  Bootstrap-tier single-node rules with little redundancy to absorb loss.
+- *Mitigation:* the supervisor is failure-tolerant by construction — a missing
+  binary, a version-pin mismatch, or an unwritable config each degrade to
+  `Degraded` and the daemon **runs on without the carrier**; a crashing child is
+  restarted with exponential backoff (base 5s, doubling, cap 300s) so a hard crash
+  loop cannot busy-spin. Version drift is *refused* by default (appliance
+  discipline: run degraded rather than manage an unpinned carrier). Announce-budget
+  tuning on constrained links is deferred to T2.6.2, where the `FrameTransport`
+  pacing layer lands; it is named here as a known residual until then.
+
+#### Information disclosure — initiator anonymity and truncated-hash addressing
+
+- *Threat:* a network observer correlates traffic to deanonymize members, or
+  exploits Reticulum's truncated-hash destination space.
+- *Mitigation / residual:* Reticulum packets carry **no source address**, which
+  helps pseudonymity but means anything that must be *attributable* — a
+  reputation-staked attestation — names and signs its signer at the app layer,
+  which RRN already does (ADR-0013). Truncated-hash addressing has a finite
+  collision space; fine at community scale, noted here as a residual to revisit if
+  a federation ever grows into a regime where destination-hash collisions become
+  plausible. The outer Reticulum link encryption (Ed25519/X25519, AES-256-CBC +
+  HMAC) is treated as a *bonus* layer only; the confidentiality guarantee is the
+  app-layer XChaCha20-Poly1305 seal, never Reticulum's unaudited crypto.
+
+**Distribution posture (open-source check, ADR-0013 → ADR-0026).** `rnsd` is a
+**separately operator-installed** runtime dependency (`pipx install rns`), never a
+Cargo dependency and never bundled or linked — so the hermetic, license-clean Rust
+workspace and its `cargo deny` allowlist are unaffected. It matters nonetheless
+that the reference code is under the non-OSI-approved **"Reticulum License"** (MIT
+plus no-harm and no-AI-training field-of-use restrictions) whose conditions attach
+to any system that *uses* it; an operator who enables the sidecar runs
+field-restricted software. This is documented for operators, not resolved in code;
+see ADR-0026.
+
 ### Vouching surface (M1.4)
 
 *Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its

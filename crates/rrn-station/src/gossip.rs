@@ -65,6 +65,10 @@ pub struct ConnectivityState {
     pub mobile_bound: AtomicBool,
     /// Per-peer reachability, keyed by peer address.
     pub peer_health: Mutex<HashMap<String, PeerHealth>>,
+    /// The Reticulum sidecar's live posture (T2.6.1). Written by the sidecar
+    /// supervisor, read by the status handler; `Disabled` until the supervisor
+    /// says otherwise (and forever, when `[sidecar] enabled = false`).
+    pub sidecar: Mutex<crate::sidecar::SidecarState>,
 }
 
 impl ConnectivityState {
@@ -77,7 +81,18 @@ impl ConnectivityState {
             mobile_advertising,
             mobile_bound: AtomicBool::new(false),
             peer_health: Mutex::new(HashMap::new()),
+            sidecar: Mutex::new(crate::sidecar::SidecarState::Disabled),
         }
+    }
+
+    /// Records the sidecar supervisor's current [`SidecarState`](crate::sidecar::SidecarState).
+    pub fn set_sidecar(&self, state: crate::sidecar::SidecarState) {
+        *self.sidecar.lock().expect("sidecar mutex") = state;
+    }
+
+    /// A clone of the sidecar's current state, for the `status` RPC.
+    pub fn sidecar_snapshot(&self) -> crate::sidecar::SidecarState {
+        self.sidecar.lock().expect("sidecar mutex").clone()
     }
 
     /// Records a round's outcome for `peer` and returns the reachability
