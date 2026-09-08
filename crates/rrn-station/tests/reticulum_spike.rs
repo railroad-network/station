@@ -8,9 +8,13 @@
 //! pin). It is not a unit test of station code — the supervisor's own behavior is
 //! covered hermetically in `sidecar.rs` against a fake `rnsd`. This proves the
 //! *adoption thesis* end to end: a real signed [`Bundle`] crosses two supervised
-//! `rnsd` instances over Reticulum/LXMF, byte-identically, **including when the
-//! receiver starts after the send** — the store-and-forward property the whole
-//! Reticulum adoption is for (ADR-0013 §Consequences).
+//! `rnsd` instances over Reticulum/LXMF, byte-identically, **with the receiver
+//! started only after the send is already in flight** — path request → later
+//! announce → path discovery → direct delivery. That is delay-tolerant delivery
+//! to an initially-absent receiver; the payload is held (by the sender helper's
+//! own poll loop) until a path appears. Full LXMF-layer store-and-forward through
+//! a propagation node — where the message survives with *neither* endpoint
+//! online — is a T2.6.2 follow-up (see ADR-0026 §5).
 //!
 //! ## Running it
 //!
@@ -111,22 +115,59 @@ fn write_spike_config(dir: &Path, node: &str, iface: &str, shared_port: u16) {
     std::fs::write(dir.join(sidecar::RETICULUM_CONFIG_FILE), cfg).unwrap();
 }
 
-/// Boots one supervised `rnsd` on a pre-written config dir and returns its
-/// shutdown sender + supervisor task.
-fn boot_rnsd(config_dir: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+/// One booted, station-supervised `rnsd`: the shared connectivity state (so the
+/// test can assert it actually reached `Running`), its shutdown sender, and the
+/// supervisor task.
+struct Node {
+    state: Arc<ConnectivityState>,
+    shutdown: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Boots one supervised `rnsd` on a pre-written config dir. Pins to `1.5` with
+/// **drift disallowed**, so the CI lane validates the pin parser against real
+/// `rnsd --version` output — a mismatch degrades the sidecar, and the test then
+/// fails at the `Running` assertion rather than passing vacuously.
+fn boot_rnsd(config_dir: PathBuf) -> Node {
     let cfg = SidecarConfig {
         rnsd_path: PathBuf::from(rnsd_bin()),
         config_dir,
         pinned_version: "1.5".to_string(),
-        allow_version_drift: true, // any 1.x rnsd is fine for the spike
+        allow_version_drift: false,
         restart_backoff: Duration::from_secs(1),
         tcp_listen: None, // config is pre-written; supervisor must not regenerate
         tcp_peers: vec![],
+        shutdown_grace: Duration::from_secs(5),
     };
     let state = Arc::new(ConnectivityState::new(vec![], "127.0.0.1:0".into(), false));
-    let (tx, rx) = watch::channel(false);
-    let handle = tokio::spawn(sidecar::supervise(cfg, state, rx));
-    (tx, handle)
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::spawn(sidecar::supervise(cfg, state.clone(), rx));
+    Node {
+        state,
+        shutdown,
+        task,
+    }
+}
+
+/// Blocks until the node's supervisor reports `Running`, failing the test if it
+/// degrades or does not come up — so a spike that never actually supervised
+/// `rnsd` cannot pass.
+async fn await_running(node: &Node, which: &str) {
+    let start = std::time::Instant::now();
+    loop {
+        match node.state.sidecar_snapshot() {
+            sidecar::SidecarState::Running { .. } => return,
+            sidecar::SidecarState::Degraded { reason } => {
+                panic!("node {which} sidecar degraded instead of running: {reason}")
+            }
+            other => {
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!("node {which} sidecar never reached Running (last: {other:?})");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 async fn run_helper(args: &[&str]) -> std::process::Output {
@@ -142,7 +183,7 @@ async fn run_helper(args: &[&str]) -> std::process::Output {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "non-hermetic: needs pinned rnsd + lxmf; run in the reticulum-spike CI lane"]
-async fn signed_bundle_survives_reticulum_lxmf_store_and_forward() {
+async fn signed_bundle_survives_reticulum_delivery_to_a_late_receiver() {
     let work = tempfile::tempdir().unwrap();
     let dir = work.path();
 
@@ -153,7 +194,8 @@ async fn signed_bundle_survives_reticulum_lxmf_store_and_forward() {
     std::fs::write(&payload_path, &payload).unwrap();
 
     // Persisted identities. Compute the receiver's LXMF hash offline, so the
-    // sender can address it *before it starts* (the store-and-forward case).
+    // sender can be launched *before the receiver exists* and hold the payload
+    // (in the helper's own poll loop) until the receiver announces a path.
     let recv_id = dir.join("recv.identity");
     let send_id = dir.join("send.identity");
     let hash_out = run_helper(&["hash", "--identity", recv_id.to_str().unwrap()]).await;
@@ -188,13 +230,19 @@ async fn signed_bundle_survives_reticulum_lxmf_store_and_forward() {
         37430,
     );
 
-    // Boot both supervised rnsd instances; give the TCP link a moment to form.
-    let (tx_a, task_a) = boot_rnsd(dir_a.clone());
-    let (tx_b, task_b) = boot_rnsd(dir_b.clone());
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Boot both supervised rnsd instances and require each to actually reach
+    // Running before the helpers attach — otherwise the helpers would become the
+    // RNS instances themselves and the spike would pass without a supervised
+    // rnsd (require_shared_instance in the helper is the second guard).
+    let node_a = boot_rnsd(dir_a.clone());
+    let node_b = boot_rnsd(dir_b.clone());
+    await_running(&node_a, "a").await;
+    await_running(&node_b, "b").await;
+    // Give the TCP link between the two rnsd instances a moment to form.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Sender goes first, addressing a receiver that is not up yet — LXMF holds
-    // and retries the message.
+    // Sender goes first, addressing a receiver that is not up yet — the helper
+    // holds and retries until the receiver announces a path.
     let script = helper_script();
     let py = python_bin();
     let send_dir = dir_a.clone();
@@ -259,10 +307,10 @@ async fn signed_bundle_survives_reticulum_lxmf_store_and_forward() {
         .unwrap();
 
     // Tear the sidecars down before asserting, so a failure still cleans up.
-    let _ = tx_a.send(true);
-    let _ = tx_b.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(15), task_a).await;
-    let _ = tokio::time::timeout(Duration::from_secs(15), task_b).await;
+    let _ = node_a.shutdown.send(true);
+    let _ = node_b.shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(15), node_a.task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), node_b.task).await;
 
     assert!(
         send_res.status.success(),

@@ -40,7 +40,10 @@ def role_hash(args):
 
 
 def role_recv(args):
-    RNS.Reticulum(args.config)
+    # require_shared_instance: fail unless a separately-running (station-
+    # supervised) rnsd owns the interfaces, so the spike cannot pass with this
+    # helper standing in as the RNS instance itself.
+    RNS.Reticulum(args.config, require_shared_instance=True)
     router = LXMF.LXMRouter(storagepath=args.storage, enforce_stamps=False)
     ident = load_or_create_identity(args.identity)
     dest = router.register_delivery_identity(ident, display_name="spike-recv")
@@ -65,7 +68,7 @@ def role_recv(args):
 
 
 def role_send(args):
-    RNS.Reticulum(args.config)
+    RNS.Reticulum(args.config, require_shared_instance=True)
     router = LXMF.LXMRouter(storagepath=args.storage, enforce_stamps=False)
     ident = load_or_create_identity(args.identity)
     source = router.register_delivery_identity(ident, display_name="spike-send")

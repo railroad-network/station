@@ -61,10 +61,15 @@ pub const RETICULUM_CONFIG_FILE: &str = "config";
 /// A child that has stayed up at least this long is treated as healthy, so its
 /// eventual exit restarts at the base backoff rather than a climbed one.
 const HEALTHY_AFTER_SECS: u64 = 30;
-/// Grace between SIGTERM and SIGKILL when stopping the child on shutdown.
-const SHUTDOWN_GRACE_SECS: u64 = 10;
+/// Default grace between SIGTERM and SIGKILL when stopping the child on shutdown.
+pub const SHUTDOWN_GRACE_SECS: u64 = 10;
 /// The backoff ceiling (ADR-0013 appliance framing; ticket: doubling, cap 300).
 const BACKOFF_CAP_SECS: u64 = 300;
+/// Bound on the startup `rnsd --version` probe. A binary that never exits on
+/// `--version` (a misconfigured wrapper) must not wedge the supervisor — which
+/// would wedge `Station::shutdown`, since it awaits this task — so the probe is
+/// raced against both a timeout and the shutdown signal.
+const VERSION_CHECK_TIMEOUT_SECS: u64 = 15;
 
 /// The supervisor's live state, mirrored into the `status` RPC's connectivity
 /// block (T2.4.1) so an operator can read the sidecar's posture at a glance.
@@ -74,6 +79,9 @@ const BACKOFF_CAP_SECS: u64 = 300;
 pub enum SidecarState {
     /// Not configured to run (`[sidecar] enabled = false`), the default.
     Disabled,
+    /// Enabled and coming up: validating the version pin and generating the
+    /// config, before the first spawn.
+    Starting,
     /// Running a managed `rnsd` of the given version.
     Running {
         /// The `rnsd` version string the supervisor validated at start.
@@ -102,6 +110,7 @@ impl SidecarState {
     pub fn describe(&self) -> (&'static str, Option<String>, Option<String>) {
         match self {
             SidecarState::Disabled => ("disabled", None, None),
+            SidecarState::Starting => ("starting", None, None),
             SidecarState::Running { version } => ("running", Some(version.clone()), None),
             SidecarState::Degraded { reason } => ("degraded", None, Some(reason.clone())),
             SidecarState::Restarting {
@@ -137,17 +146,15 @@ pub struct SidecarConfig {
     pub tcp_listen: Option<String>,
     /// The TCP client interfaces (`host:port`) to template.
     pub tcp_peers: Vec<String>,
+    /// Grace between SIGTERM and SIGKILL when stopping the child on shutdown
+    /// (default [`SHUTDOWN_GRACE_SECS`]; small in tests).
+    pub shutdown_grace: Duration,
 }
 
 impl SidecarConfig {
     /// The healthy-uptime threshold above which an exit resets the backoff.
     fn healthy_after(&self) -> Duration {
         Duration::from_secs(HEALTHY_AFTER_SECS)
-    }
-
-    /// The SIGTERM→SIGKILL grace on shutdown.
-    fn shutdown_grace(&self) -> Duration {
-        Duration::from_secs(SHUTDOWN_GRACE_SECS)
     }
 }
 
@@ -163,12 +170,23 @@ pub async fn supervise(
     state: Arc<ConnectivityState>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    state.set_sidecar(SidecarState::Starting);
+
     // 1. Version pin. A mismatch (or an unrunnable binary) degrades and returns:
     // appliance discipline runs *without* the carrier rather than with an
-    // unpinned one.
-    let version = match check_version(&cfg.rnsd_path).await {
-        Ok(v) if matches_pin(&v, &cfg.pinned_version) => v,
-        Ok(v) if cfg.allow_version_drift => {
+    // unpinned one. The probe is bounded by a timeout AND raced against shutdown,
+    // so a wrapper that never exits on `--version` cannot wedge this task — which
+    // would in turn wedge `Station::shutdown`, which awaits it.
+    let checked = tokio::select! {
+        r = tokio::time::timeout(
+            Duration::from_secs(VERSION_CHECK_TIMEOUT_SECS),
+            check_version(&cfg.rnsd_path),
+        ) => r,
+        _ = shutdown.changed() => return, // shutdown during startup: nothing to clean up
+    };
+    let version = match checked {
+        Ok(Ok(v)) if matches_pin(&v, &cfg.pinned_version) => v,
+        Ok(Ok(v)) if cfg.allow_version_drift => {
             tracing::warn!(
                 found = %v,
                 pinned = %cfg.pinned_version,
@@ -177,7 +195,7 @@ pub async fn supervise(
             );
             v
         }
-        Ok(v) => {
+        Ok(Ok(v)) => {
             let reason = format!(
                 "rnsd version {v} does not match pinned {} (set [sidecar] \
                  allow_version_drift for development)",
@@ -187,13 +205,35 @@ pub async fn supervise(
             state.set_sidecar(SidecarState::Degraded { reason });
             return;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let reason = format!("cannot run `{} --version`: {e}", cfg.rnsd_path.display());
             tracing::warn!(%reason, "running degraded WITHOUT the Reticulum sidecar");
             state.set_sidecar(SidecarState::Degraded { reason });
             return;
         }
+        Err(_elapsed) => {
+            let reason = format!(
+                "`{} --version` did not return within {VERSION_CHECK_TIMEOUT_SECS}s",
+                cfg.rnsd_path.display()
+            );
+            tracing::warn!(%reason, "running degraded WITHOUT the Reticulum sidecar");
+            state.set_sidecar(SidecarState::Degraded { reason });
+            return;
+        }
     };
+
+    // Warn (do not refuse) on a malformed interface address: it is silently
+    // dropped from the generated config otherwise, leaving a `running` sidecar
+    // with an interface the operator expected but does not have.
+    for addr in cfg.tcp_listen.iter().chain(cfg.tcp_peers.iter()) {
+        if split_host_port(addr).is_none() {
+            tracing::warn!(
+                addr = %addr,
+                "malformed [sidecar] interface address (want host:port); omitted from the \
+                 generated Reticulum config"
+            );
+        }
+    }
 
     // 2. Generate the Reticulum config once (never overwrite an operator's edits).
     if let Err(e) =
@@ -244,9 +284,12 @@ pub async fn supervise(
                             attempt = 0;
                         }
                     }
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            stop_child(&mut child, cfg.shutdown_grace()).await;
+                    // A change to `true`, or the sender dropped (`Err`) without a
+                    // clean `shutdown()`, both mean "stop" — either way, do not
+                    // fall through and respawn.
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            stop_child(&mut child, cfg.shutdown_grace).await;
                             break;
                         }
                     }
@@ -257,7 +300,9 @@ pub async fn supervise(
             }
         }
 
-        // Back off before the next attempt, cut short by shutdown.
+        // Back off before the next attempt, cut short by shutdown (or a dropped
+        // sender — an `Err` from `changed()` — so a `Station` dropped without
+        // `shutdown()` cannot spin this into a fork/kill hot loop).
         attempt = attempt.saturating_add(1);
         let backoff = backoff_for(attempt, cfg.restart_backoff);
         state.set_sidecar(SidecarState::Restarting {
@@ -266,8 +311,8 @@ pub async fn supervise(
         });
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
             }
         }
     }
@@ -278,14 +323,20 @@ pub async fn supervise(
 /// Spawns `rnsd --config <dir>` with piped stdout/stderr, killed if the handle
 /// drops.
 fn spawn_rnsd(cfg: &SidecarConfig) -> std::io::Result<Child> {
-    Command::new(&cfg.rnsd_path)
-        .arg("--config")
+    let mut cmd = Command::new(&cfg.rnsd_path);
+    cmd.arg("--config")
         .arg(&cfg.config_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // Put the child in its own process group so stop/restart can signal the
+    // whole group: a wrapper `rnsd_path` that does not `exec` would otherwise
+    // orphan the real `rnsd`, which keeps the shared-instance / TCP ports bound
+    // and makes every later spawn fail (backoff climbs while it runs unmanaged).
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.spawn()
 }
 
 /// Drains the child's stdout and stderr into `tracing` on background tasks.
@@ -298,10 +349,18 @@ fn capture_output(child: &mut Child) {
     }
 }
 
-/// Reads `reader` line by line into `tracing` at debug, tagged by `stream`.
+/// Reads `reader` a line at a time into `tracing` at debug, tagged by `stream`.
+///
+/// Splits on raw bytes and lossy-decodes, so a non-UTF-8 byte in an `rnsd` log
+/// line (possible at `loglevel = 4`) is rendered with replacement characters
+/// rather than ending the drain — which would leave the pipe unread until it
+/// fills and blocks `rnsd` on `write`, with the liveness-only supervisor none the
+/// wiser. Ends only at EOF or a real I/O error.
 async fn drain<R: AsyncRead + Unpin>(reader: R, stream: &'static str) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut segments = BufReader::new(reader).split(b'\n');
+    while let Ok(Some(segment)) = segments.next_segment().await {
+        let line = String::from_utf8_lossy(&segment);
+        let line = line.trim_end_matches('\r');
         tracing::debug!(target: "rnsd", stream, "{line}");
     }
 }
@@ -310,17 +369,23 @@ async fn drain<R: AsyncRead + Unpin>(reader: R, stream: &'static str) {
 /// grace period.
 async fn stop_child(child: &mut Child, grace: Duration) {
     tracing::info!(grace_secs = grace.as_secs(), "stopping Reticulum sidecar");
+    // Signal the child's whole process group (it leads its own, see `spawn_rnsd`),
+    // so a non-exec wrapper's real `rnsd` goes down with it. `killpg` on a leader
+    // pid targets exactly that group; a stray call is a harmless `ESRCH`.
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+    let pgid = child.id().map(|p| nix::unistd::Pid::from_raw(p as i32));
+    #[cfg(unix)]
+    if let Some(pgid) = pgid {
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
     }
     match tokio::time::timeout(grace, child.wait()).await {
         Ok(_) => {}
         Err(_) => {
             tracing::warn!("rnsd did not exit within grace; sending SIGKILL");
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
@@ -330,7 +395,13 @@ async fn stop_child(child: &mut Child, grace: Duration) {
 /// Runs `rnsd --version` and extracts a dotted version. `rnsd` prints to stdout;
 /// stderr is a fallback for builds that log it there.
 async fn check_version(rnsd_path: &Path) -> std::io::Result<String> {
-    let out = Command::new(rnsd_path).arg("--version").output().await?;
+    // `kill_on_drop` so that if the caller's timeout fires (or shutdown cancels
+    // this future), the probe child is reaped rather than leaked.
+    let out = Command::new(rnsd_path)
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     extract_version(&stdout)
@@ -467,10 +538,14 @@ pub fn render_reticulum_config(tcp_listen: Option<&str>, tcp_peers: &[String]) -
     s
 }
 
-/// Splits `host:port` on the last colon, so IPv6 literals in brackets survive.
+/// Splits `host:port` on the last colon; a bracketed IPv6 literal keeps its
+/// bracket-stripped form (`[::1]:4242` → `::1`, `4242`), since RNS wants a bare
+/// `listen_ip` / `target_host`.
 fn split_host_port(s: &str) -> Option<(&str, &str)> {
     let (host, port) = s.rsplit_once(':')?;
-    if host.is_empty() || port.is_empty() {
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     Some((host, port))
@@ -598,6 +673,8 @@ mod tests {
             restart_backoff: Duration::from_millis(20),
             tcp_listen: Some("127.0.0.1:4242".to_string()),
             tcp_peers: vec![],
+            // Short grace so the SIGKILL-fallback path is fast to exercise.
+            shutdown_grace: Duration::from_millis(500),
         }
     }
 
@@ -752,6 +829,67 @@ mod tests {
             .await
             .expect("supervisor stopped after shutdown")
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_ignores_sigterm_is_sigkilled_after_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        // Traps (ignores) SIGTERM, so only the SIGKILL fallback can stop it.
+        let rnsd = write_script(
+            dir.path(),
+            "rnsd",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"rnsd 1.5.2\"; exit 0; fi\n\
+             trap '' TERM\necho up\nwhile true; do sleep 0.05; done\n",
+        );
+        let state = state_for();
+        let (handle, tx) =
+            run_supervisor(test_cfg(rnsd, dir.path().join("reticulum")), state.clone());
+        wait_for(&state, Duration::from_secs(5), |s| {
+            matches!(s, SidecarState::Running { .. })
+        })
+        .await;
+        tx.send(true).unwrap();
+        // SIGTERM is ignored, so the supervisor waits the 500ms grace then
+        // SIGKILLs — it must still return (well under this bound).
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor SIGKILLed the child and stopped")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_a_hanging_version_probe_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        // `--version` never returns: without the shutdown race this would wedge
+        // the supervisor (and, in the daemon, `Station::shutdown`).
+        let rnsd = write_script(
+            dir.path(),
+            "rnsd",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 3600; fi\nsleep 3600\n",
+        );
+        let state = state_for();
+        let (handle, tx) =
+            run_supervisor(test_cfg(rnsd, dir.path().join("reticulum")), state.clone());
+        // Let the probe get going, then signal shutdown; the supervisor must
+        // return promptly rather than block on the hung `--version`.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor returned despite the hung version probe")
+            .unwrap();
+    }
+
+    #[test]
+    fn split_host_port_handles_ipv6_and_rejects_malformed() {
+        assert_eq!(split_host_port("0.0.0.0:4242"), Some(("0.0.0.0", "4242")));
+        assert_eq!(split_host_port("[::1]:4242"), Some(("::1", "4242")));
+        assert_eq!(split_host_port("4242"), None); // no colon
+        assert_eq!(split_host_port("host:"), None); // empty port
+        assert_eq!(split_host_port(":4242"), None); // empty host
+        assert_eq!(split_host_port("host:abc"), None); // non-numeric port
     }
 
     /// A fake child line reaches `tracing` at debug on target `rnsd`.

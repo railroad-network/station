@@ -97,14 +97,25 @@ it than when ADR-0013 chose it. reticulum-rs stays the seam-swap target if it
 gains RNode/LXMF under a permissive license; microReticulum (C++, Apache-2.0)
 remains the embedded escape hatch but still lacks LXMF.
 
-**5. The spike is genuinely faithful to the adoption thesis.** It boots two
-station-*supervised* `rnsd` instances linked over a local TCP interface, and
-carries a **real signed `Bundle`** (from the T2.2.1 record types) A→B over LXMF,
-asserting byte-identical delivery **including with the receiver started after the
-send** — the store-and-forward property that is the entire point of adopting
-Reticulum (ADR-0013 §Consequences). It passed in ~14 s. The Python side is a
-<100-line spike-support helper under `scripts/spike/`; the production Rust↔`rnsd`
-interfacing choice is §3 above, part of this ADR per ADR-0013's charter.
+**5. The spike is faithful to the adoption thesis — with one honest scope note.**
+It boots two station-*supervised* `rnsd` instances (asserting each actually
+reaches `Running`, and requiring the LXMF helpers to attach to the supervised
+shared instance rather than stand in as the RNS instance themselves) linked over
+a local TCP interface, and carries a **real signed `Bundle`** (from the T2.2.1
+record types) A→B over LXMF, asserting byte-identical delivery **with the receiver
+started only after the send is already in flight** — path request → later announce
+→ path discovery → direct delivery. It passed in ~14 s.
+
+The honest note: this exercises *delay-tolerant delivery to an initially-absent
+receiver* (the sender holds and retries until the receiver announces), which is
+the conductor pattern's shape, but it is **not** the full LXMF store-and-forward
+where a message survives with neither endpoint online — that needs a propagation
+node (LXMF `PROPAGATED`), and a `DIRECT` message cannot even be constructed until
+the recipient's identity has been recalled from an announce. Standing up a
+propagation-node variant is folded into T2.6.2, where the transport layer lands.
+The Python side is a <100-line spike-support helper under `scripts/spike/`; the
+production Rust↔`rnsd` interfacing choice is §3 above, part of this ADR per
+ADR-0013's charter.
 
 **6. Distribution posture: the sidecar is operator-installed, and its license
 stays out of our graph — but is disclosed.** ADR-0013 flagged a "new
