@@ -37,6 +37,7 @@ pub mod config;
 pub mod contract_view;
 pub mod core;
 pub mod dispute_view;
+pub mod dtn_sync;
 pub mod events;
 pub mod gossip;
 pub mod governance_view;
