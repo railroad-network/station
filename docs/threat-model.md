@@ -3043,21 +3043,33 @@ communication-metadata privacy.
   signer == the bound address): an attacker cannot bind a victim's `rrn1…` to a number
   it controls. Impersonating the station *toward* a member likewise forges nothing —
   a fake "receipt" text is just bytes that fail the station-signature check the member
-  applies.
+  applies. Note that `"paired"` is **not a membership gate**: it means only "a number
+  some identity self-bound over some carrier," so any keypair that has landed one
+  self-signed binding in the log is "paired." Standing/membership is enforced where it
+  matters — at ingest and in the ledger — not by the registry.
 
-#### Denial of service — SMS-flood and truncation
+#### Denial of service — SMS-flood, truncation, and receipt-cost amplification
 
 - *Threat:* an attacker floods the station's number with texts (each costing the
   station a poll and, in "open" mode, a reassembly slot), or the carrier drops/
-  truncates concatenated parts to stall reassembly.
-- *Mitigation:* a per-sender rolling-hour cap (`[sms] max_inbound_per_hour`, default
+  truncates concatenated parts to stall reassembly; or — spoofing a victim's number —
+  makes the station *send* receipts to the victim (the station pays per outbound SMS,
+  and the victim is nuisance-texted).
+- *Mitigation:* a per-sender fixed-1-hour-window cap (`[sms] max_inbound_per_hour`, default
   60) drops the excess with a **single rate-limited log line** (never one per text);
-  the number of distinct in-progress senders is bounded (a spoofed-number flood in
-  "open" mode cannot grow relay memory without limit); and a truncated or corrupt
-  chunk fails its base64/length check or its reassembly hash and is **refused**, so
-  the reassembler simply waits for a re-send rather than accepting wrong bytes. There
-  is no station-side retransmit protocol: the member re-sends until the receipt
-  returns, and the station re-ingests idempotently (ADR-0020 §3).
+  the per-sender reassembly and rate state are evicted once idle past the window, so
+  the tracking maps stay bounded to senders active within the last hour (a
+  spoofed-number flood cannot grow relay memory without limit); and a truncated or
+  corrupt chunk fails its base64/length check or its reassembly hash and is
+  **refused**, so the reassembler simply waits for a re-send rather than accepting
+  wrong bytes. There is no station-side retransmit protocol: the member re-sends until
+  the receipt returns, and the station re-ingests idempotently (ADR-0020 §3).
+- *Residual:* **outbound-cost amplification.** A spoofed inbound number whose carried
+  bundle decodes (even to all-refused records) still earns a signed receipt texted to
+  the *claimed* sender — so an attacker can make the station spend outbound SMS toward
+  a victim, bounded by `max_inbound_per_hour` per spoofed number and eliminated in
+  `"paired"` mode (an unbound spoof is dropped before ingest). A station on a metered
+  SMS plan should run `"paired"` and set the cap to its budget.
 
 #### Residual — carrier surveillance (the §13 sensitivity)
 

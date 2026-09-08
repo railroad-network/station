@@ -104,7 +104,7 @@ pub struct SmsSection {
     /// signature-gated at ingest).
     #[serde(default)]
     pub allowed_senders: crate::sms::AllowedSenders,
-    /// The most inbound texts one sender may send per rolling hour before the rest
+    /// The most inbound texts one sender may send per fixed 1-hour window before the rest
     /// are dropped (with a throttled log). Defaults to 60.
     #[serde(default = "default_sms_max_inbound_per_hour")]
     pub max_inbound_per_hour: u32,

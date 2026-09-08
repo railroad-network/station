@@ -91,7 +91,7 @@ price of more parts lost if any one part drops.
 | 1 | 153 | 98 |
 | 4 (default) | 612 | 442 |
 | 6 | 918 | 672 |
-| ≥ 8 | — | 720 (clamped) |
+| ≥ 7 | — | 720 (clamped) |
 
 ## 4. Sender registry (`[sms] allowed_senders`)
 
@@ -125,7 +125,7 @@ The station maps phone numbers to identities with a member-signed record,
   accepts drop-ins.
 
 An inbound text from an unpaired sender (in `"paired"` mode) or beyond the per-sender
-rate cap (`[sms] max_inbound_per_hour`, default 60, rolling hour) is dropped with a
+rate cap (`[sms] max_inbound_per_hour`, default 60, fixed 1-hour window) is dropped with a
 **single rate-limited log line**, never one per text.
 
 ## 5. Part loss and retry
@@ -137,10 +137,14 @@ model is re-send driven, exactly like paper:
   (losing a trailing part). A truncated chunk fails its base64/length check or, if it
   decodes, fails the reassembly hash — it is **refused**, never accepted as wrong
   bytes; the reassembler waits.
-- The sender **re-sends** its outbox until the delivery receipt returns. The station
-  **re-ingests idempotently** (a byte-identical presentation returns the cached
-  receipt; already-admitted records answer `known` — ADR-0020 §3), and re-queues the
-  same receipt, which the carrier eventually carries back intact.
+- The sender **re-sends** its outbox until the delivery receipt returns. A re-send
+  need **not** be byte-identical: re-encoding an outbox produces a fresh
+  `payload_id8` (the bundle's `assembled_at` is in the bytes), so the station relay
+  treats the re-sent payload as a *new* one — it supersedes any stalled partial from
+  that sender rather than colliding with it. The station **re-ingests idempotently**
+  (a byte-identical presentation returns the cached receipt; already-admitted records
+  answer `known` — ADR-0020 §3), and re-queues the same receipt, which the carrier
+  eventually carries back intact.
 - Outbound (station → member) is **paced money-first**: a strict-priority queue
   (economic before governance before bulk) drained through a per-message token
   bucket, so a delivery receipt never waits behind a bulk message on a

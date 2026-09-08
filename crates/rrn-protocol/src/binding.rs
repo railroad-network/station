@@ -146,8 +146,13 @@ pub struct SmsBinding {
     /// carrier — a metadata residual noted in the threat model.
     pub msisdn: String,
     /// When the signer issued this binding (Unix seconds). A later binding for the
-    /// same address supersedes an earlier one; testimony for that ordering, not a
-    /// window (ADR-0022 spirit).
+    /// same address supersedes an earlier one. This is a **party-asserted** time
+    /// used only to order a member's *own* successive bindings (latest-wins), never
+    /// a window, deadline, or eligibility input — so it stays within ADR-0022's
+    /// trust model (a member cannot gain anything by lying about when they bound
+    /// their own number, only pick which of their own numbers is current), and it is
+    /// the right tiebreak precisely because DTN admission order is not the issue
+    /// order.
     pub bound_at: i64,
 }
 

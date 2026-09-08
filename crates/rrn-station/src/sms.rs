@@ -55,6 +55,11 @@ const DROP_LOG_THROTTLE_SECS: i64 = 300;
 /// once — a bound so a flood of one chunk each from many (spoofed) numbers, in
 /// "open" mode, cannot grow the relay's memory without limit.
 const MAX_TRACKED_SENDERS: usize = 512;
+/// How long a partial reassembly (or an idle rate-window) is kept before the poll
+/// prune sweep discards it. A member who abandons a half-sent bundle, or a spoofed
+/// number that sent one junk chunk, ages out — so the [`MAX_TRACKED_SENDERS`] cap is
+/// a true bound, not a permanent lockout. One hour matches the rate window.
+const STALE_STATE_TTL_SECS: i64 = RATE_WINDOW_SECS;
 
 /// A validated E.164 phone number (MSISDN): `+` then 8–15 digits, leading digit
 /// non-zero. The one source of truth for the format is
@@ -182,7 +187,7 @@ pub struct SmsRelayConfig {
     pub chunk_budget_bytes: usize,
     /// Whether inbound is gated to bound senders.
     pub allowed_senders: AllowedSenders,
-    /// The most inbound texts one sender may send per rolling hour before the rest
+    /// The most inbound texts one sender may send per fixed 1-hour window before the rest
     /// are dropped (with a throttled log line).
     pub max_inbound_per_hour: u32,
     /// Outbound message pacing.
@@ -225,14 +230,22 @@ struct RateWindow {
     count: u32,
 }
 
+/// A sender's in-progress reassembly plus when it was last fed — the `last_seen`
+/// lets the poll prune sweep evict abandoned partials so tracked state stays bounded.
+struct Reassembly {
+    re: PaperReassembler,
+    last_seen: i64,
+}
+
 /// The SMS relay engine (module docs): reassembly, registry, rate cap, and paced
 /// strict-priority outbound. Clock-injected and pull-driven.
 pub struct SmsRelay<G: SmsGateway> {
     gateway: G,
     config: SmsRelayConfig,
-    /// Per-sender in-progress reassembly (a person collating their own sheets).
-    reassemblers: HashMap<Msisdn, PaperReassembler>,
-    /// Per-sender rolling-hour inbound counters.
+    /// Per-sender in-progress reassembly (a person collating their own sheets),
+    /// with a `last_seen` so abandoned partials are pruned (bounding tracked state).
+    reassemblers: HashMap<Msisdn, Reassembly>,
+    /// Per-sender fixed-window inbound counters, pruned once idle past the window.
     rates: HashMap<Msisdn, RateWindow>,
     /// Strict-priority outbound FIFOs, indexed by `Priority as usize`.
     outbound: [VecDeque<OutMsg>; 3],
@@ -271,10 +284,16 @@ impl<G: SmsGateway> SmsRelay<G> {
     /// to that sender's reassembler. Returns the payloads that completed this poll.
     ///
     /// A refused text (unpaired sender, over the rate cap, an unbound sender past the
-    /// tracking cap, or a chunk that fails to parse/decode — a truncated or corrupt
-    /// SMS) is dropped; the reassembler simply waits for a re-send. Drops are
-    /// counted and logged at most once per [`DROP_LOG_THROTTLE_SECS`].
+    /// tracking cap, a non-chunk text, or a chunk that fails to parse/decode — a
+    /// truncated or corrupt SMS) is dropped; the reassembler simply waits for a
+    /// re-send. Registry/rate/cap drops are counted and logged at most once per
+    /// [`DROP_LOG_THROTTLE_SECS`]; codec-level refusals are only traced.
+    ///
+    /// Stale tracked state (an abandoned partial reassembly, an idle rate window) is
+    /// pruned each poll past [`STALE_STATE_TTL_SECS`], so the per-sender maps stay
+    /// bounded even under a flood of one text each from many (spoofed) numbers.
     pub fn poll(&mut self, now: i64, bound: &BoundSenders) -> Result<Vec<SmsCompleted>, SmsError> {
+        self.prune_stale(now);
         let inbound = self.gateway.poll_recv()?;
         let mut completed = Vec::new();
         for msg in inbound {
@@ -283,25 +302,54 @@ impl<G: SmsGateway> SmsRelay<G> {
                 self.note_drop(now, "unpaired sender");
                 continue;
             }
-            // (2) Per-sender rolling-hour rate cap.
+            // (2) Per-sender fixed-window rate cap.
             if self.over_rate(&msg.from, now) {
                 self.note_drop(now, "over the inbound rate cap");
                 continue;
             }
-            // (3) Bound the number of distinct in-progress senders.
+            // (3) Only `rrnp:` multi-part chunks are reassembled; a non-chunk text
+            // (wrong number, a carrier notice, a single-QR form the station does not
+            // ingest) is ignored WITHOUT allocating a tracking slot for its sender.
+            if !msg.text.starts_with(rrn_protocol::paper::MULTIPART_PREFIX) {
+                tracing::debug!(from = %msg.from, "inbound SMS is not a chunk; ignored");
+                continue;
+            }
+            // (4) Bound the number of distinct in-progress senders (a real bound,
+            // since stale slots are pruned above).
             if !self.reassemblers.contains_key(&msg.from)
                 && self.reassemblers.len() >= MAX_TRACKED_SENDERS
             {
                 self.note_drop(now, "too many in-progress senders");
                 continue;
             }
-            // (4) Feed the chunk to the sender's reassembler. A parse/decode failure
-            // (a truncated or corrupt SMS) is refused safely; the sender re-sends.
-            let re = self.reassemblers.entry(msg.from.clone()).or_default();
-            match re.accept(&msg.text) {
+            // (5) Feed the chunk to the sender's reassembler. Scoped so the map
+            // borrow ends before a completed payload's slot is removed below.
+            let result = {
+                let slot = self
+                    .reassemblers
+                    .entry(msg.from.clone())
+                    .or_insert_with(|| Reassembly {
+                        re: PaperReassembler::new(),
+                        last_seen: now,
+                    });
+                slot.last_seen = now;
+                match slot.re.accept(&msg.text) {
+                    // A chunk of a DIFFERENT payload than the one in progress
+                    // (`Mixed`): SMS is machine-driven and a member re-sending its
+                    // outbox re-encodes it with a fresh `payload_id8` (the bundle's
+                    // assembled_at is in the bytes), so a new payload SUPERSEDES the
+                    // stalled one rather than being refused forever. Reset and take
+                    // this chunk as the new payload's first.
+                    Err(PaperError::Mixed) => {
+                        slot.re = PaperReassembler::new();
+                        slot.re.accept(&msg.text)
+                    }
+                    other => other,
+                }
+            };
+            match result {
                 Ok(Some((kind, bytes))) => {
-                    // Completed — the reassembler reset itself; forget its slot.
-                    self.reassemblers.remove(&msg.from);
+                    self.reassemblers.remove(&msg.from); // completed → forget the slot
                     completed.push(SmsCompleted {
                         from: msg.from,
                         kind,
@@ -315,6 +363,16 @@ impl<G: SmsGateway> SmsRelay<G> {
             }
         }
         Ok(completed)
+    }
+
+    /// Evicts per-sender state idle longer than [`STALE_STATE_TTL_SECS`]: abandoned
+    /// partial reassemblies and rate windows whose hour has elapsed. Keeps the
+    /// tracking maps bounded to senders active within the window.
+    fn prune_stale(&mut self, now: i64) {
+        self.reassemblers
+            .retain(|_, r| now.saturating_sub(r.last_seen) < STALE_STATE_TTL_SECS);
+        self.rates
+            .retain(|_, w| now.saturating_sub(w.window_start) < RATE_WINDOW_SECS);
     }
 
     /// Chunk-encodes `payload` at the SMS budget and enqueues its texts for `to` at
@@ -376,13 +434,19 @@ impl<G: SmsGateway> SmsRelay<G> {
         self.outbound.iter().map(|q| q.len()).sum()
     }
 
-    /// Cumulative inbound texts dropped (unpaired / over-rate / over-cap / refused).
+    /// Cumulative inbound texts dropped by a *policy* gate — unpaired sender,
+    /// over-rate, or over the tracked-sender cap. Codec-level refusals (a
+    /// non-chunk text, or a chunk that fails to parse/decode) are traced, not
+    /// counted here, since they are the carrier's fault, not an attacker signal.
     pub fn dropped_inbound(&self) -> u64 {
         self.dropped_inbound
     }
 
-    /// Whether `from` has exceeded the rolling-hour inbound cap, advancing its
-    /// window counter as a side effect (each accepted call counts one text).
+    /// Whether `from` has exceeded the inbound cap over the current **fixed**
+    /// 1-hour window ([`RATE_WINDOW_SECS`]), advancing its counter as a side effect
+    /// (each accepted call counts one text). Fixed rather than sliding: a burst
+    /// straddling a window boundary can admit up to 2× the cap across that boundary,
+    /// an accepted 2× overshoot in exchange for O(1) per-sender state.
     fn over_rate(&mut self, from: &Msisdn, now: i64) -> bool {
         let w = self.rates.entry(from.clone()).or_insert(RateWindow {
             window_start: now,
@@ -718,6 +782,111 @@ mod tests {
             got = Some(c.bytes);
         }
         assert_eq!(got, Some(payload));
+    }
+
+    #[test]
+    fn a_new_payload_supersedes_a_stalled_one_from_the_same_sender() {
+        // The reliability model re-sends the outbox, and a re-encoded bundle has a
+        // fresh payload_id8 (its assembled_at is in the bytes). So after a partial
+        // send is stranded (a chunk lost), the sender's NEXT, different payload must
+        // reset the reassembler — never be refused forever as `Mixed`.
+        let mut relay = open_relay(MockSmsGateway::new(SmsFaults::none(11)));
+        let from = msisdn("+15557778888");
+        let bound = BoundSenders::new();
+        let budget = sms_chunk_budget_bytes(4);
+
+        let payload_a: Vec<u8> = (0..900u32).map(|i| i as u8).collect();
+        let payload_b: Vec<u8> = (0..900u32).map(|i| (i.wrapping_mul(3) + 1) as u8).collect();
+        let a = encode_chunks_with_budget(PaperKind::Bundle, &payload_a, budget).unwrap();
+        let b = encode_chunks_with_budget(PaperKind::Bundle, &payload_b, budget).unwrap();
+        assert!(a.len() >= 2 && b.len() >= 2, "both must be multi-chunk");
+
+        // Only the first chunk of A arrives — A is stranded.
+        relay.gateway().push_inbound(&from, &a[0], 0);
+        assert!(relay.poll(0, &bound).unwrap().is_empty());
+
+        // Now B arrives in full. Its first chunk supersedes the stalled A (rather
+        // than being refused `Mixed`), and B completes byte-identical.
+        let mut got = None;
+        for text in &b {
+            relay.gateway().push_inbound(&from, text, 1);
+        }
+        for c in relay.poll(1, &bound).unwrap() {
+            got = Some(c.bytes);
+        }
+        assert_eq!(
+            got,
+            Some(payload_b),
+            "the new payload supersedes the stalled one"
+        );
+    }
+
+    #[test]
+    fn a_wrong_bytes_truncation_recovers_via_hash_reset() {
+        // A truncation that leaves a base64-VALID but shorter data field fills the
+        // slot with wrong bytes; the clean re-send conflicts, and the completion
+        // hash mismatch resets the partial so a subsequent clean pass rebuilds it.
+        let mut relay = open_relay(MockSmsGateway::new(SmsFaults::none(2)));
+        let from = msisdn("+15551212121");
+        let bound = BoundSenders::new();
+        let budget = sms_chunk_budget_bytes(4);
+        let payload: Vec<u8> = (0..900u32).map(|i| (i ^ 0x3C) as u8).collect();
+        let chunks = encode_chunks_with_budget(PaperKind::Bundle, &payload, budget).unwrap();
+        assert_eq!(chunks.len(), 3);
+
+        // Truncate chunk index 2's data to a shorter length that still decodes
+        // (drop 4 base64 chars = a whole 3 bytes, so it stays base64-valid).
+        let c1 = &chunks[1];
+        let cut = &c1[..c1.len() - 4];
+        relay.gateway().push_inbound(&from, &chunks[0], 0);
+        relay.gateway().push_inbound(&from, cut, 0);
+        relay.gateway().push_inbound(&from, &chunks[2], 0);
+        assert!(
+            relay.poll(0, &bound).unwrap().is_empty(),
+            "the wrong-bytes chunk must not complete a valid payload"
+        );
+        // A clean re-send of all three chunks then completes it (the bad slot is
+        // discarded on the hash mismatch, and the fresh pass rebuilds).
+        let mut got = None;
+        for _round in 0..5 {
+            for text in &chunks {
+                relay.gateway().push_inbound(&from, text, 1);
+            }
+            for c in relay.poll(1, &bound).unwrap() {
+                got = Some(c.bytes);
+            }
+            if got.is_some() {
+                break;
+            }
+        }
+        assert_eq!(got, Some(payload));
+    }
+
+    #[test]
+    fn stale_partial_reassemblies_are_pruned() {
+        // An abandoned partial ages out so MAX_TRACKED_SENDERS is a bound, not a
+        // permanent lockout.
+        let mut relay = open_relay(MockSmsGateway::new(SmsFaults::none(4)));
+        let from = msisdn("+15553334444");
+        let bound = BoundSenders::new();
+        let chunks = encode_chunks_with_budget(
+            PaperKind::Bundle,
+            &(0..900u32).map(|i| i as u8).collect::<Vec<u8>>(),
+            sms_chunk_budget_bytes(4),
+        )
+        .unwrap();
+        assert!(chunks.len() >= 2);
+        relay.gateway().push_inbound(&from, &chunks[0], 0);
+        assert!(relay.poll(0, &bound).unwrap().is_empty());
+        // A poll well past the TTL prunes the abandoned partial.
+        assert!(relay
+            .poll(STALE_STATE_TTL_SECS + 1, &bound)
+            .unwrap()
+            .is_empty());
+        assert!(
+            relay.reassemblers.is_empty(),
+            "the abandoned partial must be pruned"
+        );
     }
 
     #[test]

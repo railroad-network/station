@@ -324,14 +324,15 @@ async fn sms_binding_admits_via_ingest_and_flips_the_registry() {
         now,
     )
     .encode();
-    let receipt = station.core().ingest_bundle_bytes(bundle).await.unwrap();
-    let signed = receipt::decode_signed(&receipt).unwrap();
+    let first_receipt = station.core().ingest_bundle_bytes(bundle).await.unwrap();
+    let signed = receipt::decode_signed(&first_receipt).unwrap();
     assert!(
         matches!(
             signed.payload.outcomes[0].disposition,
             Disposition::Admitted { .. }
         ),
-        "a self-signed binding is admitted"
+        "a self-signed binding is admitted, got {:?}",
+        signed.payload.outcomes[0].disposition
     );
 
     // The log-derived registry now names B's number.
@@ -339,7 +340,9 @@ async fn sms_binding_admits_via_ingest_and_flips_the_registry() {
     assert!(bound.contains(&member), "the binding flips the registry");
     assert_eq!(bound.len(), 1);
 
-    // Idempotent: re-ingesting the identical binding does not double it.
+    // Idempotent: re-ingesting the identical bundle re-admits nothing — it replays
+    // the stored receipt byte-for-byte (ADR-0020 §3), and the registry (a HashSet
+    // derived from the log) stays a single entry.
     let again = Bundle::new(
         vec![EntryEnvelope::from_signed(&outbox_entry(
             &b,
@@ -351,8 +354,65 @@ async fn sms_binding_admits_via_ingest_and_flips_the_registry() {
         now,
     )
     .encode();
-    let _ = station.core().ingest_bundle_bytes(again).await.unwrap();
+    let replay = station.core().ingest_bundle_bytes(again).await.unwrap();
+    assert_eq!(
+        replay, first_receipt,
+        "a byte-identical re-ingest replays the cached receipt verbatim"
+    );
     assert_eq!(station.core().sms_bound_senders().await.len(), 1);
+
+    // A per-record `known` outcome: re-carry the same binding in a DIFFERENT
+    // presentation (bundled with a fresh, second binding), so the ledger's dedup
+    // answers `known` for the old record and admits only the new one.
+
+    // Rebind: B binds a NEW number with a later `bound_at`, carried in one bundle
+    // alongside its (already-admitted) first binding. Latest-wins per identity, so
+    // the registry ends up naming the new number and dropping the old one; and the
+    // re-carried first binding answers `known` while the new one is `admitted`.
+    let new_number = "+15550999888";
+    let first_entry = outbox_entry(&b, 0, Hash::from_bytes([0u8; 32]), &binding, now);
+    let rebind = SignedPayload::sign(SmsBinding::new(b_addr, new_number, now + 10), &b);
+    let rebind_entry = outbox_entry(&b, 1, first_entry.payload.entry_hash(), &rebind, now + 10);
+    let rebind_bundle = Bundle::new(
+        vec![
+            EntryEnvelope::from_signed(&first_entry),
+            EntryEnvelope::from_signed(&rebind_entry),
+        ],
+        now + 10,
+    )
+    .encode();
+    let receipt = station
+        .core()
+        .ingest_bundle_bytes(rebind_bundle)
+        .await
+        .unwrap();
+    let signed = receipt::decode_signed(&receipt).unwrap();
+    assert!(
+        matches!(
+            signed.payload.outcomes[0].disposition,
+            Disposition::Known { .. }
+        ),
+        "the re-carried first binding is known, got {:?}",
+        signed.payload.outcomes[0].disposition
+    );
+    assert!(
+        matches!(
+            signed.payload.outcomes[1].disposition,
+            Disposition::Admitted { .. }
+        ),
+        "the new binding is admitted, got {:?}",
+        signed.payload.outcomes[1].disposition
+    );
+    let bound = station.core().sms_bound_senders().await;
+    assert_eq!(bound.len(), 1, "one identity → one current number");
+    assert!(
+        bound.contains(&Msisdn::parse(new_number).unwrap()),
+        "the later binding wins"
+    );
+    assert!(
+        !bound.contains(&member),
+        "the superseded number drops out of the registry"
+    );
 
     station.shutdown().await;
 }

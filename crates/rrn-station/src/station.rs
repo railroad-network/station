@@ -423,11 +423,18 @@ impl Station {
         // `[sidecar]` enabled without `[lora] adapter_script`; log the state so the
         // operator sees it rather than silence.
         if config.sms.enabled {
+            if config.sms.max_parts_per_message == 0 {
+                anyhow::bail!("config: [sms] max_parts_per_message must be >= 1 (got 0)");
+            }
             match config.sms.station_msisdn.as_deref() {
-                Some(msisdn) => tracing::info!(
+                Some(msisdn) if rrn_protocol::binding::valid_msisdn(msisdn) => tracing::info!(
                     station_msisdn = msisdn,
                     allowed_senders = ?config.sms.allowed_senders,
                     "SMS carrier enabled; awaiting a gateway backend (T2.7.2 wires the modem)"
+                ),
+                Some(bad) => anyhow::bail!(
+                    "config: [sms] station_msisdn is not valid E.164 (got {bad:?}); \
+                     expected +<8..15 digits>"
                 ),
                 None => tracing::warn!(
                     "SMS carrier enabled but [sms] station_msisdn is unset; \
@@ -593,11 +600,16 @@ impl Station {
 
 /// The SMS gateway bridge (T2.7.1): drives an [`crate::sms::SmsRelay`] over a real
 /// [`crate::sms::SmsGateway`] the way [`run_dtn_syncer`] drives the Reticulum
-/// carrier. Each second it fetches the log-derived sender registry (only in
-/// `"paired"` mode), polls inbound texts, ingests each completed bundle through the
-/// core's front door, and queues the signed delivery receipt back over SMS — paced
-/// money-first. Ingest stays the core's job (ADR-0020 single writer); this only
-/// carries bytes. Never fatal to the daemon.
+/// carrier. Each second it polls inbound texts, ingests each completed bundle
+/// through the core's front door, and queues the signed delivery receipt back over
+/// SMS — paced money-first. Ingest stays the core's job (ADR-0020 single writer);
+/// this only carries bytes. Never fatal to the daemon.
+///
+/// The log-derived sender registry (consulted only in `"paired"` mode) is a scan of
+/// the whole log, so it is **cached and refreshed only when the log grows** — the
+/// loop checks the cheap `log_tail` each tick and re-derives the registry only when
+/// the tail seq changed (a binding can only enter via a log append). An idle tick
+/// costs one indexed row read, not a full-log CBOR decode.
 ///
 /// The modem/HTTP-provider [`SmsGateway`](crate::sms::SmsGateway) this drives is
 /// T2.7.2 (`Station::open` does not spawn this loop until that backend exists);
@@ -615,17 +627,22 @@ pub async fn sms_gateway_loop<G: crate::sms::SmsGateway + 'static>(
 
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Registry cache: re-derived only when the log tail advances (paired mode only).
+    let mut bound: BoundSenders = BoundSenders::new();
+    let mut registry_tail: Option<u64> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let now = clock.now();
-                // The registry is consulted only in "paired" mode; "open" processes
-                // any sender (still signature-gated at ingest).
-                let bound: BoundSenders = if paired_mode {
-                    core.sms_bound_senders().await
-                } else {
-                    BoundSenders::new()
-                };
+                // Refresh the cached registry only when the log has grown since we
+                // last derived it — a binding enters only via an append.
+                if paired_mode {
+                    let tail = core.log_tail().await;
+                    if registry_tail != Some(tail) {
+                        bound = core.sms_bound_senders().await;
+                        registry_tail = Some(tail);
+                    }
+                }
                 match relay.poll(now, &bound) {
                     Ok(completed) => {
                         for c in completed {
