@@ -292,8 +292,14 @@ and never starved; bulk yields (oldest-dropped, starvable) by design.
 
 So a peer can route to an RRN identity over a source-address-less carrier, the
 identity self-signs a **`TransportBinding`** mapping its `rrn1…` address to a
-Reticulum destination hash, appended to the log. A later binding (higher
-`issued_at`) supersedes an earlier one — the destination is a rotatable handle
-*under* the durable RRN identity, never merged with it (ADR-0013 "bind, do not
-collapse"). Fields: `address`, `destination` (hex), `issued_at`. Fixture:
+Reticulum destination hash. A later binding (higher `issued_at`) supersedes an
+earlier one — the destination is a rotatable handle *under* the durable RRN
+identity, never merged with it (ADR-0013 "bind, do not collapse"). Fields:
+`address`, `destination` (hex), `issued_at`. Fixture:
 `tests/fixtures/cross_platform_binding.json`.
+
+The record type and its self-signed `validate()` land in T2.6.2
+(`rrn_protocol::binding`); **appending a binding to the log and reading peers'
+bindings back to route outbound traffic is the follow-up** that goes with the
+station-originated outbound path (T2.6.2 wires the inbound receive → ingest →
+receipt path; the outbound directory is next).

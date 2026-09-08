@@ -154,12 +154,19 @@ pub struct Backpressure {
 }
 
 /// The outcome of a successful [`enqueue`](PacedSender::enqueue).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Enqueued {
     /// The frame was queued and nothing was dropped.
     Accepted,
-    /// The frame was queued after dropping the oldest bulk frame to make room.
-    AcceptedDroppedOldest,
+    /// The frame was queued after dropping the oldest bulk frame to make room —
+    /// its destination and bytes, so a caller tracking in-flight frames can forget
+    /// the one that was evicted (else it leaks a phantom "still queued" entry).
+    AcceptedDroppedOldest {
+        /// The evicted frame's destination.
+        to: Endpoint,
+        /// The evicted frame's bytes.
+        bytes: Vec<u8>,
+    },
 }
 
 /// A pending frame: its destination and bytes.
@@ -235,9 +242,14 @@ impl PacedSender {
         if q.len() >= cap {
             match priority {
                 Priority::Bulk => {
-                    q.pop_front();
+                    let dropped = q.pop_front();
                     self.dropped_bulk += 1;
-                    outcome = Enqueued::AcceptedDroppedOldest;
+                    if let Some(d) = dropped {
+                        outcome = Enqueued::AcceptedDroppedOldest {
+                            to: d.to,
+                            bytes: d.bytes,
+                        };
+                    }
                 }
                 Priority::Economic | Priority::Governance => {
                     return Err(Backpressure {
@@ -287,7 +299,7 @@ impl PacedSender {
     /// Tops the bucket up by the time elapsed since the last refill, capped at
     /// `burst_bytes`. Time going backwards (a clock adjustment) adds nothing.
     fn refill(&mut self, now: i64) {
-        let dt = (now - self.last_refill).max(0) as f64;
+        let dt = now.saturating_sub(self.last_refill).max(0) as f64;
         self.last_refill = now;
         let refilled = self.tokens + dt * self.budget.sustained_bytes_per_sec;
         self.tokens = refilled.min(self.budget.burst_bytes as f64);
@@ -501,7 +513,10 @@ mod tests {
         );
         assert_eq!(
             s.enqueue(Priority::Bulk, ep("p"), vec![3]).unwrap(),
-            Enqueued::AcceptedDroppedOldest
+            Enqueued::AcceptedDroppedOldest {
+                to: ep("p"),
+                bytes: vec![1] // the oldest frame
+            }
         );
         assert_eq!(s.queued_in(Priority::Bulk), 2);
         assert_eq!(s.dropped_bulk(), 1);

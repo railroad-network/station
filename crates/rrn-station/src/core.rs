@@ -660,7 +660,16 @@ impl Core {
                 }
                 Command::IngestBundle { bytes, reply } => {
                     let now = self.clock.now();
-                    let receipt = self.ingest_bundle(&bytes, now).ok();
+                    let receipt = match self.ingest_bundle(&bytes, now) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            // The peer has already been framing-acked, so a lost
+                            // bundle here is not re-driven — log it (a transient DB
+                            // error must not vanish silently).
+                            tracing::warn!(error = ?e, "DTN bundle ingest failed over Reticulum");
+                            None
+                        }
+                    };
                     let _ = reply.send(receipt);
                 }
                 Command::Handshake { reply } => {
@@ -5313,6 +5322,7 @@ const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
 /// Why an ingest could not produce a receipt at all (as opposed to a per-record
 /// refusal, which *is* part of a receipt). A malformed bundle is the caller's
 /// fault (`invalid-params`); a storage fault is the station's (`internal`).
+#[derive(Debug)]
 enum BundleIngestError {
     /// The bundle bytes did not decode as a valid [`Bundle`].
     Malformed(String),

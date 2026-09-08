@@ -85,6 +85,11 @@ def main():
     out_lock = threading.Lock()
 
     def on_delivery(message):
+        # Cap inbound frame size defensively — a peer must not be able to push an
+        # oversize LXMF resource that the station would then buffer.
+        if message.content is not None and len(message.content) > args.max_frame:
+            sys.stderr.write("dropping oversize inbound frame (%d bytes)\n" % len(message.content))
+            return
         src = message.source_hash.hex() if message.source_hash else ""
         with out_lock:
             write_message(out_fd, src, message.content)

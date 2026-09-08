@@ -48,8 +48,13 @@ pub mod codec {
     }
 
     /// Reads one message from `r`, or `None` at clean EOF. Returns the endpoint
-    /// string and the frame bytes.
-    pub fn read_message<R: std::io::Read>(r: &mut R) -> std::io::Result<Option<(String, Vec<u8>)>> {
+    /// string and the frame bytes. Refuses a body larger than `max_body` **before
+    /// allocating it**, so a peer (or a buggy adapter) cannot make us allocate an
+    /// arbitrary `u32` of memory per message.
+    pub fn read_message<R: std::io::Read>(
+        r: &mut R,
+        max_body: usize,
+    ) -> std::io::Result<Option<(String, Vec<u8>)>> {
         let mut len_buf = [0u8; 4];
         match r.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -57,6 +62,12 @@ pub mod codec {
             Err(e) => return Err(e),
         }
         let body_len = u32::from_be_bytes(len_buf) as usize;
+        if body_len > max_body {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("adapter message body {body_len} exceeds the {max_body}-byte cap"),
+            ));
+        }
         let mut body = vec![0u8; body_len];
         r.read_exact(&mut body)?;
         if body.len() < 2 {
@@ -105,7 +116,9 @@ pub struct AdapterConfig {
 /// tolerates, never a panic.
 pub struct ReticulumTransport {
     child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    /// The adapter's stdin. `None` after shutdown takes it (dropping it EOFs the
+    /// adapter's input so it can exit gracefully before the kill fallback).
+    stdin: Mutex<Option<ChildStdin>>,
     inbox: Inbox,
     profile: TransportProfile,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -140,12 +153,15 @@ impl ReticulumTransport {
                 }
             });
         }
-        // Drain stdout messages into the inbox.
+        // Drain stdout messages into the inbox, capping each at the frame budget
+        // plus a small endpoint/prefix allowance so a runaway adapter cannot make
+        // us allocate unboundedly.
         let inbox_reader = inbox.clone();
+        let max_body = cfg.max_frame_bytes.saturating_add(2 + 128);
         let reader = std::thread::spawn(move || {
             // Ends on clean EOF or a read error: the adapter is gone, and
             // send/poll then surface the failure as a Backend error.
-            while let Ok(Some((ep, frame))) = codec::read_message(&mut stdout) {
+            while let Ok(Some((ep, frame))) = codec::read_message(&mut stdout, max_body) {
                 inbox_reader
                     .lock()
                     .expect("adapter inbox mutex")
@@ -155,7 +171,7 @@ impl ReticulumTransport {
 
         Ok(Self {
             child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(Some(stdin)),
             inbox,
             profile: TransportProfile {
                 max_frame_bytes: cfg.max_frame_bytes,
@@ -166,16 +182,52 @@ impl ReticulumTransport {
         })
     }
 
-    /// Signals the adapter to stop (drops its stdin → EOF) and reaps it.
+    /// Whether the adapter child is still running (a cheap, non-blocking check the
+    /// daemon loop polls to decide when to re-spawn).
+    pub fn is_alive(&self) -> bool {
+        self.child
+            .lock()
+            .map(|mut c| matches!(c.try_wait(), Ok(None)))
+            .unwrap_or(false)
+    }
+
+    /// Stops the adapter: closes its stdin (EOF → it should exit), waits a bounded
+    /// grace, then **kills** it if it has not exited — so a wedged adapter cannot
+    /// hang station shutdown. Bounded, unlike a bare `wait()`.
     pub fn shutdown(mut self) {
-        // Dropping stdin closes the adapter's input; it exits, its stdout closes,
-        // and the reader thread ends.
-        drop(self.stdin.into_inner().ok());
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.wait();
-        }
+        self.stop_child();
         if let Some(r) = self.reader.take() {
             let _ = r.join();
+        }
+    }
+
+    /// Closes stdin, polls for exit up to a grace period, then kills.
+    fn stop_child(&mut self) {
+        // Take (drop) stdin → the adapter reaches EOF on its input and should exit.
+        if let Ok(mut guard) = self.stdin.lock() {
+            guard.take();
+        }
+        // Bounded wait: up to ~2s in 50ms polls, then SIGKILL via kill().
+        if let Ok(mut child) = self.child.lock() {
+            for _ in 0..40 {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ReticulumTransport {
+    fn drop(&mut self) {
+        // Belt-and-braces: never orphan the Python process, even on a panic path.
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.try_wait();
         }
     }
 }
@@ -193,7 +245,10 @@ impl FrameTransport for ReticulumTransport {
             });
         }
         let msg = codec::encode(&to.0, &frame);
-        let mut stdin = self.stdin.lock().expect("adapter stdin mutex");
+        let mut guard = self.stdin.lock().expect("adapter stdin mutex");
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| TransportError::Backend("adapter stopped".into()))?;
         stdin
             .write_all(&msg)
             .and_then(|()| stdin.flush())
@@ -210,15 +265,17 @@ impl FrameTransport for ReticulumTransport {
 mod tests {
     use super::codec;
 
+    const MAX: usize = 4096;
+
     #[test]
     fn codec_roundtrips_one_message() {
         let msg = codec::encode("a1b2c3d4", b"\x00\x01\xff frame bytes");
         let mut cursor = std::io::Cursor::new(msg);
-        let (ep, frame) = codec::read_message(&mut cursor).unwrap().unwrap();
+        let (ep, frame) = codec::read_message(&mut cursor, MAX).unwrap().unwrap();
         assert_eq!(ep, "a1b2c3d4");
         assert_eq!(frame, b"\x00\x01\xff frame bytes");
         // A second read hits clean EOF.
-        assert_eq!(codec::read_message(&mut cursor).unwrap(), None);
+        assert_eq!(codec::read_message(&mut cursor, MAX).unwrap(), None);
     }
 
     #[test]
@@ -228,7 +285,7 @@ mod tests {
         buf.extend(codec::encode("cc", b""));
         let mut cursor = std::io::Cursor::new(buf);
         let mut got = Vec::new();
-        while let Some(m) = codec::read_message(&mut cursor).unwrap() {
+        while let Some(m) = codec::read_message(&mut cursor, MAX).unwrap() {
             got.push(m);
         }
         assert_eq!(
@@ -247,6 +304,14 @@ mod tests {
         let mut buf = 10u32.to_be_bytes().to_vec();
         buf.extend_from_slice(&[0, 1, 2]);
         let mut cursor = std::io::Cursor::new(buf);
-        assert!(codec::read_message(&mut cursor).is_err());
+        assert!(codec::read_message(&mut cursor, MAX).is_err());
+    }
+
+    #[test]
+    fn codec_rejects_an_oversize_body_before_allocating() {
+        // A 1 GiB length prefix must be refused against the cap, not allocated.
+        let buf = (1u32 << 30).to_be_bytes().to_vec();
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(codec::read_message(&mut cursor, MAX).is_err());
     }
 }

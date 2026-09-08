@@ -2969,14 +2969,18 @@ correctness of identity→destination routing.
   controls.
 - *Mitigation:* control frames move only *unsigned carriage metadata* — a forged
   request-missing at worst causes a redundant resend (deduped, and paced as
-  economic overhead), a forged ack at worst makes the sender stop retransmitting a
-  payload the receiver can still request again; neither can forge, alter, or
-  misattribute a **record**, because a record's integrity is its own signature,
-  re-verified at the ingest front door. A `TransportBinding` is **self-signed by
-  the bound identity and log-admitted** (`binding::validate`): an attacker cannot
-  bind someone else's `rrn1…` to its destination, and redirecting to a wrong
-  destination only *denies* delivery (a connectivity event) — the misrouted bundle
-  is still sealed/signed and cannot be read or forged by whoever receives it.
+  economic overhead). A forged `ack` makes the sender drop its retransmit cache;
+  the residual is that a carrier-level forger can **deny delivery** of that one
+  payload (a subsequent request goes unanswered) until app-level tracking (T2.2.4)
+  re-bundles it — a connectivity event, not a forgery. Neither control frame can
+  forge, alter, or misattribute a **record**, because a record's integrity is its
+  own signature, re-verified at the ingest front door. A `TransportBinding` is
+  **self-signed by the bound identity** (`binding::validate` requires signer ==
+  bound address): an attacker cannot bind someone else's `rrn1…` to its
+  destination, and redirecting to a wrong destination only *denies* delivery — the
+  misrouted bundle is still sealed/signed and cannot be read or forged by whoever
+  receives it. (The daemon wiring that appends and reads bindings from the log
+  rides with the outbound path; the record + validation land in T2.6.2.)
 
 #### Denial of service — announce storms, jamming, and backpressure
 

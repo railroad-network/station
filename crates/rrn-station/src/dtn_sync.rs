@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rrn_protocol::airtime::{AirtimeBudget, Backpressure, PacedSender, Priority, QueueCaps};
+use rrn_protocol::airtime::{AirtimeBudget, Enqueued, PacedSender, Priority, QueueCaps};
 use rrn_protocol::framing::{self, Reassembler, ReassemblerConfig};
 use rrn_protocol::transport::{Endpoint, FrameTransport, TransportError};
 
@@ -178,6 +178,10 @@ pub struct SyncConfig {
     pub reassembler: ReassemblerConfig,
     /// Airtime queue depth caps.
     pub queue_caps: QueueCaps,
+    /// The most inbound in-flight payloads to track at once — a bound so a peer
+    /// spraying one chunk each of many distinct payloads cannot grow the
+    /// receiver-side map (and its request-missing traffic) without limit.
+    pub max_inbound_tracked: usize,
 }
 
 impl Default for SyncConfig {
@@ -187,6 +191,7 @@ impl Default for SyncConfig {
             cache_ttl_secs: 24 * 60 * 60,
             reassembler: ReassemblerConfig::default(),
             queue_caps: QueueCaps::default(),
+            max_inbound_tracked: 256,
         }
     }
 }
@@ -195,7 +200,14 @@ impl Default for SyncConfig {
 struct CachedSend {
     chunks: Vec<Vec<u8>>,
     priority: Priority,
-    last_touched: i64,
+    /// When the peer was last heard from about this payload (its first send, or a
+    /// request-missing) — the anchor for the retransmit TTL, so a payload to a peer
+    /// that has gone silent is *eventually* abandoned. Our own pokes do **not**
+    /// refresh it (or the cache would live forever — a real bug).
+    last_activity_at: i64,
+    /// When we last poked (re-sent the first chunk of) this payload — the poke
+    /// cadence anchor, distinct from the TTL anchor above.
+    last_poke_at: i64,
 }
 
 /// Receiver-side state for one inbound in-flight payload: who it came from and
@@ -249,31 +261,47 @@ impl<T: FrameTransport> DtnSyncer<T> {
     /// Enqueues one data chunk for `to`, skipping it if an identical chunk is
     /// already queued-not-sent (dedup — see [`pending`](Self::pending)). Returns
     /// whether it was newly enqueued.
-    fn enqueue_chunk(
-        &mut self,
-        priority: Priority,
-        to: &Endpoint,
-        chunk: Vec<u8>,
-    ) -> Result<bool, Backpressure> {
+    /// Best-effort enqueue of one data chunk, deduped against the in-flight set.
+    /// Returns whether it was newly queued (`false` if already in flight or the
+    /// pacer refused it under backpressure — either way the caller's cache + poke
+    /// will retry it, so backpressure is not an error here).
+    fn enqueue_chunk(&mut self, priority: Priority, to: &Endpoint, chunk: Vec<u8>) -> bool {
         let key = framing::frame_ids(&chunk).map(|(pid, idx)| (to.clone(), pid, idx));
         if let Some(ref k) = key {
             if self.pending.contains(k) {
-                return Ok(false); // already in flight; don't double-queue
+                return false; // already in flight; don't double-queue
             }
         }
-        self.sender.enqueue(priority, to.clone(), chunk)?;
-        if let Some(k) = key {
-            self.pending.insert(k);
+        match self.sender.enqueue(priority, to.clone(), chunk) {
+            Ok(outcome) => {
+                // If a bulk enqueue evicted an older frame, forget that frame's
+                // in-flight key — else it leaks a phantom "still queued" entry that
+                // suppresses its later retransmit forever.
+                if let Enqueued::AcceptedDroppedOldest { to: dto, bytes } = outcome {
+                    if let Some((pid, idx)) = framing::frame_ids(&bytes) {
+                        self.pending.remove(&(dto, pid, idx));
+                    }
+                }
+                if let Some(k) = key {
+                    self.pending.insert(k);
+                }
+                true
+            }
+            // Backpressured (economic/governance queue full): the cache + poke
+            // retry it later. Not queued now.
+            Err(_) => false,
         }
-        Ok(true)
     }
 
-    /// Queues a payload for `to`, chunked and paced at `priority`. The payload's
-    /// chunks are cached for retransmit until the peer acks (or the TTL elapses).
+    /// Queues a payload for `to`, chunked and paced at `priority`, and **caches it
+    /// for retransmit** until the peer acks (or the TTL elapses).
     ///
-    /// Returns [`Backpressure`] if the airtime queue for `priority` is full and
-    /// the frame was refused (economic/governance) — the caller holds and retries.
-    /// A bulk overflow silently drops its oldest instead, per the pacer.
+    /// Returns whether the payload could be framed (`false` only for one too large
+    /// to chunk for this carrier — a caller error). Backpressure is *not* a caller
+    /// concern here: the cache is inserted **before** enqueuing, so any chunk the
+    /// airtime queue refuses right now is simply delivered later by the poke /
+    /// request-missing machinery — the payload is durably tracked either way, and
+    /// no chunk is ever orphaned without a cache entry.
     pub fn send(
         &mut self,
         to: &Endpoint,
@@ -281,37 +309,32 @@ impl<T: FrameTransport> DtnSyncer<T> {
         payload: &[u8],
         priority: Priority,
         now: i64,
-    ) -> Result<(), Backpressure> {
+    ) -> bool {
         // Tag the payload so the receiver can route it, then chunk.
         let mut tagged = Vec::with_capacity(payload.len() + 1);
         tagged.push(kind.tag());
         tagged.extend_from_slice(payload);
         let chunks = match framing::chunk(&tagged, self.max_frame_bytes) {
             Ok(c) => c,
-            // A payload that cannot be framed (too many chunks for the carrier) is
-            // a caller error surfaced as backpressure rather than a panic.
-            Err(_) => return Err(Backpressure { priority, depth: 0 }),
+            Err(_) => return false, // too large to frame for this carrier
         };
-        // payload_id is the framing chunk's payload id (same for every chunk).
         let payload_id = framing::payload_id(&tagged);
 
-        // Enqueue every chunk (deduped); on backpressure, drop the cache entry and
-        // report so the caller retries the whole payload.
-        for chunk in &chunks {
-            if let Err(bp) = self.enqueue_chunk(priority, to, chunk.clone()) {
-                self.outbound.remove(&(to.clone(), payload_id));
-                return Err(bp);
-            }
-        }
+        // Cache first, so a chunk the pacer refuses right now is still tracked and
+        // retransmitted (never orphaned). Then best-effort enqueue every chunk.
         self.outbound.insert(
             (to.clone(), payload_id),
             CachedSend {
-                chunks,
+                chunks: chunks.clone(),
                 priority,
-                last_touched: now,
+                last_activity_at: now,
+                last_poke_at: now,
             },
         );
-        Ok(())
+        for chunk in chunks {
+            let _ = self.enqueue_chunk(priority, to, chunk);
+        }
+        true
     }
 
     /// Advances the engine at `now`: pumps paced frames onto the wire, drains and
@@ -354,12 +377,29 @@ impl<T: FrameTransport> DtnSyncer<T> {
                     }
                 }
                 Ok(None) => {
-                    // Incomplete: remember the source so we can ask for the rest.
+                    // `accept` returns None for BOTH "still incomplete" and
+                    // "already completed" (a duplicate chunk of a payload we
+                    // finished before). Tell them apart by `missing`: Some →
+                    // partial, track its source so we can request the rest; None →
+                    // already complete, so **re-ack** (our first ack may have been
+                    // lost — without this the sender pokes forever and the receiver
+                    // never re-acks).
                     if let Some(pid) = framing::frame_payload_id(&frame) {
-                        self.inbound.entry(pid).or_insert(InboundState {
-                            source: from.clone(),
-                            last_request_at: i64::MIN,
-                        });
+                        match self.reassembler.missing(&pid) {
+                            Some(_) => {
+                                // Bound the receiver-side map: ignore a new partial
+                                // once we are already tracking a carrier's worth.
+                                if self.inbound.len() < self.config.max_inbound_tracked
+                                    || self.inbound.contains_key(&pid)
+                                {
+                                    self.inbound.entry(pid).or_insert(InboundState {
+                                        source: from.clone(),
+                                        last_request_at: i64::MIN,
+                                    });
+                                }
+                            }
+                            None => self.enqueue_ack(&from, pid),
+                        }
                     }
                 }
                 // A malformed/duplicate/over-cap frame is ignored (the carrier's
@@ -405,6 +445,11 @@ impl<T: FrameTransport> DtnSyncer<T> {
         self.inbound.len()
     }
 
+    /// Outbound payloads still cached for retransmit (un-acked).
+    pub fn outbound_cached(&self) -> usize {
+        self.outbound.len()
+    }
+
     fn handle_control(&mut self, from: &Endpoint, ctrl: ControlFrame, now: i64) {
         match ctrl {
             ControlFrame::Ack { payload_id } => {
@@ -418,10 +463,11 @@ impl<T: FrameTransport> DtnSyncer<T> {
                 missing,
             } => {
                 // Clone the requested chunks out first (immutable borrow), then
-                // enqueue them deduped (mutable borrow).
+                // enqueue them deduped (mutable borrow). A request is proof the
+                // peer is alive, so it refreshes the TTL anchor.
                 let resend: Option<(Priority, Vec<Vec<u8>>)> =
                     self.outbound.get_mut(&(from.clone(), payload_id)).map(|c| {
-                        c.last_touched = now;
+                        c.last_activity_at = now;
                         (
                             c.priority,
                             missing
@@ -441,6 +487,15 @@ impl<T: FrameTransport> DtnSyncer<T> {
         }
     }
 
+    /// Enqueues an `Ack` for `payload_id` to `to` (economic-priority; tiny).
+    fn enqueue_ack(&mut self, to: &Endpoint, payload_id: [u8; 32]) {
+        let _ = self.sender.enqueue(
+            Priority::Economic,
+            to.clone(),
+            ControlFrame::Ack { payload_id }.encode(),
+        );
+    }
+
     /// A payload finished reassembling: strip its kind tag, ack the sender, and
     /// return it for the caller. `frame` is any one of its chunks (for the id).
     fn finish_inbound(
@@ -451,12 +506,7 @@ impl<T: FrameTransport> DtnSyncer<T> {
     ) -> Option<Completed> {
         if let Some(pid) = framing::frame_payload_id(frame) {
             self.inbound.remove(&pid);
-            // Ack so the sender can free its cache; economic-priority (tiny).
-            let _ = self.sender.enqueue(
-                Priority::Economic,
-                from.clone(),
-                ControlFrame::Ack { payload_id: pid }.encode(),
-            );
+            self.enqueue_ack(from, pid);
         }
         let (tag, body) = tagged.split_first()?;
         let kind = PayloadKind::from_tag(*tag)?;
@@ -467,27 +517,41 @@ impl<T: FrameTransport> DtnSyncer<T> {
         })
     }
 
+    /// The most chunk indexes that fit one request-missing frame on this carrier —
+    /// header is `RRNC`(4)+ver(1)+type(1)+id(32)+count(2) = 40 bytes, then 2 per
+    /// index. A request never exceeds the frame budget (or it would be refused and
+    /// the payload would stall); the rest are covered by the next interval.
+    fn max_missing_per_request(&self) -> usize {
+        self.max_frame_bytes.saturating_sub(40) / 2
+    }
+
     fn request_missing(&mut self, now: i64) {
+        let cap = self.max_missing_per_request().max(1);
         // Collect the requests first (immutable borrow of the reassembler), then
-        // enqueue (mutable borrow of the sender).
+        // enqueue (mutable borrow of the sender). Also drop inbound entries whose
+        // payload the reassembler no longer tracks (completed or evicted).
         let mut requests: Vec<(Endpoint, [u8; 32], Vec<u16>)> = Vec::new();
+        let mut done: Vec<[u8; 32]> = Vec::new();
         for (pid, state) in self.inbound.iter_mut() {
-            if now.saturating_sub(state.last_request_at) < self.config.resend_interval_secs {
-                continue;
-            }
-            // Skip if a request for this payload is already queued-not-sent.
-            if self
-                .pending_requests
-                .contains(&(state.source.clone(), *pid))
-            {
-                continue;
-            }
-            if let Some(missing) = self.reassembler.missing(pid) {
-                if !missing.is_empty() {
+            match self.reassembler.missing(pid) {
+                None => done.push(*pid), // completed or evicted: stop tracking
+                Some(missing) if missing.is_empty() => done.push(*pid),
+                Some(_)
+                    if now.saturating_sub(state.last_request_at)
+                        < self.config.resend_interval_secs => {}
+                Some(_)
+                    if self
+                        .pending_requests
+                        .contains(&(state.source.clone(), *pid)) => {}
+                Some(mut missing) => {
+                    missing.truncate(cap);
                     state.last_request_at = now;
                     requests.push((state.source.clone(), *pid, missing));
                 }
             }
+        }
+        for pid in done {
+            self.inbound.remove(&pid);
         }
         for (to, payload_id, missing) in requests {
             let frame = ControlFrame::RequestMissing {
@@ -505,36 +569,54 @@ impl<T: FrameTransport> DtnSyncer<T> {
         }
     }
 
-    /// Re-enqueues the first chunk of every un-acked cached payload that has been
-    /// quiet for `resend_interval_secs`, deduped. Bounded: at most one chunk per
-    /// stuck payload per interval, and the peer's [`ControlFrame::Ack`] drops the
-    /// cache the moment the payload lands.
+    /// Re-sends the first chunk of every un-acked cached payload that has gone
+    /// quiet (poke cadence `resend_interval_secs`), *unless* a chunk of that
+    /// payload is already queued — this rescues a payload whose only/first chunk
+    /// was lost (the receiver never saw it, so cannot request it) without
+    /// gratuitously re-sending chunk 0 while the initial transmission is still
+    /// draining. The peer's [`ControlFrame::Ack`] drops the cache once it lands.
     fn poke_unacked(&mut self, now: i64) {
         let interval = self.config.resend_interval_secs;
         let due: Vec<(Endpoint, [u8; 32])> = self
             .outbound
             .iter()
-            .filter(|(_, c)| now.saturating_sub(c.last_touched) >= interval)
+            .filter(|(_, c)| now.saturating_sub(c.last_poke_at) >= interval)
             .map(|(k, _)| k.clone())
             .collect();
-        for key in due {
+        for (to, pid) in due {
+            // Skip if any chunk of this payload is still queued to send.
+            let queued = self.pending.iter().any(|(ep, p, _)| ep == &to && *p == pid);
             let poke = self
                 .outbound
-                .get(&key)
+                .get(&(to.clone(), pid))
                 .and_then(|c| c.chunks.first().cloned().map(|ch| (c.priority, ch)));
-            if let Some((priority, chunk)) = poke {
-                let _ = self.enqueue_chunk(priority, &key.0, chunk);
+            if !queued {
+                if let Some((priority, chunk)) = poke {
+                    let _ = self.enqueue_chunk(priority, &to, chunk);
+                }
             }
-            if let Some(c) = self.outbound.get_mut(&key) {
-                c.last_touched = now;
+            if let Some(c) = self.outbound.get_mut(&(to, pid)) {
+                c.last_poke_at = now;
             }
         }
     }
 
+    /// Drops cached payloads whose peer has gone silent past the TTL (measured from
+    /// the last peer activity, never from our own pokes) — so a payload to a peer
+    /// that will never ack is eventually abandoned, and the cache stays bounded.
     fn prune_outbound(&mut self, now: i64) {
         let ttl = self.config.cache_ttl_secs;
-        self.outbound
-            .retain(|_, c| now.saturating_sub(c.last_touched) <= ttl);
+        let stale: Vec<(Endpoint, [u8; 32])> = self
+            .outbound
+            .iter()
+            .filter(|(_, c)| now.saturating_sub(c.last_activity_at) > ttl)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            self.outbound.remove(&key);
+            self.pending
+                .retain(|(ep, pid, _)| !(ep == &key.0 && *pid == key.1));
+        }
     }
 }
 
@@ -640,16 +722,14 @@ mod tests {
 
         // A sends both; the economic one is paced ahead of the bulk one regardless
         // of the order enqueued (bulk first, to prove priority beats arrival).
-        a.send(&ep_b, PayloadKind::Bundle, &bulk_bytes, Priority::Bulk, 0)
-            .unwrap();
-        a.send(
+        assert!(a.send(&ep_b, PayloadKind::Bundle, &bulk_bytes, Priority::Bulk, 0));
+        assert!(a.send(
             &ep_b,
             PayloadKind::Bundle,
             &econ_bytes,
             Priority::Economic,
-            0,
-        )
-        .unwrap();
+            0
+        ));
 
         let mut b_completed_order: Vec<Vec<u8>> = Vec::new();
         let mut a_receipts: Vec<Vec<u8>> = Vec::new();
@@ -674,8 +754,7 @@ mod tests {
                         &receipt,
                         Priority::Economic,
                         now,
-                    )
-                    .unwrap();
+                    );
                 }
             }
             if b_completed_order.len() == 2 && a_receipts.len() == 2 {
@@ -703,6 +782,92 @@ mod tests {
         assert_eq!(a_receipts.len(), 2, "both delivery receipts must return");
         assert!(a_receipts.contains(&rrn_crypto::hash::Hash::of(&econ_bytes).to_bytes().to_vec()));
         assert!(a_receipts.contains(&rrn_crypto::hash::Hash::of(&bulk_bytes).to_bytes().to_vec()));
+    }
+
+    #[test]
+    fn converges_and_releases_caches_under_heavy_loss() {
+        // 50% loss stresses every reliability path: retransmit, the sender poke
+        // (lost first chunk), and re-ack (lost ack). Both sides must complete AND
+        // free their caches (a lost ack must not wedge the sender forever).
+        let budget = AirtimeBudget {
+            sustained_bytes_per_sec: 5.0,
+            burst_bytes: 400,
+        };
+        let (mut a, mut b, _ep_a, ep_b) = pair(120, budget, 0.50, 0);
+        let payload = bundle(2, 7).encode();
+        assert!(a.send(&ep_b, PayloadKind::Bundle, &payload, Priority::Economic, 0));
+
+        let mut got = None;
+        let mut a_acked = false;
+        for now in 1..=20000 {
+            for c in a.tick(now).unwrap() {
+                let _ = c;
+            }
+            for c in b.tick(now).unwrap() {
+                if c.kind == PayloadKind::Bundle {
+                    got = Some(c.bytes.clone());
+                }
+            }
+            // Success = delivered, and A's cache released by B's ack (even across
+            // lost acks, which the re-ack path recovers).
+            if got.is_some() && a.outbound_cached() == 0 {
+                a_acked = true;
+                break;
+            }
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(payload.as_slice()),
+            "delivered under 50% loss"
+        );
+        assert!(
+            a_acked,
+            "sender cache released after ack (re-ack recovers a lost ack)"
+        );
+        assert_eq!(
+            b.inbound_inflight(),
+            0,
+            "receiver stops tracking a completed payload"
+        );
+    }
+
+    #[test]
+    fn a_cache_to_a_gone_peer_is_abandoned_after_ttl() {
+        // A sends to a peer that never responds; the cache must not poke forever —
+        // it is pruned once the TTL elapses since the last (nonexistent) activity.
+        let budget = AirtimeBudget {
+            sustained_bytes_per_sec: 100.0,
+            burst_bytes: 500,
+        };
+        let net = LoopbackNet::new(200);
+        let cfg = SyncConfig {
+            resend_interval_secs: 5,
+            cache_ttl_secs: 100,
+            ..SyncConfig::default()
+        };
+        let mut a = DtnSyncer::new(
+            FaultTransport::new(net.endpoint("a"), FaultConfig::none(1)),
+            budget,
+            cfg,
+            0,
+        );
+        assert!(a.send(
+            &Endpoint::new("gone"),
+            PayloadKind::Bundle,
+            b"hello",
+            Priority::Bulk,
+            0
+        ));
+        assert_eq!(a.outbound_cached(), 1);
+        // Tick well past the TTL; no peer ever acks or requests.
+        for now in 1..=200 {
+            a.tick(now).unwrap();
+        }
+        assert_eq!(
+            a.outbound_cached(),
+            0,
+            "cache to a gone peer is abandoned after TTL"
+        );
     }
 
     #[test]
