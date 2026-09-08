@@ -3012,6 +3012,86 @@ correctness of identity→destination routing.
   key); its at-rest custody is deferred to T2.9.1, noted here as a residual until
   then (ADR-0026 §7).
 
+### SMS as a DTN carrier (station, T2.7.1)
+
+*Implemented in T2.7.1 (the codec, seam, relay engine, and daemon bridge; the real
+modem/gateway backend is T2.7.2).* A paired phone with cellular text but no data
+encodes its outbox into GSM-7-safe `rrnp:` chunks (`rrn_protocol::paper`, sized to
+`[sms] max_parts_per_message`) and texts them to the station's number; the
+`rrn_station::sms::SmsRelay` reassembles per sender, ingests each completed bundle
+through the **same** DTN front door as every other carrier (see *DTN bundle
+ingest*), and texts the signed delivery receipt back, paced money-first. Like paper
+and Reticulum, SMS is a **dumb carrier**: integrity and authenticity ride on the
+per-record signatures the carried bundle already verifies, never on the SMS layer.
+
+**Assets:** the app-layer integrity guarantee holding over a carrier whose sender
+identifier is trivially forgeable; the availability of the single-threaded core
+against SMS-driven ingest spam; the honesty of the sender registry; members'
+communication-metadata privacy.
+
+#### Spoofing — a forged sender number
+
+- *Threat:* an MSISDN is forgeable at the carrier level, so an attacker texts the
+  station claiming to be a member (or texts *as* the station to a member).
+- *Mitigation:* the sender registry (`allowed_senders = "paired"`) is **spam control,
+  not authentication** — it processes inbound only from numbers a `rrn.net.sms_binding`
+  record names, but the **security boundary is the per-record signature** re-verified
+  at the ingest front door. A spoofed sender can at most deliver records that already
+  carry valid member signatures (i.e. re-carry someone's real, already-public bundle,
+  which is idempotent and harmless) or junk that is refused. A binding itself is
+  **self-signed by the bound identity** (`binding::validate_sms_binding` requires
+  signer == the bound address): an attacker cannot bind a victim's `rrn1…` to a number
+  it controls. Impersonating the station *toward* a member likewise forges nothing —
+  a fake "receipt" text is just bytes that fail the station-signature check the member
+  applies. Note that `"paired"` is **not a membership gate**: it means only "a number
+  some identity self-bound over some carrier," so any keypair that has landed one
+  self-signed binding in the log is "paired." Standing/membership is enforced where it
+  matters — at ingest and in the ledger — not by the registry.
+
+#### Denial of service — SMS-flood, truncation, and receipt-cost amplification
+
+- *Threat:* an attacker floods the station's number with texts (each costing the
+  station a poll and, in "open" mode, a reassembly slot), or the carrier drops/
+  truncates concatenated parts to stall reassembly; or — spoofing a victim's number —
+  makes the station *send* receipts to the victim (the station pays per outbound SMS,
+  and the victim is nuisance-texted).
+- *Mitigation:* a per-sender fixed-1-hour-window cap (`[sms] max_inbound_per_hour`, default
+  60) drops the excess with a **single rate-limited log line** (never one per text);
+  the per-sender reassembly and rate state are evicted once idle past the window, so
+  the tracking maps stay bounded to senders active within the last hour (a
+  spoofed-number flood cannot grow relay memory without limit); and a truncated or
+  corrupt chunk fails its base64/length check or its reassembly hash and is
+  **refused**, so the reassembler simply waits for a re-send rather than accepting
+  wrong bytes. There is no station-side retransmit protocol: the member re-sends until
+  the receipt returns, and the station re-ingests idempotently (ADR-0020 §3).
+- *Residual:* **outbound-cost amplification.** A spoofed inbound number whose carried
+  bundle decodes (even to all-refused records) still earns a signed receipt texted to
+  the *claimed* sender — so an attacker can make the station spend outbound SMS toward
+  a victim, bounded by `max_inbound_per_hour` per spoofed number and eliminated in
+  `"paired"` mode (an unbound spoof is dropped before ingest). A station on a metered
+  SMS plan should run `"paired"` and set the cap to its budget.
+
+#### Residual — carrier surveillance (the §13 sensitivity)
+
+- **Metadata and content are cleartext to the carrier.** SMS is unencrypted at the
+  transport: the carrier (and anyone who compels or taps it) sees *who* texts the
+  station, *when*, and the *payload bytes*. The payloads are already
+  community-public signed records, so their content leaks nothing the community does
+  not already hold — but the **metadata** (a phone number's association with a
+  Railroad community, and its activity pattern) is a genuine surveillance residual
+  with no transport-layer fix. Stated plainly: SMS trades privacy for reach. Where
+  that trade is unacceptable, the mitigation is a different rung of the degradation
+  ladder — LoRa (no carrier) or paper (no electronic trace). This is the §13
+  sensitivity of the design overview, kept factual: a community under surveillance
+  pressure should not route sensitive activity over SMS.
+
+#### Out of scope, by decision — custodial feature-phone commands
+
+The feature-phone model (a human texting `PAY 5 TO ALICE`, the station holding
+custodial keys) is **explicitly not built**: it would break the keys-stay-with-
+members principle (ADR-0006). There is no command parser; SMS carries only
+already-signed payloads. Adding custody is a new-ADR decision, not a code change.
+
 ### Vouching surface (M1.4)
 
 *Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its

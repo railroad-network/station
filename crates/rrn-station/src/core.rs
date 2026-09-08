@@ -247,6 +247,12 @@ pub enum Command {
         /// The signed receipt bytes to return, or `None` on a malformed bundle.
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// The current SMS sender registry (bound MSISDNs), derived from the log
+    /// (T2.7.1).
+    SmsBoundSenders {
+        /// The set of MSISDNs currently bound to an identity.
+        reply: oneshot::Sender<std::collections::HashSet<crate::sms::Msisdn>>,
+    },
     /// Stop the core loop (graceful shutdown).
     Shutdown,
 }
@@ -382,6 +388,18 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         self.tx.send(Command::IngestBundle { bytes, reply }).ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// The current SMS sender registry: the set of MSISDNs currently bound to an
+    /// identity by a `rrn.net.sms_binding` record (T2.7.1), derived from the log.
+    /// The SMS relay reads it to gate inbound in `"paired"` mode. An empty set on a
+    /// stopped core (fail-closed: unknown senders are simply not "paired").
+    pub async fn sms_bound_senders(&self) -> std::collections::HashSet<crate::sms::Msisdn> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::SmsBoundSenders { reply }).is_err() {
+            return std::collections::HashSet::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Returns `(our_address, log_tail_seq)`.
@@ -671,6 +689,9 @@ impl Core {
                         }
                     };
                     let _ = reply.send(receipt);
+                }
+                Command::SmsBoundSenders { reply } => {
+                    let _ = reply.send(sms_bound_senders(&AppendLog::new(&self.db)));
                 }
                 Command::Handshake { reply } => {
                     let tail = self.tail_seq();
@@ -3814,6 +3835,11 @@ impl Core {
             Some(KIND_CERT_REQUEST) => {
                 return Ok(refused_disposition(RefusalReason::UnroutableKind))
             }
+            // An SMS-reachability binding carries no engine semantics — it is a
+            // self-signed statement appended verbatim so the station can derive its
+            // inbound SMS sender registry from the log (T2.7.1). Handled off to the
+            // side and returned early; it never touches the ledger engine below.
+            Some(KIND_SMS_BINDING) => return self.admit_sms_binding(bytes, signer, signature, now),
             _ => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
         };
 
@@ -3863,6 +3889,60 @@ impl Core {
             // bundle rather than issue a receipt that misrepresents it.
             Err(rrn_ledger::Error::Storage(e)) => Err(BundleIngestError::Internal(e.to_string())),
             Err(e) => Ok(refused_disposition(map_refusal(&e))),
+        }
+    }
+
+    /// Admits a self-signed `rrn.net.sms_binding` record (T2.7.1): validate it is a
+    /// well-formed, self-signed binding (signer == the bound address, valid E.164),
+    /// then append it to the log **verbatim** via
+    /// [`append_raw`](AppendLog::append_raw). It carries no ledger semantics; the
+    /// station's inbound SMS sender registry is derived from these records on demand
+    /// ([`sms_bound_senders`]). An already-present record answers `Known`
+    /// (idempotent, like every DTN record); a malformed or badly-signed one is a
+    /// per-record refusal, never a bundle abort.
+    fn admit_sms_binding(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        use rrn_protocol::binding::{self, SmsBinding};
+        let Ok(payload) = from_canonical_bytes::<SmsBinding>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        // Self-signed + valid-E.164 gate (bad signature, wrong signer, or a
+        // malformed number are all refusals — the number the registry trusts must
+        // be one the gateway would accept, and the binding must be its owner's).
+        if binding::validate_sms_binding(&signed).is_err() {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        }
+        let stored = StoredPayload {
+            bytes: bytes.to_vec(),
+            signer: signed.signer,
+            signature: signed.signature,
+        };
+        let mut log = AppendLog::new(&self.db);
+        match log
+            .append_raw(stored, now)
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+        {
+            Some(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            // Already in the log (idempotent) — report `Known` with its sequence.
+            None => match log
+                .admission_of(&Hash::of(bytes))
+                .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+            {
+                Some((seq, _)) => Ok(Disposition::Known { seq }),
+                None => Err(BundleIngestError::Internal(
+                    "append_raw reported a duplicate binding absent from the log".into(),
+                )),
+            },
         }
     }
 
@@ -5318,6 +5398,12 @@ const KIND_CERT_RETURN: &str = "rrn.credit.cert_return";
 /// a store-and-forward bundle cannot carry. It is refused as `unroutable-kind`
 /// rather than falling through the catch-all, so the reason is deliberate.
 const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
+/// A member-signed SMS-reachability binding (T2.7.1). Unlike the ledger records
+/// above it carries no engine semantics — it is a self-signed statement appended to
+/// the log verbatim, so the station can derive its inbound SMS sender registry from
+/// the log (a cache, never authoritative). Admitted via the normal DTN path so a
+/// member can register a number over any carrier.
+const KIND_SMS_BINDING: &str = rrn_protocol::binding::SMS_BINDING_KIND;
 
 /// Why an ingest could not produce a receipt at all (as opposed to a per-record
 /// refusal, which *is* part of a receipt). A malformed bundle is the caller's
@@ -5846,6 +5932,43 @@ fn periods_charged_of(
         .get(&ContractRef(id.to_bytes()))
         .map(|periods| periods.iter().filter(|&&p| p < total).count() as u32)
         .unwrap_or(0)
+}
+
+/// The station's current SMS sender registry (T2.7.1), derived from the log's
+/// `rrn.net.sms_binding` records: the set of MSISDNs currently bound to an
+/// identity, latest-binding-wins per identity, so a member who rebinds to a new
+/// number drops the old one from the set. Self-signing is re-checked here (signer
+/// == the bound address) so a record that somehow bypassed admission cannot inject
+/// a number. A pure derivation of the log — a cache, never authoritative state
+/// (ADR-0020); the `"paired"` mode gates inbound against it.
+fn sms_bound_senders(log: &AppendLog) -> std::collections::HashSet<crate::sms::Msisdn> {
+    use rrn_protocol::binding::{SmsBinding, SMS_BINDING_KIND};
+    // The latest binding (by `bound_at`, log order breaking ties) per identity.
+    let mut latest: std::collections::HashMap<Address, (i64, String)> =
+        std::collections::HashMap::new();
+    for entry in log.iter_from(1) {
+        let Ok(entry) = entry else { continue };
+        if dtn_record_kind(&entry.payload.bytes).as_deref() != Some(SMS_BINDING_KIND) {
+            continue;
+        }
+        let Ok(binding) = from_canonical_bytes::<SmsBinding>(&entry.payload.bytes) else {
+            continue;
+        };
+        // Self-signed: the log entry's signer must be the bound identity's key.
+        if entry.payload.signer != *binding.address.public_key() {
+            continue;
+        }
+        let slot = latest
+            .entry(binding.address)
+            .or_insert((i64::MIN, String::new()));
+        if binding.bound_at >= slot.0 {
+            *slot = (binding.bound_at, binding.msisdn);
+        }
+    }
+    latest
+        .into_values()
+        .filter_map(|(_, msisdn)| crate::sms::Msisdn::parse(msisdn).ok())
+        .collect()
 }
 
 /// The proposal a transaction carries, whatever state it has reached. Every

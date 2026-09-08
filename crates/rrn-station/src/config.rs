@@ -68,6 +68,81 @@ pub struct StationConfig {
     /// design's ~250 B/s raw at 1% duty, T2.6.2).
     #[serde(default)]
     pub lora: LoraSection,
+    /// SMS carrier (optional; disabled by default, T2.7.1). A member's paired phone
+    /// texts its outbox to the station's number; the station decodes, ingests, and
+    /// texts receipts back.
+    #[serde(default)]
+    pub sms: SmsSection,
+}
+
+/// `[sms]` — SMS as a DTN carrier (T2.7.1, Overview §10.3 "No internet — SMS").
+///
+/// SMS is a *carrier for signed payloads*, never custody: a paired phone encodes
+/// its outbox into GSM-7-safe text chunks and texts them to `station_msisdn`; the
+/// station reassembles, ingests through the same DTN front door the online path
+/// uses (ADR-0020 §3), and texts the signed receipt back. Off by default; and even
+/// when enabled, T2.7.1 ships no modem backend — the real gateway that this config
+/// drives is T2.7.2, so an enabled `[sms]` without that backend is supervised-but-
+/// idle (mirroring `[sidecar]` without `[lora] adapter_script`). See
+/// `docs/spec/sms-carrier.md`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SmsSection {
+    /// Whether the SMS carrier is enabled at all. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The station's own phone number (E.164), the number members text. Required
+    /// when the modem backend runs (T2.7.2); optional here.
+    #[serde(default)]
+    pub station_msisdn: Option<String>,
+    /// The most concatenated GSM-7 parts one SMS message (one chunk) may span.
+    /// Defaults to 4 (→ a 442-byte chunk budget; see
+    /// [`rrn_protocol::paper::sms_chunk_budget_bytes`]). Must be ≥ 1.
+    #[serde(default = "default_sms_max_parts")]
+    pub max_parts_per_message: usize,
+    /// Which inbound senders to process: `"paired"` (default — only numbers a
+    /// `rrn.net.sms_binding` record names) or `"open"` (any number; still
+    /// signature-gated at ingest).
+    #[serde(default)]
+    pub allowed_senders: crate::sms::AllowedSenders,
+    /// The most inbound texts one sender may send per fixed 1-hour window before the rest
+    /// are dropped (with a throttled log). Defaults to 60.
+    #[serde(default = "default_sms_max_inbound_per_hour")]
+    pub max_inbound_per_hour: u32,
+}
+
+fn default_sms_max_parts() -> usize {
+    4
+}
+fn default_sms_max_inbound_per_hour() -> u32 {
+    60
+}
+
+impl Default for SmsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            station_msisdn: None,
+            max_parts_per_message: default_sms_max_parts(),
+            allowed_senders: crate::sms::AllowedSenders::default(),
+            max_inbound_per_hour: default_sms_max_inbound_per_hour(),
+        }
+    }
+}
+
+impl SmsSection {
+    /// The [`SmsRelayConfig`](crate::sms::SmsRelayConfig) this section describes:
+    /// the chunk budget derived from `max_parts_per_message`, the registry mode, and
+    /// the inbound rate cap. Outbound pacing takes its default.
+    pub fn relay_config(&self) -> crate::sms::SmsRelayConfig {
+        crate::sms::SmsRelayConfig {
+            chunk_budget_bytes: rrn_protocol::paper::sms_chunk_budget_bytes(
+                self.max_parts_per_message,
+            ),
+            allowed_senders: self.allowed_senders,
+            max_inbound_per_hour: self.max_inbound_per_hour,
+            message_budget: crate::sms::MessageBudget::default(),
+        }
+    }
 }
 
 /// `[lora]` — the airtime budget the Reticulum transport paces to (T2.6.2).
@@ -611,6 +686,7 @@ impl StationConfig {
             dtn: DtnSection::default(),
             sidecar: SidecarSection::default(),
             lora: LoraSection::default(),
+            sms: SmsSection::default(),
         }
     }
 }
@@ -834,6 +910,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.lora.budget().sustained_bytes_per_sec, 30.0);
+    }
+
+    #[test]
+    fn sms_defaults_to_disabled() {
+        // A config written before [sms] existed still parses, and the carrier is
+        // off with the protocol defaults.
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert!(!cfg.sms.enabled);
+        assert_eq!(cfg.sms.station_msisdn, None);
+        assert_eq!(cfg.sms.max_parts_per_message, 4);
+        assert_eq!(cfg.sms.allowed_senders, crate::sms::AllowedSenders::Paired);
+        assert_eq!(cfg.sms.max_inbound_per_hour, 60);
+        // The derived relay config sizes the chunk budget from max_parts (442 @ 4).
+        assert_eq!(cfg.sms.relay_config().chunk_budget_bytes, 442);
+    }
+
+    #[test]
+    fn sms_section_overrides_defaults() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [sms]
+            enabled = true
+            station_msisdn = "+15550001111"
+            max_parts_per_message = 6
+            allowed_senders = "open"
+            max_inbound_per_hour = 120
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert!(cfg.sms.enabled);
+        assert_eq!(cfg.sms.station_msisdn.as_deref(), Some("+15550001111"));
+        assert_eq!(cfg.sms.max_parts_per_message, 6);
+        assert_eq!(cfg.sms.allowed_senders, crate::sms::AllowedSenders::Open);
+        assert_eq!(cfg.sms.max_inbound_per_hour, 120);
+        // 153×6 = 918 chars − 22 header = 896 data chars → floor(896×3/4) = 672.
+        assert_eq!(cfg.sms.relay_config().chunk_budget_bytes, 672);
     }
 
     #[test]
