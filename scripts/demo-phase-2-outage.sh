@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# demo-phase-2-outage.sh — the Phase-2 exit criterion, narrated.
+# demo-phase-2-outage.sh — the 72-hour outage simulation, narrated.
 #
-# Runs the 72-hour outage simulation harness (`outage_72h.rs`) for a single seed
-# with narration on, so a human can watch the timeline (T0 normal ops → 72h
-# connectivity loss over courier / paper / mock-LoRa channels → reconnect →
-# settlement horizon) and see each of the nine exit invariants asserted in turn.
+# Runs the outage simulation for a single scenario with narration turned on, so you
+# can watch the timeline step by step: normal operations, then 72 simulated hours of
+# activity over courier / paper / long-range-radio channels while connectivity is
+# lost, then reconnect, reconcile, and settle — with each guarantee checked in turn.
 #
-# This is the human-runnable cousin of `cargo test -p rrn-station --test
-# outage_72h`; CI drives seeds {1,2,3} with narration off. Simulated time
-# (injected clocks end to end) keeps the 72 hours to a few seconds of wall-clock.
+# It is the human-narrated companion to the plain test run,
+# `cargo test -p rrn-station --test outage_72h`. Simulated time keeps the whole
+# 72-hour scenario to a few seconds of wall-clock.
 #
-# Usage:  scripts/demo-phase-2-outage.sh [SEED]   (SEED defaults to 1)
+# Usage:  scripts/demo-phase-2-outage.sh [SCENARIO]   (1, 2, or 3; defaults to 1)
 
 set -euo pipefail
 
@@ -23,7 +23,7 @@ case "$SEED" in
   2) TEST="outage_72h_seed_2" ;;
   3) TEST="outage_72h_seed_3" ;;
   *)
-    echo "This demo narrates one of the CI seeds. Usage: $0 [1|2|3]" >&2
+    echo "This demo runs one of the three scenarios. Usage: $0 [1|2|3]" >&2
     exit 2
     ;;
 esac
@@ -31,29 +31,29 @@ esac
 cat <<'EOF'
 
 ########################################################################
-#  Railroad Network — Phase 2 exit criterion (ADR-0017), executable.   #
+#  Railroad Network — the 72-hour outage simulation.                   #
 #                                                                      #
 #  A community of ~20 members and one station run through a 72-hour    #
 #  full connectivity loss with realistic economic activity over every  #
-#  offline channel, then reconnect, reconcile, and settle. The harness #
-#  asserts — mechanically — full reconciliation, value conservation,   #
-#  no ledger forks, and no credit limit violated.                      #
+#  offline channel, then reconnect, reconcile, and settle — verifying  #
+#  full reconciliation, value conservation, ledger integrity, and      #
+#  that no credit limit is bypassed.                                   #
 ########################################################################
 EOF
 
 echo
-echo "=== Running the outage simulation (seed $SEED), narrated ==="
+echo "=== Running the outage simulation (scenario $SEED), narrated ==="
 echo
 
-# `--nocapture` lets the harness's narration reach the terminal; the env var is
-# what turns that narration on (the same test stays silent under plain `cargo test`).
+# `--nocapture` lets the narration reach the terminal; the env var is what turns it
+# on (the same test stays silent under a plain `cargo test`).
 RRN_OUTAGE_NARRATE=1 cargo test \
   --manifest-path "$REPO_ROOT/Cargo.toml" \
   -p rrn-station --test outage_72h "$TEST" \
   -- --exact --nocapture
 
 echo
-echo "=== Exit criterion demonstrated for seed $SEED. ==="
-echo "Run the full gate (all seeds + determinism) with:"
+echo "=== Simulation complete (scenario $SEED). ==="
+echo "Run every scenario plus the reproducibility check with:"
 echo "    cargo test -p rrn-station --test outage_72h"
 echo "See docs/phase-2-exit-evidence.md for what this proves and what it does not."
