@@ -2,17 +2,22 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-07 (maintainer delegated the decision review to a
+Fable reviewer, which returned ACCEPT with caveats; the caveats are folded in:
+§4's license wording softened to "denied by our current allowlist" — EPL-2.0
+revisitable like MPL-2.0, AGPL not — and §7 records the conditions carried into
+T2.6.2: propagation-node (`PROPAGATED`) delivery and an LXMF-stamp stance as
+explicit acceptance criteria, the adapter topology/line-protocol choices, and the
+adapter-identity custody handed to T2.9.1). Ratifying the sidecar does not
+pre-approve T2.6.2's design; see §7.
 
 Date: 2026-09-07
 
 > **Human-review checkpoint (T2.6.1).** This ADR records the outcome of the
 > Phase-2 spike that [ADR-0013](0013-federation-transport-reticulum.md)
-> chartered, and it **stops here for maintainer review**. It is deliberately left
-> *Proposed*: the maintainer ratifies (marks it Accepted) or redirects before
-> T2.6.2 begins building the `FrameTransport` backend on top of the decision. The
-> supervisor, the spike, and the threat-model section it references have already
-> landed with this ADR; only the *decision* awaits ratification.
+> chartered. The supervisor, the spike, and the threat-model section it references
+> landed with it; the *decision* was ratified as above before T2.6.2 begins
+> building the `FrameTransport` backend on top of it.
 >
 > **ADR-number note.** ADR-0013 anticipated this taking number 0023. By the time
 > the ticket ran, the README board had reserved 0023 (emergency governance,
@@ -81,21 +86,27 @@ supervisor already manages `rnsd`; T2.6.2 extends the pattern to the adapter, or
 folds the adapter into the same supervised subtree). The status/health probe uses
 the control RPC (`rnstatus`) that the generated config's shared instance exposes.
 
-**4. Native Rust (reticulum-rs) remains deferred — and is now blocked on license,
-not only on capability.** ADR-0013's decisive question was whether reticulum-rs
-drives an RNode over LoRa yet. As of 2026-09-07 the answer is still **no** for the
-seam-swap target we named: BeechatNetworkSystemsLtd/**Reticulum-rs** (crates.io
-`reticulum` 0.1.0, MIT) ships only TCP/serial/Kaonic interfaces — no RNode/LoRa
-module, no LXMF. Newer entrants *have* closed the capability gap (FreeTAKTeam
-**LXMF-rs** v0.11.0 with a bearer-neutral RNode backend and full LXMF; codeberg
-**leviculum**, "LoRa radio support … tested against Python Reticulum on real
-hardware") — but both are under copyleft licenses our `cargo deny` allowlist
-denies (EPL-2.0 and AGPL-3.0-or-later respectively), so neither is an available
-native path for a crate we would *link*. The sidecar keeps Reticulum's code out
-of our link/license graph entirely (see §6), which is now a *stronger* reason for
-it than when ADR-0013 chose it. reticulum-rs stays the seam-swap target if it
-gains RNode/LXMF under a permissive license; microReticulum (C++, Apache-2.0)
-remains the embedded escape hatch but still lacks LXMF.
+**4. Native Rust (reticulum-rs) remains deferred — on capability, and (for the
+ports that have closed the capability gap) on our current license allowlist.**
+ADR-0013's decisive question was whether reticulum-rs drives an RNode over LoRa
+yet. As of 2026-09-07 the answer is still **no** for the seam-swap target we
+named: BeechatNetworkSystemsLtd/**Reticulum-rs** (crates.io `reticulum` 0.1.0,
+MIT) ships only TCP/serial/Kaonic interfaces — no RNode/LoRa module, no LXMF.
+Newer entrants *have* closed the capability gap (FreeTAKTeam **LXMF-rs** v0.11.0
+with a bearer-neutral RNode backend and full LXMF; codeberg **leviculum**, "LoRa
+radio support … tested against Python Reticulum on real hardware") — but neither
+is admitted by our current `cargo deny` allowlist: leviculum is **AGPL-3.0** (a
+hard policy block), and LXMF-rs is **EPL-2.0** (OSI-approved, file-scoped weak
+copyleft — the same category as the MPL-2.0 we already admit for uniffi, so
+*revisitable* by the maintainer, not settled law). Even were LXMF-rs admitted, it
+is a young single-vendor port of an unspecified protocol, so ADR-0013's
+"chase-the-reference" objection applies with full force — the capability leg, not
+the license leg, is what actually defers it. Either way the sidecar keeps
+Reticulum's code out of our link/license graph entirely (see §6), a *stronger*
+reason for it than when ADR-0013 chose it. reticulum-rs stays the seam-swap target
+if it gains RNode/LXMF under a permissively-licensed, non-single-vendor line;
+microReticulum (C++, Apache-2.0) remains the embedded escape hatch but still lacks
+LXMF.
 
 **5. The spike is faithful to the adoption thesis — with one honest scope note.**
 It boots two station-*supervised* `rnsd` instances (asserting each actually
@@ -125,9 +136,9 @@ our distribution posture." Confirmed: the reference code is under the **"Reticul
 License"** — the MIT text plus two field-of-use restrictions (the software may not
 be used in a system that can "purposefully do harm to human beings," nor "in the
 creation of an artificial intelligence, machine learning or language model
-training dataset"). It is **not OSI-approved** (field-of-use restrictions), and is
-reported marked non-free by Debian (unverified against Debian primary sources). We
-neither bundle nor link it: `rnsd`/`lxmf` are **operator-installed** runtime
+training dataset"). It is **not OSI-approved** — the field-of-use restrictions
+disqualify it, and it would fail a strict free-software test. We neither bundle nor
+link it: `rnsd`/`lxmf` are **operator-installed** runtime
 dependencies (`pipx install rns lxmf`), so they never enter the Cargo graph, the
 `cargo deny` license allowlist, or the shipped artifact — the workspace stays
 Apache-2.0/MIT and license-clean. What we *do* owe is disclosure: an operator who
@@ -136,6 +147,34 @@ attach to any system that uses it. That is documented in the threat model and th
 operator runbook (community-setup), not resolved in code. This is a *stronger*
 argument for the sidecar over a linked native port than ADR-0013 had — a linked
 Reticulum-License (or EPL/AGPL, §4) crate would fail our allowlist outright.
+
+**7. Conditions carried into T2.6.2 (from the ratification review).** Ratifying
+the sidecar does not pre-approve T2.6.2's design; these are named as acceptance
+criteria / open decisions it must settle, none of which reopens *this* decision:
+
+- **Adapter topology is a deliberate choice, not an inheritance from the spike.**
+  The adapter may *attach* to a supervised `rnsd` (two co-processes, `require_
+  shared_instance`, keeps `rnstatus`/future attachers working) or *be* the RNS
+  instance itself (one co-process owning the interfaces, half the supervised
+  surface). Pick one on its merits.
+- **The line protocol is length-prefixed binary frames**, not the spike's
+  hex-per-line — bundles are opaque and can be large. The health probe shells out
+  to `rnstatus`; it does not speak the control RPC (Python `multiprocessing`
+  pickle) from Rust.
+- **Propagation-node store-and-forward (LXMF `PROPAGATED`) is an explicit
+  acceptance criterion.** The spike proves delay-tolerant delivery to a late
+  receiver, not survival with *neither* endpoint online — and ADR-0013's headline
+  "conductor pattern as a protocol primitive" ROI rides on the propagated path. If
+  it proves unworkable the sidecar is still right, but the scope-reduction claim
+  must be re-stated.
+- **LXMF stamps (proof-of-work) need a position.** The spike runs
+  `enforce_stamps=False`; T2.6.2 must decide the stance, weighing propagation-node
+  abuse resistance against CPU cost on a Pi-class station.
+- **The adapter's Reticulum identity is a new persisted secret at rest.** It is
+  *not* an RRN key (nothing here holds one), but it is a private key that decides
+  who may *receive* for this station: its custody belongs in T2.9.1's at-rest
+  scope, and its rotation/re-bind rides ADR-0013's "bind, do not collapse" signed
+  association — neither is wired yet.
 
 ## Consequences
 

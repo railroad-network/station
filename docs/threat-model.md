@@ -2898,7 +2898,13 @@ now runs a second, unaudited runtime and process.
   one. Owning `rnsd` also means owning its Reticulum identity/destinations, but
   those are disposable reachability handles bound under — never collapsed into —
   the RRN identity (ADR-0013 "bind, do not collapse"), so re-binding after a
-  compromise costs a signed statement, not recovery.
+  compromise costs a signed statement, not recovery. A caveat on "cannot pivot
+  into the station": the two processes are a crash/memory-containment boundary, not
+  a privilege one — run as the same OS user they share a filesystem, so an attacker
+  who owns `rnsd` can read/write whatever that user can (the wallet file is
+  passphrase-encrypted at rest, but local metadata is not). The operator mitigation
+  is to run the sidecar under a separate, least-privileged service account; a
+  station that enables the carrier on shared hardware should.
 
 #### Denial of service — supervisor and announce budget
 
