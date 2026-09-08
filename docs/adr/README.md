@@ -57,6 +57,11 @@ Decision Records) convention, using the structure in
 - [0017 — Single-community resilience comes before federation](0017-resilience-before-federation.md)
 - [0018 — A debt floor bounds how far a member can sign themselves into debt](0018-debt-floor.md)
 - [0019 — A freshness bound on `confirmed_at` protects the dispute window](0019-confirmation-freshness-bound.md)
+- [0020 — The community log keeps one writer; resilience is delay-tolerant submission, not multi-writer merge](0020-single-writer-log-dtn-submission.md)
+- [0021 — Escrowed offline spending certificates bound the debt floor under partition](0021-escrowed-offline-spending-certificates.md)
+- [0022 — The admission clock: the station's clock at admission is the only window-bearing clock](0022-admission-clock-time-trust.md)
+- [0025 — Equivocation cases are a distinct jury case kind with a Lapsed default and identity-anchored sortition](0025-equivocation-dispute-cases.md)
+- [0026 — The Reticulum sidecar is ratified: pinned `rnsd` 1.5, driven from the station, native Rust deferred](0026-reticulum-sidecar-ratified.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.

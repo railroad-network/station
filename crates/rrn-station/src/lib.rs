@@ -54,6 +54,7 @@ pub mod rpc;
 pub mod rpc_client;
 pub mod rpc_envelope;
 pub mod server;
+pub mod sidecar;
 pub mod station;
 pub mod transaction_view;
 pub mod vouch_view;

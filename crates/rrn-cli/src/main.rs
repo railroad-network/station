@@ -668,9 +668,17 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 ));
                 out.push_str(&format!(
-                    "pending: {} outbox, {} receipts",
+                    "pending: {} outbox, {} receipts\n",
                     c.pending_outbox, c.pending_receipts
                 ));
+                let sc = &c.sidecar;
+                let detail = sc
+                    .version
+                    .as_deref()
+                    .or(sc.reason.as_deref())
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                out.push_str(&format!("reticulum sidecar: {}{}", sc.state, detail));
                 Ok(out)
             })
         }

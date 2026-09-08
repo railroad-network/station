@@ -557,6 +557,40 @@ is originate a payment *from* the station side offline — that is the member's
 phone's job. See the end-to-end walkthrough in
 [`scripts/demo-phase-2-paper.sh`](../scripts/demo-phase-2-paper.sh).
 
+### Reticulum carrier — optional, off by default (experimental)
+
+Between paper and full internet sits a middle rung: carrying traffic over
+**Reticulum**, the mesh/LoRa/packet-radio stack the network adopted as its
+federation and collapse-mode carrier (ADR-0013). In this build the station can
+*supervise* the Reticulum daemon (`rnsd`) as a managed background service; the
+actual message transport over it lands in a later milestone (T2.6.2), so today
+this is plumbing you can stand up and watch, not yet a way to move payments.
+
+It is **off unless you turn it on** (`[sidecar] enabled = false` by default), and
+turning it on asks something of you first:
+
+- **Install the daemon yourself.** `rnsd` is not bundled with the station — you
+  install it separately, pinned: `pipx install "rns==1.5.2" "lxmf==1.1.1"` (any
+  `1.5.x` is accepted; the station refuses to manage an unpinned build). Confirm
+  with `rnsd --version`.
+- **Know what you're installing.** Reticulum's code is under the **Reticulum
+  License** — permissive (MIT-style) but with two use restrictions (no use in a
+  system built to harm people; no use in building AI/ML training datasets). It is
+  not an OSI-approved license. The station never bundles or links it — you install
+  it as a separate program — but by enabling the sidecar you choose to run that
+  software. If that is a problem for your community, leave the sidecar off; nothing
+  else depends on it.
+- **Turn it on** by adding a `[sidecar]` block to `config.toml` (`enabled = true`,
+  optionally `rnsd_path`, `tcp_listen`, `tcp_peers`). The station generates a
+  Reticulum config under `<data_dir>/reticulum/` on first run and never overwrites
+  your edits.
+
+Watch it with `rrn status`: the `connectivity.sidecar` block reads `disabled`,
+`running` (with the version), `degraded` (with a reason — e.g. a version
+mismatch), or `restarting`. A degraded or crashed sidecar **never takes the
+station down** — its loss is a connectivity event, exactly like an unreachable
+peer.
+
 ### When a member reports a problem
 
 Every error the app hits is recorded on the phone, surviving restarts. Ask

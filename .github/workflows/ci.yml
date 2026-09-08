@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  # Manual trigger for the non-hermetic `reticulum-spike` lane (T2.6.1), which is
+  # gated on this event so it never blocks a normal push/PR.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -88,6 +91,34 @@ jobs:
       - run: cargo +nightly fuzz run shamir_reconstruct  -- -max_total_time=60
       - run: cargo +nightly fuzz run wallet_decrypt      -- -max_total_time=60
       - run: cargo +nightly fuzz run address_parse       -- -max_total_time=60
+
+  reticulum-spike:
+    name: reticulum-spike
+    # Non-hermetic integration spike (T2.6.1, ADR-0013 / ADR-0026): installs the
+    # pinned Python Reticulum daemon + LXMF and runs the `#[ignore]`d spike that
+    # carries a real signed Bundle across two supervised `rnsd` instances over
+    # LXMF store-and-forward. Manual only (`workflow_dispatch`) — it needs a
+    # network install and real processes, so it never gates a normal push/PR.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the pinned Reticulum (rns 1.5.2 / lxmf 1.1.1)
+        run: |
+          python -m venv /tmp/rns
+          /tmp/rns/bin/pip install --upgrade pip
+          /tmp/rns/bin/pip install 'rns==1.5.2' 'lxmf==1.1.1'
+          /tmp/rns/bin/rnsd --version
+      - name: Run the Reticulum spike
+        env:
+          RRN_SPIKE_RNSD: /tmp/rns/bin/rnsd
+          RRN_SPIKE_PYTHON: /tmp/rns/bin/python
+        run: cargo test -p rrn-station --test reticulum_spike -- --ignored --nocapture
 
   coverage:
     name: coverage
