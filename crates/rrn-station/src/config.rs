@@ -64,6 +64,90 @@ pub struct StationConfig {
     /// default, ADR-0013).
     #[serde(default)]
     pub sidecar: SidecarSection,
+    /// LoRa airtime budget for the Reticulum transport (optional; defaults to the
+    /// design's ~250 B/s raw at 1% duty, T2.6.2).
+    #[serde(default)]
+    pub lora: LoraSection,
+}
+
+/// `[lora]` — the airtime budget the Reticulum transport paces to (T2.6.2).
+///
+/// LoRa's honest ceiling is ~250 raw bytes/second, and regional duty-cycle rules
+/// cut *sustained* throughput far lower (design overview §10.3). The station paces
+/// to `sustained = raw_bytes_per_sec × duty_cycle_percent / 100`, prioritizing
+/// money over governance over bulk (`rrn_protocol::airtime`). Code takes numbers;
+/// the per-geography duty-cycle table is the T2.6.3 operator runbook's job.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoraSection {
+    /// Raw carrier throughput in bytes/second before the duty cycle. Defaults to
+    /// 250 (the design's LoRa figure).
+    #[serde(default = "default_raw_bytes_per_sec")]
+    pub raw_bytes_per_sec: f64,
+    /// Duty-cycle **percentage** (`1.0` = 1%). Defaults to 1.0 — the conservative
+    /// EU-868-style ceiling; a laxer region raises it.
+    #[serde(default = "default_duty_cycle_percent")]
+    pub duty_cycle_percent: f64,
+    /// Token-bucket burst ceiling in bytes — the largest catch-up burst after an
+    /// idle period, and the largest single frame the budget can ever pass. Must be
+    /// ≥ the carrier's frame size. Defaults to 500.
+    #[serde(default = "default_burst_bytes")]
+    pub burst_bytes: u32,
+    /// The largest carrier frame in bytes (chunk size the framing layer targets).
+    /// Defaults to 480 — under a typical LoRa/Reticulum MTU, and ≤ `burst_bytes`.
+    #[serde(default = "default_lora_frame_bytes")]
+    pub frame_bytes: usize,
+    /// Path to the Reticulum LXMF adapter script
+    /// (`scripts/reticulum/lxmf_adapter.py`). When set **and** `[sidecar]` is
+    /// enabled, the station runs the DTN transport over Reticulum (T2.6.2);
+    /// omitted → the sidecar is supervised but no DTN traffic flows over it yet.
+    #[serde(default)]
+    pub adapter_script: Option<String>,
+    /// The Python interpreter that has `rns` + `lxmf` for the adapter. Defaults to
+    /// `"python3"` on `PATH`.
+    #[serde(default = "default_adapter_python")]
+    pub adapter_python: String,
+}
+
+fn default_adapter_python() -> String {
+    "python3".to_string()
+}
+
+fn default_raw_bytes_per_sec() -> f64 {
+    250.0
+}
+fn default_duty_cycle_percent() -> f64 {
+    1.0
+}
+fn default_burst_bytes() -> u32 {
+    500
+}
+fn default_lora_frame_bytes() -> usize {
+    480
+}
+
+impl Default for LoraSection {
+    fn default() -> Self {
+        Self {
+            raw_bytes_per_sec: default_raw_bytes_per_sec(),
+            duty_cycle_percent: default_duty_cycle_percent(),
+            burst_bytes: default_burst_bytes(),
+            frame_bytes: default_lora_frame_bytes(),
+            adapter_script: None,
+            adapter_python: default_adapter_python(),
+        }
+    }
+}
+
+impl LoraSection {
+    /// The [`AirtimeBudget`](rrn_protocol::airtime::AirtimeBudget) this section
+    /// describes.
+    pub fn budget(&self) -> rrn_protocol::airtime::AirtimeBudget {
+        rrn_protocol::airtime::AirtimeBudget::from_duty_cycle(
+            self.raw_bytes_per_sec,
+            self.duty_cycle_percent,
+            self.burst_bytes,
+        )
+    }
 }
 
 /// `[peers]` — who to gossip with.
@@ -526,6 +610,7 @@ impl StationConfig {
             timers: TimersSection::default(),
             dtn: DtnSection::default(),
             sidecar: SidecarSection::default(),
+            lora: LoraSection::default(),
         }
     }
 }
@@ -727,6 +812,28 @@ mod tests {
             cfg.sidecar.tcp_peers,
             vec!["203.0.113.7:4242", "198.51.100.9:4242"]
         );
+    }
+
+    #[test]
+    fn lora_defaults_and_budget() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.lora.raw_bytes_per_sec, 250.0);
+        assert_eq!(cfg.lora.duty_cycle_percent, 1.0);
+        assert_eq!(cfg.lora.burst_bytes, 500);
+        assert_eq!(cfg.lora.frame_bytes, 480);
+        // 250 raw × 1% = 2.5 sustained B/s.
+        assert_eq!(cfg.lora.budget().sustained_bytes_per_sec, 2.5);
+
+        let overridden = StationConfig::parse(
+            "[network]\nlisten = \"127.0.0.1:7411\"\n[lora]\nduty_cycle_percent = 10.0\nraw_bytes_per_sec = 300.0\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(overridden.lora.budget().sustained_bytes_per_sec, 30.0);
     }
 
     #[test]

@@ -317,6 +317,35 @@ impl Station {
             }
         }
 
+        // Airtime-budget sanity (T2.6.2): a frame must fit the framing header and
+        // the burst bucket, and the rates must be finite and non-negative — else
+        // the pacer would refuse every frame (silent starvation) or misbehave.
+        if config.lora.adapter_script.is_some() {
+            let header = rrn_protocol::framing::HEADER_LEN;
+            if config.lora.frame_bytes <= header {
+                anyhow::bail!(
+                    "config: [lora] frame_bytes must be > the {header}-byte framing header (got {})",
+                    config.lora.frame_bytes
+                );
+            }
+            if config.lora.frame_bytes > config.lora.burst_bytes as usize {
+                anyhow::bail!(
+                    "config: [lora] frame_bytes ({}) must be <= burst_bytes ({}), or every full \
+                     frame is refused by the airtime bucket",
+                    config.lora.frame_bytes,
+                    config.lora.burst_bytes
+                );
+            }
+            let rate = config.lora.raw_bytes_per_sec;
+            let duty = config.lora.duty_cycle_percent;
+            if !rate.is_finite() || rate <= 0.0 || !duty.is_finite() || duty <= 0.0 {
+                anyhow::bail!(
+                    "config: [lora] raw_bytes_per_sec and duty_cycle_percent must be finite and \
+                     positive (got {rate}, {duty})"
+                );
+            }
+        }
+
         // Supervised Reticulum sidecar (T2.6.1, ADR-0013). Off unless the
         // operator opts in; when on, it runs `rnsd` as an appliance-style managed
         // child. A carrier only — its failures degrade to "sidecar unavailable"
@@ -348,6 +377,43 @@ impl Station {
                 connectivity.clone(),
                 shutdown_rx.clone(),
             )));
+
+            // Reticulum DTN transport (T2.6.2, ADR-0026 §3): when an adapter
+            // script is configured, spawn the supervised Python LXMF adapter and
+            // run the DtnSyncer over it — receiving bundles, ingesting them, and
+            // returning signed receipts, paced to the [lora] airtime budget. Only
+            // with a live `rnsd` + adapter does this carry traffic; failure to
+            // spawn is a connectivity event, never fatal.
+            if let Some(script) = config.lora.adapter_script.clone() {
+                let reticulum_dir = config
+                    .sidecar
+                    .config_dir
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("reticulum"));
+                let adapter_cfg = crate::reticulum::AdapterConfig {
+                    python: PathBuf::from(&config.lora.adapter_python),
+                    script: PathBuf::from(script),
+                    config_dir: reticulum_dir.clone(),
+                    identity_path: reticulum_dir.join("adapter.identity"),
+                    max_frame_bytes: config.lora.frame_bytes,
+                    sustained_bytes_per_sec: Some(
+                        config.lora.budget().sustained_bytes_per_sec as u32,
+                    ),
+                };
+                // The loop waits for the sidecar to be `Running` before spawning
+                // the adapter (which attaches to `rnsd`'s shared instance and would
+                // fail before `rnsd` is up), and re-spawns it with backoff on exit
+                // — so an `rnsd` restart, or a wedged adapter, self-heals.
+                tasks.push(tokio::spawn(reticulum_dtn_loop(
+                    adapter_cfg,
+                    config.lora.budget(),
+                    core.clone(),
+                    connectivity.clone(),
+                    params.clock.clone(),
+                    shutdown_rx.clone(),
+                )));
+            }
         }
 
         // Settlement sweep timer.
@@ -503,6 +569,118 @@ impl Station {
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// Manages the Reticulum DTN transport (T2.6.2): waits for the sidecar to be
+/// `Running`, spawns the LXMF adapter, then each second pumps the paced sender
+/// onto the carrier and drains arrivals — ingesting each completed bundle through
+/// the core's front door and sending its signed receipt back. If the adapter dies
+/// (an `rnsd` restart, a wedge), it is re-spawned with backoff; on shutdown the
+/// adapter is torn down cleanly. Never fatal to the daemon.
+async fn reticulum_dtn_loop(
+    adapter: crate::reticulum::AdapterConfig,
+    budget: rrn_protocol::airtime::AirtimeBudget,
+    core: CoreHandle,
+    connectivity: Arc<gossip::ConnectivityState>,
+    clock: Clock,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut backoff = 2u64;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        // Wait until the sidecar is actually running before attaching the adapter.
+        if !matches!(
+            connectivity.sidecar_snapshot(),
+            crate::sidecar::SidecarState::Running { .. }
+        ) {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                _ = shutdown.changed() => { if *shutdown.borrow() { break; } continue; }
+            }
+        }
+
+        let transport = match crate::reticulum::ReticulumTransport::spawn(adapter.clone()) {
+            Ok(t) => {
+                tracing::info!("Reticulum DTN transport started");
+                backoff = 2;
+                t
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start the Reticulum DTN adapter; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                    _ = shutdown.changed() => { if *shutdown.borrow() { break; } }
+                }
+                backoff = (backoff * 2).min(300);
+                continue;
+            }
+        };
+
+        let stopped = run_dtn_syncer(transport, budget, &core, &clock, &mut shutdown).await;
+        if stopped {
+            break; // clean shutdown; the syncer already tore the adapter down
+        }
+        // Adapter died: back off, then re-spawn (re-checking the sidecar).
+        tracing::warn!("Reticulum DTN adapter exited; will re-spawn after backoff");
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+            _ = shutdown.changed() => { if *shutdown.borrow() { break; } }
+        }
+        backoff = (backoff * 2).min(300);
+    }
+    tracing::info!("Reticulum DTN transport stopped");
+}
+
+/// Runs one adapter's `DtnSyncer` until shutdown (returns `true`) or the adapter
+/// dies (returns `false`). On either exit the transport is shut down.
+async fn run_dtn_syncer(
+    transport: crate::reticulum::ReticulumTransport,
+    budget: rrn_protocol::airtime::AirtimeBudget,
+    core: &CoreHandle,
+    clock: &Clock,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    use crate::dtn_sync::{DtnSyncer, PayloadKind, SyncConfig};
+    use rrn_protocol::airtime::Priority;
+
+    let mut syncer = DtnSyncer::new(transport, budget, SyncConfig::default(), clock.now());
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let clean = loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if !syncer.transport().is_alive() {
+                    break false; // adapter gone → caller re-spawns
+                }
+                let now = clock.now();
+                match syncer.tick(now) {
+                    Ok(completed) => {
+                        for c in completed {
+                            match c.kind {
+                                PayloadKind::Bundle => {
+                                    if let Some(receipt) = core.ingest_bundle_bytes(c.bytes).await {
+                                        syncer.send(&c.source, PayloadKind::Receipt, &receipt, Priority::Economic, now);
+                                    }
+                                }
+                                PayloadKind::Receipt => tracing::debug!(
+                                    source = %c.source.0,
+                                    "DTN delivery receipt received over Reticulum"
+                                ),
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "Reticulum DTN transport error"),
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break true; }
+            }
+        }
+    };
+    syncer.into_transport().shutdown();
+    clean
 }
 
 /// Periodically asks the core to sweep settlement at the current clock time.

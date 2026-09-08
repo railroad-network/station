@@ -238,6 +238,15 @@ pub enum Command {
         /// The sealed response, or `None` when there is still nothing.
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// Ingest a DTN bundle carried in over the Reticulum transport (T2.6.2), the
+    /// same front door as `bundle_submit`; reply with the signed delivery-receipt
+    /// bytes to send back, or `None` if the bundle was malformed.
+    IngestBundle {
+        /// The reassembled bundle bytes.
+        bytes: Vec<u8>,
+        /// The signed receipt bytes to return, or `None` on a malformed bundle.
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// Stop the core loop (graceful shutdown).
     Shutdown,
 }
@@ -364,6 +373,15 @@ impl CoreHandle {
             return 0;
         }
         rx.await.unwrap_or(0)
+    }
+
+    /// Ingests a DTN bundle carried over the Reticulum transport (T2.6.2) and
+    /// returns the signed delivery-receipt bytes to send back, or `None` if the
+    /// bundle was malformed or the core stopped. Idempotent (ADR-0020 §3).
+    pub async fn ingest_bundle_bytes(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Command::IngestBundle { bytes, reply }).ok()?;
+        rx.await.ok().flatten()
     }
 
     /// Returns `(our_address, log_tail_seq)`.
@@ -639,6 +657,20 @@ impl Core {
                 Command::PruneReceipts { reply } => {
                     let n = self.do_prune_receipts();
                     let _ = reply.send(n);
+                }
+                Command::IngestBundle { bytes, reply } => {
+                    let now = self.clock.now();
+                    let receipt = match self.ingest_bundle(&bytes, now) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            // The peer has already been framing-acked, so a lost
+                            // bundle here is not re-driven — log it (a transient DB
+                            // error must not vanish silently).
+                            tracing::warn!(error = ?e, "DTN bundle ingest failed over Reticulum");
+                            None
+                        }
+                    };
+                    let _ = reply.send(receipt);
                 }
                 Command::Handshake { reply } => {
                     let tail = self.tail_seq();
@@ -5290,6 +5322,7 @@ const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
 /// Why an ingest could not produce a receipt at all (as opposed to a per-record
 /// refusal, which *is* part of a receipt). A malformed bundle is the caller's
 /// fault (`invalid-params`); a storage fault is the station's (`internal`).
+#[derive(Debug)]
 enum BundleIngestError {
     /// The bundle bytes did not decode as a valid [`Bundle`].
     Malformed(String),

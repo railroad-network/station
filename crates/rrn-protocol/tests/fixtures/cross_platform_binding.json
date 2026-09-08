@@ -1,0 +1,9 @@
+{
+  "_comment": "Cross-platform transport-binding fixture (T2.6.2, ADR-0013). `canonical_hex` is the canonical dCBOR of the rrn.net.binding payload; `signature_hex` is the self-signature over it. Deterministic (blake3-derived seed); regenerate with RRN_REGEN=1.",
+  "signer_seed": "39cea0c4f2f92cd360bdb5d37d684116ebc2a50e7fa16f0148829330115b2a90",
+  "address": "rrn1k0hvz687wd9h2csutzdhtxt7fghy7j2s84ey6rzs9agfyxg846sqcflcae",
+  "destination": "6f5c2a1b0e9d8c7f",
+  "issued_at": 1700000500,
+  "canonical_hex": "a4646b696e646f72726e2e6e65742e62696e64696e6767616464726573735820b3eec168fe734b75621c589b75997e4a2e4f49503d724d0c502f50921907aea0696973737565645f61741a6553f2f46b64657374696e6174696f6e7036663563326131623065396438633766",
+  "signature_hex": "73e44867e254443d49304e14d3ae15cdc10ac2eb0f79a918bda4204746e2455adb668882db2b354c5611bad7c059542a9f118df586c1674f0fbe4bd94a223907"
+}

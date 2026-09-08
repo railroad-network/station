@@ -106,6 +106,22 @@ impl OutboxEntry {
         Hash::of(&self.record_bytes)
     }
 
+    /// The `kind` discriminator of the carried record (`"rrn.<area>.<name>"`),
+    /// read from its canonical bytes. Used to pace a bundle by the importance of
+    /// its contents (T2.6.2 airtime budgeting). `None` if the record is not a CBOR
+    /// map with a string `kind` — which a validly-signed record always is, so a
+    /// `None` here means malformed carriage, and the caller treats it as the
+    /// lowest priority rather than elevating it.
+    pub fn record_kind(&self) -> Option<String> {
+        match rrn_crypto::serialize::checked_from_data(&self.record_bytes)
+            .ok()?
+            .into_case()
+        {
+            CBORCase::Map(map) => map.extract::<&str, String>("kind").ok(),
+            _ => None,
+        }
+    }
+
     /// Verifies the *embedded* record's signature: that
     /// [`record_sig`](OutboxEntry::record_sig) is a valid signature by
     /// [`record_signer`](OutboxEntry::record_signer) over

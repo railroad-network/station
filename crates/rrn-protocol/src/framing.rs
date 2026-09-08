@@ -220,6 +220,32 @@ impl ChunkHeader {
     }
 }
 
+/// The payload id carried in a data frame's header (blake3 of the payload), or
+/// `None` if `frame` is not a well-formed framing chunk (wrong magic/version, too
+/// short). Lets a caller group a carrier's frames by payload — and tell a data
+/// chunk from a non-framing control frame — without a full decode (T2.6.2's
+/// reliability layer).
+pub fn frame_payload_id(frame: &[u8]) -> Option<[u8; 32]> {
+    ChunkHeader::decode(frame).ok().map(|h| h.payload_id)
+}
+
+/// The `(payload_id, chunk_index)` a data frame carries in its header, or `None`
+/// if `frame` is not a well-formed framing chunk. Lets a sender key a
+/// per-chunk in-flight set (so a flood of request-missing does not enqueue the
+/// same chunk twice — T2.6.2).
+pub fn frame_ids(frame: &[u8]) -> Option<([u8; 32], u16)> {
+    ChunkHeader::decode(frame)
+        .ok()
+        .map(|h| (h.payload_id, h.chunk_index))
+}
+
+/// The payload id [`chunk`] will assign to `payload` — blake3 of its bytes — so a
+/// sender can key its retransmit cache by the same id the receiver reports missing
+/// chunks against, without re-deriving the framing internals.
+pub fn payload_id(payload: &[u8]) -> [u8; 32] {
+    Hash::of(payload).to_bytes()
+}
+
 /// Splits `payload` into frames sized for a carrier delivering at most
 /// `max_frame_bytes` per frame.
 ///
