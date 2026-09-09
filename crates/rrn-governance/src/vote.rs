@@ -21,9 +21,17 @@
 //!   endorsements does not count, matching the proposal module's rule that votes
 //!   do not count in [`Deliberation`](crate::proposal::ProposalPhase::Deliberation));
 //! - the ballot is **admitted within the proposal's window** — admitted by the
-//!   proposal's `voting_ends_at`, where both the window and its close run on the
-//!   station's *admission* clock, not the voter's `cast_at` (ADR-0022 / T2.1.3);
-//!   Phase 1 runs deliberation and voting as one window (ADR-0012);
+//!   attested `voting_ends_at`, judged on the admitting station's *admission*
+//!   clock, not the voter's `cast_at` (ADR-0022 / T2.1.3). This bound is enforced
+//!   on the **write path** ([`append_vote`]): the station takes a ballot only while
+//!   its own admission clock is still inside the window. Replay does **not**
+//!   re-apply the close — `created_at` is re-stamped per replica, so a wall-clock
+//!   re-gate would make a late-syncing replica drop ballots the admitting station
+//!   accepted. Instead, exactly as the ledger gates settlement at admission and
+//!   then trusts the settled record on replay (ADR-0022 §2), [`votes`] trusts that
+//!   a ballot on the log was admitted in-window by the station that took it, and
+//!   counts every ballot admitted after the proposal's open *position*. Phase 1
+//!   runs deliberation and voting as one window (ADR-0012).
 //!   > Note: publication is monotonic (co-signatures only accrue), so a ballot
 //!   > accepted while the proposal was published stays published — and valid —
 //!   > under any later replay.
@@ -32,9 +40,12 @@
 //!   frozen electorate that authors and co-signs (T2.1.3);
 //! - the voter has **not already voted** on this proposal.
 //!
-//! The window and the electorate are both anchored on admission, never on the
-//! voter's `cast_at` (which is retained as testimony only), so replay is
-//! deterministic and a ballot cannot be back-dated into or out of the window.
+//! The electorate is pinned by open *position* and the window is anchored on the
+//! attested admission instant, never on the voter's `cast_at` (retained as
+//! testimony only), so replay is replica-deterministic: two replicas replaying the
+//! same log agree on which ballots count and on the electorate. The one residual —
+//! a ballot raw-replicated onto a replica without ever being window-gated by an
+//! honest station — is documented in the `rrn-governance` threat-model section.
 //!
 //! # No changing a vote (Phase 1)
 //!
@@ -118,14 +129,13 @@ pub fn votes(
     db: &Database,
 ) -> Result<HashMap<Address, VoteChoice>, VoteError> {
     let records = proposal_records(log, proposal_id, db)?;
-    let Some(proposal) = records.proposal.as_ref() else {
+    if records.proposal.is_none() {
         return Ok(HashMap::new());
-    };
+    }
     let (open_seq, open_time) = (records.open_seq, records.open_time);
     if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
         return Ok(HashMap::new());
     }
-    let voting_close = proposal.voting_ends_at;
 
     let founders = founder_set(db)?;
     let mut ballots: HashMap<Address, VoteChoice> = HashMap::new();
@@ -140,13 +150,23 @@ pub fn votes(
         if Address::from_public_key(entry.payload.signer) != vote.voter {
             continue;
         }
-        // The window is on *admission* (ADR-0022 / T2.1.3): a ballot counts iff it
-        // was admitted by the proposal's close. Its `cast_at` is testimony only.
-        // The log is monotone, so a ballot admitted after the proposal always has
-        // `entry.created_at >= open_time`; the close is the real gate.
-        if entry.created_at > voting_close {
+        // A ballot is admitted *after* the proposal opens; an entry at or before the
+        // open position is never a ballot on this proposal (only reachable via
+        // gossip injection). Log *position* orders the log — not the re-stamped
+        // `created_at` — so this gate is replica-identical (ADR-0022 / T2.1.3).
+        if entry.seq <= open_seq {
             continue;
         }
+        // The voting-window bound is enforced on the *write* path (`append_vote`,
+        // against the admitting station's own clock), just as the ledger gates
+        // settlement at admission and thereafter trusts the settled log record on
+        // replay (ADR-0022 §2). Replay does *not* re-apply a wall-clock close:
+        // `created_at` is re-stamped per replica, so re-gating here would make a
+        // late-syncing replica drop ballots the admitting station accepted and
+        // split the tally. A ballot on the log was admitted in-window by the station
+        // that took it; replay counts it. (Residual: a raw-replicated ballot never
+        // gated by an honest station — see threat-model, `rrn-governance` STRIDE.)
+        //
         // Voter eligibility is pinned at the proposal's open position — the frozen
         // electorate — not at the ballot's own admission.
         if !is_eligible_asof(db, &founders, &vote.voter, open_time, open_seq)? {
@@ -800,10 +820,12 @@ mod tests {
         )
         .unwrap();
 
-        // Bypass the guards exactly as replication does: an outsider's ballot, a
-        // ballot forged onto another member, and a second ballot from members[1]
-        // must all be dropped by replay. These are admitted in-window (`now = NOW`,
-        // clamped) and dropped for reasons other than the window.
+        // Bypass the guards exactly as replication does: an outsider's ballot (no
+        // standing), a ballot forged onto another member (signer != voter), and a
+        // second ballot from members[1] (first-wins) must all be dropped by replay —
+        // dropped by the electorate, signer, and dedup guards, none of which is the
+        // window. (The window bound is a write-path gate, not re-applied on replay —
+        // see `replay_counts_a_ballot_present_on_the_log`.)
         log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW), NOW)
             .unwrap();
         log.append(
@@ -821,17 +843,39 @@ mod tests {
         .unwrap();
         log.append(vote(&members[1], &proposal, VoteChoice::No, NOW), NOW)
             .unwrap();
-        // A ballot *admitted* after the window closes is dropped by the window
-        // (T2.1.3) — appended last so the monotone admission clock is past close.
+
+        let ballots = votes(&log, &proposal.proposal_id, &db).unwrap();
+        assert_eq!(ballots.len(), 1);
+        // The first ballot from members[1] stands; the later No is ignored.
+        assert_eq!(ballots.get(&addr(&members[1])), Some(&VoteChoice::Yes));
+    }
+
+    #[test]
+    fn replay_counts_a_ballot_present_on_the_log() {
+        // The voting window is enforced on the *write* path (`append_vote`, against
+        // the admitting station's clock); replay does not re-apply it. `created_at`
+        // is re-stamped per replica (ADR-0022 §1), so re-gating on it here would make
+        // a late-syncing replica drop ballots the admitting station accepted, and two
+        // replicas of one chain would disagree. So a ballot present on the log — from
+        // an eligible voter, positioned after the proposal's open — is counted on
+        // replay whatever this replica's local admission clock reads. This is the
+        // residual noted in the module docs and threat model: a raw-replicated ballot
+        // is trusted to have been window-gated by the station that first took it.
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let (members, proposal) = published_statute(&db, &station, 0);
+        let mut log = AppendLog::new(&db);
+
+        // Raw-appended (as replication does, bypassing `append_vote`) and re-stamped
+        // with an admission clock long past the close — yet counted.
         log.append(
-            vote(&members[2], &proposal, VoteChoice::Yes, NOW),
-            proposal.voting_ends_at + 1,
+            vote(&members[1], &proposal, VoteChoice::Yes, NOW),
+            proposal.voting_ends_at + 1_000_000,
         )
         .unwrap();
 
         let ballots = votes(&log, &proposal.proposal_id, &db).unwrap();
         assert_eq!(ballots.len(), 1);
-        // The first ballot from members[1] stands; the later No is ignored.
         assert_eq!(ballots.get(&addr(&members[1])), Some(&VoteChoice::Yes));
     }
 

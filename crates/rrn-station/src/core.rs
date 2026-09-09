@@ -6936,6 +6936,94 @@ mod tests {
         assert_eq!(ledger_view::balance_of(&core.db, &bob_addr).unwrap(), 300);
     }
 
+    /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle (acceptance 3,
+    /// T2.1.3). A founder signs a statute proposal and a ballot offline; the station
+    /// admits each from an ingested bundle through `admit_gov_proposal` /
+    /// `admit_gov_vote` — no live governance RPC — writing the station-signed window
+    /// attestation on admission. The window and the counted ballot both anchor on
+    /// admission, so the statute carries.
+    #[test]
+    fn dtn_governance_proposal_and_vote_route_end_to_end() {
+        let mut core = test_core(); // clock = 1000
+                                    // A phone-held founder: signs governance records offline, submits over DTN.
+                                    // Sole founder ⇒ bootstrap grace lets it publish and carry a statute alone
+                                    // (ADR-0015), so no co-signers are needed to drive the end-to-end path.
+        let founder = Keypair::generate();
+        call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({
+                "community_id": "commons",
+                "founder_secrets_hex": [hex(&founder.secret_key().to_bytes())],
+            }),
+        );
+
+        // Authored offline at 900 (testimony); the window will anchor on *admission*.
+        let proposal = Proposal::new(
+            Address::from_public_key(founder.public_key()),
+            "Quiet hours in the workshop".into(),
+            "No power tools after 9pm.".into(),
+            ProposalKind::Statute,
+            900,
+        )
+        .unwrap();
+        let signed_proposal = SignedPayload::sign(proposal.clone(), &founder);
+        let e_prop = outbox_entry(&founder, 0, zero(), &signed_proposal, 900);
+
+        let receipt = submit_bundle(&mut core, std::slice::from_ref(&e_prop), 1000);
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the DTN-carried proposal is admitted through admit_gov_proposal"
+        );
+
+        // It rode DTN onto queryable governance state, published under grace, and its
+        // window anchored on admission (1000), not the authored-at 900.
+        let listed = call(&mut core, "governance_proposals", serde_json::json!({}));
+        let rows = listed["proposals"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["proposal_id"], proposal.proposal_id.to_string());
+        assert_eq!(rows[0]["published"], true);
+        assert_eq!(
+            rows[0]["voting_ends_at"].as_i64().unwrap(),
+            1000 + 7 * 86_400,
+            "the window runs from admission, not the authored-at timestamp"
+        );
+
+        // The founder votes Yes offline; a second bundle carries the ballot, chained
+        // at outbox position 1. Admit it within the admission-anchored window.
+        core.clock.advance(3600); // clock = 4600, still inside the window
+        let ballot = Vote {
+            proposal_id: proposal.proposal_id,
+            voter: Address::from_public_key(founder.public_key()),
+            choice: VoteChoice::Yes,
+            cast_at: 4600,
+        };
+        let signed_vote = SignedPayload::sign(ballot, &founder);
+        let e_vote = outbox_entry(&founder, 1, e_prop.payload.entry_hash(), &signed_vote, 4600);
+        let assembled_at = core.clock.now();
+        let vote_receipt = submit_bundle(&mut core, &[e_vote], assembled_at);
+        assert!(
+            matches!(
+                vote_receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the DTN-carried ballot is admitted through admit_gov_vote"
+        );
+
+        // Past the close, the statute has carried on the strength of the DTN ballot.
+        core.clock.advance(7 * 86_400); // clock = 4600 + 7d, past voting_ends_at
+        let detail = call(
+            &mut core,
+            "governance_proposal",
+            serde_json::json!({ "proposal_id": proposal.proposal_id.to_string() }),
+        );
+        assert_eq!(detail["tally"]["yes"], 1);
+        assert_eq!(detail["tally"]["outcome"], "passed");
+    }
+
     /// Issues a headroom certificate for `member` through the engine (the live,
     /// connected path a member uses before going offline), returning its content
     /// id. The DTN cert-backed spends below then draw against it.

@@ -123,6 +123,21 @@ pub fn build_window(
 /// earliest in log order (the station writes exactly one per proposal, on
 /// admission).
 pub fn window_of(log: &AppendLog, proposal_id: &ProposalId) -> Option<ProposalWindow> {
+    window_and_seq_of(log, proposal_id).map(|(w, _)| w)
+}
+
+/// Like [`window_of`], but also returns the log seq of the attestation entry —
+/// the proposal's replica-stable **open position** (T2.1.3).
+///
+/// This is the seq of the *station-signed attestation*, not of the author's
+/// proposal entry: the attestation is the station's own record, so a peer that
+/// pre-injects the author's proposal bytes early over gossip cannot move the open
+/// position (it cannot forge the station's signature). Governance pins the
+/// electorate at this seq (ADR-0022 §5, "the attestation's log seq").
+pub fn window_and_seq_of(
+    log: &AppendLog,
+    proposal_id: &ProposalId,
+) -> Option<(ProposalWindow, u64)> {
     for entry in log.iter_from(1) {
         let Ok(entry) = entry else {
             continue;
@@ -131,7 +146,7 @@ pub fn window_of(log: &AppendLog, proposal_id: &ProposalId) -> Option<ProposalWi
             continue;
         };
         if record.proposal_id == *proposal_id {
-            return Some(record);
+            return Some((record, entry.seq));
         }
     }
     None

@@ -71,7 +71,7 @@ use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::charter::{founder_charter, Charter, CharterError, VotingMechanism};
-use crate::window::{build_window, window_of};
+use crate::window::{build_window, window_and_seq_of};
 
 /// Discriminant carried in the `kind` field of a [`Proposal`]'s canonical CBOR,
 /// so log replay can tell a proposal apart from other records.
@@ -458,13 +458,13 @@ pub(crate) fn is_eligible_asof(
 /// Finds a proposal's authorized record without caring about its co-signatures.
 ///
 /// Skips any entry that is not a proposal, one whose id does not match, one not
-/// signed by its own author, one that breaks its own rules, and one whose author
-/// was not an established member as of its `created_at` — the same gate
-/// [`append_proposal`] applies, so replay reaches the write path's verdict.
-/// Returns the authorized proposal with its window fields populated from the
-/// station attestation, plus its *open* position `(open_seq, open_time)`. Author
-/// eligibility is judged at that open position (ADR-0022 / T2.1.3), not the
-/// author's `created_at`.
+/// signed by its own author, one that breaks its own rules, one with no station
+/// window attestation yet, and one whose author was not an established member as of
+/// its **open position** — the same gate [`append_proposal`] applies, so replay
+/// reaches the write path's verdict. Returns the authorized proposal with its
+/// window fields populated from the station attestation, plus its *open* position
+/// `(open_seq, open_time)` — the attestation's seq and attested admission instant
+/// (ADR-0022 / T2.1.3), never the author's `created_at`.
 fn find_proposal(
     log: &AppendLog,
     proposal_id: &ProposalId,
@@ -485,17 +485,26 @@ fn find_proposal(
         if proposal.validate().is_err() {
             continue;
         }
-        // The proposal's admission is its open position; the author must have been
-        // eligible then, judged on the log prefix up to and including it.
-        let (open_seq, open_time) = (entry.seq, entry.created_at);
+        // The window comes from the station's signed attestation, the one
+        // replica-identical statement of this proposal's admission (ADR-0022 §1).
+        // A proposal with no attestation is not yet windowed — not authorized to
+        // read — so skip it rather than fall back to this replica's re-stamped
+        // `entry.created_at`, which differs per replica and would split the derived
+        // window, electorate, and outcome across replicas (T2.1.3 acceptance 1).
+        let Some((w, open_seq)) = window_and_seq_of(log, proposal_id) else {
+            continue;
+        };
+        proposal.voting_ends_at = w.voting_ends_at;
+        proposal.implementation_at = w.implementation_at;
+        // The proposal's open position is the *attestation's* seq (ADR-0022 §5,
+        // "the attestation's log seq") and the station-attested admission instant —
+        // never `entry.created_at`, which each replica re-stamps on receipt, nor the
+        // author's own proposal entry (a peer can pre-inject those bytes early, but
+        // not forge the station's attestation). The author must have been eligible
+        // at that open position.
+        let open_time = w.admitted_at;
         if !is_eligible_asof(db, &founders, &proposal.author, open_time, open_seq)? {
             continue;
-        }
-        // Populate the window from the station's signed attestation. A proposal
-        // with no attestation is not yet windowed — leave the fields at zero.
-        if let Some(w) = window_of(log, proposal_id) {
-            proposal.voting_ends_at = w.voting_ends_at;
-            proposal.implementation_at = w.implementation_at;
         }
         return Ok(Some((proposal, open_seq, open_time)));
     }
@@ -556,8 +565,9 @@ pub fn proposal_records(
 /// appearing once.
 ///
 /// Applies the same authorization the [`find_proposal`] read path does — self-
-/// signed by its author, valid by its own rules, author established as of
-/// `created_at` — so a gossiped entry that dodged the guards is not returned. The
+/// signed by its author, valid by its own rules, carrying a station window
+/// attestation, author established as of its open position — so a gossiped entry
+/// that dodged the guards is not returned. The
 /// enactment sweep ([`crate::lifecycle::enact_due`]) walks this to find the passed
 /// proposals it is due to put into force.
 pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, ProposalError> {
@@ -575,14 +585,19 @@ pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, Pr
         if proposal.validate().is_err() {
             continue;
         }
-        // Author eligibility at the proposal's own open position (T2.1.3).
-        let (open_seq, open_time) = (entry.seq, entry.created_at);
+        // The window (and the admission instant it carries) comes from the station
+        // attestation, never this replica's re-stamped `created_at`; a proposal
+        // with no attestation is not yet windowed and is not returned (T2.1.3).
+        let Some((w, open_seq)) = window_and_seq_of(log, &proposal.proposal_id) else {
+            continue;
+        };
+        proposal.voting_ends_at = w.voting_ends_at;
+        proposal.implementation_at = w.implementation_at;
+        // Author eligibility at the proposal's open position: the attestation's seq
+        // and the attested admission instant (ADR-0022 §5, T2.1.3).
+        let open_time = w.admitted_at;
         if !is_eligible_asof(db, &founders, &proposal.author, open_time, open_seq)? {
             continue;
-        }
-        if let Some(w) = window_of(log, &proposal.proposal_id) {
-            proposal.voting_ends_at = w.voting_ends_at;
-            proposal.implementation_at = w.implementation_at;
         }
         if seen.insert(proposal.proposal_id) {
             proposals.push(proposal);

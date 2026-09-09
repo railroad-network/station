@@ -774,6 +774,74 @@ mod tests {
         assert_eq!(after.outcome, before.outcome);
     }
 
+    #[test]
+    fn two_replicas_replaying_the_same_log_agree_on_outcome_and_electorate() {
+        // Acceptance 1 (T2.1.3): a replica that admits the whole chain *late* — every
+        // entry re-stamped with a `created_at` well past the voting close — must
+        // reach the same window, outcome, and electorate as the station that
+        // admitted them in real time. Before windows/eligibility were read from the
+        // station attestation (its `admitted_at`) and pinned by log *position*, the
+        // late replica re-stamped `created_at` past the close, so `votes()` dropped
+        // every ballot and `find_proposal` mis-pinned the electorate — two replicas
+        // of one chain disagreed on the result. This is the regression that a
+        // one-replica test cannot see.
+        let db1 = fresh_db();
+        let station = Keypair::generate();
+        let (members, proposal) = published_statute(&db1, &station, 4);
+        let mut log1 = AppendLog::new(&db1);
+        for m in &members[0..3] {
+            append_vote(
+                &mut log1,
+                vote(m, &proposal, VoteChoice::Yes, NOW),
+                &db1,
+                NOW,
+            )
+            .unwrap();
+        }
+        append_vote(
+            &mut log1,
+            vote(&members[3], &proposal, VoteChoice::No, NOW),
+            &db1,
+            NOW,
+        )
+        .unwrap();
+
+        let close = proposal.voting_ends_at;
+        let t1 = tally(&db1, &proposal.proposal_id, close + 1).unwrap();
+        assert_eq!(t1.outcome, Some(ProposalOutcome::Passed));
+        assert_eq!(t1.eligible_voters, 4);
+
+        // Second replica: replay every payload verbatim, but admit them all long
+        // after the window closed (a partition that healed 100 months late). Each
+        // entry's `created_at` is re-stamped to `late`; only the signed payloads —
+        // including the station's window attestation and its `admitted_at` — carry
+        // over unchanged.
+        let late = close + 100 * MONTH;
+        let db2 = fresh_db();
+        {
+            let src = AppendLog::new(&db1);
+            let mut dst = AppendLog::new(&db2);
+            for entry in src.iter_from(1) {
+                dst.append_raw(entry.unwrap().payload, late).unwrap();
+            }
+        }
+
+        let t2 = tally(&db2, &proposal.proposal_id, late + 1).unwrap();
+        assert_eq!(
+            t2.outcome, t1.outcome,
+            "a late-syncing replica must agree on the outcome"
+        );
+        assert_eq!(
+            t2.eligible_voters, t1.eligible_voters,
+            "and on the pinned electorate"
+        );
+        assert_eq!(
+            (t2.yes_count, t2.no_count, t2.abstain_count),
+            (t1.yes_count, t1.no_count, t1.abstain_count),
+            "and on every counted ballot"
+        );
+    }
+
     // --- Kind-specific thresholds --------------------------------------------
 
     #[test]
