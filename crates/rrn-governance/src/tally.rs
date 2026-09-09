@@ -32,12 +32,13 @@
 //! The eligible electorate is the community's **established members** — the same
 //! effective-composite ≥ Member-band set that authors, co-signs, and votes —
 //! plus, while the community is in bootstrap grace, its genesis founders
-//! (ADR-0015). It is measured as of the proposal's `voting_ends_at`. Pinning
-//! eligibility to the close (rather than
-//! to wall-clock `now`) is what makes a concluded outcome **stable**: members who
-//! join or lapse after voting ends cannot move a settled quorum. Before the close,
-//! evaluating at `voting_ends_at` reads the same current membership (nothing on the
-//! log post-dates now), so live counts stay meaningful too.
+//! (ADR-0015). It is pinned at the proposal's **open log position** — the seq at
+//! which the station admitted the proposal (ADR-0022 §5, T2.1.3) — not at a
+//! wall-clock instant. Pinning to the open *position* is what makes a concluded
+//! outcome **stable and replica-deterministic**: nothing admitted after the
+//! proposal opened can join its electorate, so back-dated reputation evidence
+//! cannot silently grow a settled quorum on replay, and two replicas replaying the
+//! same log agree on the denominator.
 //!
 //! # Outcome timing
 //!
@@ -46,7 +47,7 @@
 //! when the ballots and the electorate are both frozen. A proposal that never
 //! published has no counting ballots and concludes [`Failed`](ProposalOutcome::Failed).
 
-use rrn_reputation::staking::grace_electorate;
+use rrn_reputation::staking::grace_electorate_asof;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -78,7 +79,8 @@ pub struct VoteTally {
     pub no_count: u32,
     /// Ballots explicitly abstaining — turnout, but not decisive.
     pub abstain_count: u32,
-    /// Established members eligible to vote, as of the proposal's `voting_ends_at`.
+    /// Established members eligible to vote, pinned at the proposal's open log
+    /// position (T2.1.3).
     pub eligible_voters: u32,
     /// Whether participation reached the Charter's quorum for this kind.
     pub quorum_met: bool,
@@ -196,10 +198,14 @@ fn count_against(
         }
     }
 
-    // The electorate as of the close: established members, plus the genesis
-    // founders while the community is in bootstrap grace (ADR-0015). Pinned at
-    // `voting_ends_at`, like the ballots, so a concluded quorum stays stable.
-    let eligible = grace_electorate(db, &governing.founders, proposal.voting_ends_at)?.len() as u32;
+    // The electorate: established members, plus the genesis founders while the
+    // community is in bootstrap grace (ADR-0015). Pinned at the proposal's *open*
+    // log position (T2.1.3), so it is replica-deterministic and cannot be packed
+    // by standing manufactured — even with a back-dated timestamp — after the
+    // proposal opens. A concluded quorum stays stable on replay.
+    let eligible =
+        grace_electorate_asof(db, &governing.founders, records.open_time, records.open_seq)?.len()
+            as u32;
     let participation = yes + no + abstain;
     let decisive = yes + no;
 
@@ -426,15 +432,44 @@ mod tests {
     }
 
     fn statute(author: &Keypair, at: i64) -> Proposal {
-        Proposal::new(
-            addr(author),
-            "Quiet hours in the workshop".into(),
-            "No power tools after 9pm.".into(),
-            ProposalKind::Statute,
+        with_window(
+            Proposal::new(
+                addr(author),
+                "Quiet hours in the workshop".into(),
+                "No power tools after 9pm.".into(),
+                ProposalKind::Statute,
+                at,
+            )
+            .unwrap(),
             at,
-            &test_charter_body(),
         )
-        .unwrap()
+    }
+
+    /// Populates a built proposal's window cache to match the station attestation
+    /// (tests append at `at`, so admitted_at == at).
+    fn with_window(mut p: Proposal, at: i64) -> Proposal {
+        let (v, i) = crate::window::window_for(&test_charter_body(), &p.kind, at);
+        p.voting_ends_at = v;
+        p.implementation_at = i;
+        p
+    }
+
+    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies a
+    /// station keypair and the test charter body for the window attestation.
+    fn propose(
+        log: &mut AppendLog,
+        signed: crate::proposal::SignedProposal,
+        db: &Database,
+        at: i64,
+    ) -> Result<rrn_storage::log::LogEntry, crate::proposal::ProposalError> {
+        append_proposal(
+            log,
+            signed,
+            db,
+            &Keypair::generate(),
+            &test_charter_body(),
+            at,
+        )
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedPayload<ProposalCosign> {
@@ -473,7 +508,7 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             db,
@@ -520,6 +555,50 @@ mod tests {
         assert!(t.quorum_met);
         assert!(t.approval_met);
         assert_eq!(t.outcome, Some(ProposalOutcome::Passed));
+    }
+
+    #[test]
+    fn a_back_dated_member_admitted_after_open_does_not_join_the_electorate() {
+        // The concluded-tally back-dating regression (T2.1.3 acceptance): a member
+        // established by evidence admitted *after* a proposal opens must not enter
+        // that proposal's electorate, even when the evidence's own timestamps are
+        // back-dated to on/before the open (legal under ADR-0022 §3). Before the
+        // position pin, `grace_electorate(db, founders, voting_ends_at)` read the
+        // electorate by wall-clock time and would silently grow a concluded quorum.
+        let db = fresh_db();
+        let station = Keypair::generate();
+        // Four established members (past bootstrap grace); the minimum a published
+        // statute needs (author + three co-signers). Kept small: the reputation
+        // anchoring check is costly, so a bigger electorate only slows the test.
+        let (members, proposal) = published_statute(&db, &station, 4);
+
+        let close = proposal.voting_ends_at;
+        let before = tally(&db, &proposal.proposal_id, close + 1)
+            .unwrap()
+            .eligible_voters;
+        assert_eq!(before, 4);
+
+        // After the proposal opened, seed an 11th established member — real raw
+        // standing plus an anchoring vouch — all admitted now, timestamped at the
+        // open instant (a time-pin at the open would have counted them).
+        let newcomer = Keypair::generate();
+        earn_raw_standing(&db, &newcomer, &station, NOW);
+        append_vouch(&db, &members[0], &addr(&newcomer), NOW);
+
+        // Time-based, the community now has a fifth established member...
+        assert_eq!(
+            rrn_reputation::staking::established_member_count(&db, close + 1).unwrap(),
+            5
+        );
+        // ...but the proposal's electorate, pinned at its OPEN log position, is
+        // unchanged: nothing admitted after the proposal opened can pack it.
+        let after = tally(&db, &proposal.proposal_id, close + 1)
+            .unwrap()
+            .eligible_voters;
+        assert_eq!(
+            after, 4,
+            "back-dated evidence admitted after open must not change a concluded electorate"
+        );
     }
 
     #[test]
@@ -708,16 +787,18 @@ mod tests {
 
         let mut next = test_charter_body();
         next.version = 2;
-        let amendment = Proposal::new(
-            addr(&author),
-            "Amend the charter".into(),
-            "Raise the workshop budget.".into(),
-            ProposalKind::CharterAmendment { new_charter: next },
+        let amendment = with_window(
+            Proposal::new(
+                addr(&author),
+                "Amend the charter".into(),
+                "Raise the workshop budget.".into(),
+                ProposalKind::CharterAmendment { new_charter: next },
+                NOW,
+            )
+            .unwrap(),
             NOW,
-            &test_charter_body(),
-        )
-        .unwrap();
-        append_proposal(
+        );
+        propose(
             &mut log,
             SignedPayload::sign(amendment.clone(), &author),
             &db,
@@ -771,7 +852,7 @@ mod tests {
         let author = founders[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -811,7 +892,7 @@ mod tests {
         let author = founders[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -850,7 +931,7 @@ mod tests {
         let author = founders[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -889,7 +970,7 @@ mod tests {
 
         let mut log = AppendLog::new(&db);
         let proposal = statute(&founder, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &founder),
             &db,
@@ -935,7 +1016,7 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,

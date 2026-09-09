@@ -20,18 +20,21 @@
 //!   it is genuinely open for voting — a ballot on a motion still gathering
 //!   endorsements does not count, matching the proposal module's rule that votes
 //!   do not count in [`Deliberation`](crate::proposal::ProposalPhase::Deliberation));
-//! - `cast_at` falls **within the proposal's window**, `[created_at, voting_ends_at]`
-//!   — Phase 1 runs deliberation and voting as one window (ADR-0012), so the
-//!   window that opens the proposal is the window a ballot must land in;
+//! - the ballot is **admitted within the proposal's window** — admitted by the
+//!   proposal's `voting_ends_at`, where both the window and its close run on the
+//!   station's *admission* clock, not the voter's `cast_at` (ADR-0022 / T2.1.3);
+//!   Phase 1 runs deliberation and voting as one window (ADR-0012);
 //!   > Note: publication is monotonic (co-signatures only accrue), so a ballot
 //!   > accepted while the proposal was published stays published — and valid —
 //!   > under any later replay.
-//! - the voter is an **established member** (effective composite at or above the
-//!   Member band) as of `cast_at`, the same electorate that authors and co-signs;
+//! - the voter is in the **electorate pinned at the proposal's open log
+//!   position** — an established member (or grace founder) then, the same
+//!   frozen electorate that authors and co-signs (T2.1.3);
 //! - the voter has **not already voted** on this proposal.
 //!
-//! A voter's standing is judged at their ballot's own `cast_at`, never at append
-//! time, so replay is deterministic.
+//! The window and the electorate are both anchored on admission, never on the
+//! voter's `cast_at` (which is retained as testimony only), so replay is
+//! deterministic and a ballot cannot be back-dated into or out of the window.
 //!
 //! # No changing a vote (Phase 1)
 //!
@@ -58,8 +61,8 @@ use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::proposal::{
-    composite_at, effective_cosign_threshold, founder_set, is_eligible, proposal_records,
-    ProposalError, ProposalId,
+    composite_at_position, effective_cosign_threshold, founder_set, is_eligible_asof,
+    proposal_records, ProposalError, ProposalId,
 };
 
 /// Discriminant carried in the `kind` field of a [`Vote`]'s canonical CBOR, so
@@ -90,8 +93,10 @@ pub struct Vote {
     pub voter: Address,
     /// The choice cast.
     pub choice: VoteChoice,
-    /// Unix seconds the ballot was cast — the voter's clock, and when their
-    /// established-member standing is judged, so replay is deterministic.
+    /// Unix seconds the ballot was cast — the voter's clock. **Testimony only**
+    /// (ADR-0022 / T2.1.3): the ballot's window membership runs on its admission,
+    /// and the voter's standing is judged at the proposal's open log position;
+    /// neither reads this.
     pub cast_at: i64,
 }
 
@@ -116,9 +121,11 @@ pub fn votes(
     let Some(proposal) = records.proposal.as_ref() else {
         return Ok(HashMap::new());
     };
-    if !records.is_published(effective_cosign_threshold(db, proposal)?) {
+    let (open_seq, open_time) = (records.open_seq, records.open_time);
+    if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
         return Ok(HashMap::new());
     }
+    let voting_close = proposal.voting_ends_at;
 
     let founders = founder_set(db)?;
     let mut ballots: HashMap<Address, VoteChoice> = HashMap::new();
@@ -133,10 +140,16 @@ pub fn votes(
         if Address::from_public_key(entry.payload.signer) != vote.voter {
             continue;
         }
-        if vote.cast_at < proposal.created_at || vote.cast_at > proposal.voting_ends_at {
+        // The window is on *admission* (ADR-0022 / T2.1.3): a ballot counts iff it
+        // was admitted by the proposal's close. Its `cast_at` is testimony only.
+        // The log is monotone, so a ballot admitted after the proposal always has
+        // `entry.created_at >= open_time`; the close is the real gate.
+        if entry.created_at > voting_close {
             continue;
         }
-        if !is_eligible(db, &founders, &vote.voter, vote.cast_at)? {
+        // Voter eligibility is pinned at the proposal's open position — the frozen
+        // electorate — not at the ballot's own admission.
+        if !is_eligible_asof(db, &founders, &vote.voter, open_time, open_seq)? {
             continue;
         }
         // First ballot wins; a later one from the same voter is ignored.
@@ -170,22 +183,29 @@ pub fn append_vote(
     let Some(proposal) = records.proposal.as_ref() else {
         return Err(VoteError::UnknownProposal(vote.proposal_id));
     };
-    if !records.is_published(effective_cosign_threshold(db, proposal)?) {
+    let (open_seq, open_time) = (records.open_seq, records.open_time);
+    if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
         return Err(VoteError::ProposalNotPublished(vote.proposal_id));
     }
-    if vote.cast_at < proposal.created_at || vote.cast_at > proposal.voting_ends_at {
+    // The ballot will be admitted at the monotone-clamped `now`; the window is on
+    // that admission, not the voter's `cast_at` (ADR-0022 / T2.1.3).
+    let admitted_at = match log.tail()? {
+        Some(t) => now.max(t.created_at),
+        None => now,
+    };
+    if admitted_at > proposal.voting_ends_at {
         return Err(VoteError::OutsideVotingWindow {
             proposal_id: vote.proposal_id,
-            cast_at: vote.cast_at,
-            opened_at: proposal.created_at,
-            closed_at: proposal.voting_ends_at,
+            admitted_at,
+            open_time,
+            voting_ends_at: proposal.voting_ends_at,
         });
     }
 
-    if !is_eligible(db, &founder_set(db)?, &vote.voter, vote.cast_at)? {
+    if !is_eligible_asof(db, &founder_set(db)?, &vote.voter, open_time, open_seq)? {
         return Err(VoteError::VoterNotEstablished {
             voter: vote.voter,
-            composite: composite_at(db, &vote.voter, vote.cast_at)?,
+            composite: composite_at_position(db, &vote.voter, open_time, open_seq)?,
         });
     }
 
@@ -218,21 +238,21 @@ pub enum VoteError {
     /// yet open for voting.
     #[error("proposal {0} has not published; voting is not open")]
     ProposalNotPublished(ProposalId),
-    /// The ballot was cast outside the proposal's `[created_at, voting_ends_at]`
-    /// window.
+    /// The ballot was *admitted* after the proposal's window closed (ADR-0022:
+    /// the window runs on admission, not the voter's `cast_at`).
     #[error(
-        "vote on proposal {proposal_id} cast at {cast_at} is outside \
-         the voting window [{opened_at}, {closed_at}]"
+        "vote on proposal {proposal_id} admitted at {admitted_at} is outside \
+         the voting window [{open_time}, {voting_ends_at}]"
     )]
     OutsideVotingWindow {
         /// The proposal.
         proposal_id: ProposalId,
-        /// When the ballot was cast.
-        cast_at: i64,
-        /// When the window opened (the proposal's `created_at`).
-        opened_at: i64,
-        /// When the window closes (the proposal's `voting_ends_at`).
-        closed_at: i64,
+        /// When the ballot was admitted (the station clock at admission).
+        admitted_at: i64,
+        /// When the window opened (the proposal's admission).
+        open_time: i64,
+        /// When the window closes (the attested `voting_ends_at`).
+        voting_ends_at: i64,
     },
     /// The voter is not an established member as of when they cast the ballot.
     #[error("voter {voter} is not an established member (composite {composite:.2} < 2.0)")]
@@ -445,15 +465,31 @@ mod tests {
     }
 
     fn statute(author: &Keypair, at: i64) -> Proposal {
-        Proposal::new(
+        let mut p = Proposal::new(
             addr(author),
             "Quiet hours in the workshop".into(),
             "No power tools after 9pm.".into(),
             ProposalKind::Statute,
             at,
-            &test_charter(),
         )
-        .unwrap()
+        .unwrap();
+        // Populate the window cache the way the station attestation will (tests
+        // append at `at`, so admitted_at == at).
+        let (v, i) = crate::window::window_for(&test_charter(), &p.kind, at);
+        p.voting_ends_at = v;
+        p.implementation_at = i;
+        p
+    }
+
+    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies a
+    /// station keypair and the default test charter for the window attestation.
+    fn propose(
+        log: &mut AppendLog,
+        signed: crate::proposal::SignedProposal,
+        db: &Database,
+        at: i64,
+    ) -> Result<LogEntry, ProposalError> {
+        append_proposal(log, signed, db, &Keypair::generate(), &test_charter(), at)
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedPayload<ProposalCosign> {
@@ -491,7 +527,7 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             db,
@@ -720,7 +756,7 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
