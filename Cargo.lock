@@ -1888,12 +1888,14 @@ name = "rrn-governance"
 version = "0.1.0"
 dependencies = [
  "dcbor",
+ "hex",
  "rrn-crypto",
  "rrn-identity",
  "rrn-ledger",
  "rrn-reputation",
  "rrn-storage",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
 ]

@@ -36,3 +36,5 @@ tracing = "0.1"
 # `rrn-ledger` (ADR-0012), since governance decides policy, it does not move
 # credit.
 rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
+hex = "0.4"
+serde_json = "1"

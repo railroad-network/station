@@ -1992,12 +1992,64 @@ channel.
   not need formal governance yet; there is no floor on electorate size before
   proposals may pass, and adding one is a Phase 3 question.
 
+#### Backdated evidence, spoofed windows, and replica divergence (the admission clock)
+
+- *Threat:* governance windows and eligibility were derived from party-asserted
+  timestamps. An author could set a clock back to publish a proposal already
+  closing or forward to vote in a window others saw as shut; and — the sharper
+  attack — because a member's standing was read at a *wall-clock* instant while
+  reputation counts evidence by its own signed `issued_at`/`settled_at` (legal to
+  back-date under ADR-0022 §3), a faction could admit **back-dated** vouches
+  *after* a proposal opened and retroactively grow that proposal's electorate,
+  changing a concluded tally's denominator on replay.
+- *Mitigation (shipped, T2.1.3, ADR-0022):* governance no longer does author-clock
+  arithmetic. A proposal's deliberation/voting window and implementation time are
+  derived from the station's **admission** of the proposal and restated in a
+  station-signed `rrn.gov.proposal_window` attestation, so the window is a signed,
+  replicated fact rather than a per-replica admission-clock computation (the
+  ADR-0005 / `ProposalImplemented` pattern). A ballot counts iff it was *admitted*
+  by the proposal's close. Author, co-signer, and voter eligibility and the tally
+  quorum denominator are pinned at the proposal's **open log position** — the seq
+  at which it was admitted (ADR-0022 §5, "ordering is log order") — via
+  position-bounded reputation (`score_at_position`, `grace_electorate_asof`), so
+  nothing admitted after a proposal opens can enter its electorate, whatever
+  timestamp it claims. Regression:
+  `tally.rs::a_back_dated_member_admitted_after_open_does_not_join_the_electorate`.
+- *Residual risk:* the window attestation's authority is the station's signature,
+  and — matching the existing `ProposalImplemented` treatment — governance does not
+  re-verify the attestation's signer against a pinned station identity, because it
+  has no station-identity concept in Phase 1; a station-signed governance concept
+  arrives with ADR-0023's `emergency_activated` (T2.8.2), and pinning the window
+  attestation's signer is a follow-up. The station clock at admission remains the
+  operational trust root (ADR-0022 §6). The dispute-escalation electorate still
+  uses the *time*-based `grace_electorate` and shares the residual back-dating
+  vector this ticket closed only for the governance path; `grace_electorate_asof`
+  is now the tool to close it there too (follow-up).
+
+#### DTN-carried governance records
+
+- *Threat:* extending the DTN router to admit `rrn.gov.*` records could let a
+  courier-carried proposal, co-signature, or ballot bypass a gate the live RPC
+  enforces.
+- *Mitigation (shipped, T2.1.3):* `route_dtn_record` admits the three governance
+  kinds through the **same append guards** (`append_proposal`/`append_cosign`/
+  `append_vote`) the RPC uses — identical eligibility, publication, window, and
+  duplicate checks — so DTN is not a bypass; the window still anchors on *this*
+  admission. A re-carried record already on the log is the idempotent `known`
+  disposition, not a second admission.
+- *Residual risk:* the same as any DTN ingress — availability depends on couriers,
+  and a governance record authored offline is only as timely as its carriage
+  (ADR-0020); a proposal carried past its (admission-anchored) window simply
+  opens its window on arrival, which is the intended "late knowledge delays, never
+  truncates" behaviour.
+
 #### Proposal flooding / governance DoS
 
 - *Threat:* an identity floods the community with proposals to bury real ones or
   force constant voting.
 - *Mitigation (shipped, T1.9.4):* authorship itself requires established standing
-  (`append_proposal` gates the author on `is_established` at `created_at`), and a
+  (`append_proposal` gates the author on eligibility at the proposal's open
+  admission position, T2.1.3), and a
   proposal does not reach a ballot until at least `DEFAULT_COSIGN_THRESHOLD` (3)
   *distinct established* members other than the author co-sign it (`append_cosign`
   + `proposal_records`). A motion nobody else with standing will endorse never
