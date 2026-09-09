@@ -97,16 +97,40 @@ pub struct ProposalWindow {
 /// A [`ProposalWindow`] signed by the attesting station.
 pub type SignedWindow = SignedPayload<ProposalWindow>;
 
+/// The compressed `(voting_ends_at, implementation_at)` an
+/// [`Emergency`](ProposalKind::Emergency) proposal runs under when admitted at
+/// `admitted_at` **while an emergency declaration is in force** (ADR-0023 §3a): the
+/// window is `emergency_window_secs` from admission and effect is immediate. This is
+/// decided once, by the station, at admission, and frozen into the signed
+/// [`ProposalWindow`] attestation — replay reads it back, so the compression is a
+/// replicated fact, not a per-replica re-derivation (T2.8.2 invariant 1).
+pub fn compressed_emergency_window(admitted_at: i64, emergency_window_secs: i64) -> (i64, i64) {
+    let voting_ends_at = admitted_at + emergency_window_secs;
+    (voting_ends_at, voting_ends_at)
+}
+
 /// Builds and station-signs the window attestation for a proposal admitted at
 /// `admitted_at` under `charter`.
+///
+/// `emergency_window_secs` is `Some` only for an [`Emergency`](ProposalKind::Emergency)
+/// proposal admitted while a declaration is active (ADR-0023 §3a): the window then
+/// compresses to that many seconds from admission. For every other case it is
+/// `None` and the ordinary [`window_for`] windows apply — so an `Emergency` proposal
+/// raised with no active declaration keeps its Phase-1 full window (ADR-0023 §1).
 pub fn build_window(
     station: &Keypair,
     proposal_id: ProposalId,
     kind: &ProposalKind,
     charter: &Charter,
     admitted_at: i64,
+    emergency_window_secs: Option<i64>,
 ) -> SignedWindow {
-    let (voting_ends_at, implementation_at) = window_for(charter, kind, admitted_at);
+    let (voting_ends_at, implementation_at) = match (kind, emergency_window_secs) {
+        (ProposalKind::Emergency { .. }, Some(secs)) => {
+            compressed_emergency_window(admitted_at, secs)
+        }
+        _ => window_for(charter, kind, admitted_at),
+    };
     SignedPayload::sign(
         ProposalWindow {
             proposal_id,

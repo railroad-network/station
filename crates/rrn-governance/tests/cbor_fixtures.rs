@@ -14,6 +14,9 @@
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::serialize::to_canonical_bytes;
+use rrn_governance::emergency::{
+    EmergencyActivated, EmergencyCosign, EmergencyDeclaration, EmergencyLapse,
+};
 use rrn_governance::proposal::{Proposal, ProposalCosign, ProposalKind};
 use rrn_governance::vote::{Vote, VoteChoice};
 use rrn_governance::window::ProposalWindow;
@@ -68,11 +71,48 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
         charter_hash: Hash::of(b"effective-charter"),
     };
 
+    // Emergency-governance record kinds (T2.8.2, ADR-0023). An initial declaration
+    // (no `previous_declaration_hash`), a co-signature toward it, a lapse against
+    // it, and the station-signed activation attestation — all byte-locked for the
+    // mobile repo.
+    let declaration = EmergencyDeclaration {
+        community_id: "commons".into(),
+        author: addr("author"),
+        reason: "storm surge; grid down".into(),
+        scope: "flood-response".into(),
+        duration_secs: 72 * 3600,
+        stated_renewal_index: 0,
+        previous_declaration_hash: None,
+        created_at: AT,
+    };
+    let decl_hash = declaration.hash();
+    let em_cosign = EmergencyCosign {
+        declaration_hash: decl_hash,
+        signer: addr("cosigner"),
+    };
+    let em_lapse = EmergencyLapse {
+        declaration_hash: decl_hash,
+        author: addr("author"),
+    };
+    let activated = EmergencyActivated {
+        declaration_hash: decl_hash,
+        activation_instant: AT,
+        scheduled_expiry: AT + 72 * 3600,
+        renewal_count: 0,
+    };
+
     vec![
         ("rrn.gov.proposal", to_canonical_bytes(proposal)),
         ("rrn.gov.proposal_cosign", to_canonical_bytes(cosign)),
         ("rrn.gov.vote", to_canonical_bytes(vote)),
         ("rrn.gov.proposal_window", to_canonical_bytes(window)),
+        (
+            "rrn.gov.emergency_declaration",
+            to_canonical_bytes(declaration),
+        ),
+        ("rrn.gov.emergency_cosign", to_canonical_bytes(em_cosign)),
+        ("rrn.gov.emergency_lapse", to_canonical_bytes(em_lapse)),
+        ("rrn.gov.emergency_activated", to_canonical_bytes(activated)),
     ]
 }
 

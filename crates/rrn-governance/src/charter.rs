@@ -78,6 +78,22 @@ pub struct GovernanceStructure {
     /// Approval share required for an emergency proposal (a higher bar; takes
     /// effect immediately).
     pub emergency_threshold_pct: u8,
+    /// Seconds an `Emergency`-kind proposal deliberates/votes **while an emergency
+    /// declaration is in force** — the compressed decision window (ADR-0023 §3a).
+    /// Clamped up to [`crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS`] on use, so a
+    /// charter can never shrink the window below the floor.
+    pub emergency_window_secs: i64,
+    /// Share of the electorate whose co-signatures a declaration needs to take
+    /// force (author included), a supermajority (ADR-0023 §2). Clamped up to
+    /// [`crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR`] on use.
+    pub emergency_declaration_pct: u8,
+    /// Quorum an emergency-passed (compressed-path) measure must meet — a majority
+    /// of the pinned electorate, so speed does not shrink the deciding body
+    /// (ADR-0023 §3). Clamped up to [`crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR`].
+    pub emergency_quorum_pct: u8,
+    /// Most consecutive renewals an emergency chain may take (ADR-0023 §4). Clamped
+    /// down to [`crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING`] on use.
+    pub max_consecutive_renewals: u32,
 }
 
 impl Default for GovernanceStructure {
@@ -89,7 +105,45 @@ impl Default for GovernanceStructure {
             deliberation_window_days: 7,
             implementation_delay_days: 7,
             emergency_threshold_pct: 67,
+            emergency_window_secs: crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS,
+            emergency_declaration_pct: crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR,
+            emergency_quorum_pct: crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR,
+            max_consecutive_renewals: crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING,
         }
+    }
+}
+
+impl GovernanceStructure {
+    /// The compressed emergency window, floored — a charter may raise it, never
+    /// lower it below [`crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS`] (ADR-0023 §3,
+    /// "window floor"). This is the *derive tolerance*: even a hostile charter that
+    /// stored a sub-floor value cannot compress the window below the floor.
+    pub fn effective_emergency_window_secs(&self) -> i64 {
+        self.emergency_window_secs
+            .max(crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS)
+    }
+
+    /// The declaration supermajority, floored to
+    /// [`crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR`] (ADR-0023 §2).
+    pub fn effective_emergency_declaration_pct(&self) -> u8 {
+        self.emergency_declaration_pct
+            .max(crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR)
+    }
+
+    /// The emergency measure quorum, floored to
+    /// [`crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR`] (ADR-0023 §3, "measure
+    /// quorum") — never lower than the declaration's own collective bar.
+    pub fn effective_emergency_quorum_pct(&self) -> u8 {
+        self.emergency_quorum_pct
+            .max(crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR)
+    }
+
+    /// The consecutive-renewal cap, capped at
+    /// [`crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING`] (ADR-0023 §4) — a
+    /// charter may set a *stricter* cap but never a looser one.
+    pub fn effective_max_consecutive_renewals(&self) -> u32 {
+        self.max_consecutive_renewals
+            .min(crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING)
     }
 }
 
@@ -487,6 +541,16 @@ impl From<GovernanceStructure> for CBOR {
             g.implementation_delay_days as u64,
         );
         m.insert("emergency_threshold_pct", g.emergency_threshold_pct as u64);
+        m.insert("emergency_window_secs", g.emergency_window_secs);
+        m.insert(
+            "emergency_declaration_pct",
+            g.emergency_declaration_pct as u64,
+        );
+        m.insert("emergency_quorum_pct", g.emergency_quorum_pct as u64);
+        m.insert(
+            "max_consecutive_renewals",
+            g.max_consecutive_renewals as u64,
+        );
         m.into()
     }
 }
@@ -505,6 +569,10 @@ impl TryFrom<CBOR> for GovernanceStructure {
             deliberation_window_days: extract_u8(&map, "deliberation_window_days")?,
             implementation_delay_days: extract_u8(&map, "implementation_delay_days")?,
             emergency_threshold_pct: extract_u8(&map, "emergency_threshold_pct")?,
+            emergency_window_secs: map.extract::<&str, i64>("emergency_window_secs")?,
+            emergency_declaration_pct: extract_u8(&map, "emergency_declaration_pct")?,
+            emergency_quorum_pct: extract_u8(&map, "emergency_quorum_pct")?,
+            max_consecutive_renewals: extract_u32(&map, "max_consecutive_renewals")?,
         })
     }
 }

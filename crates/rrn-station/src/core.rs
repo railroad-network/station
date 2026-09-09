@@ -33,6 +33,7 @@ use rrn_governance::charter::{
     create_charter, latest_charter, store_charter, store_pending_charter, CharterParams,
     SignedCharter,
 };
+use rrn_governance::emergency::{self, EmergencyCosign, EmergencyDeclaration, EmergencyLapse};
 use rrn_governance::proposal::{
     append_cosign, append_proposal, Proposal, ProposalCosign, ProposalId, ProposalKind,
 };
@@ -807,6 +808,13 @@ impl Core {
             "governance_propose" => self.m_governance_propose(req),
             "governance_cosign" => self.m_governance_cosign(req),
             "governance_vote" => self.m_governance_vote(req),
+            // Emergency governance (T2.8.2, ADR-0023); writes are station-signed by
+            // this wallet, whose signature counts toward the supermajority.
+            "governance_emergency_declare" => self.m_governance_emergency_declare(req),
+            "governance_emergency_cosign" => self.m_governance_emergency_cosign(req),
+            "governance_emergency_lapse" => self.m_governance_emergency_lapse(req),
+            "governance_emergency_status" => self.m_governance_emergency_status(),
+            "governance_emergency_report" => self.m_governance_emergency_report(),
             // Operator-facing disputes (T1.10.5). Reads answer with the same
             // views the mobile channel serves; the writes are signed by this
             // station's own wallet, as `propose` and `vouch` are.
@@ -868,6 +876,7 @@ impl Core {
             bootstrap_in_grace: established < threshold,
             established_members: established as u64,
             grace_threshold: threshold as u64,
+            emergency: self.active_emergency_status(self.clock.now())?,
         })
     }
 
@@ -937,6 +946,7 @@ impl Core {
             community: VOUCH_COMMUNITY.to_string(),
             bootstrap_in_grace: established < threshold,
             established_members: established as u64,
+            emergency: self.active_emergency_status(self.clock.now())?,
             connectivity: rpc::ConnectivityBlock {
                 peers,
                 mobile_listen,
@@ -2469,7 +2479,8 @@ impl Core {
     }
 
     fn m_governance_statutes(&self) -> Result<serde_json::Value, rpc::RpcError> {
-        let statutes = governance_view::statutes_view(&self.db).map_err(internal)?;
+        let statutes =
+            governance_view::statutes_view(&self.db, self.clock.now()).map_err(internal)?;
         Ok(serde_json::json!({ "statutes": statutes }))
     }
 
@@ -2771,6 +2782,193 @@ impl Core {
         )
         .map_err(|e| invalid_params(e.to_string()))?;
         Ok(serde_json::json!({ "ok": true }))
+    }
+
+    // --- emergency governance (T2.8.2, ADR-0023) ---------------------------
+
+    /// Renders a derived [`emergency::ActiveEmergency`] into the RPC/banner shape,
+    /// computing `active`/`lapsed` against `now`.
+    fn emergency_status(&self, e: &emergency::ActiveEmergency, now: i64) -> rpc::EmergencyStatus {
+        rpc::EmergencyStatus {
+            declaration_hash: e.declaration_hash.to_string(),
+            reason: e.reason.clone(),
+            scope: e.scope.clone(),
+            activation_instant: e.activation_instant,
+            scheduled_expiry: e.scheduled_expiry,
+            renewal_count: e.renewal_count,
+            active: e.lapsed_at_seq.is_none()
+                && e.activation_instant < now
+                && now <= e.scheduled_expiry,
+            lapsed: e.lapsed_at_seq.is_some(),
+        }
+    }
+
+    /// The active emergency, if one holds now, in the banner shape (for `status`
+    /// and `whoami`).
+    fn active_emergency_status(
+        &self,
+        now: i64,
+    ) -> Result<Option<rpc::EmergencyStatus>, rpc::RpcError> {
+        Ok(emergency::active_emergency_at(&self.db, now, u64::MAX)
+            .map_err(internal)?
+            .map(|e| self.emergency_status(&e, now)))
+    }
+
+    /// `governance_emergency_declare` — raise a declaration, station-signed by the
+    /// wallet (whose signature counts toward the supermajority, ADR-0023 §2). If it
+    /// alone crosses the threshold (a lone- or two-founder grace community), the
+    /// append guard writes the `emergency_activated` attestation.
+    fn m_governance_emergency_declare(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovEmergencyDeclareParams = parse_params(req)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let charter = effective_charter(&self.db)
+            .map_err(internal)?
+            .ok_or_else(|| invalid_params("no charter published; run governance charter-init"))?;
+        let previous_declaration_hash = match &params.previous_declaration_hash {
+            Some(s) => Some(Hash::from_hex(s).map_err(|e| invalid_params(e.to_string()))?),
+            None => None,
+        };
+        let decl = EmergencyDeclaration {
+            community_id: charter.community_id,
+            author: self.wallet.address,
+            reason: params.reason,
+            scope: params.scope,
+            duration_secs: params
+                .duration_secs
+                .unwrap_or(emergency::EMERGENCY_DEFAULT_DURATION_SECS),
+            stated_renewal_index: 0,
+            previous_declaration_hash,
+            created_at: now,
+        };
+        let declaration_hash = decl.hash();
+        let mut log = AppendLog::new(&self.db);
+        emergency::append_declaration(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(decl, &station),
+            &self.db,
+            &station,
+            now,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let active = emergency::active_emergency_at(&self.db, now, u64::MAX)
+            .map_err(internal)?
+            .is_some_and(|e| e.declaration_hash == declaration_hash);
+        ok(&rpc::GovEmergencyActionResult {
+            declaration_hash: declaration_hash.to_string(),
+            active,
+        })
+    }
+
+    /// `governance_emergency_cosign` — co-sign a declaration (or a lapse), toward its
+    /// supermajority. The append guard writes the activation attestation if this
+    /// carries a declaration across (ADR-0023 §2).
+    fn m_governance_emergency_cosign(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovEmergencyTargetParams = parse_params(req)?;
+        let target =
+            Hash::from_hex(&params.declaration_hash).map_err(|e| invalid_params(e.to_string()))?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let cosign = EmergencyCosign {
+            declaration_hash: target,
+            signer: self.wallet.address,
+        };
+        let mut log = AppendLog::new(&self.db);
+        emergency::append_cosign(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(cosign, &station),
+            &self.db,
+            &station,
+            now,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let active = emergency::active_emergency_at(&self.db, now, u64::MAX)
+            .map_err(internal)?
+            .is_some_and(|e| e.declaration_hash == target);
+        ok(&rpc::GovEmergencyActionResult {
+            declaration_hash: target.to_string(),
+            active,
+        })
+    }
+
+    /// `governance_emergency_lapse` — raise a lapse against an active emergency; it
+    /// takes effect once its own co-signatures reach the supermajority (ADR-0023 §4).
+    /// Returns the *lapse's* hash — what its co-signatures target.
+    fn m_governance_emergency_lapse(
+        &mut self,
+        req: &rpc::Request,
+    ) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::GovEmergencyTargetParams = parse_params(req)?;
+        let declaration_hash =
+            Hash::from_hex(&params.declaration_hash).map_err(|e| invalid_params(e.to_string()))?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let lapse = EmergencyLapse {
+            declaration_hash,
+            author: self.wallet.address,
+        };
+        let lapse_hash = lapse.hash();
+        let mut log = AppendLog::new(&self.db);
+        emergency::append_lapse(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(lapse, &station),
+            &self.db,
+            now,
+        )
+        .map_err(|e| invalid_params(e.to_string()))?;
+        let active = emergency::active_emergency_at(&self.db, now, u64::MAX)
+            .map_err(internal)?
+            .is_some_and(|e| e.declaration_hash == declaration_hash);
+        ok(&rpc::GovEmergencyActionResult {
+            declaration_hash: lapse_hash.to_string(),
+            active,
+        })
+    }
+
+    /// `governance_emergency_status` — the active emergency (if any) and the full
+    /// derived timeline.
+    fn m_governance_emergency_status(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let now = self.clock.now();
+        let timeline = emergency::emergency_timeline(&self.db).map_err(internal)?;
+        let history = timeline
+            .iter()
+            .map(|e| self.emergency_status(e, now))
+            .collect();
+        ok(&rpc::GovEmergencyStatusResult {
+            active: self.active_emergency_status(now)?,
+            history,
+        })
+    }
+
+    /// `governance_emergency_report` — the derived post-emergency review surface
+    /// (ADR-0023 §6): every activation, its co-signers, and the measures passed
+    /// under it. No new record kinds — a pure replay of the log.
+    fn m_governance_emergency_report(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let now = self.clock.now();
+        let activations = emergency::emergency_report(&self.db)
+            .map_err(internal)?
+            .into_iter()
+            .map(|a| rpc::EmergencyReportEntry {
+                emergency: self.emergency_status(&a.emergency, now),
+                cosigners: a.cosigners.iter().map(|c| c.to_string()).collect(),
+                measures: a
+                    .measures
+                    .into_iter()
+                    .map(|(id, title, expires_at)| rpc::EmergencyMeasure {
+                        proposal_id: id.to_string(),
+                        title,
+                        expires_at,
+                    })
+                    .collect(),
+            })
+            .collect();
+        ok(&rpc::GovEmergencyReportResult { activations })
     }
 
     // --- disputes (T1.10.5) ------------------------------------------------
@@ -3852,6 +4050,21 @@ impl Core {
             }
             Some(KIND_GOV_COSIGN) => return self.admit_gov_cosign(bytes, signer, signature, now),
             Some(KIND_GOV_VOTE) => return self.admit_gov_vote(bytes, signer, signature, now),
+            // Emergency-governance records (ADR-0023) ride DTN like any member
+            // record: a declaration, its co-signature, or a lapse authored offline
+            // is admitted through the same append guards the live RPC uses, and the
+            // station writes the `emergency_activated` attestation on the crossing
+            // co-signature just as it does on the live path (T2.8.2). Each returns
+            // its own disposition early.
+            Some(KIND_EMERGENCY_DECLARATION) => {
+                return self.admit_emergency_declaration(bytes, signer, signature, now)
+            }
+            Some(KIND_EMERGENCY_COSIGN) => {
+                return self.admit_emergency_cosign(bytes, signer, signature, now)
+            }
+            Some(KIND_EMERGENCY_LAPSE) => {
+                return self.admit_emergency_lapse(bytes, signer, signature, now)
+            }
             _ => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
         };
 
@@ -4052,6 +4265,85 @@ impl Core {
         match append_vote(&mut log, signed, &self.db, now) {
             Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
             Err(rrn_governance::vote::VoteError::AlreadyVoted { .. }) => self.gov_known(bytes),
+            Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
+        }
+    }
+
+    /// Admits a DTN-carried [`EmergencyDeclaration`] through the same append guard
+    /// the RPC uses (ADR-0023 §2). The station writes the `emergency_activated`
+    /// attestation inside the guard if the author's own signature already crosses.
+    fn admit_emergency_declaration(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<EmergencyDeclaration>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        let station = self.station_keypair();
+        let mut log = AppendLog::new(&self.db);
+        match emergency::append_declaration(&mut log, signed, &self.db, &station, now) {
+            Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            Err(emergency::EmergencyError::AlreadyPresent) => self.gov_known(bytes),
+            Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
+        }
+    }
+
+    /// Admits a DTN-carried [`EmergencyCosign`] (toward a declaration or a lapse)
+    /// through the RPC's append guard; the station writes the activation attestation
+    /// if this co-signature carries a declaration across its supermajority.
+    fn admit_emergency_cosign(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<EmergencyCosign>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        let station = self.station_keypair();
+        let mut log = AppendLog::new(&self.db);
+        match emergency::append_cosign(&mut log, signed, &self.db, &station, now) {
+            Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            Err(emergency::EmergencyError::AlreadyCosigned { .. }) => self.gov_known(bytes),
+            Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
+        }
+    }
+
+    /// Admits a DTN-carried [`EmergencyLapse`] through the RPC's append guard
+    /// (ADR-0023 §4); its effect is re-derived from later lapse co-signatures.
+    fn admit_emergency_lapse(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<EmergencyLapse>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        let mut log = AppendLog::new(&self.db);
+        match emergency::append_lapse(&mut log, signed, &self.db, now) {
+            Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            Err(emergency::EmergencyError::AlreadyPresent) => self.gov_known(bytes),
             Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
         }
     }
@@ -5520,6 +5812,13 @@ const KIND_SMS_BINDING: &str = rrn_protocol::binding::SMS_BINDING_KIND;
 const KIND_GOV_PROPOSAL: &str = "rrn.gov.proposal";
 const KIND_GOV_COSIGN: &str = "rrn.gov.proposal_cosign";
 const KIND_GOV_VOTE: &str = "rrn.gov.vote";
+// Emergency-governance record kinds carried over DTN (T2.8.2, ADR-0023). The
+// member-signed declaration, co-signature, and lapse ride bundles like any member
+// record; the station-signed `emergency_activated` attestation is written locally
+// and is never member-submitted, so it has no ingest arm.
+const KIND_EMERGENCY_DECLARATION: &str = "rrn.gov.emergency_declaration";
+const KIND_EMERGENCY_COSIGN: &str = "rrn.gov.emergency_cosign";
+const KIND_EMERGENCY_LAPSE: &str = "rrn.gov.emergency_lapse";
 
 /// Why an ingest could not produce a receipt at all (as opposed to a per-record
 /// refusal, which *is* part of a receipt). A malformed bundle is the caller's
@@ -7022,6 +7321,145 @@ mod tests {
         );
         assert_eq!(detail["tally"]["yes"], 1);
         assert_eq!(detail["tally"]["outcome"], "passed");
+    }
+
+    /// Emergency governance end-to-end via DTN only (T2.8.2 invariant 5, ADR-0023):
+    /// a founder declares an emergency offline and submits it in a bundle; the
+    /// station admits it through `admit_emergency_declaration`, writing the
+    /// `emergency_activated` attestation on the crossing (a sole founder is its own
+    /// two-thirds). A DTN-carried Emergency proposal then rides the *compressed*
+    /// 24 h window, and a DTN-carried ballot inside that window carries it. Same
+    /// admission-anchored behaviour as the live RPC path.
+    #[test]
+    fn dtn_emergency_declaration_and_measure_route_end_to_end() {
+        let mut core = test_core(); // clock = 1000
+        let founder = Keypair::generate();
+        call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({
+                "community_id": "commons",
+                "founder_secrets_hex": [hex(&founder.secret_key().to_bytes())],
+            }),
+        );
+
+        // The founder declares an emergency offline; N=1 grace ⇒ the declaration's
+        // own signature crosses the two-thirds bar, so admitting it activates.
+        let decl = EmergencyDeclaration {
+            community_id: "commons".into(),
+            author: Address::from_public_key(founder.public_key()),
+            reason: "storm".into(),
+            scope: "flood".into(),
+            duration_secs: 72 * 3600,
+            stated_renewal_index: 0,
+            previous_declaration_hash: None,
+            created_at: 900,
+        };
+        let signed_decl = SignedPayload::sign(decl.clone(), &founder);
+        let e_decl = outbox_entry(&founder, 0, zero(), &signed_decl, 900);
+        let receipt = submit_bundle(&mut core, std::slice::from_ref(&e_decl), 1000);
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the DTN-carried declaration is admitted through admit_emergency_declaration"
+        );
+
+        // The station wrote the activation attestation on admission: the emergency
+        // is live, surfaced over the status RPC. (The activation boundary is strict —
+        // a record admitted *after* the activation instant is governed, §5 — so read
+        // status a tick later, as an operator would.)
+        core.clock.advance(1); // clock = 1001
+        let status = call(
+            &mut core,
+            "governance_emergency_status",
+            serde_json::json!({}),
+        );
+        assert!(status["active"].is_object(), "an emergency is active");
+        assert_eq!(status["active"]["scheduled_expiry"], 1000 + 72 * 3600);
+
+        // A DTN-carried Emergency proposal now rides the compressed 24 h window.
+        core.clock.advance(999); // clock = 2000, inside the emergency span
+        let measure = Proposal::new(
+            Address::from_public_key(founder.public_key()),
+            "Authorize fuel run".into(),
+            "Buy diesel.".into(),
+            ProposalKind::Emergency {
+                expires_at: 2000 + 3600,
+            },
+            1500,
+        )
+        .unwrap();
+        let signed_measure = SignedPayload::sign(measure.clone(), &founder);
+        let e_measure = outbox_entry(
+            &founder,
+            1,
+            e_decl.payload.entry_hash(),
+            &signed_measure,
+            2000,
+        );
+        let now = core.clock.now();
+        let m_receipt = submit_bundle(&mut core, std::slice::from_ref(&e_measure), now);
+        assert!(matches!(
+            m_receipt.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+        let detail = call(
+            &mut core,
+            "governance_proposal",
+            serde_json::json!({ "proposal_id": measure.proposal_id.to_string() }),
+        );
+        assert_eq!(
+            detail["voting_ends_at"].as_i64().unwrap(),
+            2000 + 24 * 3600,
+            "the DTN-carried emergency measure rides the compressed 24 h window"
+        );
+
+        // A DTN-carried ballot inside the compressed window carries the measure.
+        core.clock.advance(60); // clock = 2060, well inside the 24 h window
+        let ballot = Vote {
+            proposal_id: measure.proposal_id,
+            voter: Address::from_public_key(founder.public_key()),
+            choice: VoteChoice::Yes,
+            cast_at: 2060,
+        };
+        let signed_vote = SignedPayload::sign(ballot, &founder);
+        let e_vote = outbox_entry(
+            &founder,
+            2,
+            e_measure.payload.entry_hash(),
+            &signed_vote,
+            2060,
+        );
+        let now = core.clock.now();
+        let v_receipt = submit_bundle(&mut core, std::slice::from_ref(&e_vote), now);
+        assert!(matches!(
+            v_receipt.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+
+        // Past the compressed close, the emergency measure has carried, and the
+        // derived report attributes it to the emergency that governed it.
+        core.clock.advance(24 * 3600); // past voting_ends_at
+        let detail = call(
+            &mut core,
+            "governance_proposal",
+            serde_json::json!({ "proposal_id": measure.proposal_id.to_string() }),
+        );
+        assert_eq!(detail["tally"]["outcome"], "passed");
+        let report = call(
+            &mut core,
+            "governance_emergency_report",
+            serde_json::json!({}),
+        );
+        let acts = report["activations"].as_array().unwrap();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0]["measures"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            acts[0]["measures"][0]["proposal_id"],
+            measure.proposal_id.to_string()
+        );
     }
 
     /// Issues a headroom certificate for `member` through the engine (the live,

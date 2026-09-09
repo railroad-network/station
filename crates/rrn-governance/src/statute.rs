@@ -42,7 +42,7 @@ use rrn_crypto::signed::SignedPayload;
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
-use crate::proposal::{proposal_records, Proposal, ProposalError, ProposalId};
+use crate::proposal::{proposal_records, Proposal, ProposalError, ProposalId, ProposalKind};
 use crate::tally::{tally, ProposalOutcome, TallyError};
 
 /// Discriminant carried in the `kind` field of a [`ProposalImplemented`]'s
@@ -119,6 +119,15 @@ pub fn record_implementation(
     if is_implemented(log, &proposal.proposal_id) {
         return Err(StatuteError::AlreadyImplemented(proposal.proposal_id));
     }
+    // §3b — the constitution is frozen while an emergency holds: a CharterAmendment's
+    // enactment is deferred until the emergency lapses (its window keeps running; it
+    // just cannot take effect inside the emergency). Ordinary statutes still enact.
+    if matches!(proposal.kind, ProposalKind::CharterAmendment { .. })
+        && crate::emergency::is_emergency_active_now(db, now)
+            .map_err(|e| StatuteError::Emergency(Box::new(e)))?
+    {
+        return Err(StatuteError::CharterFrozenByEmergency(proposal.proposal_id));
+    }
     if tally(db, &proposal.proposal_id, now)?.outcome != Some(ProposalOutcome::Passed) {
         return Err(StatuteError::NotPassed(proposal.proposal_id));
     }
@@ -141,9 +150,11 @@ pub fn record_implementation(
 /// enactment time was at or after its `implementation_at`.
 ///
 /// This is the queryable statutes surface. It re-derives legitimacy so a gossiped
-/// enactment record that should never have been written is not believed. Returned
-/// in log order, each proposal once.
-pub fn enacted_statutes(db: &Database) -> Result<Vec<EnactedStatute>, StatuteError> {
+/// enactment record that should never have been written is not believed, and — for
+/// an [`Emergency`](ProposalKind::Emergency) measure — enforces its `expires_at`
+/// kind-wide: an expired measure has no effect and is dropped as of `now` (ADR-0023
+/// §1). Returned in log order, each proposal once.
+pub fn enacted_statutes(db: &Database, now: i64) -> Result<Vec<EnactedStatute>, StatuteError> {
     let log = AppendLog::new(db);
     let mut out = Vec::new();
     for entry in log.iter_from(1) {
@@ -158,6 +169,14 @@ pub fn enacted_statutes(db: &Database) -> Result<Vec<EnactedStatute>, StatuteErr
         // ...that genuinely passed, at or after its implementation time.
         if record.implemented_at < proposal.implementation_at {
             continue;
+        }
+        // §1 — an Emergency measure lapses at its `expires_at`: past that it has no
+        // effect, so it drops out of the in-force set (enforced kind-wide, whether it
+        // passed on the compressed path or the ordinary Emergency path).
+        if let ProposalKind::Emergency { expires_at } = proposal.kind {
+            if now > expires_at {
+                continue;
+            }
         }
         if tally(db, &record.proposal_id, record.implemented_at)?.outcome
             != Some(ProposalOutcome::Passed)
@@ -198,6 +217,13 @@ pub enum StatuteError {
     /// The proposal is already enacted.
     #[error("proposal {0} is already enacted")]
     AlreadyImplemented(ProposalId),
+    /// A CharterAmendment's enactment is deferred while an emergency is active — the
+    /// constitution is frozen for the emergency's life (ADR-0023 §3b).
+    #[error("amendment {0} enactment is deferred: the charter is frozen during an emergency")]
+    CharterFrozenByEmergency(ProposalId),
+    /// An error deriving emergency-governance state (ADR-0023).
+    #[error("emergency: {0}")]
+    Emergency(#[from] Box<crate::emergency::EmergencyError>),
     /// A tally error while verifying the proposal passed.
     #[error("tally: {0}")]
     Tally(#[from] TallyError),

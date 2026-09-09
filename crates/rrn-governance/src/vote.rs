@@ -136,6 +136,17 @@ pub fn votes(
     if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
         return Ok(HashMap::new());
     }
+    // Ballot eligibility is pinned at the *emergency activation* position for a
+    // compressed-path proposal (ADR-0023 §3c) and at the proposal's own open
+    // position otherwise (T2.1.3). The ballot-after-open gate below still uses the
+    // proposal's own `open_seq` — ballots always follow the proposal.
+    let is_emergency = records
+        .proposal
+        .as_ref()
+        .is_some_and(|p| p.kind.is_emergency());
+    let (pin_time, pin_seq) =
+        crate::emergency::electorate_pin(db, is_emergency, open_time, open_seq)
+            .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
 
     let founders = founder_set(db)?;
     let mut ballots: HashMap<Address, VoteChoice> = HashMap::new();
@@ -167,9 +178,10 @@ pub fn votes(
         // that took it; replay counts it. (Residual: a raw-replicated ballot never
         // gated by an honest station — see threat-model, `rrn-governance` STRIDE.)
         //
-        // Voter eligibility is pinned at the proposal's open position — the frozen
-        // electorate — not at the ballot's own admission.
-        if !is_eligible_asof(db, &founders, &vote.voter, open_time, open_seq)? {
+        // Voter eligibility is pinned at the governing electorate position (the
+        // proposal's open, or the emergency's activation for a compressed proposal —
+        // §3c), not at the ballot's own admission.
+        if !is_eligible_asof(db, &founders, &vote.voter, pin_time, pin_seq)? {
             continue;
         }
         // First ballot wins; a later one from the same voter is ignored.
@@ -222,10 +234,15 @@ pub fn append_vote(
         });
     }
 
-    if !is_eligible_asof(db, &founder_set(db)?, &vote.voter, open_time, open_seq)? {
+    // The governing electorate pin: emergency activation for a compressed-path
+    // proposal (ADR-0023 §3c), the proposal's own open otherwise.
+    let (pin_time, pin_seq) =
+        crate::emergency::electorate_pin(db, proposal.kind.is_emergency(), open_time, open_seq)
+            .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
+    if !is_eligible_asof(db, &founder_set(db)?, &vote.voter, pin_time, pin_seq)? {
         return Err(VoteError::VoterNotEstablished {
             voter: vote.voter,
-            composite: composite_at_position(db, &vote.voter, open_time, open_seq)?,
+            composite: composite_at_position(db, &vote.voter, pin_time, pin_seq)?,
         });
     }
 

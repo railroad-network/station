@@ -870,3 +870,23 @@ optional.
 - Design overview §2.4 (implementation delay as exit runway), §2.7 (the emergency
   governance sketch this ADR locks), §2.8 (governance capture as the existential
   threat), §12 (the Phase-2 deliverable).
+
+## Clarifications
+
+*Clarifications record a corrected reading of the decision above; they do not change
+it. Flagged for maintainer ratification alongside this ADR.*
+
+- **2026-09-09 (T2.8.2) — the declaration threshold is a true two-thirds,
+  `ceil(2N/3)`.** §2 states the bar as `ceil(N × emergency_declaration_pct / 100)`
+  with `pct = 67`, but its worked cases fix the *intent* at two-thirds: a 3-member
+  grace electorate needs 2 ("author plus one") and a 20-member one 14 — which is
+  `ceil(2N/3)`, not `ceil(N × 67/100)` (that reads `ceil(2.01) = 3` at N=3, i.e.
+  *unanimity*, and generally two-thirds+1 wherever N is a multiple of 3, the very
+  sizes where two-thirds is exact). A `u8` percent cannot spell 66.67, and the ADR's
+  own precedent — `founder_threshold`'s `ceil(n × 3/4)` — is an exact rational, not a
+  percent. T2.8.2 therefore implements the floor value 67 as exactly `ceil(2N/3)`
+  and any charter-**raised** bar literally as `ceil(N × pct/100)` (never below
+  two-thirds, monotone in N and `pct`). Author-plus-one for three founders grants
+  nothing ADR-0015 grace does not already grant, whereas a holdout veto would defeat
+  §2's own co-present-supermajority partition rationale. See
+  `rrn_governance::emergency::declaration_threshold`.

@@ -26,9 +26,10 @@ use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CertListResult, CertRequestResult,
     CloseListingResult, ConfirmResult, ContractStateResult, CreateListingResult,
     DisputeEscalateResult, DisputeEscalationVoteResult, DisputeRaiseResult, DisputeResolveResult,
-    DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult, GovProposeResult,
-    HistoryResult, InquireResult, InquiryStateResult, ProposeResult, RecoverImportResult,
-    StatusResult, TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
+    DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult,
+    GovEmergencyActionResult, GovProposeResult, HistoryResult, InquireResult, InquiryStateResult,
+    ProposeResult, RecoverImportResult, StatusResult, TransactionRow, TransactionsResult,
+    VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -585,6 +586,37 @@ enum GovernanceCmd {
     },
     /// List the statutes in force.
     Statutes,
+    /// Declare an emergency (ADR-0023): compresses the emergency-proposal window
+    /// once a supermajority of the electorate co-signs. Signed by the station
+    /// wallet, whose signature counts toward the threshold.
+    EmergencyDeclare {
+        /// The crisis, human-readable (testimony/display only).
+        reason: String,
+        /// The declared emergency domain (testimony/display only).
+        scope: String,
+        /// Requested lifetime in seconds (clamped to [24h, 7d]; default 72h).
+        #[arg(long)]
+        duration_secs: Option<i64>,
+        /// The hex hash of the declaration this renews, if any (advisory).
+        #[arg(long)]
+        previous: Option<String>,
+    },
+    /// Co-sign an emergency declaration (or a lapse), toward its supermajority.
+    EmergencyCosign {
+        /// The hex declaration hash (for a lapse, the lapse's own hash).
+        declaration_hash: String,
+    },
+    /// Raise a lapse to end an active emergency early; it takes effect once its own
+    /// co-signatures reach the supermajority. Prints the lapse hash to co-sign.
+    EmergencyLapse {
+        /// The hex hash of the declaration whose emergency to end.
+        declaration_hash: String,
+    },
+    /// Show the active emergency (if any) and the full derived timeline.
+    EmergencyStatus,
+    /// The post-emergency report: every activation, its co-signers, and the
+    /// measures passed under it (ADR-0023 §6).
+    EmergencyReport,
 }
 
 fn main() -> ExitCode {
@@ -1288,7 +1320,151 @@ async fn cmd_governance(
             let v = client.call("governance_statutes", json!({})).await?;
             emit(fmt, &v, || Ok(render_statutes(&v["statutes"])))
         }
+        GovernanceCmd::EmergencyDeclare {
+            reason,
+            scope,
+            duration_secs,
+            previous,
+        } => {
+            let mut params = json!({ "reason": reason, "scope": scope });
+            if let Some(d) = duration_secs {
+                params["duration_secs"] = json!(d);
+            }
+            if let Some(p) = previous {
+                params["previous_declaration_hash"] = json!(p);
+            }
+            let v = client.call("governance_emergency_declare", params).await?;
+            emit(fmt, &v, || {
+                let r: GovEmergencyActionResult = parse(&v)?;
+                Ok(format!(
+                    "declaration {} ({})",
+                    r.declaration_hash,
+                    if r.active {
+                        "active"
+                    } else {
+                        "pending co-signatures"
+                    }
+                ))
+            })
+        }
+        GovernanceCmd::EmergencyCosign { declaration_hash } => {
+            let v = client
+                .call(
+                    "governance_emergency_cosign",
+                    json!({ "declaration_hash": declaration_hash }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: GovEmergencyActionResult = parse(&v)?;
+                Ok(format!(
+                    "co-signed {} ({})",
+                    r.declaration_hash,
+                    if r.active { "active" } else { "pending" }
+                ))
+            })
+        }
+        GovernanceCmd::EmergencyLapse { declaration_hash } => {
+            let v = client
+                .call(
+                    "governance_emergency_lapse",
+                    json!({ "declaration_hash": declaration_hash }),
+                )
+                .await?;
+            emit(fmt, &v, || {
+                let r: GovEmergencyActionResult = parse(&v)?;
+                Ok(format!(
+                    "lapse {} raised — co-sign it to end the emergency",
+                    r.declaration_hash
+                ))
+            })
+        }
+        GovernanceCmd::EmergencyStatus => {
+            let v = client
+                .call("governance_emergency_status", json!({}))
+                .await?;
+            emit(fmt, &v, || Ok(render_emergency_status(&v)))
+        }
+        GovernanceCmd::EmergencyReport => {
+            let v = client
+                .call("governance_emergency_report", json!({}))
+                .await?;
+            emit(fmt, &v, || Ok(render_emergency_report(&v)))
+        }
     }
+}
+
+/// Renders the emergency status: the active emergency (if any) and the timeline.
+fn render_emergency_status(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    match v.get("active") {
+        Some(a) if !a.is_null() => {
+            out.push_str(&format!(
+                "ACTIVE emergency: {} — {}\n  scope: {}  expires_at: {}  renewals: {}\n",
+                a["declaration_hash"].as_str().unwrap_or(""),
+                a["reason"].as_str().unwrap_or(""),
+                a["scope"].as_str().unwrap_or(""),
+                a["scheduled_expiry"].as_i64().unwrap_or(0),
+                a["renewal_count"].as_u64().unwrap_or(0),
+            ));
+        }
+        _ => out.push_str("no active emergency\n"),
+    }
+    let history = v["history"].as_array().cloned().unwrap_or_default();
+    if !history.is_empty() {
+        out.push_str(&format!("history ({}):\n", history.len()));
+        for e in history {
+            out.push_str(&format!(
+                "  {} — {} [{}]\n",
+                e["declaration_hash"].as_str().unwrap_or(""),
+                e["reason"].as_str().unwrap_or(""),
+                if e["lapsed"].as_bool().unwrap_or(false) {
+                    "lapsed"
+                } else if e["active"].as_bool().unwrap_or(false) {
+                    "active"
+                } else {
+                    "expired"
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Renders the post-emergency report: each activation, its co-signers, and measures.
+fn render_emergency_report(v: &serde_json::Value) -> String {
+    let activations = v["activations"].as_array().cloned().unwrap_or_default();
+    if activations.is_empty() {
+        return "no emergencies on record".to_string();
+    }
+    let mut out = String::new();
+    for a in activations {
+        let e = &a["emergency"];
+        out.push_str(&format!(
+            "emergency {} — {} (scope: {})\n  activated {} expires {} renewals {}\n",
+            e["declaration_hash"].as_str().unwrap_or(""),
+            e["reason"].as_str().unwrap_or(""),
+            e["scope"].as_str().unwrap_or(""),
+            e["activation_instant"].as_i64().unwrap_or(0),
+            e["scheduled_expiry"].as_i64().unwrap_or(0),
+            e["renewal_count"].as_u64().unwrap_or(0),
+        ));
+        let cosigners = a["cosigners"].as_array().cloned().unwrap_or_default();
+        out.push_str(&format!("  co-signers: {}\n", cosigners.len()));
+        let measures = a["measures"].as_array().cloned().unwrap_or_default();
+        if measures.is_empty() {
+            out.push_str("  measures: none\n");
+        } else {
+            for m in measures {
+                out.push_str(&format!(
+                    "  measure {} — {} (expires {})\n",
+                    m["proposal_id"].as_str().unwrap_or(""),
+                    m["title"].as_str().unwrap_or(""),
+                    m["expires_at"].as_i64().unwrap_or(0),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Dispatches `rrn dispute …` to the daemon's `dispute*` methods.
