@@ -667,7 +667,9 @@ mod tests {
     }
 
     #[test]
-    fn a_vote_after_the_window_closes_is_rejected() {
+    fn a_vote_admitted_after_the_window_closes_is_rejected() {
+        // The window runs on *admission* (T2.1.3): a ballot admitted after the
+        // proposal's close is refused, whatever its `cast_at` claims.
         let db = fresh_db();
         let station = Keypair::generate();
         let (members, proposal) = published_statute(&db, &station, 0);
@@ -675,27 +677,26 @@ mod tests {
 
         let err = append_vote(
             &mut log,
-            vote(
-                &members[1],
-                &proposal,
-                VoteChoice::Yes,
-                proposal.voting_ends_at + 1,
-            ),
+            // An in-window `cast_at`, but admitted after close.
+            vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
-            NOW,
+            proposal.voting_ends_at + 1,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::OutsideVotingWindow { .. }));
     }
 
     #[test]
-    fn a_vote_before_the_window_opens_is_rejected() {
+    fn cast_at_is_testimony_the_window_runs_on_admission() {
+        // A ballot with an out-of-range `cast_at` (before the proposal even
+        // existed) is still counted when *admitted* inside the window: `cast_at`
+        // is testimony, never the gate (ADR-0022 / T2.1.3).
         let db = fresh_db();
         let station = Keypair::generate();
         let (members, proposal) = published_statute(&db, &station, 0);
         let mut log = AppendLog::new(&db);
 
-        let err = append_vote(
+        append_vote(
             &mut log,
             vote(
                 &members[1],
@@ -706,8 +707,12 @@ mod tests {
             &db,
             NOW,
         )
-        .unwrap_err();
-        assert!(matches!(err, VoteError::OutsideVotingWindow { .. }));
+        .expect("a ballot admitted in-window counts regardless of its cast_at");
+        assert_eq!(
+            votes(&log, &proposal.proposal_id, &db).unwrap().len(),
+            1,
+            "the back-dated-cast_at ballot is counted"
+        );
     }
 
     #[test]
@@ -796,20 +801,11 @@ mod tests {
         .unwrap();
 
         // Bypass the guards exactly as replication does: an outsider's ballot, a
-        // ballot out of window, a ballot forged onto another member, and a second
-        // ballot from members[1] must all be dropped by replay.
-        log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW), 0)
+        // ballot forged onto another member, and a second ballot from members[1]
+        // must all be dropped by replay. These are admitted in-window (`now = NOW`,
+        // clamped) and dropped for reasons other than the window.
+        log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW), NOW)
             .unwrap();
-        log.append(
-            vote(
-                &members[2],
-                &proposal,
-                VoteChoice::Yes,
-                proposal.voting_ends_at + 1,
-            ),
-            0,
-        )
-        .unwrap();
         log.append(
             SignedPayload::sign(
                 Vote {
@@ -820,11 +816,18 @@ mod tests {
                 },
                 &members[2], // signer != voter
             ),
-            0,
+            NOW,
         )
         .unwrap();
-        log.append(vote(&members[1], &proposal, VoteChoice::No, NOW), 0)
+        log.append(vote(&members[1], &proposal, VoteChoice::No, NOW), NOW)
             .unwrap();
+        // A ballot *admitted* after the window closes is dropped by the window
+        // (T2.1.3) — appended last so the monotone admission clock is past close.
+        log.append(
+            vote(&members[2], &proposal, VoteChoice::Yes, NOW),
+            proposal.voting_ends_at + 1,
+        )
+        .unwrap();
 
         let ballots = votes(&log, &proposal.proposal_id, &db).unwrap();
         assert_eq!(ballots.len(), 1);
