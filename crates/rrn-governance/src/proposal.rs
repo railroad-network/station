@@ -18,9 +18,11 @@
 //!
 //! Authorship requires standing: the author must be an **established member** —
 //! effective (anchored) composite reputation at or above the Member band
-//! ([`BAND_MEMBER_MIN`]) — as of the proposal's own `created_at` (ADR-0012 § 5).
-//! Reading the gate at the proposal's signed timestamp rather than at append time
-//! is what makes replay deterministic: every station re-derives the same verdict.
+//! ([`BAND_MEMBER_MIN`]) — as of the proposal's **open log position**, the seq at
+//! which the station admitted it (ADR-0012 § 5, ADR-0022 / T2.1.3). Reading the
+//! gate at the admission position rather than the author's self-asserted
+//! `created_at` is what makes replay deterministic *and* unspoofable: a back-dated
+//! timestamp cannot change who was established when the proposal opened.
 //!
 //! A drafted proposal is not yet live. It **publishes** — advances from gathering
 //! endorsements to open for voting — once at least [`DEFAULT_COSIGN_THRESHOLD`]
@@ -31,13 +33,15 @@
 //! # One window: deliberate and vote together (Phase 1)
 //!
 //! Phase 1 runs deliberation and voting as a **single window** (the concurrent
-//! model chosen for M1.9): the window opens at `created_at` and closes at
-//! `voting_ends_at = created_at + window_days`, where `window_days` is the
-//! Charter's `deliberation_window_days` for a statute or admin rule and its
-//! `charter_deliberation_window_days` for an amendment. Members discuss and cast
-//! ballots (T1.9.5) over that one span; there is no separate voting window, and
-//! the frozen Charter carries no field for one. A passed non-emergency proposal
-//! takes effect after `implementation_delay_days` more
+//! model chosen for M1.9): the window opens at the proposal's **admission** and
+//! closes at `voting_ends_at = admitted_at + window_days`, where `window_days` is
+//! the Charter's `deliberation_window_days` for a statute or admin rule and its
+//! `charter_deliberation_window_days` for an amendment. The window is *not* author
+//! testimony and *not* part of the signed proposal (ADR-0022): the station
+//! restates it in a signed [`crate::window::ProposalWindow`] attestation on
+//! admission, and it is populated back onto the [`Proposal`] on replay. Members
+//! discuss and cast ballots (T1.9.5) over that one span. A passed non-emergency
+//! proposal takes effect after `implementation_delay_days` more
 //! ([`Proposal::implementation_at`]); an [`Emergency`](ProposalKind::Emergency)
 //! takes effect immediately on passing (its higher approval bar, not a shorter
 //! window, is what guards abuse — a dedicated emergency window is Phase 2).
@@ -56,16 +60,18 @@ use std::collections::HashSet;
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::Keypair;
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_reputation::model::BAND_MEMBER_MIN;
 use rrn_reputation::scoring::ReputationScorer;
-use rrn_reputation::staking::{grace_electorate, in_grace};
+use rrn_reputation::staking::{grace_electorate_asof, in_grace_asof};
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::charter::{founder_charter, Charter, CharterError, VotingMechanism};
+use crate::window::{build_window, window_and_seq_of};
 
 /// Discriminant carried in the `kind` field of a [`Proposal`]'s canonical CBOR,
 /// so log replay can tell a proposal apart from other records.
@@ -85,14 +91,6 @@ pub const MAX_TITLE_BYTES: usize = 200;
 
 /// Longest a proposal body may be, in bytes. Generous, since the body is markdown.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
-
-/// Seconds in a day, for turning the Charter's day-valued windows into the
-/// second-valued timestamps a proposal carries.
-const SECONDS_PER_DAY: i64 = 86_400;
-
-fn days_to_secs(days: u8) -> i64 {
-    days as i64 * SECONDS_PER_DAY
-}
 
 /// The content address of a proposal: the Blake3 hash of its canonical bytes.
 #[derive(Clone, Copy, PartialEq, Eq, std::hash::Hash, Debug)]
@@ -202,14 +200,18 @@ pub struct Proposal {
     pub body: String,
     /// What the proposal would do.
     pub kind: ProposalKind,
-    /// Unix seconds the proposal was created — the author's clock, and the start
-    /// of its combined deliberation/voting window.
+    /// Unix seconds the proposal was created — the author's clock. **Testimony
+    /// only** (ADR-0022): plausibility-bounded display/evidence, never window
+    /// arithmetic. The window runs from *admission*, not this (T2.1.3).
     pub created_at: i64,
-    /// Unix seconds the window closes. Phase 1 deliberation and voting share this
-    /// one window, so it is both the deliberation end and the voting end.
+    /// Unix seconds the deliberation/voting window closes. **Not signed and not
+    /// author-set**: derived from the station's admission of the proposal and
+    /// carried in the [`crate::window::ProposalWindow`] attestation, populated
+    /// onto this struct by [`find_proposal`] on replay. Zero on a freshly
+    /// constructed or just-decoded proposal until populated.
     pub voting_ends_at: i64,
-    /// Unix seconds a passed proposal takes effect: `voting_ends_at` plus the
-    /// implementation delay, or `voting_ends_at` itself for an emergency.
+    /// Unix seconds a passed proposal takes effect. Same provenance as
+    /// [`voting_ends_at`](Self::voting_ends_at): attestation-derived, not signed.
     pub implementation_at: i64,
 }
 
@@ -228,30 +230,12 @@ impl Proposal {
         body: String,
         kind: ProposalKind,
         created_at: i64,
-        charter: &Charter,
     ) -> Result<Self, ProposalError> {
-        let gs = &charter.governance_structure;
-        let ar = &charter.amendment_rules;
-        let (window_days, impl_delay_days, immediate) = match &kind {
-            ProposalKind::Statute | ProposalKind::AdministrativeRule { .. } => (
-                gs.deliberation_window_days,
-                gs.implementation_delay_days,
-                false,
-            ),
-            ProposalKind::CharterAmendment { .. } => (
-                ar.charter_deliberation_window_days,
-                gs.implementation_delay_days,
-                false,
-            ),
-            ProposalKind::Emergency { .. } => (gs.deliberation_window_days, 0, true),
-        };
-        let voting_ends_at = created_at + days_to_secs(window_days);
-        let implementation_at = if immediate {
-            voting_ends_at
-        } else {
-            voting_ends_at + days_to_secs(impl_delay_days)
-        };
-
+        // The window fields are NOT author-set and NOT part of the signed content
+        // (ADR-0022, T2.1.3): they are derived from the station's *admission* of
+        // this proposal and carried in the station-signed [`crate::window::ProposalWindow`]
+        // attestation, then populated back onto this struct on replay
+        // ([`find_proposal`]). At construction/sign time they are placeholder zeros.
         let mut proposal = Proposal {
             proposal_id: ProposalId(Hash::from_bytes([0u8; 32])),
             author,
@@ -259,8 +243,8 @@ impl Proposal {
             body,
             kind,
             created_at,
-            voting_ends_at,
-            implementation_at,
+            voting_ends_at: 0,
+            implementation_at: 0,
         };
         proposal.validate()?;
         proposal.proposal_id = proposal.compute_id();
@@ -318,8 +302,9 @@ pub struct ProposalCosign {
     /// claim travels inside the signed content: replay checks both, and a record
     /// whose content disagrees with its signature is rejected, not resolved.
     pub cosigner: Address,
-    /// Unix seconds the endorsement was made — the co-signer's clock, and when
-    /// their established-member standing is judged, so replay is deterministic.
+    /// Unix seconds the endorsement was made — the co-signer's clock. **Testimony
+    /// only** (ADR-0022 / T2.1.3): the co-signer's standing is judged at the
+    /// proposal's open log position, not here.
     pub cosigned_at: i64,
 }
 
@@ -332,10 +317,20 @@ pub type SignedCosign = SignedPayload<ProposalCosign>;
 /// authorization and replay can never read the log differently.
 #[derive(Clone, Debug, Default)]
 pub struct ProposalRecords {
-    /// The proposal itself, absent if this log has no valid record of it.
+    /// The proposal itself, absent if this log has no valid record of it. When
+    /// present its window fields (`voting_ends_at`/`implementation_at`) are
+    /// populated from the station's [`crate::window::ProposalWindow`] attestation.
     pub proposal: Option<Proposal>,
     /// The distinct established members who have validly co-signed it.
     pub cosigners: HashSet<Address>,
+    /// The log seq at which the proposal was admitted — its *open* position. The
+    /// electorate (co-sign threshold, voter eligibility, quorum denominator) is
+    /// pinned here (T2.1.3), so nothing admitted later can pack it. `0` when
+    /// `proposal` is absent.
+    pub open_seq: u64,
+    /// The station's admission-clock reading at the proposal's open position. `0`
+    /// when `proposal` is absent.
+    pub open_time: i64,
 }
 
 impl ProposalRecords {
@@ -391,96 +386,94 @@ pub fn phase(records: &ProposalRecords, cosign_threshold: u32, now: i64) -> Opti
     })
 }
 
-/// Whether `address` is an established member as of `at_time`: effective
-/// (anchored) composite reputation at or above the Member band.
-pub(crate) fn is_established(
-    db: &Database,
-    address: &Address,
-    at_time: i64,
-) -> Result<bool, ProposalError> {
-    Ok(composite_at(db, address, at_time)? >= BAND_MEMBER_MIN)
-}
-
 /// The genesis founders named in the published founder Charter, or empty if no
 /// Charter has been published yet. Resolved once per replay and threaded into
-/// [`is_eligible`] so a below-band check does not re-scan the log per entry.
+/// [`is_eligible_asof`] so a below-band check does not re-scan the log per entry.
 pub(crate) fn founder_set(db: &Database) -> Result<Vec<Address>, ProposalError> {
     Ok(founder_charter(db)?
         .map(|c| c.charter().founders.clone())
         .unwrap_or_default())
 }
 
-/// Whether `address` may act in governance as of `at_time` (ADR-0015): the
-/// grace-aware electorate test that replaces the bare established-member gate for
-/// authoring, co-signing, and voting.
+/// The co-sign threshold in force for a proposal opened at `(open_time, open_seq)`
+/// (ADR-0015 § 3, position-pinned per T2.1.3).
 ///
-/// An established member always qualifies. While the community is in bootstrap
-/// grace ([`in_grace`]), a genesis `founder` also qualifies even below the Member
-/// band — the union `rrn_reputation::staking::grace_electorate` materializes,
-/// evaluated one address at a time. Once grace ends, only the established test
-/// remains, so founders who never earned standing drop out on their own.
-///
-/// `founders` is supplied by the caller (from [`founder_set`]); `is_established`
-/// is checked first so the steady-state path never pays for the grace lookup.
-pub(crate) fn is_eligible(
+/// Outside bootstrap grace this is the configured [`DEFAULT_COSIGN_THRESHOLD`].
+/// **During grace** it clamps down to the number of *other* eligible members — the
+/// grace electorate as of the proposal's *open* log position, minus one for the
+/// author, who cannot co-sign their own motion — so a founder set too small to
+/// field the full threshold (a solo- or two-founder genesis) is not deadlocked by
+/// a bar it can never clear. A one-member community publishes with zero
+/// co-signers; the threshold only relaxes downward, never above the configured
+/// value. Judging the electorate at the open position (not the author clock) keeps
+/// the threshold replica-deterministic and unpackable after the proposal opens.
+pub fn effective_cosign_threshold(
+    db: &Database,
+    open_time: i64,
+    open_seq: u64,
+) -> Result<u32, ProposalError> {
+    if !in_grace_asof(db, open_time, open_seq)? {
+        return Ok(DEFAULT_COSIGN_THRESHOLD);
+    }
+    let electorate =
+        grace_electorate_asof(db, &founder_set(db)?, open_time, open_seq)?.len() as u32;
+    Ok(DEFAULT_COSIGN_THRESHOLD.min(electorate.saturating_sub(1)))
+}
+
+/// The composite reputation `address` held at `at_time`, computed from the log
+/// prefix `[1, max_seq]` (T2.1.3) — the composite as it stood at a window's *open*
+/// log position, so evidence admitted after it cannot change the reading whatever
+/// timestamp it claims. Used for the rich error the write path reports when the
+/// established-member gate refuses. `max_seq == u64::MAX` is the whole log.
+pub(crate) fn composite_at_position(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    max_seq: u64,
+) -> Result<f32, ProposalError> {
+    Ok(ReputationScorer::new(db)
+        .score_at_position(address, at_time, max_seq)?
+        .composite())
+}
+
+/// [`is_eligible`] pinned at a log *position* (T2.1.3, ADR-0022 §5): whether
+/// `address` was in the governing electorate as of the prefix `[1, max_seq]` at
+/// `at_time` — an established member then, or a genesis `founder` while the
+/// community was in bootstrap grace then. Governance judges every actor
+/// (author, co-signer, voter) at the proposal's open position, so no standing
+/// manufactured after a proposal opens can enter its electorate.
+pub(crate) fn is_eligible_asof(
     db: &Database,
     founders: &[Address],
     address: &Address,
     at_time: i64,
+    max_seq: u64,
 ) -> Result<bool, ProposalError> {
-    if is_established(db, address, at_time)? {
+    if composite_at_position(db, address, at_time, max_seq)? >= BAND_MEMBER_MIN {
         return Ok(true);
     }
-    Ok(in_grace(db, at_time)? && founders.contains(address))
-}
-
-/// The co-sign threshold in force for `proposal` (ADR-0015 § 3).
-///
-/// Outside bootstrap grace this is the configured [`DEFAULT_COSIGN_THRESHOLD`].
-/// **During grace** it clamps down to the number of *other* eligible members —
-/// the grace electorate at the proposal's `created_at`, minus one for the author,
-/// who cannot co-sign their own motion — so a founder set too small to field the
-/// full threshold (a solo- or two-founder genesis) is not deadlocked by a bar it
-/// can never clear. A one-member community publishes with zero co-signers; the
-/// threshold only relaxes downward, never above the configured value.
-pub fn effective_cosign_threshold(
-    db: &Database,
-    proposal: &Proposal,
-) -> Result<u32, ProposalError> {
-    if !in_grace(db, proposal.created_at)? {
-        return Ok(DEFAULT_COSIGN_THRESHOLD);
-    }
-    let electorate = grace_electorate(db, &founder_set(db)?, proposal.created_at)?.len() as u32;
-    Ok(DEFAULT_COSIGN_THRESHOLD.min(electorate.saturating_sub(1)))
-}
-
-/// The composite reputation `address` holds as of `at_time`, also used for the
-/// rich error the write path reports when the established-member gate refuses.
-pub(crate) fn composite_at(
-    db: &Database,
-    address: &Address,
-    at_time: i64,
-) -> Result<f32, ProposalError> {
-    Ok(ReputationScorer::new(db)
-        .score(address, at_time)?
-        .composite())
+    Ok(in_grace_asof(db, at_time, max_seq)? && founders.contains(address))
 }
 
 /// Finds a proposal's authorized record without caring about its co-signatures.
 ///
 /// Skips any entry that is not a proposal, one whose id does not match, one not
-/// signed by its own author, one that breaks its own rules, and one whose author
-/// was not an established member as of its `created_at` — the same gate
-/// [`append_proposal`] applies, so replay reaches the write path's verdict.
+/// signed by its own author, one that breaks its own rules, one with no station
+/// window attestation yet, and one whose author was not an established member as of
+/// its **open position** — the same gate [`append_proposal`] applies, so replay
+/// reaches the write path's verdict. Returns the authorized proposal with its
+/// window fields populated from the station attestation, plus its *open* position
+/// `(open_seq, open_time)` — the attestation's seq and attested admission instant
+/// (ADR-0022 / T2.1.3), never the author's `created_at`.
 fn find_proposal(
     log: &AppendLog,
     proposal_id: &ProposalId,
     db: &Database,
-) -> Result<Option<Proposal>, ProposalError> {
+) -> Result<Option<(Proposal, u64, i64)>, ProposalError> {
     let founders = founder_set(db)?;
     for entry in log.iter_from(1) {
         let entry = entry?;
-        let Ok(proposal) = from_canonical_bytes::<Proposal>(&entry.payload.bytes) else {
+        let Ok(mut proposal) = from_canonical_bytes::<Proposal>(&entry.payload.bytes) else {
             continue;
         };
         if proposal.proposal_id != *proposal_id {
@@ -492,10 +485,28 @@ fn find_proposal(
         if proposal.validate().is_err() {
             continue;
         }
-        if !is_eligible(db, &founders, &proposal.author, proposal.created_at)? {
+        // The window comes from the station's signed attestation, the one
+        // replica-identical statement of this proposal's admission (ADR-0022 §1).
+        // A proposal with no attestation is not yet windowed — not authorized to
+        // read — so skip it rather than fall back to this replica's re-stamped
+        // `entry.created_at`, which differs per replica and would split the derived
+        // window, electorate, and outcome across replicas (T2.1.3 acceptance 1).
+        let Some((w, open_seq)) = window_and_seq_of(log, proposal_id) else {
+            continue;
+        };
+        proposal.voting_ends_at = w.voting_ends_at;
+        proposal.implementation_at = w.implementation_at;
+        // The proposal's open position is the *attestation's* seq (ADR-0022 §5,
+        // "the attestation's log seq") and the station-attested admission instant —
+        // never `entry.created_at`, which each replica re-stamps on receipt, nor the
+        // author's own proposal entry (a peer can pre-inject those bytes early, but
+        // not forge the station's attestation). The author must have been eligible
+        // at that open position.
+        let open_time = w.admitted_at;
+        if !is_eligible_asof(db, &founders, &proposal.author, open_time, open_seq)? {
             continue;
         }
-        return Ok(Some(proposal));
+        return Ok(Some((proposal, open_seq, open_time)));
     }
     Ok(None)
 }
@@ -512,7 +523,7 @@ pub fn proposal_records(
     proposal_id: &ProposalId,
     db: &Database,
 ) -> Result<ProposalRecords, ProposalError> {
-    let Some(proposal) = find_proposal(log, proposal_id, db)? else {
+    let Some((proposal, open_seq, open_time)) = find_proposal(log, proposal_id, db)? else {
         return Ok(ProposalRecords::default());
     };
     let author = proposal.author;
@@ -533,7 +544,10 @@ pub fn proposal_records(
         if cosign.cosigner == author {
             continue;
         }
-        if !is_eligible(db, &founders, &cosign.cosigner, cosign.cosigned_at)? {
+        // Eligibility is pinned at the proposal's open position (T2.1.3): the
+        // co-signing electorate is frozen when the proposal opens, so standing
+        // manufactured during the window does not admit a co-signer.
+        if !is_eligible_asof(db, &founders, &cosign.cosigner, open_time, open_seq)? {
             continue;
         }
         cosigners.insert(cosign.cosigner);
@@ -542,6 +556,8 @@ pub fn proposal_records(
     Ok(ProposalRecords {
         proposal: Some(proposal),
         cosigners,
+        open_seq,
+        open_time,
     })
 }
 
@@ -549,8 +565,9 @@ pub fn proposal_records(
 /// appearing once.
 ///
 /// Applies the same authorization the [`find_proposal`] read path does — self-
-/// signed by its author, valid by its own rules, author established as of
-/// `created_at` — so a gossiped entry that dodged the guards is not returned. The
+/// signed by its author, valid by its own rules, carrying a station window
+/// attestation, author established as of its open position — so a gossiped entry
+/// that dodged the guards is not returned. The
 /// enactment sweep ([`crate::lifecycle::enact_due`]) walks this to find the passed
 /// proposals it is due to put into force.
 pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, ProposalError> {
@@ -559,7 +576,7 @@ pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, Pr
     let mut proposals = Vec::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
-        let Ok(proposal) = from_canonical_bytes::<Proposal>(&entry.payload.bytes) else {
+        let Ok(mut proposal) = from_canonical_bytes::<Proposal>(&entry.payload.bytes) else {
             continue;
         };
         if Address::from_public_key(entry.payload.signer) != proposal.author {
@@ -568,7 +585,18 @@ pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, Pr
         if proposal.validate().is_err() {
             continue;
         }
-        if !is_eligible(db, &founders, &proposal.author, proposal.created_at)? {
+        // The window (and the admission instant it carries) comes from the station
+        // attestation, never this replica's re-stamped `created_at`; a proposal
+        // with no attestation is not yet windowed and is not returned (T2.1.3).
+        let Some((w, open_seq)) = window_and_seq_of(log, &proposal.proposal_id) else {
+            continue;
+        };
+        proposal.voting_ends_at = w.voting_ends_at;
+        proposal.implementation_at = w.implementation_at;
+        // Author eligibility at the proposal's open position: the attestation's seq
+        // and the attested admission instant (ADR-0022 §5, T2.1.3).
+        let open_time = w.admitted_at;
+        if !is_eligible_asof(db, &founders, &proposal.author, open_time, open_seq)? {
             continue;
         }
         if seen.insert(proposal.proposal_id) {
@@ -578,15 +606,22 @@ pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, Pr
     Ok(proposals)
 }
 
-/// Publishes an author's proposal: appends the author-signed [`Proposal`].
+/// Publishes an author's proposal: appends the author-signed [`Proposal`], then
+/// the station-signed [`crate::window::ProposalWindow`] attestation that anchors
+/// its window on this admission (ADR-0022 / T2.1.3).
 ///
 /// Rejects a proposal whose signer is not its author, one that breaks its own
-/// rules, one whose author is not an established member as of its `created_at`,
-/// and one already on this log.
+/// rules, one whose author was not eligible at the proposal's *open* position, and
+/// one already on this log. `charter` is the effective Charter the window is
+/// computed against (the caller resolves it — governance unit tests pass a fixture
+/// directly, the station resolves [`crate::tally::effective_charter`]). Returns the
+/// proposal's own log entry.
 pub fn append_proposal(
     log: &mut AppendLog,
     signed: SignedProposal,
     db: &Database,
+    station: &Keypair,
+    charter: &Charter,
     now: i64,
 ) -> Result<LogEntry, ProposalError> {
     let proposal = &signed.payload;
@@ -598,16 +633,31 @@ pub fn append_proposal(
         });
     }
     proposal.validate()?;
-    if !is_eligible(db, &founder_set(db)?, &proposal.author, proposal.created_at)? {
+    // The proposal's open position is the admission it is about to receive: the
+    // next seq, at the monotone-clamped admission time. Eligibility is judged
+    // there, matching the replay path (find_proposal), not the author's clock.
+    let (open_seq, open_time) = match log.tail()? {
+        Some(t) => (t.seq + 1, now.max(t.created_at)),
+        None => (1, now),
+    };
+    if !is_eligible_asof(db, &founder_set(db)?, &proposal.author, open_time, open_seq)? {
         return Err(ProposalError::AuthorNotEstablished {
             author: proposal.author,
-            composite: composite_at(db, &proposal.author, proposal.created_at)?,
+            composite: composite_at_position(db, &proposal.author, open_time, open_seq)?,
         });
     }
     if find_proposal(log, &proposal.proposal_id, db)?.is_some() {
         return Err(ProposalError::AlreadyProposed(proposal.proposal_id));
     }
-    Ok(log.append(signed, now)?)
+    let proposal_id = proposal.proposal_id;
+    let kind = proposal.kind.clone();
+    let entry = log.append(signed, now)?;
+    // Restate the admission-anchored window in a station-signed record so the
+    // window is replica-identical (ADR-0022 §1). Its admission time is the
+    // proposal's own admission (entry.created_at == open_time).
+    let window = build_window(station, proposal_id, &kind, charter, entry.created_at);
+    log.append(window, now)?;
+    Ok(entry)
 }
 
 /// Records a member's endorsement of a proposal: appends the co-signer's signed
@@ -638,10 +688,13 @@ pub fn append_cosign(
     if cosign.cosigner == proposal.author {
         return Err(ProposalError::AuthorCannotCosign);
     }
-    if !is_eligible(db, &founder_set(db)?, &cosign.cosigner, cosign.cosigned_at)? {
+    // Co-signer eligibility is pinned at the proposal's open position (T2.1.3),
+    // the same electorate replay counts, not the co-signer's own clock.
+    let (open_seq, open_time) = (records.open_seq, records.open_time);
+    if !is_eligible_asof(db, &founder_set(db)?, &cosign.cosigner, open_time, open_seq)? {
         return Err(ProposalError::CosignerNotEstablished {
             cosigner: cosign.cosigner,
-            composite: composite_at(db, &cosign.cosigner, cosign.cosigned_at)?,
+            composite: composite_at_position(db, &cosign.cosigner, open_time, open_seq)?,
         });
     }
     if records.cosigners.contains(&cosign.cosigner) {
@@ -806,8 +859,11 @@ impl From<Proposal> for CBOR {
         m.insert("body", p.body);
         m.insert("proposal_kind", p.kind);
         m.insert("created_at", p.created_at);
-        m.insert("voting_ends_at", p.voting_ends_at);
-        m.insert("implementation_at", p.implementation_at);
+        // `voting_ends_at`/`implementation_at` are deliberately NOT in the signed
+        // content (T2.1.3): the window is not author testimony but a function of
+        // the station's admission time, restated in the signed ProposalWindow
+        // attestation. Including them would sign author-clock arithmetic and hash
+        // it into `proposal_id`.
         m.into()
     }
 }
@@ -829,8 +885,9 @@ impl TryFrom<CBOR> for Proposal {
             body: map.extract::<&str, String>("body")?,
             kind: map.extract::<&str, ProposalKind>("proposal_kind")?,
             created_at: map.extract::<&str, i64>("created_at")?,
-            voting_ends_at: map.extract::<&str, i64>("voting_ends_at")?,
-            implementation_at: map.extract::<&str, i64>("implementation_at")?,
+            // Not signed; populated from the ProposalWindow attestation on replay.
+            voting_ends_at: 0,
+            implementation_at: 0,
         };
         proposal.proposal_id = proposal.compute_id();
         Ok(proposal)
@@ -995,15 +1052,38 @@ mod tests {
     }
 
     fn statute(author: &Keypair, at: i64) -> Proposal {
-        Proposal::new(
+        let p = Proposal::new(
             addr(author),
             "Quiet hours in the workshop".into(),
             "No power tools after 9pm.".into(),
             ProposalKind::Statute,
             at,
-            &test_charter(),
         )
-        .unwrap()
+        .unwrap();
+        with_window(p, at)
+    }
+
+    /// Populates a test proposal's window cache the way the station attestation
+    /// will, using the default charter at admission time `at`. Tests append at
+    /// `at`, so `admitted_at == at` and this matches the on-log attestation —
+    /// letting tests keep reading `proposal.voting_ends_at` on the built object.
+    fn with_window(mut p: Proposal, at: i64) -> Proposal {
+        let (v, i) = crate::window::window_for(&test_charter(), &p.kind, at);
+        p.voting_ends_at = v;
+        p.implementation_at = i;
+        p
+    }
+
+    /// Test helper: a drop-in for the old `propose(log, signed, db, at)`
+    /// that supplies a station keypair and the default test charter (the window
+    /// attestation's signer is not verified in replay, so a fresh key is fine).
+    fn propose(
+        log: &mut AppendLog,
+        signed: SignedProposal,
+        db: &Database,
+        at: i64,
+    ) -> Result<LogEntry, ProposalError> {
+        append_proposal(log, signed, db, &Keypair::generate(), &test_charter(), at)
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedCosign {
@@ -1027,7 +1107,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1046,7 +1126,7 @@ mod tests {
         let newcomer = Keypair::generate(); // no standing at all
         let mut log = AppendLog::new(&db);
 
-        let err = append_proposal(
+        let err = propose(
             &mut log,
             SignedPayload::sign(statute(&newcomer, NOW), &newcomer),
             &db,
@@ -1066,7 +1146,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         // Honestly authored by members[0] but signed by members[1].
-        let err = append_proposal(
+        let err = propose(
             &mut log,
             SignedPayload::sign(statute(&members[0], NOW), &members[1]),
             &db,
@@ -1088,7 +1168,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1136,7 +1216,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1173,7 +1253,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1200,7 +1280,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1221,7 +1301,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1243,7 +1323,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1277,15 +1357,14 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
             NOW,
         )
         .unwrap();
-        let err = append_proposal(&mut log, SignedPayload::sign(proposal, &author), &db, NOW)
-            .unwrap_err();
+        let err = propose(&mut log, SignedPayload::sign(proposal, &author), &db, NOW).unwrap_err();
         assert!(matches!(err, ProposalError::AlreadyProposed(_)));
     }
 
@@ -1299,7 +1378,7 @@ mod tests {
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -1331,63 +1410,6 @@ mod tests {
     // --- Model: windows, id, CBOR --------------------------------------------
 
     #[test]
-    fn windows_follow_the_charter_per_kind() {
-        let author = Keypair::generate();
-        let charter = test_charter();
-        let gs = charter.governance_structure.clone();
-        let ar = charter.amendment_rules.clone();
-        let at = NOW;
-
-        let s = Proposal::new(
-            addr(&author),
-            "t".into(),
-            "b".into(),
-            ProposalKind::Statute,
-            at,
-            &charter,
-        )
-        .unwrap();
-        assert_eq!(
-            s.voting_ends_at,
-            at + days_to_secs(gs.deliberation_window_days)
-        );
-        assert_eq!(
-            s.implementation_at,
-            s.voting_ends_at + days_to_secs(gs.implementation_delay_days)
-        );
-
-        let amendment = Proposal::new(
-            addr(&author),
-            "t".into(),
-            "b".into(),
-            ProposalKind::CharterAmendment {
-                new_charter: test_charter(),
-            },
-            at,
-            &charter,
-        )
-        .unwrap();
-        assert_eq!(
-            amendment.voting_ends_at,
-            at + days_to_secs(ar.charter_deliberation_window_days)
-        );
-
-        // An emergency takes effect the instant it passes — no implementation delay.
-        let emergency = Proposal::new(
-            addr(&author),
-            "t".into(),
-            "b".into(),
-            ProposalKind::Emergency {
-                expires_at: at + MONTH,
-            },
-            at,
-            &charter,
-        )
-        .unwrap();
-        assert_eq!(emergency.implementation_at, emergency.voting_ends_at);
-    }
-
-    #[test]
     fn the_proposal_id_is_the_content_hash_and_is_not_signed() {
         let author = Keypair::generate();
         let proposal = statute(&author, NOW);
@@ -1411,7 +1433,6 @@ mod tests {
             "No power tools after 9pm.".into(),
             ProposalKind::Statute,
             NOW,
-            &test_charter(),
         )
         .unwrap();
         assert_ne!(a.proposal_id, b.proposal_id);
@@ -1432,15 +1453,8 @@ mod tests {
                 expires_at: NOW + MONTH,
             },
         ] {
-            let proposal = Proposal::new(
-                addr(&author),
-                "Title".into(),
-                "Body.".into(),
-                kind,
-                NOW,
-                &test_charter(),
-            )
-            .unwrap();
+            let proposal =
+                Proposal::new(addr(&author), "Title".into(), "Body.".into(), kind, NOW).unwrap();
             let back: Proposal =
                 from_canonical_bytes(&to_canonical_bytes(proposal.clone())).unwrap();
             assert_eq!(proposal, back);
@@ -1458,7 +1472,6 @@ mod tests {
     #[test]
     fn a_proposal_must_have_a_title_and_body() {
         let author = Keypair::generate();
-        let charter = test_charter();
         assert!(matches!(
             Proposal::new(
                 addr(&author),
@@ -1466,7 +1479,6 @@ mod tests {
                 "b".into(),
                 ProposalKind::Statute,
                 NOW,
-                &charter
             ),
             Err(ProposalError::EmptyTitle)
         ));
@@ -1477,7 +1489,6 @@ mod tests {
                 "".into(),
                 ProposalKind::Statute,
                 NOW,
-                &charter
             ),
             Err(ProposalError::EmptyBody)
         ));

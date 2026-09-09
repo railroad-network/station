@@ -398,9 +398,26 @@ pub struct LedgerSnapshot {
 impl LedgerSnapshot {
     /// Replays the whole log into a snapshot.
     pub fn derive(log: &AppendLog) -> Result<Self> {
+        Self::derive_to(log, u64::MAX)
+    }
+
+    /// Replays the log prefix `[1, max_seq]` into a snapshot — the ledger state as
+    /// it stood at that log *position*.
+    ///
+    /// Used by position-bounded reputation scoring (T2.1.3): pinning an electorate
+    /// at a log position means every derived input — settlements, confirmations,
+    /// disputes — must also stop at that position, so evidence admitted later
+    /// cannot leak into a pinned score however old its self-asserted timestamp is.
+    /// Entries arrive in ascending `seq` (`iter_from`), so the scan stops at the
+    /// first entry past the bound.
+    pub fn derive_to(log: &AppendLog, max_seq: u64) -> Result<Self> {
         let mut snapshot = LedgerSnapshot::default();
         for entry in log.iter_from(1) {
-            snapshot.apply(&entry?)?;
+            let entry = entry?;
+            if entry.seq > max_seq {
+                break;
+            }
+            snapshot.apply(&entry)?;
         }
         Ok(snapshot)
     }

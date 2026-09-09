@@ -2699,15 +2699,8 @@ impl Core {
             .map_err(internal)?
             .ok_or_else(|| invalid_params("no charter published; run governance charter-init"))?;
         let kind = parse_proposal_kind(&params)?;
-        let proposal = Proposal::new(
-            self.wallet.address,
-            params.title,
-            params.body,
-            kind,
-            now,
-            &charter,
-        )
-        .map_err(|e| invalid_params(e.to_string()))?;
+        let proposal = Proposal::new(self.wallet.address, params.title, params.body, kind, now)
+            .map_err(|e| invalid_params(e.to_string()))?;
         let proposal_id = proposal.proposal_id.to_string();
 
         let mut log = AppendLog::new(&self.db);
@@ -2715,6 +2708,8 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(proposal, &station),
             &self.db,
+            &station,
+            &charter,
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
@@ -3065,8 +3060,15 @@ impl Core {
         }
         let proposal_id = signed.payload.proposal_id.to_string();
         let now = self.clock.now();
+        // The window attestation is computed against the effective Charter at
+        // admission (ADR-0022 / T2.1.3); without a published Charter there is no
+        // window to anchor, so governance is not yet operable.
+        let charter = effective_charter(&self.db)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+            .ok_or((rpc::INVALID_PARAMS, "no Charter has been published".into()))?;
+        let station = self.station_keypair();
         let mut log = AppendLog::new(&self.db);
-        append_proposal(&mut log, signed, &self.db, now)
+        append_proposal(&mut log, signed, &self.db, &station, &charter, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "proposal_id": proposal_id }))
     }
@@ -3840,6 +3842,16 @@ impl Core {
             // inbound SMS sender registry from the log (T2.7.1). Handled off to the
             // side and returned early; it never touches the ledger engine below.
             Some(KIND_SMS_BINDING) => return self.admit_sms_binding(bytes, signer, signature, now),
+            // Governance records ride DTN like any member record (ADR-0020): a
+            // proposal, co-signature, or ballot authored offline is admitted on
+            // arrival through the same append guards the live RPC uses, so windows
+            // and eligibility run on this admission (T2.1.3). They do not touch the
+            // ledger engine, so each returns its own disposition early.
+            Some(KIND_GOV_PROPOSAL) => {
+                return self.admit_gov_proposal(bytes, signer, signature, now)
+            }
+            Some(KIND_GOV_COSIGN) => return self.admit_gov_cosign(bytes, signer, signature, now),
+            Some(KIND_GOV_VOTE) => return self.admit_gov_vote(bytes, signer, signature, now),
             _ => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
         };
 
@@ -3943,6 +3955,104 @@ impl Core {
                     "append_raw reported a duplicate binding absent from the log".into(),
                 )),
             },
+        }
+    }
+
+    /// The idempotent `known` disposition for a governance record already on the
+    /// log: a benign re-carriage (ADR-0020), reported with its admission seq.
+    fn gov_known(&self, bytes: &[u8]) -> Result<Disposition, BundleIngestError> {
+        match AppendLog::new(&self.db)
+            .admission_of(&Hash::of(bytes))
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+        {
+            Some((seq, _)) => Ok(Disposition::Known { seq }),
+            None => Ok(refused_disposition(RefusalReason::Rejected)),
+        }
+    }
+
+    /// Admits a DTN-carried governance [`Proposal`] through the same append guard
+    /// the RPC uses, anchoring its window on this admission (T2.1.3). Needs a
+    /// published Charter for the window attestation; without one governance is not
+    /// yet operable, so the record is `unroutable-kind` rather than rejected.
+    fn admit_gov_proposal(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<Proposal>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        let Some(charter) =
+            effective_charter(&self.db).map_err(|e| BundleIngestError::Internal(e.to_string()))?
+        else {
+            return Ok(refused_disposition(RefusalReason::UnroutableKind));
+        };
+        let station = self.station_keypair();
+        let mut log = AppendLog::new(&self.db);
+        match append_proposal(&mut log, signed, &self.db, &station, &charter, now) {
+            Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            Err(rrn_governance::proposal::ProposalError::AlreadyProposed(_)) => {
+                self.gov_known(bytes)
+            }
+            Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
+        }
+    }
+
+    /// Admits a DTN-carried [`ProposalCosign`] through the RPC's append guard.
+    fn admit_gov_cosign(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<ProposalCosign>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        let mut log = AppendLog::new(&self.db);
+        match append_cosign(&mut log, signed, &self.db, now) {
+            Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            Err(rrn_governance::proposal::ProposalError::AlreadyCosigned { .. }) => {
+                self.gov_known(bytes)
+            }
+            Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
+        }
+    }
+
+    /// Admits a DTN-carried [`Vote`] through the RPC's append guard; the ballot's
+    /// voting window runs on this admission (T2.1.3).
+    fn admit_gov_vote(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<Vote>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        let mut log = AppendLog::new(&self.db);
+        match append_vote(&mut log, signed, &self.db, now) {
+            Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            Err(rrn_governance::vote::VoteError::AlreadyVoted { .. }) => self.gov_known(bytes),
+            Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
         }
     }
 
@@ -5404,6 +5514,12 @@ const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
 /// the log (a cache, never authoritative). Admitted via the normal DTN path so a
 /// member can register a number over any carrier.
 const KIND_SMS_BINDING: &str = rrn_protocol::binding::SMS_BINDING_KIND;
+// Governance record kinds carried over DTN (T2.1.3); the strings mirror the
+// `pub(crate)` discriminators in `rrn-governance` (a proposal, its co-signature,
+// and a ballot).
+const KIND_GOV_PROPOSAL: &str = "rrn.gov.proposal";
+const KIND_GOV_COSIGN: &str = "rrn.gov.proposal_cosign";
+const KIND_GOV_VOTE: &str = "rrn.gov.vote";
 
 /// Why an ingest could not produce a receipt at all (as opposed to a per-record
 /// refusal, which *is* part of a receipt). A malformed bundle is the caller's
@@ -6818,6 +6934,94 @@ mod tests {
             -300
         );
         assert_eq!(ledger_view::balance_of(&core.db, &bob_addr).unwrap(), 300);
+    }
+
+    /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle (acceptance 3,
+    /// T2.1.3). A founder signs a statute proposal and a ballot offline; the station
+    /// admits each from an ingested bundle through `admit_gov_proposal` /
+    /// `admit_gov_vote` — no live governance RPC — writing the station-signed window
+    /// attestation on admission. The window and the counted ballot both anchor on
+    /// admission, so the statute carries.
+    #[test]
+    fn dtn_governance_proposal_and_vote_route_end_to_end() {
+        let mut core = test_core(); // clock = 1000
+                                    // A phone-held founder: signs governance records offline, submits over DTN.
+                                    // Sole founder ⇒ bootstrap grace lets it publish and carry a statute alone
+                                    // (ADR-0015), so no co-signers are needed to drive the end-to-end path.
+        let founder = Keypair::generate();
+        call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({
+                "community_id": "commons",
+                "founder_secrets_hex": [hex(&founder.secret_key().to_bytes())],
+            }),
+        );
+
+        // Authored offline at 900 (testimony); the window will anchor on *admission*.
+        let proposal = Proposal::new(
+            Address::from_public_key(founder.public_key()),
+            "Quiet hours in the workshop".into(),
+            "No power tools after 9pm.".into(),
+            ProposalKind::Statute,
+            900,
+        )
+        .unwrap();
+        let signed_proposal = SignedPayload::sign(proposal.clone(), &founder);
+        let e_prop = outbox_entry(&founder, 0, zero(), &signed_proposal, 900);
+
+        let receipt = submit_bundle(&mut core, std::slice::from_ref(&e_prop), 1000);
+        assert!(
+            matches!(
+                receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the DTN-carried proposal is admitted through admit_gov_proposal"
+        );
+
+        // It rode DTN onto queryable governance state, published under grace, and its
+        // window anchored on admission (1000), not the authored-at 900.
+        let listed = call(&mut core, "governance_proposals", serde_json::json!({}));
+        let rows = listed["proposals"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["proposal_id"], proposal.proposal_id.to_string());
+        assert_eq!(rows[0]["published"], true);
+        assert_eq!(
+            rows[0]["voting_ends_at"].as_i64().unwrap(),
+            1000 + 7 * 86_400,
+            "the window runs from admission, not the authored-at timestamp"
+        );
+
+        // The founder votes Yes offline; a second bundle carries the ballot, chained
+        // at outbox position 1. Admit it within the admission-anchored window.
+        core.clock.advance(3600); // clock = 4600, still inside the window
+        let ballot = Vote {
+            proposal_id: proposal.proposal_id,
+            voter: Address::from_public_key(founder.public_key()),
+            choice: VoteChoice::Yes,
+            cast_at: 4600,
+        };
+        let signed_vote = SignedPayload::sign(ballot, &founder);
+        let e_vote = outbox_entry(&founder, 1, e_prop.payload.entry_hash(), &signed_vote, 4600);
+        let assembled_at = core.clock.now();
+        let vote_receipt = submit_bundle(&mut core, &[e_vote], assembled_at);
+        assert!(
+            matches!(
+                vote_receipt.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the DTN-carried ballot is admitted through admit_gov_vote"
+        );
+
+        // Past the close, the statute has carried on the strength of the DTN ballot.
+        core.clock.advance(7 * 86_400); // clock = 4600 + 7d, past voting_ends_at
+        let detail = call(
+            &mut core,
+            "governance_proposal",
+            serde_json::json!({ "proposal_id": proposal.proposal_id.to_string() }),
+        );
+        assert_eq!(detail["tally"]["yes"], 1);
+        assert_eq!(detail["tally"]["outcome"], "passed");
     }
 
     /// Issues a headroom certificate for `member` through the engine (the live,
@@ -9198,7 +9402,9 @@ mod tests {
             "governance_init_charter",
             serde_json::json!({ "community_id": "commons" }),
         );
-        let charter = effective_charter(&core.db).unwrap().unwrap();
+        // A Charter is published (the station derives the proposal's window from
+        // it on admission; the author no longer signs the window, T2.1.3).
+        assert!(effective_charter(&core.db).unwrap().is_some());
 
         // member[0] authors a statute over the mobile channel.
         let proposal = Proposal::new(
@@ -9207,7 +9413,6 @@ mod tests {
             "No power tools after 9pm.".into(),
             ProposalKind::Statute,
             TEN_MONTHS,
-            &charter,
         )
         .unwrap();
         let pid = proposal.proposal_id.to_string();

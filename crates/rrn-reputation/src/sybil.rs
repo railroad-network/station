@@ -162,7 +162,20 @@ fn allowance(from_time: i64, to_time: i64) -> f32 {
 /// Whether `address` has been vouched for by a member established enough to
 /// anchor it.
 pub fn is_anchored(db: &Database, address: &Address, at_time: i64) -> Result<bool> {
-    Ok(anchoring_voucher(db, address, at_time)?.is_some())
+    is_anchored_bounded(db, address, at_time, u64::MAX)
+}
+
+/// Like [`is_anchored`], but only vouches (and voucher evidence) admitted within
+/// the log prefix `[1, max_seq]` count — the position-bounded form T2.1.3 uses so
+/// a back-dated anchoring vouch admitted after a window closes cannot retroactively
+/// anchor a member into a pinned electorate.
+pub fn is_anchored_bounded(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    max_seq: u64,
+) -> Result<bool> {
+    Ok(anchoring_voucher_bounded(db, address, at_time, max_seq)?.is_some())
 }
 
 /// The member whose vouch anchors `address`, if any: the first, in log order, to
@@ -192,11 +205,26 @@ pub fn anchoring_voucher(
     address: &Address,
     at_time: i64,
 ) -> Result<Option<Address>> {
+    anchoring_voucher_bounded(db, address, at_time, u64::MAX)
+}
+
+/// Like [`anchoring_voucher`], but only vouches admitted within the log prefix
+/// `[1, max_seq]` are considered, and the voucher's composite is judged from the
+/// same bounded prefix (T2.1.3). `max_seq == u64::MAX` is the unbounded form.
+pub fn anchoring_voucher_bounded(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    max_seq: u64,
+) -> Result<Option<Address>> {
     let log = AppendLog::new(db);
     let scorer = ReputationScorer::new(db);
 
     for entry in log.iter_from(1) {
         let entry = entry?;
+        if entry.seq > max_seq {
+            break;
+        }
         let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) else {
             continue;
         };
@@ -209,7 +237,11 @@ pub fn anchoring_voucher(
         if voucher == *address {
             continue;
         }
-        if scorer.score_raw_at(&voucher, at_time)?.composite() >= ANCHOR_VOUCHER_MIN_COMPOSITE {
+        if scorer
+            .score_raw_at_bounded(&voucher, at_time, max_seq)?
+            .composite()
+            >= ANCHOR_VOUCHER_MIN_COMPOSITE
+        {
             return Ok(Some(voucher));
         }
     }

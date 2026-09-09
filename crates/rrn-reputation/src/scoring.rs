@@ -51,7 +51,7 @@ use rrn_storage::log::AppendLog;
 
 use crate::decay::decayed;
 use crate::model::{ReputationProfile, DIMENSION_MAX};
-use crate::sybil::{anchored_profile, is_anchored};
+use crate::sybil::{anchored_profile, is_anchored_bounded};
 use crate::Result;
 
 /// Points one qualifying event contributes to its dimension, before capping and
@@ -118,8 +118,25 @@ impl<'db> ReputationScorer<'db> {
     /// evidence still accrues underneath, so being anchored later reveals the
     /// score rather than starting it.
     pub fn score_at(&self, address: &Address, at_time: i64) -> Result<ReputationProfile> {
-        let raw = self.score_raw_at(address, at_time)?;
-        let anchored = is_anchored(self.db, address, at_time)?;
+        self.score_at_position(address, at_time, u64::MAX)
+    }
+
+    /// The address's reputation as it stood at `at_time`, computed from only the
+    /// log prefix `[1, max_seq]` — the position-bounded profile T2.1.3 uses to pin
+    /// a governance electorate at a window's log position.
+    ///
+    /// Both the evidence and the anchoring vouch are bounded to the prefix, so a
+    /// member cannot be lifted over the band (nor anchored) by records admitted
+    /// after `max_seq`, whatever timestamp those records assert. Passing
+    /// `u64::MAX` is exactly [`score_at`](Self::score_at).
+    pub fn score_at_position(
+        &self,
+        address: &Address,
+        at_time: i64,
+        max_seq: u64,
+    ) -> Result<ReputationProfile> {
+        let raw = self.score_raw_at_bounded(address, at_time, max_seq)?;
+        let anchored = is_anchored_bounded(self.db, address, at_time, max_seq)?;
         Ok(anchored_profile(&raw, anchored))
     }
 
@@ -134,6 +151,25 @@ impl<'db> ReputationScorer<'db> {
         address: &Address,
         at_time: i64,
     ) -> Result<ReputationProfile> {
+        self.score_raw_at_bounded(address, at_time, u64::MAX)
+    }
+
+    /// Like [`score_raw_at`](Self::score_raw_at), but only evidence admitted within
+    /// the log prefix `[1, max_seq]` counts — the position-bounded form (T2.1.3).
+    ///
+    /// Both time bounds still apply (evidence must be `<= at_time` *and* admitted
+    /// `<= max_seq`), but the position bound is what closes the back-dating vector:
+    /// a vouch or settlement admitted after a governance window's close has
+    /// `seq > max_seq` and is excluded regardless of how old its self-asserted
+    /// `issued_at`/`settled_at` claims to be (ADR-0022 §3 makes arbitrarily-old
+    /// testimony legal). `max_seq == u64::MAX` recovers the unbounded scorer
+    /// exactly.
+    pub(crate) fn score_raw_at_bounded(
+        &self,
+        address: &Address,
+        at_time: i64,
+        max_seq: u64,
+    ) -> Result<ReputationProfile> {
         let log = AppendLog::new(self.db);
 
         let mut trade = DimensionTally::default();
@@ -141,8 +177,9 @@ impl<'db> ReputationScorer<'db> {
 
         // Trade reliability and confirmations-as-attestations come from the
         // replayed ledger state, which has already folded proposals, confirmations
-        // and settlements into per-transaction lifecycle states.
-        let ledger = LedgerSnapshot::derive(&log)?;
+        // and settlements into per-transaction lifecycle states — bounded to the
+        // same log prefix so a late-admitted settlement cannot leak in.
+        let ledger = LedgerSnapshot::derive_to(&log, max_seq)?;
         for (_, state) in ledger.iter() {
             if let TransactionState::Settled {
                 proposal,
@@ -189,6 +226,9 @@ impl<'db> ReputationScorer<'db> {
         // so they need a direct scan. A payload that is not a vouch is skipped.
         for entry in log.iter_from(1) {
             let entry = entry?;
+            if entry.seq > max_seq {
+                break;
+            }
             let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) else {
                 continue;
             };
@@ -222,9 +262,12 @@ impl<'db> ReputationScorer<'db> {
             .equivocations()
             .map(|r| (r.payload.equivocation_id, r.signer))
             .collect();
-        let overturned = overturned_equivocations(&log, &station_signers, at_time)?;
+        let overturned = overturned_equivocations(&log, &station_signers, at_time, max_seq)?;
         for entry in log.iter_from(1) {
             let entry = entry?;
+            if entry.seq > max_seq {
+                break;
+            }
             let Ok(record) = from_canonical_bytes::<EquivocationRecord>(&entry.payload.bytes)
             else {
                 continue;
@@ -278,10 +321,14 @@ fn overturned_equivocations(
     log: &AppendLog,
     station_signers: &HashMap<EquivocationId, PublicKey>,
     at_time: i64,
+    max_seq: u64,
 ) -> Result<HashSet<EquivocationId>> {
     let mut out = HashSet::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
+        if entry.seq > max_seq {
+            break;
+        }
         let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(&entry.payload.bytes)
         else {
             continue;

@@ -141,6 +141,60 @@ pub fn grace_electorate(db: &Database, founders: &[Address], at_time: i64) -> Re
     Ok(electorate)
 }
 
+/// Like [`established_members`], but each identity is scored from only the log
+/// prefix `[1, max_seq]` (T2.1.3). A member whose band-crossing evidence was
+/// admitted after `max_seq` is excluded whatever timestamp that evidence claims —
+/// the position-bounded form governance uses to pin an electorate at a window's
+/// log position (ADR-0022 §5), closing the back-dated-evidence packing vector.
+/// `max_seq == u64::MAX` is exactly [`established_members`].
+pub fn established_members_asof(db: &Database, at_time: i64, max_seq: u64) -> Result<Vec<Address>> {
+    let scorer = ReputationScorer::new(db);
+    let mut members = Vec::new();
+    for address in known_addresses(db)? {
+        if scorer
+            .score_at_position(&address, at_time, max_seq)?
+            .composite()
+            >= BAND_MEMBER_MIN
+        {
+            members.push(address);
+        }
+    }
+    Ok(members)
+}
+
+/// Position-bounded [`established_member_count`] (T2.1.3): the count as of the log
+/// prefix `[1, max_seq]`.
+pub fn established_member_count_asof(db: &Database, at_time: i64, max_seq: u64) -> Result<usize> {
+    Ok(established_members_asof(db, at_time, max_seq)?.len())
+}
+
+/// Position-bounded [`in_grace`] (T2.1.3): whether the community was in bootstrap
+/// grace as of the log prefix `[1, max_seq]`.
+pub fn in_grace_asof(db: &Database, at_time: i64, max_seq: u64) -> Result<bool> {
+    Ok(established_member_count_asof(db, at_time, max_seq)? < BOOTSTRAP_GRACE_THRESHOLD)
+}
+
+/// Position-bounded [`grace_electorate`] (T2.1.3): the governing electorate as of
+/// the log prefix `[1, max_seq]`. Founders (a genesis fact) still count during
+/// grace regardless of position; only the *established* set is prefix-bounded, so
+/// no standing manufactured after `max_seq` can enter the electorate.
+pub fn grace_electorate_asof(
+    db: &Database,
+    founders: &[Address],
+    at_time: i64,
+    max_seq: u64,
+) -> Result<Vec<Address>> {
+    let mut electorate = established_members_asof(db, at_time, max_seq)?;
+    if electorate.len() < BOOTSTRAP_GRACE_THRESHOLD {
+        for founder in founders {
+            if !electorate.contains(founder) {
+                electorate.push(*founder);
+            }
+        }
+    }
+    Ok(electorate)
+}
+
 /// The outcome of checking whether `confirmer` may confirm a Tier-2 transaction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tier2Eligibility {
@@ -310,6 +364,36 @@ mod tests {
         for _ in 0..10 {
             append_vouch(db, who, &addr(&Keypair::generate()), at);
         }
+    }
+
+    #[test]
+    fn position_bound_excludes_evidence_admitted_after_it() {
+        // The back-dating vector (T2.1.3): a voucher earns real standing, then —
+        // after some log position — an anchoring vouch for `subject` is admitted,
+        // back-dated so its `issued_at` is old. A wall-clock scorer would see it;
+        // a position-bounded scorer pinned before its admission must not.
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let voucher = Keypair::generate();
+        let subject = Keypair::generate();
+        let t = 10 * MONTH;
+
+        earn_raw_standing(&db, &voucher, &station, t);
+        let bound_before = AppendLog::new(&db).tail().unwrap().unwrap().seq;
+
+        // The anchoring vouch is admitted *after* the bound, but claims an old
+        // `issued_at` (<= t) — legal testimony under ADR-0022 §3.
+        append_vouch(&db, &voucher, &addr(&subject), t);
+
+        // Unbounded: the subject is anchored. Bounded before the vouch's admission:
+        // it is not, however old the vouch claims to be.
+        assert!(crate::sybil::is_anchored(&db, &addr(&subject), t).unwrap());
+        assert!(!crate::sybil::is_anchored_bounded(&db, &addr(&subject), t, bound_before).unwrap());
+        // Parity: the unbounded form is exactly the u64::MAX-bounded form.
+        assert_eq!(
+            crate::sybil::is_anchored(&db, &addr(&subject), t).unwrap(),
+            crate::sybil::is_anchored_bounded(&db, &addr(&subject), t, u64::MAX).unwrap()
+        );
     }
 
     #[test]

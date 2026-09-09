@@ -1992,12 +1992,94 @@ channel.
   not need formal governance yet; there is no floor on electorate size before
   proposals may pass, and adding one is a Phase 3 question.
 
+#### Backdated evidence, spoofed windows, and replica divergence (the admission clock)
+
+- *Threat:* governance windows and eligibility were derived from party-asserted
+  timestamps. An author could set a clock back to publish a proposal already
+  closing or forward to vote in a window others saw as shut; and — the sharper
+  attack — because a member's standing was read at a *wall-clock* instant while
+  reputation counts evidence by its own signed `issued_at`/`settled_at` (legal to
+  back-date under ADR-0022 §3), a faction could admit **back-dated** vouches
+  *after* a proposal opened and retroactively grow that proposal's electorate,
+  changing a concluded tally's denominator on replay.
+- *Mitigation (shipped, T2.1.3, ADR-0022):* governance no longer does author-clock
+  arithmetic. A proposal's deliberation/voting window and implementation time are
+  derived from the station's **admission** of the proposal and restated in a
+  station-signed `rrn.gov.proposal_window` attestation, so the window is a signed,
+  replicated fact rather than a per-replica admission-clock computation (the
+  ADR-0005 / `ProposalImplemented` pattern). The voting-window bound is enforced on
+  the **write path** (`append_vote` takes a ballot only while the admitting station's
+  own clock is inside the attested window); replay does **not** re-apply a wall-clock
+  close, because `created_at` is re-stamped per replica (ADR-0022 §1) and re-gating on
+  it would make a late-syncing replica drop ballots the admitting station accepted and
+  split the tally. Instead — exactly as the ledger gates settlement at admission and
+  thereafter trusts the settled record on replay (ADR-0022 §2) — replay trusts that a
+  ballot on the log was window-gated by the station that took it, and counts every
+  ballot admitted after the proposal's **open log position**. Author, co-signer, and
+  voter eligibility and the tally quorum denominator are pinned at that open position —
+  the seq at which the proposal was admitted (ADR-0022 §5, "ordering is log order") —
+  via position-bounded reputation (`score_at_position`, `grace_electorate_asof`), so
+  nothing admitted after a proposal opens can enter its electorate, whatever timestamp
+  it claims. Two replicas replaying one chain therefore agree on window, electorate, and
+  outcome. Regressions:
+  `tally.rs::a_back_dated_member_admitted_after_open_does_not_join_the_electorate` and
+  `tally.rs::two_replicas_replaying_the_same_log_agree_on_outcome_and_electorate`.
+- *Residual risk:* because replay trusts log presence for ballots, a ballot
+  **raw-replicated** onto a replica (only via the Phase-0 gossip/replication path
+  `append_raw`, which appends a configured static peer's signed bytes without the
+  `append_vote` window gate) that was *never* window-gated by an honest station would be
+  counted. The vector is a **colluding configured gossip peer**, not an ordinary
+  elector: an elector's own submission always goes through `append_vote` (RPC, or DTN →
+  `admit_gov_vote`), which gates it; `cast_at` is testimony that nothing reads, so
+  back-dating buys nothing. The exposure is narrow: the injected voter must be in the
+  electorate pinned at open, and only their first ballot counts. Restating the close in
+  a station-signed record (the settlement/`ProposalImplemented` pattern) would close it
+  and is a follow-up; the alternative — re-gating on the replica-local clock — is the
+  divergence bug this ticket removed, so it is not an option.
+  `vote.rs::replay_counts_a_ballot_present_on_the_log` pins the trusted-log behaviour.
+  Separately, the window attestation's authority is the station's signature, and —
+  as with the existing `ProposalImplemented` record — governance does not re-verify the
+  attestation's signer against a pinned station identity, because it has no
+  station-identity concept in Phase 1. The forge impact is **higher** than
+  `ProposalImplemented`, though: that record is a cheap existence check whose real
+  consequence (a proposal passed) is re-derived from the vote, whereas a forged
+  `rrn.gov.proposal_window` injected *before* the genuine one wins `window_of`'s
+  earliest-match and directly sets `voting_ends_at`/`implementation_at`/`admitted_at` —
+  moving the outcome gate and the eligibility instant. Only a configured gossip peer can
+  inject one (DTN refuses both kinds as `UnroutableKind`), and pinning `open_seq` to the
+  *attestation's* seq already denies a peer control of the open position; pinning the
+  signer of both records against a station identity is the remaining follow-up, and is
+  the higher priority of the two. A station-signed governance identity concept arrives
+  with ADR-0023's `emergency_activated` (T2.8.2). The station clock at admission remains the operational trust root
+  (ADR-0022 §6). The dispute-escalation electorate still uses the *time*-based
+  `grace_electorate` and shares the residual back-dating vector this ticket closed only
+  for the governance path; `grace_electorate_asof` is now the tool to close it there too
+  (follow-up).
+
+#### DTN-carried governance records
+
+- *Threat:* extending the DTN router to admit `rrn.gov.*` records could let a
+  courier-carried proposal, co-signature, or ballot bypass a gate the live RPC
+  enforces.
+- *Mitigation (shipped, T2.1.3):* `route_dtn_record` admits the three governance
+  kinds through the **same append guards** (`append_proposal`/`append_cosign`/
+  `append_vote`) the RPC uses — identical eligibility, publication, window, and
+  duplicate checks — so DTN is not a bypass; the window still anchors on *this*
+  admission. A re-carried record already on the log is the idempotent `known`
+  disposition, not a second admission.
+- *Residual risk:* the same as any DTN ingress — availability depends on couriers,
+  and a governance record authored offline is only as timely as its carriage
+  (ADR-0020); a proposal carried past its (admission-anchored) window simply
+  opens its window on arrival, which is the intended "late knowledge delays, never
+  truncates" behaviour.
+
 #### Proposal flooding / governance DoS
 
 - *Threat:* an identity floods the community with proposals to bury real ones or
   force constant voting.
 - *Mitigation (shipped, T1.9.4):* authorship itself requires established standing
-  (`append_proposal` gates the author on `is_established` at `created_at`), and a
+  (`append_proposal` gates the author on eligibility at the proposal's open
+  admission position, T2.1.3), and a
   proposal does not reach a ballot until at least `DEFAULT_COSIGN_THRESHOLD` (3)
   *distinct established* members other than the author co-sign it (`append_cosign`
   + `proposal_records`). A motion nobody else with standing will endorse never

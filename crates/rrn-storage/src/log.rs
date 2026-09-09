@@ -271,6 +271,28 @@ impl<'a> AppendLog<'a> {
         Ok(row.map(|(seq, created_at)| (seq as u64, created_at)))
     }
 
+    /// The highest `seq` whose entry was admitted at or before `t` — i.e. the
+    /// right boundary of the log prefix admitted by time `t`. `0` when no entry
+    /// was admitted that early (an empty prefix; `seq` starts at 1).
+    ///
+    /// Because admission times are clamped monotone non-decreasing on append
+    /// ([`append`](Self::append)/[`append_raw`](Self::append_raw)), the set of
+    /// entries with `created_at <= t` is exactly the contiguous prefix
+    /// `[1, bound]` — so this seq bound and a `created_at <= t` filter select the
+    /// same entries. That equivalence is what lets governance pin an electorate
+    /// "as of a window instant" by **log position** (ADR-0022 §5, "ordering is
+    /// log order") rather than by wall-clock time, closing the back-dated-evidence
+    /// vector (T2.1.3). The query is `MAX(seq) WHERE created_at <= t` so it stays
+    /// correct even if monotonicity were ever to regress.
+    pub fn last_seq_admitted_by(&self, t: i64) -> Result<u64> {
+        let seq: Option<i64> = self.db.conn().query_row(
+            "SELECT MAX(seq) FROM log_entries WHERE created_at <= ?1",
+            [t],
+            |row| row.get(0),
+        )?;
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
     /// Fetches the entry at `seq`, if present.
     pub fn get(&self, seq: u64) -> Result<Option<LogEntry>> {
         let raw = self
@@ -637,6 +659,40 @@ mod tests {
         assert_eq!(append_note_at(&mut log, &kp, 2, 900).created_at, 1_000);
         // A forwards step advances normally.
         assert_eq!(append_note_at(&mut log, &kp, 3, 1_100).created_at, 1_100);
+    }
+
+    #[test]
+    fn last_seq_admitted_by_bounds_the_prefix() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+
+        // Empty log: no prefix, bound is 0.
+        assert_eq!(log.last_seq_admitted_by(9_999).unwrap(), 0);
+
+        append_note_at(&mut log, &kp, 1, 1_000); // seq 1 @ 1000
+        append_note_at(&mut log, &kp, 2, 1_000); // seq 2 @ 1000 (equal ts)
+        append_note_at(&mut log, &kp, 3, 2_000); // seq 3 @ 2000
+
+        // Before the first admission: still empty.
+        assert_eq!(log.last_seq_admitted_by(999).unwrap(), 0);
+        // At an equal-timestamp boundary: both seq 1 and 2 are included.
+        assert_eq!(log.last_seq_admitted_by(1_000).unwrap(), 2);
+        // Between the two distinct times: the prefix stops at seq 2.
+        assert_eq!(log.last_seq_admitted_by(1_999).unwrap(), 2);
+        // At/after the last admission: the whole log.
+        assert_eq!(log.last_seq_admitted_by(2_000).unwrap(), 3);
+        assert_eq!(log.last_seq_admitted_by(5_000).unwrap(), 3);
+
+        // Equivalence with a created_at filter: the bound is the prefix boundary,
+        // so every entry with seq <= bound has created_at <= t and no later one
+        // does (relies on the monotone clamp).
+        let t = 1_000;
+        let bound = log.last_seq_admitted_by(t).unwrap();
+        for seq in 1..=3 {
+            let admitted = log.get(seq).unwrap().unwrap().created_at;
+            assert_eq!(admitted <= t, seq <= bound);
+        }
     }
 
     #[test]

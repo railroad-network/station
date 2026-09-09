@@ -20,18 +20,32 @@
 //!   it is genuinely open for voting — a ballot on a motion still gathering
 //!   endorsements does not count, matching the proposal module's rule that votes
 //!   do not count in [`Deliberation`](crate::proposal::ProposalPhase::Deliberation));
-//! - `cast_at` falls **within the proposal's window**, `[created_at, voting_ends_at]`
-//!   — Phase 1 runs deliberation and voting as one window (ADR-0012), so the
-//!   window that opens the proposal is the window a ballot must land in;
+//! - the ballot is **admitted within the proposal's window** — admitted by the
+//!   attested `voting_ends_at`, judged on the admitting station's *admission*
+//!   clock, not the voter's `cast_at` (ADR-0022 / T2.1.3). This bound is enforced
+//!   on the **write path** ([`append_vote`]): the station takes a ballot only while
+//!   its own admission clock is still inside the window. Replay does **not**
+//!   re-apply the close — `created_at` is re-stamped per replica, so a wall-clock
+//!   re-gate would make a late-syncing replica drop ballots the admitting station
+//!   accepted. Instead, exactly as the ledger gates settlement at admission and
+//!   then trusts the settled record on replay (ADR-0022 §2), [`votes`] trusts that
+//!   a ballot on the log was admitted in-window by the station that took it, and
+//!   counts every ballot admitted after the proposal's open *position*. Phase 1
+//!   runs deliberation and voting as one window (ADR-0012).
 //!   > Note: publication is monotonic (co-signatures only accrue), so a ballot
 //!   > accepted while the proposal was published stays published — and valid —
 //!   > under any later replay.
-//! - the voter is an **established member** (effective composite at or above the
-//!   Member band) as of `cast_at`, the same electorate that authors and co-signs;
+//! - the voter is in the **electorate pinned at the proposal's open log
+//!   position** — an established member (or grace founder) then, the same
+//!   frozen electorate that authors and co-signs (T2.1.3);
 //! - the voter has **not already voted** on this proposal.
 //!
-//! A voter's standing is judged at their ballot's own `cast_at`, never at append
-//! time, so replay is deterministic.
+//! The electorate is pinned by open *position* and the window is anchored on the
+//! attested admission instant, never on the voter's `cast_at` (retained as
+//! testimony only), so replay is replica-deterministic: two replicas replaying the
+//! same log agree on which ballots count and on the electorate. The one residual —
+//! a ballot raw-replicated onto a replica without ever being window-gated by an
+//! honest station — is documented in the `rrn-governance` threat-model section.
 //!
 //! # No changing a vote (Phase 1)
 //!
@@ -58,8 +72,8 @@ use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::proposal::{
-    composite_at, effective_cosign_threshold, founder_set, is_eligible, proposal_records,
-    ProposalError, ProposalId,
+    composite_at_position, effective_cosign_threshold, founder_set, is_eligible_asof,
+    proposal_records, ProposalError, ProposalId,
 };
 
 /// Discriminant carried in the `kind` field of a [`Vote`]'s canonical CBOR, so
@@ -90,8 +104,10 @@ pub struct Vote {
     pub voter: Address,
     /// The choice cast.
     pub choice: VoteChoice,
-    /// Unix seconds the ballot was cast — the voter's clock, and when their
-    /// established-member standing is judged, so replay is deterministic.
+    /// Unix seconds the ballot was cast — the voter's clock. **Testimony only**
+    /// (ADR-0022 / T2.1.3): the ballot's window membership runs on its admission,
+    /// and the voter's standing is judged at the proposal's open log position;
+    /// neither reads this.
     pub cast_at: i64,
 }
 
@@ -113,10 +129,11 @@ pub fn votes(
     db: &Database,
 ) -> Result<HashMap<Address, VoteChoice>, VoteError> {
     let records = proposal_records(log, proposal_id, db)?;
-    let Some(proposal) = records.proposal.as_ref() else {
+    if records.proposal.is_none() {
         return Ok(HashMap::new());
-    };
-    if !records.is_published(effective_cosign_threshold(db, proposal)?) {
+    }
+    let (open_seq, open_time) = (records.open_seq, records.open_time);
+    if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
         return Ok(HashMap::new());
     }
 
@@ -133,10 +150,26 @@ pub fn votes(
         if Address::from_public_key(entry.payload.signer) != vote.voter {
             continue;
         }
-        if vote.cast_at < proposal.created_at || vote.cast_at > proposal.voting_ends_at {
+        // A ballot is admitted *after* the proposal opens; an entry at or before the
+        // open position is never a ballot on this proposal (only reachable via
+        // gossip injection). Log *position* orders the log — not the re-stamped
+        // `created_at` — so this gate is replica-identical (ADR-0022 / T2.1.3).
+        if entry.seq <= open_seq {
             continue;
         }
-        if !is_eligible(db, &founders, &vote.voter, vote.cast_at)? {
+        // The voting-window bound is enforced on the *write* path (`append_vote`,
+        // against the admitting station's own clock), just as the ledger gates
+        // settlement at admission and thereafter trusts the settled log record on
+        // replay (ADR-0022 §2). Replay does *not* re-apply a wall-clock close:
+        // `created_at` is re-stamped per replica, so re-gating here would make a
+        // late-syncing replica drop ballots the admitting station accepted and
+        // split the tally. A ballot on the log was admitted in-window by the station
+        // that took it; replay counts it. (Residual: a raw-replicated ballot never
+        // gated by an honest station — see threat-model, `rrn-governance` STRIDE.)
+        //
+        // Voter eligibility is pinned at the proposal's open position — the frozen
+        // electorate — not at the ballot's own admission.
+        if !is_eligible_asof(db, &founders, &vote.voter, open_time, open_seq)? {
             continue;
         }
         // First ballot wins; a later one from the same voter is ignored.
@@ -170,22 +203,29 @@ pub fn append_vote(
     let Some(proposal) = records.proposal.as_ref() else {
         return Err(VoteError::UnknownProposal(vote.proposal_id));
     };
-    if !records.is_published(effective_cosign_threshold(db, proposal)?) {
+    let (open_seq, open_time) = (records.open_seq, records.open_time);
+    if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
         return Err(VoteError::ProposalNotPublished(vote.proposal_id));
     }
-    if vote.cast_at < proposal.created_at || vote.cast_at > proposal.voting_ends_at {
+    // The ballot will be admitted at the monotone-clamped `now`; the window is on
+    // that admission, not the voter's `cast_at` (ADR-0022 / T2.1.3).
+    let admitted_at = match log.tail()? {
+        Some(t) => now.max(t.created_at),
+        None => now,
+    };
+    if admitted_at > proposal.voting_ends_at {
         return Err(VoteError::OutsideVotingWindow {
             proposal_id: vote.proposal_id,
-            cast_at: vote.cast_at,
-            opened_at: proposal.created_at,
-            closed_at: proposal.voting_ends_at,
+            admitted_at,
+            open_time,
+            voting_ends_at: proposal.voting_ends_at,
         });
     }
 
-    if !is_eligible(db, &founder_set(db)?, &vote.voter, vote.cast_at)? {
+    if !is_eligible_asof(db, &founder_set(db)?, &vote.voter, open_time, open_seq)? {
         return Err(VoteError::VoterNotEstablished {
             voter: vote.voter,
-            composite: composite_at(db, &vote.voter, vote.cast_at)?,
+            composite: composite_at_position(db, &vote.voter, open_time, open_seq)?,
         });
     }
 
@@ -218,21 +258,21 @@ pub enum VoteError {
     /// yet open for voting.
     #[error("proposal {0} has not published; voting is not open")]
     ProposalNotPublished(ProposalId),
-    /// The ballot was cast outside the proposal's `[created_at, voting_ends_at]`
-    /// window.
+    /// The ballot was *admitted* after the proposal's window closed (ADR-0022:
+    /// the window runs on admission, not the voter's `cast_at`).
     #[error(
-        "vote on proposal {proposal_id} cast at {cast_at} is outside \
-         the voting window [{opened_at}, {closed_at}]"
+        "vote on proposal {proposal_id} admitted at {admitted_at} is outside \
+         the voting window [{open_time}, {voting_ends_at}]"
     )]
     OutsideVotingWindow {
         /// The proposal.
         proposal_id: ProposalId,
-        /// When the ballot was cast.
-        cast_at: i64,
-        /// When the window opened (the proposal's `created_at`).
-        opened_at: i64,
-        /// When the window closes (the proposal's `voting_ends_at`).
-        closed_at: i64,
+        /// When the ballot was admitted (the station clock at admission).
+        admitted_at: i64,
+        /// When the window opened (the proposal's admission).
+        open_time: i64,
+        /// When the window closes (the attested `voting_ends_at`).
+        voting_ends_at: i64,
     },
     /// The voter is not an established member as of when they cast the ballot.
     #[error("voter {voter} is not an established member (composite {composite:.2} < 2.0)")]
@@ -445,15 +485,31 @@ mod tests {
     }
 
     fn statute(author: &Keypair, at: i64) -> Proposal {
-        Proposal::new(
+        let mut p = Proposal::new(
             addr(author),
             "Quiet hours in the workshop".into(),
             "No power tools after 9pm.".into(),
             ProposalKind::Statute,
             at,
-            &test_charter(),
         )
-        .unwrap()
+        .unwrap();
+        // Populate the window cache the way the station attestation will (tests
+        // append at `at`, so admitted_at == at).
+        let (v, i) = crate::window::window_for(&test_charter(), &p.kind, at);
+        p.voting_ends_at = v;
+        p.implementation_at = i;
+        p
+    }
+
+    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies a
+    /// station keypair and the default test charter for the window attestation.
+    fn propose(
+        log: &mut AppendLog,
+        signed: crate::proposal::SignedProposal,
+        db: &Database,
+        at: i64,
+    ) -> Result<LogEntry, ProposalError> {
+        append_proposal(log, signed, db, &Keypair::generate(), &test_charter(), at)
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedPayload<ProposalCosign> {
@@ -491,7 +547,7 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             db,
@@ -631,7 +687,9 @@ mod tests {
     }
 
     #[test]
-    fn a_vote_after_the_window_closes_is_rejected() {
+    fn a_vote_admitted_after_the_window_closes_is_rejected() {
+        // The window runs on *admission* (T2.1.3): a ballot admitted after the
+        // proposal's close is refused, whatever its `cast_at` claims.
         let db = fresh_db();
         let station = Keypair::generate();
         let (members, proposal) = published_statute(&db, &station, 0);
@@ -639,27 +697,26 @@ mod tests {
 
         let err = append_vote(
             &mut log,
-            vote(
-                &members[1],
-                &proposal,
-                VoteChoice::Yes,
-                proposal.voting_ends_at + 1,
-            ),
+            // An in-window `cast_at`, but admitted after close.
+            vote(&members[1], &proposal, VoteChoice::Yes, NOW),
             &db,
-            NOW,
+            proposal.voting_ends_at + 1,
         )
         .unwrap_err();
         assert!(matches!(err, VoteError::OutsideVotingWindow { .. }));
     }
 
     #[test]
-    fn a_vote_before_the_window_opens_is_rejected() {
+    fn cast_at_is_testimony_the_window_runs_on_admission() {
+        // A ballot with an out-of-range `cast_at` (before the proposal even
+        // existed) is still counted when *admitted* inside the window: `cast_at`
+        // is testimony, never the gate (ADR-0022 / T2.1.3).
         let db = fresh_db();
         let station = Keypair::generate();
         let (members, proposal) = published_statute(&db, &station, 0);
         let mut log = AppendLog::new(&db);
 
-        let err = append_vote(
+        append_vote(
             &mut log,
             vote(
                 &members[1],
@@ -670,8 +727,12 @@ mod tests {
             &db,
             NOW,
         )
-        .unwrap_err();
-        assert!(matches!(err, VoteError::OutsideVotingWindow { .. }));
+        .expect("a ballot admitted in-window counts regardless of its cast_at");
+        assert_eq!(
+            votes(&log, &proposal.proposal_id, &db).unwrap().len(),
+            1,
+            "the back-dated-cast_at ballot is counted"
+        );
     }
 
     #[test]
@@ -720,7 +781,7 @@ mod tests {
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &author),
             &db,
@@ -759,21 +820,14 @@ mod tests {
         )
         .unwrap();
 
-        // Bypass the guards exactly as replication does: an outsider's ballot, a
-        // ballot out of window, a ballot forged onto another member, and a second
-        // ballot from members[1] must all be dropped by replay.
-        log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW), 0)
+        // Bypass the guards exactly as replication does: an outsider's ballot (no
+        // standing), a ballot forged onto another member (signer != voter), and a
+        // second ballot from members[1] (first-wins) must all be dropped by replay —
+        // dropped by the electorate, signer, and dedup guards, none of which is the
+        // window. (The window bound is a write-path gate, not re-applied on replay —
+        // see `replay_counts_a_ballot_present_on_the_log`.)
+        log.append(vote(&outsider, &proposal, VoteChoice::Yes, NOW), NOW)
             .unwrap();
-        log.append(
-            vote(
-                &members[2],
-                &proposal,
-                VoteChoice::Yes,
-                proposal.voting_ends_at + 1,
-            ),
-            0,
-        )
-        .unwrap();
         log.append(
             SignedPayload::sign(
                 Vote {
@@ -784,15 +838,44 @@ mod tests {
                 },
                 &members[2], // signer != voter
             ),
-            0,
+            NOW,
         )
         .unwrap();
-        log.append(vote(&members[1], &proposal, VoteChoice::No, NOW), 0)
+        log.append(vote(&members[1], &proposal, VoteChoice::No, NOW), NOW)
             .unwrap();
 
         let ballots = votes(&log, &proposal.proposal_id, &db).unwrap();
         assert_eq!(ballots.len(), 1);
         // The first ballot from members[1] stands; the later No is ignored.
+        assert_eq!(ballots.get(&addr(&members[1])), Some(&VoteChoice::Yes));
+    }
+
+    #[test]
+    fn replay_counts_a_ballot_present_on_the_log() {
+        // The voting window is enforced on the *write* path (`append_vote`, against
+        // the admitting station's clock); replay does not re-apply it. `created_at`
+        // is re-stamped per replica (ADR-0022 §1), so re-gating on it here would make
+        // a late-syncing replica drop ballots the admitting station accepted, and two
+        // replicas of one chain would disagree. So a ballot present on the log — from
+        // an eligible voter, positioned after the proposal's open — is counted on
+        // replay whatever this replica's local admission clock reads. This is the
+        // residual noted in the module docs and threat model: a raw-replicated ballot
+        // is trusted to have been window-gated by the station that first took it.
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let (members, proposal) = published_statute(&db, &station, 0);
+        let mut log = AppendLog::new(&db);
+
+        // Raw-appended (as replication does, bypassing `append_vote`) and re-stamped
+        // with an admission clock long past the close — yet counted.
+        log.append(
+            vote(&members[1], &proposal, VoteChoice::Yes, NOW),
+            proposal.voting_ends_at + 1_000_000,
+        )
+        .unwrap();
+
+        let ballots = votes(&log, &proposal.proposal_id, &db).unwrap();
+        assert_eq!(ballots.len(), 1);
         assert_eq!(ballots.get(&addr(&members[1])), Some(&VoteChoice::Yes));
     }
 

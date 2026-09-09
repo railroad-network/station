@@ -260,8 +260,9 @@ fn summarize(
 ) -> Result<ProposalSummary, GovernanceViewError> {
     let records = proposal_records(log, &proposal.proposal_id, db)?;
     // The publish bar clamps down during bootstrap grace (ADR-0015 § 3), so a
-    // small founder set is not shown as forever un-published.
-    let threshold = effective_cosign_threshold(db, proposal)?;
+    // small founder set is not shown as forever un-published. The electorate is
+    // pinned at the proposal's open log position (T2.1.3).
+    let threshold = effective_cosign_threshold(db, records.open_time, records.open_seq)?;
     let published = records.is_published(threshold);
     let phase = phase(&records, threshold, now)
         .map(phase_name)

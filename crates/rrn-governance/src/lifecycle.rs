@@ -254,7 +254,7 @@ mod tests {
     /// every member cast `choice`. Leaves it published with ballots in.
     fn file_and_vote(db: &Database, members: &[Keypair], proposal: &Proposal, choice: VoteChoice) {
         let mut log = AppendLog::new(db);
-        append_proposal(
+        propose(
             &mut log,
             SignedPayload::sign(proposal.clone(), &members[0]),
             db,
@@ -270,15 +270,43 @@ mod tests {
     }
 
     fn statute(author: &Keypair, charter: &Charter) -> Proposal {
-        Proposal::new(
+        let p = Proposal::new(
             addr(author),
             "Quiet hours in the workshop".into(),
             "No power tools after 9pm.".into(),
             ProposalKind::Statute,
             NOW,
-            charter,
         )
-        .unwrap()
+        .unwrap();
+        with_window(p, charter, NOW)
+    }
+
+    /// Populates a built proposal's window cache to match the station attestation
+    /// (tests append at `at`, so admitted_at == at).
+    fn with_window(mut p: Proposal, charter: &Charter, at: i64) -> Proposal {
+        let (v, i) = crate::window::window_for(charter, &p.kind, at);
+        p.voting_ends_at = v;
+        p.implementation_at = i;
+        p
+    }
+
+    /// Drop-in for the old `append_proposal(log, signed, db, at)`. All test
+    /// charters use default windows (`charter_body`), so a default charter for the
+    /// attestation matches every proposal's populated window.
+    fn propose(
+        log: &mut AppendLog,
+        signed: crate::proposal::SignedProposal,
+        db: &Database,
+        at: i64,
+    ) -> Result<rrn_storage::log::LogEntry, crate::proposal::ProposalError> {
+        append_proposal(
+            log,
+            signed,
+            db,
+            &Keypair::generate(),
+            &charter_body(1, None),
+            at,
+        )
     }
 
     // --- The sweep -----------------------------------------------------------
@@ -322,17 +350,20 @@ mod tests {
         let members = established_members(&db, &station, 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
-        let emergency = Proposal::new(
-            addr(&members[0]),
-            "Close the workshop after the flood".into(),
-            "No entry until the electrics are checked.".into(),
-            ProposalKind::Emergency {
-                expires_at: NOW + MONTH,
-            },
-            NOW,
+        let emergency = with_window(
+            Proposal::new(
+                addr(&members[0]),
+                "Close the workshop after the flood".into(),
+                "No entry until the electrics are checked.".into(),
+                ProposalKind::Emergency {
+                    expires_at: NOW + MONTH,
+                },
+                NOW,
+            )
+            .unwrap(),
             &charter,
-        )
-        .unwrap();
+            NOW,
+        );
         // An emergency takes effect the instant it passes — no implementation delay.
         assert_eq!(emergency.implementation_at, emergency.voting_ends_at);
         file_and_vote(&db, &members, &emergency, VoteChoice::Yes);
@@ -406,17 +437,20 @@ mod tests {
         // A v2 that chains to v1.
         let v2 = charter_body(2, Some(v1_hash));
         let v2_hash = v2.hash();
-        let amendment = Proposal::new(
-            addr(&members[0]),
-            "Raise the workshop budget".into(),
-            "Version 2 of the charter.".into(),
-            ProposalKind::CharterAmendment {
-                new_charter: v2.clone(),
-            },
-            NOW,
+        let amendment = with_window(
+            Proposal::new(
+                addr(&members[0]),
+                "Raise the workshop budget".into(),
+                "Version 2 of the charter.".into(),
+                ProposalKind::CharterAmendment {
+                    new_charter: v2.clone(),
+                },
+                NOW,
+            )
+            .unwrap(),
             &v1,
-        )
-        .unwrap();
+            NOW,
+        );
         // Unanimous yes clears the 75% charter-amendment approval bar.
         file_and_vote(&db, &members, &amendment, VoteChoice::Yes);
 
@@ -443,15 +477,18 @@ mod tests {
         let v1 = charter_body(1, None);
 
         let v2 = charter_body(2, Some(v1_hash));
-        let amendment = Proposal::new(
-            addr(&members[0]),
-            "A rejected amendment".into(),
-            "Version 2 nobody wanted.".into(),
-            ProposalKind::CharterAmendment { new_charter: v2 },
-            NOW,
+        let amendment = with_window(
+            Proposal::new(
+                addr(&members[0]),
+                "A rejected amendment".into(),
+                "Version 2 nobody wanted.".into(),
+                ProposalKind::CharterAmendment { new_charter: v2 },
+                NOW,
+            )
+            .unwrap(),
             &v1,
-        )
-        .unwrap();
+            NOW,
+        );
         // It fails: everyone votes No.
         file_and_vote(&db, &members, &amendment, VoteChoice::No);
 
