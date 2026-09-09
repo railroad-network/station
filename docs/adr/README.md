@@ -60,6 +60,7 @@ Decision Records) convention, using the structure in
 - [0020 — The community log keeps one writer; resilience is delay-tolerant submission, not multi-writer merge](0020-single-writer-log-dtn-submission.md)
 - [0021 — Escrowed offline spending certificates bound the debt floor under partition](0021-escrowed-offline-spending-certificates.md)
 - [0022 — The admission clock: the station's clock at admission is the only window-bearing clock](0022-admission-clock-time-trust.md)
+- [0023 — Emergency governance: deciding faster in a crisis without building a coup lever](0023-emergency-governance-modes.md)
 - [0025 — Equivocation cases are a distinct jury case kind with a Lapsed default and identity-anchored sortition](0025-equivocation-dispute-cases.md)
 - [0026 — The Reticulum sidecar is ratified: pinned `rnsd` 1.5, driven from the station, native Rust deferred](0026-reticulum-sidecar-ratified.md)
 
