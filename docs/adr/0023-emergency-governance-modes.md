@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed
+Accepted
 
-Date: 2026-09-08
+Date: 2026-09-08 (ratified 2026-09-08)
 
 ## Context
 
