@@ -39,3 +39,4 @@ pub mod proposal;
 pub mod statute;
 pub mod tally;
 pub mod vote;
+pub mod window;
