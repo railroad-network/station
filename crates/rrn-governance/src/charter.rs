@@ -541,7 +541,7 @@ impl From<GovernanceStructure> for CBOR {
             g.implementation_delay_days as u64,
         );
         m.insert("emergency_threshold_pct", g.emergency_threshold_pct as u64);
-        // The T2.8.2 emergency parameters are **additive** fields on a
+        // The emergency parameters are **additive** fields on a
         // content-addressed record: each is omitted from the map when it equals its
         // default, so a pre-emergency (Phase-1) charter — which never carried these
         // keys — hashes byte-identically under this encoder, and an unchanged
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn emergency_params_are_additive_default_charter_bytes_unchanged() {
-        // A default charter OMITS every T2.8.2 emergency key, so a pre-emergency
+        // A default charter OMITS every emergency key, so a pre-emergency
         // (Phase-1) charter — which never carried them — decodes and hashes
         // identically under this encoder; the `charter_hash` does not move on
         // upgrade (ADR-0010 additive-field discipline).

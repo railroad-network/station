@@ -138,7 +138,7 @@ pub fn votes(
     }
     // Ballot eligibility is pinned at the *emergency activation* position for a
     // compressed-path proposal (ADR-0023 §3c) and at the proposal's own open
-    // position otherwise (T2.1.3). The ballot-after-open gate below still uses the
+    // position otherwise (ADR-0022). The ballot-after-open gate below still uses the
     // proposal's own `open_seq` — ballots always follow the proposal.
     let is_emergency = records
         .proposal

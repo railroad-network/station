@@ -808,7 +808,7 @@ impl Core {
             "governance_propose" => self.m_governance_propose(req),
             "governance_cosign" => self.m_governance_cosign(req),
             "governance_vote" => self.m_governance_vote(req),
-            // Emergency governance (T2.8.2, ADR-0023); writes are station-signed by
+            // Emergency governance (ADR-0023); writes are station-signed by
             // this wallet, whose signature counts toward the supermajority.
             "governance_emergency_declare" => self.m_governance_emergency_declare(req),
             "governance_emergency_cosign" => self.m_governance_emergency_cosign(req),
@@ -2796,7 +2796,7 @@ impl Core {
         Ok(serde_json::json!({ "ok": true }))
     }
 
-    // --- emergency governance (T2.8.2, ADR-0023) ---------------------------
+    // --- emergency governance (ADR-0023) ---------------------------
 
     /// Renders a derived [`emergency::ActiveEmergency`] into the RPC/banner shape,
     /// computing `active`/`lapsed` against `now`.
@@ -4080,7 +4080,7 @@ impl Core {
             // record: a declaration, its co-signature, or a lapse authored offline
             // is admitted through the same append guards the live RPC uses, and the
             // station writes the `emergency_activated` attestation on the crossing
-            // co-signature just as it does on the live path (T2.8.2). Each returns
+            // co-signature just as it does on the live path. Each returns
             // its own disposition early.
             Some(KIND_EMERGENCY_DECLARATION) => {
                 return self.admit_emergency_declaration(bytes, signer, signature, now)
@@ -5838,7 +5838,7 @@ const KIND_SMS_BINDING: &str = rrn_protocol::binding::SMS_BINDING_KIND;
 const KIND_GOV_PROPOSAL: &str = "rrn.gov.proposal";
 const KIND_GOV_COSIGN: &str = "rrn.gov.proposal_cosign";
 const KIND_GOV_VOTE: &str = "rrn.gov.vote";
-// Emergency-governance record kinds carried over DTN (T2.8.2, ADR-0023). The
+// Emergency-governance record kinds carried over DTN (ADR-0023). The
 // member-signed declaration, co-signature, and lapse ride bundles like any member
 // record; the station-signed `emergency_activated` attestation is written locally
 // and is never member-submitted, so it has no ingest arm.
@@ -7349,7 +7349,7 @@ mod tests {
         assert_eq!(detail["tally"]["outcome"], "passed");
     }
 
-    /// Emergency governance end-to-end via DTN only (T2.8.2 invariant 5, ADR-0023):
+    /// Emergency governance end-to-end via DTN only (ADR-0023):
     /// a founder declares an emergency offline and submits it in a bundle; the
     /// station admits it through `admit_emergency_declaration`, writing the
     /// `emergency_activated` attestation on the crossing (a sole founder is its own

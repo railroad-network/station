@@ -71,7 +71,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
         charter_hash: Hash::of(b"effective-charter"),
     };
 
-    // Emergency-governance record kinds (T2.8.2, ADR-0023). An initial declaration
+    // Emergency-governance record kinds (ADR-0023). An initial declaration
     // (no `previous_declaration_hash`), a co-signature toward it, a lapse against
     // it, and the station-signed activation attestation — all byte-locked for the
     // mobile repo.

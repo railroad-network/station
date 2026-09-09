@@ -103,7 +103,7 @@ pub type SignedWindow = SignedPayload<ProposalWindow>;
 /// window is `emergency_window_secs` from admission and effect is immediate. This is
 /// decided once, by the station, at admission, and frozen into the signed
 /// [`ProposalWindow`] attestation — replay reads it back, so the compression is a
-/// replicated fact, not a per-replica re-derivation (T2.8.2 invariant 1).
+/// replicated fact, not a per-replica re-derivation (replica determinism).
 pub fn compressed_emergency_window(admitted_at: i64, emergency_window_secs: i64) -> (i64, i64) {
     let voting_ends_at = admitted_at + emergency_window_secs;
     (voting_ends_at, voting_ends_at)

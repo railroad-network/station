@@ -1120,7 +1120,7 @@ pub struct GovVoteParams {
     pub choice: String,
 }
 
-// --- Emergency governance (T2.8.2, ADR-0023) --------------------------------
+// --- Emergency governance (ADR-0023) --------------------------------
 
 /// `governance_emergency_declare` params — raise an emergency declaration
 /// (daemon-signed by the station wallet, whose signature counts toward the

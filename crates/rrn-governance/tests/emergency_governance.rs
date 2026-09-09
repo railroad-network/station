@@ -1,6 +1,6 @@
-//! Emergency-governance conformance suite (T2.8.2, ADR-0023).
+//! Emergency-governance conformance suite (ADR-0023).
 //!
-//! Each test maps to one of the ticket's invariants. To stay fast, the community is
+//! Each test maps to one of ADR-0023's invariants. To stay fast, the community is
 //! a **bootstrap-grace** one (founders are the electorate, ADR-0015) — no expensive
 //! reputation seeding — which exercises the same code paths the established-member
 //! electorate does, at a small size the ADR itself calls out (§2 worked case).

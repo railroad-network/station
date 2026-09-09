@@ -26,7 +26,7 @@
 //!   replica (ADR-0022 §1; [`rrn_storage::log`]), so the boundary must be restated
 //!   in a signed record — exactly as the ledger restates settlement and this crate
 //!   restates a proposal's [window](crate::window) — or two replicas would disagree
-//!   on which window governed a past vote (T2.8.2 invariant 1).
+//!   on which window governed a past vote (the replica-determinism invariant).
 //!
 //! A renewal is **not** a new kind — it is a fresh declaration whose *continuation*
 //! status is derived from log proximity (§4). A compressed proposal's window end is
@@ -42,8 +42,8 @@
 //! follows. Every input it reads is a *signed* record at a definite log position
 //! (the activation instant and scheduled expiry are signed onto the attestation;
 //! the co-signature and lapse boundaries are log *positions*, which are replica-
-//! identical), so every replica computes the identical timeline (T2.8.2 invariant
-//! 1). Whether a given proposal ran under an emergency is [`emergency_active_for`].
+//! identical), so every replica computes the identical timeline (replica
+//! determinism). Whether a given proposal ran under an emergency is [`emergency_active_for`].
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
@@ -661,7 +661,7 @@ fn fold_chain(activations: &[(i64, i64)]) -> Option<ChainState> {
                 // Monotone: a renewal that overlaps the prior activation (rare, but
                 // permitted — a continuation may activate before the previous span
                 // ends) must never move the chain end *backwards*, which would shorten
-                // the cooldown and break the <= 50% duty cycle (T2.8.2 review 4).
+                // the cooldown and break the <= 50% duty cycle.
                 cur.end_instant = cur.end_instant.max(expiry);
             }
             _ => {
@@ -719,7 +719,7 @@ fn clamp_duration(requested: i64) -> i64 {
 /// The activation instant and scheduled expiry are read from the (signed)
 /// attestation, not recomputed from this replica's re-stamped admission clock; every
 /// other input is a log position. So every replica computes the identical timeline
-/// (T2.8.2 invariant 1).
+/// (replica determinism).
 pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, EmergencyError> {
     let log = AppendLog::new(db);
     let founders = founder_set(db)?;
@@ -777,8 +777,7 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
         }
         // A duplicate legitimate attestation for a declaration already activated is
         // ignored — but this check is *after* legitimacy, so a gossiped bogus
-        // attestation that fails the checks below never blocks the station's real one
-        // (T2.8.2 review finding 2).
+        // attestation that fails the checks below never blocks the station's real one.
         if seen_decls.contains(&act.declaration_hash) {
             continue;
         }
@@ -937,7 +936,7 @@ pub fn emergency_for_proposal(
 /// under an active declaration this is the emergency's activation position — so a
 /// member whose standing is manufactured after the emergency began neither counts
 /// in the denominator nor casts a valid ballot. For every other proposal it is the
-/// proposal's own open position `(open_time, open_seq)`, unchanged (T2.1.3).
+/// proposal's own open position `(open_time, open_seq)`, unchanged (ADR-0022).
 pub fn electorate_pin(
     db: &Database,
     is_emergency: bool,
@@ -1050,7 +1049,7 @@ fn next_admission(log: &AppendLog, now: i64) -> Result<(u64, i64), EmergencyErro
 /// The `(declaration_pct, max_renewals)` that govern emergency *legitimacy*, read
 /// from the immutable **genesis (founder) charter** so the append-time activation
 /// decision matches [`emergency_timeline`]'s re-derivation exactly and no later
-/// amendment can move it (T2.8.2 review 3). Falls back to the hard floors/ceiling if
+/// amendment can move it. Falls back to the hard floors/ceiling if
 /// no Charter is published.
 fn emergency_params(db: &Database) -> Result<(u8, u32), EmergencyError> {
     Ok(match founder_charter(db)? {
