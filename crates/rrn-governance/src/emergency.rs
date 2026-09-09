@@ -658,7 +658,11 @@ fn fold_chain(activations: &[(i64, i64)]) -> Option<ChainState> {
             Some(cur) if instant < cur.end_instant + EMERGENCY_COOLDOWN_SECS => {
                 cur.consecutive += 1;
                 cur.total_active += active;
-                cur.end_instant = expiry;
+                // Monotone: a renewal that overlaps the prior activation (rare, but
+                // permitted — a continuation may activate before the previous span
+                // ends) must never move the chain end *backwards*, which would shorten
+                // the cooldown and break the <= 50% duty cycle (T2.8.2 review 4).
+                cur.end_instant = cur.end_instant.max(expiry);
             }
             _ => {
                 chain = Some(ChainState {
@@ -720,17 +724,36 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
     let log = AppendLog::new(db);
     let founders = founder_set(db)?;
 
-    // The community id the founder root names — a declaration for another community
-    // is not this community's emergency. (Founder root, not the amended charter, so
-    // the timeline never re-enters charter/tally resolution.)
-    let community = founder_charter(db)?.map(|c| c.charter().community_id.clone());
-
-    // The declaration bar comes from the effective Charter. Amendments are never
-    // Emergency-kind proposals, so resolving it here cannot recurse back into the
-    // emergency derivation.
-    let declaration_pct = effective_charter(db)?
-        .map(|c| c.governance_structure.effective_emergency_declaration_pct())
+    // The community id, the declaration bar, and the renewal cap are resolved from
+    // the **genesis (founder) charter**, never the amendable effective charter. The
+    // founder charter and the founding set are immutable genesis facts (charter.rs:
+    // founders are "retained unchanged on amendment"), so which past activations were
+    // legitimate is a pure function of genesis + signed records that no later
+    // amendment can rewrite — the replica-determinism invariant 1 demands this, and
+    // deriving the bar from a signed-but-forgeable attestation field would instead let
+    // a forged attestation set its own bar. (Divergence noted in the PR: this makes
+    // the emergency-*legitimacy* parameters non-amendable in Phase 2; a general
+    // position-bounded charter resolution — which the ordinary tally thresholds also
+    // want — is recommended follow-up.) Reading founder_charter, not effective_charter,
+    // also keeps the timeline off the tally/charter-resolution path entirely.
+    let genesis = founder_charter(db)?;
+    let community = genesis.as_ref().map(|c| c.charter().community_id.clone());
+    let declaration_pct = genesis
+        .as_ref()
+        .map(|c| {
+            c.charter()
+                .governance_structure
+                .effective_emergency_declaration_pct()
+        })
         .unwrap_or(EMERGENCY_DECLARATION_PCT_FLOOR);
+    let max_renewals = genesis
+        .as_ref()
+        .map(|c| {
+            c.charter()
+                .governance_structure
+                .effective_max_consecutive_renewals()
+        })
+        .unwrap_or(MAX_CONSECUTIVE_RENEWALS_CEILING);
 
     let mut timeline: Vec<ActiveEmergency> = Vec::new();
     let mut chain_pairs: Vec<(i64, i64)> = Vec::new();
@@ -741,14 +764,10 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
         let Ok(act) = from_canonical_bytes::<EmergencyActivated>(&entry.payload.bytes) else {
             continue;
         };
-        // One activation per declaration; a duplicate attestation is ignored.
-        if !seen_decls.insert(act.declaration_hash) {
-            continue;
-        }
         let activation_seq = entry.seq;
 
         // The declaration must exist, be self-signed, and name this community.
-        let Some((decl, _decl_seq)) = find_declaration(&log, &act.declaration_hash)? else {
+        let Some((decl, decl_seq)) = find_declaration(&log, &act.declaration_hash)? else {
             continue;
         };
         if let Some(community) = &community {
@@ -756,13 +775,17 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
                 continue;
             }
         }
+        // A duplicate legitimate attestation for a declaration already activated is
+        // ignored — but this check is *after* legitimacy, so a gossiped bogus
+        // attestation that fails the checks below never blocks the station's real one
+        // (T2.8.2 review finding 2).
+        if seen_decls.contains(&act.declaration_hash) {
+            continue;
+        }
 
         // Re-derive the crossing: distinct eligible signatures, pinned at the
         // attestation's own position, must reach the threshold by that position.
         let pin_time = act.activation_instant;
-        let author_seq = find_declaration(&log, &act.declaration_hash)?
-            .map(|(_, seq)| seq)
-            .unwrap_or(activation_seq);
         let n = grace_electorate_asof(db, &founders, pin_time, activation_seq)?.len();
         let threshold = declaration_threshold(n, declaration_pct);
         let sigs = eligible_signatures(
@@ -771,7 +794,7 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
             &founders,
             &act.declaration_hash,
             &decl.author,
-            author_seq,
+            decl_seq,
             pin_time,
             activation_seq,
             activation_seq,
@@ -787,18 +810,17 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
         if act.scheduled_expiry != scheduled {
             continue;
         }
-        let Some(renewal_count) =
-            chain_decision(&chain_pairs, act.activation_instant, scheduled, {
-                effective_charter(db)?
-                    .map(|c| c.governance_structure.effective_max_consecutive_renewals())
-                    .unwrap_or(MAX_CONSECUTIVE_RENEWALS_CEILING)
-            })
-        else {
+        let Some(renewal_count) = chain_decision(
+            &chain_pairs,
+            act.activation_instant,
+            scheduled,
+            max_renewals,
+        ) else {
             continue; // caps/cooldown refused this activation
         };
 
         // Legitimate. Find any lapse that reached its own threshold, pinned at the
-        // same activation position.
+        // same activation position (the lapse answers to the same electorate and bar).
         let lapsed_at_seq = lapse_boundary(
             &log,
             db,
@@ -806,10 +828,10 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
             &act.declaration_hash,
             pin_time,
             activation_seq,
-            declaration_pct,
-            n,
+            threshold,
         )?;
 
+        seen_decls.insert(act.declaration_hash);
         chain_pairs.push((act.activation_instant, scheduled));
         timeline.push(ActiveEmergency {
             declaration_hash: act.declaration_hash,
@@ -827,8 +849,8 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
 
 /// The log seq at which a lapse for `decl_hash` crossed the supermajority (drawn
 /// from the emergency's own pinned electorate, §4), or `None` if no lapse reached
-/// it. `n` is the pinned electorate size (the denominator), so the lapse answers to
-/// exactly the same threshold as the declaration.
+/// it. `threshold` is the emergency's own crossing threshold — the lapse answers to
+/// exactly the same electorate and bar as the declaration.
 #[allow(clippy::too_many_arguments)]
 fn lapse_boundary(
     log: &AppendLog,
@@ -837,10 +859,8 @@ fn lapse_boundary(
     decl_hash: &Hash,
     pin_time: i64,
     pin_seq: u64,
-    declaration_pct: u8,
-    n: usize,
+    threshold: usize,
 ) -> Result<Option<u64>, EmergencyError> {
-    let threshold = declaration_threshold(n, declaration_pct);
     // A lapse targets the declaration; its co-signatures target the lapse's own
     // hash. Find every lapse record for this declaration and take the earliest that
     // crosses.
@@ -879,8 +899,9 @@ fn lapse_boundary(
 
 /// The emergency, if any, that governs a record admitted at station instant
 /// `admitted_at` and log position `seq` (ADR-0023 §5). `None` when no declaration's
-/// active span covers it — the record then runs the ordinary regime. At most one
-/// emergency can cover any instant (the §4 caps forbid overlap).
+/// active span covers it — the record then runs the ordinary regime. Returns the
+/// first (earliest-activated) covering emergency; overlapping chains are rare but
+/// possible, and the earliest governs.
 pub fn active_emergency_at(
     db: &Database,
     admitted_at: i64,
@@ -974,8 +995,10 @@ pub fn declaration_cosigners(
 }
 
 /// The derived post-emergency report: for every legitimate activation, its
-/// co-signers and the measures passed under it (ADR-0023 §6). A pure read of the
-/// log — no new record kinds.
+/// co-signers and every Emergency measure **admitted under it** (ADR-0023 §6) — the
+/// honest superset, so a measure that was raised under the emergency and *failed* is
+/// still surfaced for review, not hidden; whether each passed is the tally's call. A
+/// pure read of the log — no new record kinds.
 pub fn emergency_report(db: &Database) -> Result<Vec<EmergencyReportActivation>, EmergencyError> {
     let timeline = emergency_timeline(db)?;
     let log = AppendLog::new(db);
@@ -1024,13 +1047,20 @@ fn next_admission(log: &AppendLog, now: i64) -> Result<(u64, i64), EmergencyErro
     })
 }
 
-/// Reads the effective Charter's `(declaration_pct, max_renewals)`, falling back to
-/// the hard floors/ceiling if no Charter is published.
+/// The `(declaration_pct, max_renewals)` that govern emergency *legitimacy*, read
+/// from the immutable **genesis (founder) charter** so the append-time activation
+/// decision matches [`emergency_timeline`]'s re-derivation exactly and no later
+/// amendment can move it (T2.8.2 review 3). Falls back to the hard floors/ceiling if
+/// no Charter is published.
 fn emergency_params(db: &Database) -> Result<(u8, u32), EmergencyError> {
-    Ok(match effective_charter(db)? {
+    Ok(match founder_charter(db)? {
         Some(c) => (
-            c.governance_structure.effective_emergency_declaration_pct(),
-            c.governance_structure.effective_max_consecutive_renewals(),
+            c.charter()
+                .governance_structure
+                .effective_emergency_declaration_pct(),
+            c.charter()
+                .governance_structure
+                .effective_max_consecutive_renewals(),
         ),
         None => (
             EMERGENCY_DECLARATION_PCT_FLOOR,

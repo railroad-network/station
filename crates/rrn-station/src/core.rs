@@ -2494,6 +2494,7 @@ impl Core {
         let params: rpc::GovInitCharterParams = parse_params(req)?;
         let station = self.station_keypair();
         let now = self.clock.now();
+        self.ensure_charter_not_frozen(now)?;
 
         let founders: Vec<Keypair> = if params.founder_secrets_hex.is_empty() {
             vec![station.clone()]
@@ -2554,6 +2555,7 @@ impl Core {
         }
         let station = self.station_keypair();
         let now = self.clock.now();
+        self.ensure_charter_not_frozen(now)?;
 
         let mut founders = Vec::with_capacity(params.founders.len());
         for a in &params.founders {
@@ -2664,6 +2666,16 @@ impl Core {
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         let station = self.station_keypair();
         let now = self.clock.now();
+        // §3b founder-charter freeze: do not advance the founding ceremony while an
+        // emergency is active (ADR-0023 §3b).
+        if emergency::is_emergency_active_now(&self.db, now)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+        {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "the charter is frozen while an emergency is active (ADR-0023 §3b)".to_string(),
+            ));
+        }
         let mut log = AppendLog::new(&self.db);
         // Threshold-clearing appends publish (verify_founders holds); short of it,
         // the Charter stays pending — both are the same append, gated on reads.
@@ -2812,6 +2824,20 @@ impl Core {
         Ok(emergency::active_emergency_at(&self.db, now, u64::MAX)
             .map_err(internal)?
             .map(|e| self.emergency_status(&e, now)))
+    }
+
+    /// §3b founder-charter freeze: no founder charter is published (or its ceremony
+    /// advanced) while an emergency is active — the effective charter is frozen on
+    /// *every* door, not only the amendment-proposal path (ADR-0023 §3b). Latent in
+    /// Phase 1 (the ceremony pins version 1 and refuses once a charter exists), but
+    /// enforced here so the freeze is on the asset, not one of its doors.
+    fn ensure_charter_not_frozen(&self, now: i64) -> Result<(), rpc::RpcError> {
+        if emergency::is_emergency_active_now(&self.db, now).map_err(internal)? {
+            return Err(invalid_params(
+                "the charter is frozen while an emergency is active (ADR-0023 §3b)",
+            ));
+        }
+        Ok(())
     }
 
     /// `governance_emergency_declare` — raise a declaration, station-signed by the

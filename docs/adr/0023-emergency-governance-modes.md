@@ -890,3 +890,20 @@ it. Flagged for maintainer ratification alongside this ADR.*
   nothing ADR-0015 grace does not already grant, whereas a holdout veto would defeat
   §2's own co-present-supermajority partition rationale. See
   `rrn_governance::emergency::declaration_threshold`.
+
+- **2026-09-09 (T2.8.2) — span boundary and genesis-resolved legitimacy parameters.**
+  Two readings the implementation fixes: (i) §4's "ends when `activation_instant +
+  duration_secs ≤ now`" and §5's `activation_instant < admission(P) ≤ scheduled_expiry`
+  are reconciled in favour of §5 — a proposal is governed for admissions in the span
+  `(activation_instant, scheduled_expiry]`; a record admitted in the exact second of
+  activation is ungoverned (strict `<`), an immaterial one-tick edge. (ii) The
+  parameters deciding **whether a past emergency was legitimate** — the declaration bar
+  and the renewal cap — are resolved from the **immutable genesis (founder) charter**,
+  not the amendable effective charter, so no post-emergency amendment can retroactively
+  rewrite which activations were legitimate (invariant 1 / §5 "reconstructible for all
+  time"); a signed-but-forgeable attestation field would instead let a forged
+  attestation choose its own bar. The cost: those legitimacy parameters are effectively
+  non-amendable in Phase 2 (the compressed-window seconds and the measure quorum —
+  threshold *numbers* like the ordinary statute bars — still track the effective
+  charter). A general position-bounded charter resolution, wanted by the ordinary tally
+  thresholds too, is recommended follow-up.

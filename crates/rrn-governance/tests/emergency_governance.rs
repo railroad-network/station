@@ -632,6 +632,390 @@ fn an_expired_emergency_measure_drops_out_of_the_in_force_set() {
     );
 }
 
+// --- §3 the raised emergency quorum binds -----------------------------------
+
+#[test]
+fn the_raised_emergency_quorum_binds_where_the_statute_quorum_would_pass() {
+    let (db, founders, st) = three_founder_community();
+    let charter = rrn_governance::tally::effective_charter(&db)
+        .unwrap()
+        .unwrap();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let at = t0 + 10;
+
+    // A compressed Emergency measure with a single voter: emergency quorum is 50% of
+    // the pinned electorate of 3 ⇒ needs 2 to turn out, so 1 of 3 fails quorum.
+    let em = propose_emergency(&db, &st, &charter, &founders[0], at + 3600, at);
+    cosign_prop(&db, &founders[1], &em, at);
+    cosign_prop(&db, &founders[2], &em, at);
+    vote_prop(&db, &founders[0], &em, VoteChoice::Yes, at + 1);
+    let t = tally(&db, &em.proposal_id, em.voting_ends_at + 1).unwrap();
+    assert_eq!(t.eligible_voters, 3);
+    assert!(!t.quorum_met, "1 of 3 is below the 50% emergency quorum");
+    assert_eq!(t.outcome, Some(ProposalOutcome::Failed));
+
+    // An ordinary Statute with the same 1-of-3 turnout clears the 30% statute quorum
+    // and passes — so the failure above is the raised emergency quorum binding.
+    let statute = {
+        let p = Proposal::new(
+            addr(&founders[0]),
+            "Ordinary rule".into(),
+            "b".into(),
+            ProposalKind::Statute,
+            at,
+        )
+        .unwrap();
+        let id = p.proposal_id;
+        let mut log = AppendLog::new(&db);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(p, &founders[0]),
+            &db,
+            &st,
+            &charter,
+            at,
+        )
+        .unwrap();
+        rrn_governance::proposal::proposal_records(&AppendLog::new(&db), &id, &db)
+            .unwrap()
+            .proposal
+            .unwrap()
+    };
+    cosign_prop(&db, &founders[1], &statute, at);
+    cosign_prop(&db, &founders[2], &statute, at);
+    vote_prop(&db, &founders[0], &statute, VoteChoice::Yes, at + 1);
+    let ts = tally(&db, &statute.proposal_id, statute.voting_ends_at + 1).unwrap();
+    assert!(ts.quorum_met, "1 of 3 clears the 30% statute quorum");
+    assert_eq!(ts.outcome, Some(ProposalOutcome::Passed));
+}
+
+// --- §4 the renewal count cap (isolated from the duration cap) ---------------
+
+#[test]
+fn the_consecutive_renewal_count_cap_refuses_a_fourth_activation() {
+    // Short (1-day) activations keep the chain well under the 14-day duration cap, so
+    // the *count* cap (<= 2 renewals ⇒ 3 activations) is what binds the 4th.
+    let (db, founders, st) = three_founder_community();
+    let mut instant = 1_000_000;
+    let mut renewals = vec![];
+    for _ in 0..3 {
+        let h = declare(&db, &st, &founders[0], DAY, instant);
+        em_cosign(&db, &st, &founders[1], h, instant);
+        let e = emergency::active_emergency_at(&db, instant + 1, u64::MAX)
+            .unwrap()
+            .unwrap();
+        renewals.push(e.renewal_count);
+        instant = e.scheduled_expiry + 1; // within the 14-day cooldown ⇒ continuation
+    }
+    assert_eq!(renewals, vec![0, 1, 2], "three activations: counts 0,1,2");
+
+    // The fourth continuation would be renewal_count 3 > cap 2 → it does not activate.
+    let h4 = declare(&db, &st, &founders[0], DAY, instant);
+    em_cosign(&db, &st, &founders[1], h4, instant);
+    assert!(
+        emergency::active_emergency_at(&db, instant + 1, u64::MAX)
+            .unwrap()
+            .is_none(),
+        "a fourth consecutive activation exceeds the renewal count cap"
+    );
+}
+
+// --- §3b amendment enactment deferral ---------------------------------------
+
+#[test]
+fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
+    let (db, founders, st) = three_founder_community();
+    let charter = rrn_governance::tally::effective_charter(&db)
+        .unwrap()
+        .unwrap();
+    let t0 = 1_000_000;
+
+    // Publish + pass a charter amendment BEFORE any emergency (so it is due to enact).
+    let mut v2 = charter.clone();
+    v2.version = 2;
+    v2.previous_hash = Some(charter.hash());
+    let p = Proposal::new(
+        addr(&founders[0]),
+        "Raise the budget".into(),
+        "v2".into(),
+        ProposalKind::CharterAmendment { new_charter: v2 },
+        t0,
+    )
+    .unwrap();
+    let amendment_id = p.proposal_id;
+    {
+        let mut log = AppendLog::new(&db);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(p, &founders[0]),
+            &db,
+            &st,
+            &charter,
+            t0,
+        )
+        .unwrap();
+    }
+    let amendment =
+        rrn_governance::proposal::proposal_records(&AppendLog::new(&db), &amendment_id, &db)
+            .unwrap()
+            .proposal
+            .unwrap();
+    for c in &founders[1..3] {
+        cosign_prop(&db, c, &amendment, t0);
+    }
+    for f in &founders {
+        vote_prop(&db, f, &amendment, VoteChoice::Yes, t0 + 1);
+    }
+
+    // Activate a **7-day** emergency AFTER the amendment's voting closes but before
+    // its implementation time, so the emergency is still active when enactment comes
+    // due AND still active after the lapse would end it (proving the *lapse* — not
+    // expiry — is what unfreezes). The declaration is not a CharterAmendment, so it is
+    // not itself frozen.
+    let act_at = amendment.voting_ends_at + DAY; // voting has closed
+    let due = amendment.implementation_at; // < act_at + 7d
+    assert!(
+        due < act_at + 7 * DAY,
+        "the emergency must span the enactment"
+    );
+    let h = declare(&db, &st, &founders[0], 7 * DAY, act_at);
+    em_cosign(&db, &st, &founders[1], h, act_at);
+    assert!(emergency::active_emergency_at(&db, due, u64::MAX)
+        .unwrap()
+        .is_some());
+
+    let enacted = rrn_governance::lifecycle::enact_due(&db, &st, due).unwrap();
+    assert!(
+        !enacted.contains(&amendment.proposal_id),
+        "the amendment must not enact while the emergency is active"
+    );
+    assert_eq!(
+        rrn_governance::tally::effective_charter(&db)
+            .unwrap()
+            .unwrap()
+            .version,
+        1,
+        "the effective charter is still v1 during the emergency"
+    );
+
+    // Lapse the emergency (while it is still within its scheduled span), then the
+    // amendment enacts — so the lapse, not expiry, is what unfroze it.
+    let lapse_at = due + 1;
+    assert!(lapse_at < act_at + 7 * DAY, "lapse before natural expiry");
+    let lapse = em_lapse(&db, &founders[0], h, lapse_at);
+    em_cosign(&db, &st, &founders[1], lapse, lapse_at);
+    assert!(emergency::active_emergency_at(&db, lapse_at + 1, u64::MAX)
+        .unwrap()
+        .is_none());
+    let enacted = rrn_governance::lifecycle::enact_due(&db, &st, lapse_at + 1).unwrap();
+    assert!(enacted.contains(&amendment.proposal_id));
+    assert_eq!(
+        rrn_governance::tally::effective_charter(&db)
+            .unwrap()
+            .unwrap()
+            .version,
+        2,
+        "after the lapse the amendment enacts and the charter is v2"
+    );
+}
+
+// --- §3a a ballot admitted past the compressed close is refused --------------
+
+#[test]
+fn a_ballot_admitted_after_the_compressed_close_is_refused() {
+    let (db, founders, st) = three_founder_community();
+    let charter = rrn_governance::tally::effective_charter(&db)
+        .unwrap()
+        .unwrap();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let at = t0 + 10;
+    let p = propose_emergency(&db, &st, &charter, &founders[0], at + 3600, at);
+    cosign_prop(&db, &founders[1], &p, at);
+    cosign_prop(&db, &founders[2], &p, at);
+
+    let v = Vote {
+        proposal_id: p.proposal_id,
+        voter: addr(&founders[0]),
+        choice: VoteChoice::Yes,
+        cast_at: at,
+    };
+    let mut log = AppendLog::new(&db);
+    let err = append_vote(
+        &mut log,
+        SignedPayload::sign(v, &founders[0]),
+        &db,
+        p.voting_ends_at + 1,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        rrn_governance::vote::VoteError::OutsideVotingWindow { .. }
+    ));
+}
+
+// --- §3c the electorate pin excludes members manufactured after activation ---
+//
+// This is the one property a founder-only grace community cannot exhibit (founders
+// are eligible at every position), so it seeds real established-member reputation.
+
+mod reputation {
+    use super::*;
+    use rrn_identity::attestation::Attestation;
+    use rrn_identity::vouch::{VouchBody, VouchKind};
+    use rrn_ledger::settlement::SettlementRecord;
+    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+
+    fn append_settled(
+        db: &Database,
+        sender: &Keypair,
+        receiver: &Keypair,
+        st: &Keypair,
+        nonce: u64,
+        at: i64,
+    ) {
+        let mut log = AppendLog::new(db);
+        let proposal = TransactionProposal::new(
+            addr(sender),
+            addr(receiver),
+            300,
+            None,
+            nonce,
+            1,
+            i64::MAX / 2,
+        );
+        let pid = proposal.id;
+        log.append(SignedPayload::sign(proposal, sender), 0)
+            .unwrap();
+        log.append(
+            SignedPayload::sign(
+                TransactionConfirmation {
+                    proposal_id: pid,
+                    confirmer: addr(receiver),
+                    confirmed_at: at,
+                },
+                receiver,
+            ),
+            0,
+        )
+        .unwrap();
+        log.append(
+            SignedPayload::sign(
+                SettlementRecord {
+                    proposal_id: pid,
+                    sender: addr(sender),
+                    receiver: addr(receiver),
+                    amount_centi: 300,
+                    settled_at: at,
+                },
+                st,
+            ),
+            0,
+        )
+        .unwrap();
+    }
+
+    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
+        let mut log = AppendLog::new(db);
+        let vouch = Attestation {
+            kind: VouchKind,
+            body: VouchBody {
+                community: "commons".into(),
+                statement: "trustworthy".into(),
+                reputation_stake_centi: 0,
+            },
+            subject: *subject,
+            issued_at: at,
+            expires_at: None,
+        };
+        log.append(vouch.sign(voucher), 0).unwrap();
+    }
+
+    fn earn_raw_standing(db: &Database, who: &Keypair, st: &Keypair, at: i64) {
+        for nonce in 0..10 {
+            append_settled(db, who, st, st, nonce, at);
+        }
+        for _ in 0..10 {
+            append_vouch(db, who, &addr(&Keypair::generate()), at);
+        }
+    }
+
+    fn established_members(db: &Database, st: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
+        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
+        for m in &members {
+            earn_raw_standing(db, m, st, at);
+        }
+        for i in 0..n {
+            append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
+        }
+        members
+    }
+
+    #[test]
+    fn a_member_established_after_activation_cannot_vote_in_the_emergency() {
+        let db = fresh_db();
+        let st = station();
+        const AT: i64 = 300 * DAY;
+        // Four established members (grace off). They are the electorate.
+        let members = established_members(&db, &st, 4, AT);
+        publish_charter(&db, &members);
+
+        // Activate: author + 2 co-signs cross ceil(2*4/3) = 3.
+        let h = declare(&db, &st, &members[0], 72 * 3600, AT);
+        em_cosign(&db, &st, &members[1], h, AT);
+        em_cosign(&db, &st, &members[2], h, AT);
+        assert!(emergency::active_emergency_at(&db, AT + 1, u64::MAX)
+            .unwrap()
+            .is_some());
+
+        // A compressed Emergency proposal, published (default bar 3 co-signers, grace
+        // off) by three of the four established members.
+        let charter = rrn_governance::tally::effective_charter(&db)
+            .unwrap()
+            .unwrap();
+        let p = propose_emergency(&db, &st, &charter, &members[0], AT + 3600, AT + 5);
+        for c in &members[1..4] {
+            cosign_prop(&db, c, &p, AT + 5);
+        }
+
+        // AFTER activation, manufacture a fifth established member.
+        let newcomer = Keypair::generate();
+        earn_raw_standing(&db, &newcomer, &st, AT + 10);
+        append_vouch(&db, &members[0], &addr(&newcomer), AT + 10);
+        assert_eq!(
+            rrn_reputation::staking::established_member_count(&db, AT + 20).unwrap(),
+            5,
+            "the community now has five established members by wall clock"
+        );
+
+        // The newcomer's ballot is refused on the write path (pinned electorate is 4).
+        let v = Vote {
+            proposal_id: p.proposal_id,
+            voter: addr(&newcomer),
+            choice: VoteChoice::Yes,
+            cast_at: AT + 20,
+        };
+        let mut log = AppendLog::new(&db);
+        let err =
+            append_vote(&mut log, SignedPayload::sign(v, &newcomer), &db, AT + 20).unwrap_err();
+        assert!(matches!(
+            err,
+            rrn_governance::vote::VoteError::VoterNotEstablished { .. }
+        ));
+
+        // And the pinned denominator stays 4, not 5.
+        for c in &members[0..2] {
+            vote_prop(&db, c, &p, VoteChoice::Yes, AT + 20);
+        }
+        let t = tally(&db, &p.proposal_id, p.voting_ends_at + 1).unwrap();
+        assert_eq!(
+            t.eligible_voters, 4,
+            "the emergency denominator is pinned at activation — the newcomer is excluded"
+        );
+    }
+}
+
 // --- Pure chain/threshold logic (proptest) ----------------------------------
 
 proptest::proptest! {

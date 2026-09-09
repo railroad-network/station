@@ -541,16 +541,31 @@ impl From<GovernanceStructure> for CBOR {
             g.implementation_delay_days as u64,
         );
         m.insert("emergency_threshold_pct", g.emergency_threshold_pct as u64);
-        m.insert("emergency_window_secs", g.emergency_window_secs);
-        m.insert(
-            "emergency_declaration_pct",
-            g.emergency_declaration_pct as u64,
-        );
-        m.insert("emergency_quorum_pct", g.emergency_quorum_pct as u64);
-        m.insert(
-            "max_consecutive_renewals",
-            g.max_consecutive_renewals as u64,
-        );
+        // The T2.8.2 emergency parameters are **additive** fields on a
+        // content-addressed record: each is omitted from the map when it equals its
+        // default, so a pre-emergency (Phase-1) charter — which never carried these
+        // keys — hashes byte-identically under this encoder, and an unchanged
+        // charter's `charter_hash` does not move (ADR-0010 discipline). A charter
+        // that customises a parameter carries only that key.
+        let d = GovernanceStructure::default();
+        if g.emergency_window_secs != d.emergency_window_secs {
+            m.insert("emergency_window_secs", g.emergency_window_secs);
+        }
+        if g.emergency_declaration_pct != d.emergency_declaration_pct {
+            m.insert(
+                "emergency_declaration_pct",
+                g.emergency_declaration_pct as u64,
+            );
+        }
+        if g.emergency_quorum_pct != d.emergency_quorum_pct {
+            m.insert("emergency_quorum_pct", g.emergency_quorum_pct as u64);
+        }
+        if g.max_consecutive_renewals != d.max_consecutive_renewals {
+            m.insert(
+                "max_consecutive_renewals",
+                g.max_consecutive_renewals as u64,
+            );
+        }
         m.into()
     }
 }
@@ -562,6 +577,7 @@ impl TryFrom<CBOR> for GovernanceStructure {
             CBORCase::Map(map) => map,
             _ => return Err(dcbor::Error::WrongType),
         };
+        let default_gov = GovernanceStructure::default();
         Ok(GovernanceStructure {
             voting_mechanism: map.extract::<&str, VotingMechanism>("voting_mechanism")?,
             statute_quorum_pct: extract_u8(&map, "statute_quorum_pct")?,
@@ -569,10 +585,24 @@ impl TryFrom<CBOR> for GovernanceStructure {
             deliberation_window_days: extract_u8(&map, "deliberation_window_days")?,
             implementation_delay_days: extract_u8(&map, "implementation_delay_days")?,
             emergency_threshold_pct: extract_u8(&map, "emergency_threshold_pct")?,
-            emergency_window_secs: map.extract::<&str, i64>("emergency_window_secs")?,
-            emergency_declaration_pct: extract_u8(&map, "emergency_declaration_pct")?,
-            emergency_quorum_pct: extract_u8(&map, "emergency_quorum_pct")?,
-            max_consecutive_renewals: extract_u32(&map, "max_consecutive_renewals")?,
+            // Additive fields: absent on a pre-emergency charter (and omitted when
+            // default), so each falls back to the default rather than failing decode.
+            emergency_window_secs: match map.get::<&str, CBOR>("emergency_window_secs") {
+                Some(c) => i64::try_from(c).map_err(|_| dcbor::Error::WrongType)?,
+                None => default_gov.emergency_window_secs,
+            },
+            emergency_declaration_pct: match map.get::<&str, CBOR>("emergency_declaration_pct") {
+                Some(_) => extract_u8(&map, "emergency_declaration_pct")?,
+                None => default_gov.emergency_declaration_pct,
+            },
+            emergency_quorum_pct: match map.get::<&str, CBOR>("emergency_quorum_pct") {
+                Some(_) => extract_u8(&map, "emergency_quorum_pct")?,
+                None => default_gov.emergency_quorum_pct,
+            },
+            max_consecutive_renewals: match map.get::<&str, CBOR>("max_consecutive_renewals") {
+                Some(_) => extract_u32(&map, "max_consecutive_renewals")?,
+                None => default_gov.max_consecutive_renewals,
+            },
         })
     }
 }
@@ -1058,5 +1088,56 @@ mod tests {
         let db = fresh_db();
         assert!(founder_charter(&db).unwrap().is_none());
         assert!(founder_charter_hash(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn emergency_params_are_additive_default_charter_bytes_unchanged() {
+        // A default charter OMITS every T2.8.2 emergency key, so a pre-emergency
+        // (Phase-1) charter — which never carried them — decodes and hashes
+        // identically under this encoder; the `charter_hash` does not move on
+        // upgrade (ADR-0010 additive-field discipline).
+        let gov = GovernanceStructure::default();
+        let cbor = CBOR::from(gov.clone());
+        let CBORCase::Map(map) = cbor.clone().into_case() else {
+            panic!("map");
+        };
+        for key in [
+            "emergency_window_secs",
+            "emergency_declaration_pct",
+            "emergency_quorum_pct",
+            "max_consecutive_renewals",
+        ] {
+            assert!(
+                map.get::<&str, CBOR>(key).is_none(),
+                "{key} must be omitted"
+            );
+        }
+        let back: GovernanceStructure = cbor.try_into().unwrap();
+        assert_eq!(gov, back);
+
+        // Customising one parameter carries just that key and changes the bytes.
+        let custom = GovernanceStructure {
+            emergency_window_secs: 48 * 3600,
+            ..GovernanceStructure::default()
+        };
+        assert_ne!(to_canonical_bytes(gov), to_canonical_bytes(custom.clone()));
+        let back2: GovernanceStructure =
+            from_canonical_bytes(&to_canonical_bytes(custom.clone())).unwrap();
+        assert_eq!(custom, back2);
+    }
+
+    #[test]
+    fn a_pre_emergency_governance_map_decodes_with_defaults() {
+        // A Phase-1 governance_structure map (only the original six keys) must decode
+        // — not hard-fail — with the emergency parameters at their defaults.
+        let mut m = Map::new();
+        m.insert("voting_mechanism", VotingMechanism::Direct);
+        m.insert("statute_quorum_pct", 30u64);
+        m.insert("statute_approval_pct", 50u64);
+        m.insert("deliberation_window_days", 7u64);
+        m.insert("implementation_delay_days", 7u64);
+        m.insert("emergency_threshold_pct", 67u64);
+        let gov: GovernanceStructure = CBOR::from(m).try_into().unwrap();
+        assert_eq!(gov, GovernanceStructure::default());
     }
 }

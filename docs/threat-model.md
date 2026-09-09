@@ -2237,6 +2237,25 @@ then lapses* — and withhold every adjacent one.
   `rrn-ledger` or `rrn-reputation`: the settlement and dispute windows, the debt
   floor, certificates, and reputation are untouched, by construction. A flood does
   not authorize economic restructuring.
+- *Residual — the station signer is not yet pinned on attestations.* The
+  `emergency_activated` attestation (like ADR-0022's `ProposalWindow` and
+  `ProposalImplemented`) is trusted structurally — its declaration must re-derive as
+  having crossed the supermajority — but the derivation does not yet verify the
+  attestation's *signer* is the community's station key. A gossip peer that already
+  holds a genuine supermajority (so the crossing re-derives) could inject an
+  attestation with an attacker-chosen `activation_instant`, shifting the active span
+  by up to one declaration's clamped duration (≤ 7 d); it cannot manufacture an
+  emergency without a real supermajority (co-signatures must be from eligible members,
+  which re-derives). This is why the emergency-*legitimacy* parameters are read from
+  the genesis charter rather than any attestation field. Pinning the station signer
+  uniformly across all three station attestations is recommended follow-up (it is a
+  pre-existing gap, not introduced here). A duplicate/bogus attestation cannot *block*
+  the real one: the "already activated" check runs only after legitimacy passes.
+- *Residual — a renewal re-pins the electorate at its own activation.* Each activation
+  in a chain pins at its own position, so a chain that renews mid-emergency can refresh
+  its pinned electorate up to `MAX_CONSECUTIVE_RENEWALS_CEILING` times — ADR-consistent
+  (each renewal is a fresh collective act), but a standing supermajority could admit
+  members between renewals into the next segment's electorate.
 - *Residual risks (stated plainly in ADR-0023):* a standing two-thirds faction can
   still (a) *cycle* emergencies at up to a 50 % duty cycle and (b) file an ordinary
   power measure under a "flood response" declaration — `reason`/`scope` are

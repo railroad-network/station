@@ -122,8 +122,15 @@ pub fn record_implementation(
     // §3b — the constitution is frozen while an emergency holds: a CharterAmendment's
     // enactment is deferred until the emergency lapses (its window keeps running; it
     // just cannot take effect inside the emergency). Ordinary statutes still enact.
+    // The freeze is judged at the *monotone-clamped* admission instant this enactment
+    // record will carry, not the raw sweep `now` — so a station clock that regresses
+    // below the activation instant cannot slip an amendment past the freeze (review 9).
+    let admitted_at = match log.tail()? {
+        Some(t) => now.max(t.created_at),
+        None => now,
+    };
     if matches!(proposal.kind, ProposalKind::CharterAmendment { .. })
-        && crate::emergency::is_emergency_active_now(db, now)
+        && crate::emergency::is_emergency_active_now(db, admitted_at)
             .map_err(|e| StatuteError::Emergency(Box::new(e)))?
     {
         return Err(StatuteError::CharterFrozenByEmergency(proposal.proposal_id));
