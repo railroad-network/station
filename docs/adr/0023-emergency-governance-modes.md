@@ -128,14 +128,24 @@ load-bearing rule:
 
 > **An emergency-passed measure must itself lapse.** A measure enacted on the
 > compressed path (an `Emergency` proposal that passed while a declaration was
-> active) must carry `expires_at ≤ effective_expiry(emergency at proposal
-> admission) + EMERGENCY_MEASURE_GRACE`, where `effective_expiry` is the
-> *actual* end of the declaration active at the proposal's admission — shortened
-> by an `emergency_lapse` if one arrives, not the originally scheduled expiry.
-> The recommended grace is one ordinary `implementation_delay_days` (7 days):
-> long enough to legislate a durable replacement through the *normal* full-window
-> process, not long enough to be a standing law. Making a crisis measure
-> permanent therefore always costs the ordinary process.
+> active) must carry `expires_at ≤ scheduled_expiry(emergency at proposal
+> admission) + EMERGENCY_MEASURE_GRACE`, where `scheduled_expiry` is the
+> emergency's `activation_instant + duration_secs` as attested at the proposal's
+> admission (§2). The recommended grace is one ordinary `implementation_delay_days`
+> (7 days): long enough to legislate a durable replacement through the *normal*
+> full-window process, not long enough to be a standing law. Making a crisis
+> measure permanent therefore always costs the ordinary process.
+
+The bound is checked against the **scheduled** expiry, deliberately, and this
+resolves a subtlety the review surfaced: the bound is evaluated at *proposal
+admission*, when no early `emergency_lapse` may exist yet, so it cannot depend on
+one. An early lapse ends the *emergency* going forward — it stops compression, the
+freeze, and the pin (§4) — but it does **not** retroactively re-shorten a measure
+that already passed: that measure runs to its own signed `expires_at`. Anything
+else would make an enacted statute's effective lifetime differ from its signed
+content and force a second station-signed restatement per measure; the scheduled
+bound avoids that entirely, at the cost of a measure outliving an early-lifted
+emergency by at most the grace — an acceptable, and visible, slack.
 
 Two enforcement details this ADR fixes, because the implementation ticket needs
 them decided: **(i)** an `Emergency` proposal admitted *during* an emergency with
@@ -147,7 +157,13 @@ measure** (kind-level: an expired measure has no effect in `enacted_statutes`),
 and only the *bound* above is compressed-path-specific. Today the field is
 entirely inert — serialized but read by nothing in `statute.rs`/`lifecycle.rs` —
 so enforcing it at all is new work T2.8.2 must do; making it fast without making
-it enforced would be the bug.
+it enforced would be the bug. And because enforcing it kind-wide now gives the
+*un*-declared Emergency kind — an "immediate effect at 67%, no exit runway"
+instrument with, today, no lifetime bound at all — a bound too: an Emergency
+measure passed with **no** active declaration must carry
+`expires_at ≤ voting_ends_at + 30 d`, so the ordinary-path Emergency kind cannot
+be a permanent law either. This is consistent with the Sunset rule and closes a
+latent hole the compressed path would otherwise have left beside it.
 
 This converts the "two gates" claim into a real one: an ordinary
 `Statute`/`AdministrativeRule`/`CharterAmendment` raised during an emergency
@@ -187,21 +203,29 @@ and the implementation sketch lists it.
   electorate (founders ∪ established) while the community is in bootstrap grace.
   This reuses the one electorate the whole governance stack already trusts; it
   introduces **no council, executive, or operator role**, because a new
-  privileged declarer *is* the power ladder we are trying not to build. As with
-  ordinary proposals (`proposal.rs`), the author cannot co-sign their own
-  declaration — the threshold below counts *other* electorate members.
+  privileged declarer *is* the power ladder we are trying not to build. Unlike an
+  ordinary proposal (where the author cannot co-sign their own motion), the
+  **author's own signature counts toward the declaration threshold** — a
+  declaration is a signed act, not a motion seeking endorsement, so there is no
+  "other members" subtraction to reason about.
 
-- **The threshold is a supermajority, and it is the primary anti-abuse defense.**
-  The declaration takes force at the admission of the co-signature that crosses
-  `emergency_declaration_pct` of the electorate. Recommended default **67%**,
-  with a floor `EMERGENCY_DECLARATION_PCT_FLOOR = 67%` — a charter may raise this
-  bar but **never lower it below two-thirds** (§4 explains why every emergency
-  parameter needs a floor). The denominator is the electorate at the **log
-  position of the crossing co-signature** (§3c's position-bounded rule, applied
-  here too), not a wall-clock instant, so the "how many is two-thirds" question
-  has one deterministic answer. Requiring a supermajority *collective* act to
-  unlock compression is what stops a faction from squatting on the emergency
-  lever: one member, or a bare majority, cannot compress anything.
+- **The threshold is a supermajority, stated as an exact integer, and it is the
+  primary anti-abuse defense.** The declaration takes force at the admission of
+  the co-signature that brings the count of **distinct electorate signatures
+  (the author's included)** to at least `ceil(N × emergency_declaration_pct /
+  100)`, where `N` is the size of the electorate at the **log position of the
+  crossing co-signature** (§3c's position-bounded rule, applied to the
+  denominator too — so `N` and the count have one deterministic answer, computed
+  the way `founder_threshold` computes `ceil(n × 3 / 4)` in integer arithmetic).
+  Recommended default `emergency_declaration_pct` = **67%**, with a floor
+  `EMERGENCY_DECLARATION_PCT_FLOOR = 67%` — a charter may raise this bar but
+  **never lower it below two-thirds** (§4 explains why every emergency parameter
+  needs a floor). Worked cases: a 20-member electorate needs `ceil(20 × 0.67)` =
+  14 signatures; a 3-member grace electorate needs `ceil(3 × 0.67)` = 2 (author
+  plus one). Requiring a supermajority *collective* act to unlock compression is
+  what stops a faction from squatting on the emergency lever: one member, or a
+  bare majority, cannot compress anything. (A small electorate makes 2 signatures
+  a real emergency — named honestly in Consequences.)
 
 - **Declarer and co-signer eligibility is judged at admission position, not on
   the author clock.** Ordinary co-signs record an author-clock `cosigned_at` and
@@ -226,8 +250,9 @@ and the implementation sketch lists it.
   station-signed `ProposalImplemented`). So this ADR adds a fourth,
   **station-signed** record kind, **`rrn.gov.emergency_activated`**
   (`kind = "rrn.gov.emergency_activated"`; fields: the `declaration_hash`, the
-  station-attested `activation_instant`, the `effective_expiry`, and the
-  log-derived `renewal_count` of §4), written by the station when it admits the
+  station-attested `activation_instant`, the `scheduled_expiry`
+  (`= activation_instant + duration_secs`), and the log-derived `renewal_count`
+  of §4), written by the station when it admits the
   crossing co-signature. The activation instant is then a *signed, replicated
   fact*, not a per-replica clock reading, and every downstream rule (§3–§5) reads
   it from that record — so the mode has exactly one clock and every replica
@@ -313,12 +338,12 @@ The parameter table, normal vs emergency, with floors:
 
 | Parameter | Normal | Emergency | Rule |
 |---|---|---|---|
-| Decision window (Emergency-kind proposals) | `deliberation_window_days` (7 d) | `emergency_window_secs` (charter; default **24 h**) | Clamped to hard floor `EMERGENCY_WINDOW_FLOOR_SECS` = **12 h**; **compresses, never below the floor** |
+| Decision window (Emergency-kind proposals) | `deliberation_window_days` (7 d) | `emergency_window_secs` (charter; default **24 h**) | Clamped to hard floor `EMERGENCY_WINDOW_FLOOR_SECS` = **24 h**; **compresses, never below the floor** (§3, "window floor") |
 | Implementation delay | `implementation_delay_days` (7 d) | 0 | Already the Emergency kind's behaviour; unchanged |
-| Measure lifetime (`expires_at`) | n/a | `≤ emergency_expiry + EMERGENCY_MEASURE_GRACE` (7 d), **enforced** | §1 — a compressed-path measure must lapse |
+| Measure lifetime (`expires_at`) | n/a | `≤ scheduled_expiry + EMERGENCY_MEASURE_GRACE` (7 d), **enforced** | §1 — a compressed-path measure must lapse |
 | Approval bar | `statute_approval_pct` (50%) | `emergency_threshold_pct` (67%) | **Raised, never lowered** — speed does not cheapen passage |
-| Quorum | `statute_quorum_pct` (30%) | same (never lowered) | Emergency may not *reduce* the quorum bar or denominator |
-| Declaration bar | n/a | `emergency_declaration_pct` (67%) | Floor 67%; charter may raise, never lower (§2) |
+| Quorum | `statute_quorum_pct` (30%) | `emergency_quorum_pct` (**50%**) | **Raised, floor 50%** — the measure bar must not be *lower* than the declaration's collective act (§3, "measure quorum") |
+| Declaration bar | n/a | `emergency_declaration_pct` (67% of electorate, author included) | Floor 67%; charter may raise, never lower (§2) |
 | Charter amendment | allowed | **frozen** (admit + enact) | §3(b) |
 | Electorate | live | **pinned at the activation co-sign's log position** (denominator + eligibility) | §3(c) |
 | Settlement window (ADR-0011) | 24 / 48 h | **unchanged** | Economic protection — never compresses |
@@ -334,14 +359,36 @@ overview's scope limit — a flood does not authorize economic restructuring —
 enforced here by simply never wiring the emergency state into the ledger's window
 arithmetic at all (Non-goals).
 
+**On the measure quorum.** The emergency raises the *quorum* for a compressed-path
+measure to `emergency_quorum_pct` (default 50%, floor 50%), and this is not
+cosmetic — it closes an inversion the design would otherwise have. The
+declaration is a hard collective gate (67% of the *whole* electorate must
+sign, §2), but the measure it unlocks would, at the ordinary `statute_quorum_pct`
+(30%), pass on a turnout of 6 of 20 — so a storm declaration co-signed by
+everyone would become a fast lane on which a handful decide, at the ordinary bar,
+for the emergency's life. The code already anticipated this: `tally.rs` notes
+"configurable emergency quorum is Phase 2." Raising the measure quorum to a
+majority of the *pinned* electorate keeps the deciding body's size honest: an
+emergency compresses *time*, but the number of people who must actually turn out
+to bind everyone does not fall below half. The approval bar stays the raised 67%
+of decisive votes; neither bar is ever *lowered* (Non-goals).
+
 **On the window floor's honesty.** `EMERGENCY_WINDOW_FLOOR_SECS` cannot make a
 compressed window "DTN-safe": under ADR-0020 a confirmation "carried for three
 days settles three days late," and nothing measured in *hours* can include a
-member whose carrier takes *days*. The floor's job is narrower — to stop the
-window collapsing toward zero, which would be instant capture — not to promise
-inclusivity it cannot deliver. Any emergency vote structurally excludes
-deeply-partitioned members; that is an honest cost of deciding in a crisis, named
-in Consequences, not a defect the floor repairs.
+member whose carrier takes *days*. So the floor is not about DTN inclusivity at
+all — it is about how much *notice* the reachable-but-absent get, and the one
+DTN-real notice number the system already commits to is ADR-0011's **Tier-1 24 h
+settlement window**: the minimum a member gets to contest even a small trade. A
+statute that binds everyone should not get *less* notice than a 5-Common trade,
+so the floor is **24 h**, equal to the default — the window is not
+charter-lowerable in Phase 2. One honesty this forces: the Context's "fuel before
+dawn" urgency is **not** served by any floor on offer — a same-night decision is
+below every number here — and, more fundamentally, governance authorizes but does
+not *move* credit (ADR-0012), so "spend on fuel" is an act a member takes, not a
+tally the station closes in hours. The value a fast window actually delivers is
+collective, visible, expiring *authorization*, not disbursement; the ADR states
+that plainly rather than implying an hours-scale spend.
 
 ### 4. Expiry: automatic, short, renewable only by a fresh collective act, and hard-capped by log-derived proximity
 
@@ -349,17 +396,25 @@ in Consequences, not a defect the floor repairs.
   at the admission of the record being judged. There is no "until lifted"; the
   *default* state is off, and staying on takes work.
 
-- **Short, with floors and a ceiling.** The declaration's requested
-  `duration_secs` is the sole source of the emergency's length, clamped to
-  `[EMERGENCY_DURATION_FLOOR, EMERGENCY_DURATION_CEILING]` — there is no separate
-  charter "duration" parameter to reconcile against it; the charter tunes only the
-  floor/ceiling, and those are themselves bounded by hard constants a charter
-  cannot breach. Recommended default (an absent/typical request) **72 h**, floor
-  **24 h** (an emergency shorter than a day is not worth the ceremony), ceiling
-  **14 days** (the overview's upper "7–14 day" band and ADR-0021's DTN delivery
-  grace). Reconciling the ticket's "72 h" with the overview's "7–14 days": the
-  default is 72 h and the ceiling is 14 days, so a community may lawfully choose
-  within the overview's band while the shipped default stays conservative.
+- **Short, with a ceiling derived from the ordinary process — not analogised.**
+  The declaration's requested `duration_secs` is the sole source of one
+  emergency's length, clamped to `[EMERGENCY_DURATION_FLOOR,
+  EMERGENCY_DURATION_CEILING]` — there is no separate charter "duration"
+  parameter; the charter tunes only the floor/ceiling, themselves bounded by hard
+  constants. Recommended default (an absent/typical request) **72 h**, floor
+  **24 h** (an emergency shorter than a day is not worth the ceremony), and a
+  **per-declaration ceiling of 7 days**. The ceiling is *derived*, not borrowed:
+  the whole thesis of §1 is that durability must cost the ordinary process, and
+  the ordinary process takes exactly `deliberation_window_days +
+  implementation_delay_days` = **14 days** to put a statute into effect. An
+  emergency longer than that exists only to *avoid* a process that could have
+  completed meanwhile, so no single declaration may run longer than half of it
+  (7 days), and no *chain* (§4, next bullet) longer than all of it (14 days). This
+  supersedes an earlier draft that set the ceiling at 14 days by analogy to
+  ADR-0021's DTN delivery grace — a carriage-latency number with no bearing on how
+  long a community should hold its exit runway shut; the derived bound is the
+  right one, and it keeps a chain inside the overview's "7–14 day" band while the
+  default stays a conservative 72 h.
 
 - **Renewal is a fresh collective act, and "consecutive" is log-derived, not
   self-asserted.** A renewal is a fresh `emergency_declaration` that must gather
@@ -372,21 +427,27 @@ in Consequences, not a defect the floor repairs.
   bypass of "hit the cap, then re-declare with index 0": a self-reset index buys
   nothing, because proximity, not the field, governs.
 
-- **Hard-capped, then a cooldown longer than the chain.** A continuation chain
-  may renew at most `MAX_CONSECUTIVE_RENEWALS` times (recommend **2** — at most
-  three back-to-back activations, capped by a ceiling constant a charter cannot
-  exceed). Once the cap is reached the emergency lapses, and — because
-  "consecutive" is proximity-based — any further declaration whose activation
-  would fall within the cooldown of that lapse simply **does not activate**:
-  replay refuses to treat it as effective. The cooldown must be **at least the
-  chain's own total active duration** (`EMERGENCY_COOLDOWN_SECS ≥ Σ chain
-  durations`, and strictly greater than `EMERGENCY_MEASURE_GRACE`), so a community
-  can never spend more than half its calendar time under emergency and a lapsing
-  measure's grace can never dovetail straight into the next chain (see the
-  Consequences residual on cycling, which this bound answers). Both the cap and
-  the cooldown are pure functions of admission times in the log — no free-text
-  statute is parsed. This makes a *perpetual emergency state* impossible; it
-  bounds, but does not forbid, a faction *cycling* emergencies at the ceiling,
+- **Two caps — a count and a duration — then a fixed cooldown.** A count cap
+  alone bounds nothing useful (three 7-day activations is still 21 days), so a
+  chain is capped on *both*: at most `MAX_CONSECUTIVE_RENEWALS` renewals (recommend
+  **2** — three activations) **and** at most `EMERGENCY_CHAIN_MAX_SECS` = **14
+  days** of total active time across the proximity-derived chain (the running
+  total T2.8.2 accumulates as it admits each continuation). Whichever binds first
+  ends the chain. Then a **fixed** cooldown: `EMERGENCY_COOLDOWN_SECS` = **14
+  days**, a plain constant — not the earlier draft's "≥ Σ chain durations," which
+  was circular (continuation is *defined* by proximity within the cooldown, so a
+  cooldown that depends on the chain it gates cannot be evaluated in one pass). A
+  fixed 14 days is `≥` any 14-day-capped chain and strictly `>`
+  `EMERGENCY_MEASURE_GRACE` (7 days), which gives the same **≤ 50% duty cycle**
+  and stops a lapsing measure's grace from dovetailing straight into the next
+  chain's re-pass — while staying a pure constant replay can check. Any
+  declaration whose activation would fall within the cooldown of a chain's end
+  simply **does not activate**. The honest cost, which the earlier draft skipped:
+  the cooldown also refuses a *genuine* second crisis — a storm, then a flood ten
+  days later — and 14 days is chosen as tolerable for that, where a 42-day cooldown
+  would not be. Both caps and the cooldown are pure functions of admission times;
+  no free-text statute is parsed. This makes a *perpetual emergency state*
+  impossible; it bounds, but does not forbid, a faction *cycling* emergencies,
   which Consequences names honestly.
 
 - **Early lift is allowed; late lift is not needed.** A signed
@@ -399,8 +460,11 @@ in Consequences, not a defect the floor repairs.
   position-pinned electorate** the emergency itself uses (§3c), so a lift is
   governed by the same body that would vote its measures, not a differently-drawn
   one. The lapse takes effect at the admission of its own threshold-crossing
-  co-signature; the station records it, shortening `effective_expiry`. The
-  *absence* of a lift never extends anything — expiry is unconditional.
+  co-signature, ending the emergency's **compression, freeze, and pin from that
+  admission forward**; a measure that already passed keeps its own signed
+  `expires_at` and is *not* retroactively shortened (§1), which is why the measure
+  bound is checked against the *scheduled* expiry and no per-measure restatement is
+  needed. The *absence* of a lift never extends anything — expiry is unconditional.
 
 ### 5. Record: emergency state is a pure function of the log, forever reconstructible
 
@@ -420,7 +484,9 @@ emergency_active_for(proposal P) :=
         A.renewal_count did not exceed the §4 cap and A's activation was not
           refused by the §4 cooldown (both derivable from prior signed
           activation records), and
-        A.activation_instant < station_admission(P) ≤ A.effective_expiry
+        A.activation_instant < station_admission(P) ≤ A.scheduled_expiry
+          (and, if an emergency_lapse superseded A before P, no later than that
+           lapse's admission)
 ```
 
 where `station_admission(P)` is the station's own attested admission of `P`
@@ -432,7 +498,8 @@ station re-bootstrapped by outbox replay (ADR-0020) all compute the identical
 answer, and *which window governed every admission is reconstructible for all
 time* (T2.8.2 invariant 1). An `Emergency` proposal's window is
 `emergency_window_secs` iff `emergency_active_for(P)`; a proposal whose station
-admission falls one second past `effective_expiry` runs the ordinary window.
+admission falls one second past `scheduled_expiry` (or past an early lapse) runs
+the ordinary window.
 This is the ADR-0015 grace discipline (`in_grace` derivable from the log) made
 replica-safe by the ADR-0005/0022 station-signed-restatement pattern, because an
 emergency's boundaries are far more consequential to get identically right on
@@ -445,13 +512,18 @@ every device than grace's are.
   compressed-window vote was an ordinary one. The banner names the active
   emergency, its reason, and its expiry.
 
-- **Flagged and reviewable.** Every measure passed under an emergency is
+- **Flagged, and served as a report.** Every measure passed under an emergency is
   identifiable by replay (an `Emergency` proposal admitted under an active
-  declaration), which makes an honest post-emergency review possible without new
-  machinery. The overview's "logged and subject to post-emergency review" is
-  satisfied by the log itself; a community that wants a *mandatory* automatic
-  review may adopt it as a statute. We recommend against *building in* a
-  compulsory dispute per emergency (Consequences explains why).
+  declaration). The overview's "logged and subject to post-emergency review" is
+  met not by a mandatory dispute but by a **derived, station-served emergency
+  report** (RPC + CLI, **no new record kinds**): for each activation it lists the
+  declaration, its co-signers, every measure passed under it, and each measure's
+  expiry; the banner shows "passed under emergency X, expires Y" until the measure
+  lapses. A community that wants a *mandatory* review may still adopt one by
+  statute, but the accountability requirement is satisfied by a surface the log
+  already supports rather than a statute a community might never pass. We do not
+  *build in* a compulsory dispute (Consequences explains the real reason — there
+  is no machine effect for its verdict to reverse).
 
 - **Amendable always, and self-lapsing regardless.** Because the charter is
   frozen (§3b) and every emergency measure expires (§1), nothing enacted under
@@ -473,19 +545,48 @@ review comments:
   created; the declarers are the ordinary electorate (§2).
 - **No lowered bar.** Emergency changes *how long* you have to reach a threshold,
   never *how high* it is (§3).
-- **No general governance re-anchoring — but the emergency path is
-  non-negotiably admission-anchored.** This ADR does not re-anchor *ordinary*
-  governance windows to the admission clock (ADR-0022 never did, and doing it
-  generally is a larger change). It *requires* the emergency declaration, window,
-  and expiry to be admission-anchored (Context), and flags the broader gap as
-  recommended follow-up (Consequences), but does not decide it here.
-- **No machine-enforced scope.** `reason`/`scope` are testimony and display; the
-  machine does not verify that an `Emergency` measure is germane to the declared
-  crisis (Alternatives explains why not, and Consequences names the residual).
+- **No general governance re-anchoring *in this ADR* — but it is owed, as
+  conformance, before T2.8.2.** This ADR decides only the emergency path's
+  admission anchoring. Re-anchoring *ordinary* governance windows and eligibility
+  is **not a new decision** — ADR-0022 already ruled the admission clock "the only
+  clock that bears on windows, deadlines, ordering, and eligibility," so today's
+  author-clock governance (`proposal.rs`, `vote.rs`) is a *conformance gap against
+  an Accepted ADR*, not a design question. It therefore needs **no new ADR**, but
+  it does need its own ticket (**T2.1.3**, filed with this work), and that ticket
+  must land **before T2.8.2** — otherwise the crate carries two window regimes and
+  two eligibility gates at once, doubling the derivation and its tests. That
+  ticket also fixes a **live ordinary-path bug** this ADR's §3c analysis exposed:
+  `tally.rs` pins the electorate at `voting_ends_at` by *time* (`grace_electorate(
+  db, founders, at_time)`), so a vouch admitted after a vote closes but back-dated
+  earlier (legal under ADR-0022 §3) silently changes a *concluded* tally's
+  denominator on replay — contradicting the "concluded quorum stays stable"
+  guarantee. This ADR closes that hole for emergencies (position-bounded pin);
+  T2.1.3 closes it everywhere.
+- **No machine-enforced scope — with one forward pre-commitment.** `reason`/`scope`
+  are testimony and display; the machine does not verify that an `Emergency`
+  measure is germane to the declared crisis (Alternatives explains why not, and
+  Consequences names the residual). But one bound is worth committing to the
+  record now, because it becomes enforceable the moment it matters: **when the
+  statute→config rule engine lands** (the ADR-0012 follow-up that gives a passed
+  statute a mechanical effect), **a compressed-path measure may not mutate any
+  charter or config parameter.** That is machine-checkable without any taxonomy —
+  it is a flat "no config writes on the fast path" — and it closes, in advance,
+  the future world in which a fast measure could quietly re-tune the very
+  parameters (quorum, windows, the emergency constants themselves) that bound it.
 
 ## Consequences
 
 ### Coup-risk analysis (the reason this ADR is cautious)
+
+First, what the mechanism actually *creates*, since it bounds the whole analysis:
+an emergency's only **mechanical** effects are the compressed window, the
+**charter freeze**, and the **electorate pin**. A passed statute binds nothing by
+itself today — governance does not move credit or execute anything (ADR-0012) —
+so the fear is not that a fast measure "does" something in the ledger; it is that
+the freeze and the pin, plus a fast, low-visibility *authorization*, tilt the
+community's politics. The coup-risk analysis is therefore written around the
+freeze and the pin, not around an imagined economic action a governance measure
+cannot take.
 
 The attack this mechanism most plausibly enables: **a supermajority faction
 declares an emergency, files an ordinary power measure as an `Emergency`
@@ -496,9 +597,11 @@ zero, only bounded. The bounds this ADR places on it:
 
 1. **Declaration is collective, not unilateral** (§2): a supermajority of the
    electorate must co-sign before *any* window compresses.
-2. **The passing bar does not fall** (§3): a measure still needs 67% approval.
-   Speed never lowers the threshold, so a faction that lacks a real supermajority
-   cannot pass a real measure fast.
+2. **Neither passing bar falls, and the quorum *rises*** (§3): a measure still
+   needs 67% approval of decisive votes, and — the fix for the declaration-harder-
+   than-measure inversion — its quorum rises to a majority (`emergency_quorum_pct`,
+   50%) of the *pinned* electorate. Speed never lowers a threshold; the number who
+   must turn out to bind everyone stays at least half.
 3. **The measure lapses** (§1): a compressed-path measure carries a bounded,
    enforced `expires_at`, so nothing durable can be enacted fast — durability
    still costs the ordinary process. This is the answer to the "narrow by effect,
@@ -525,17 +628,19 @@ zero, only bounded. The bounds this ADR places on it:
   (§3b) is a protection, but its inverse is a lever: a 67% faction can declare an
   emergency *specifically* to freeze an amendment that would curb it, and can
   *cycle* emergencies to extend both the freeze and a "temporary" measure. The §4
-  cap-plus-cooldown makes a perpetual emergency *state* impossible, but the
-  ceiling numbers should be stated honestly: at the 14-day ceiling with two
-  renewals, one chain runs ~42 days; the cooldown bound (`≥` the chain's total
-  duration, §4) then forces at least ~42 days *outside* emergency before the next
-  chain — so a faction cannot hold the charter frozen, or a re-filed measure in
-  force, more than roughly **half** the calendar time, and at the 72 h default far
-  less. That the cooldown must exceed `EMERGENCY_MEASURE_GRACE` is what stops a
-  lapsing measure's grace from dovetailing straight into the next chain's re-pass.
-  Half-time cycling by a standing two-thirds supermajority is a real residual, not
-  fully closed; the honest backstops remain the supermajority itself, the frozen
-  charter (they cannot entrench the cycle), and full visibility.
+  caps make a perpetual emergency *state* impossible, but the ceiling numbers
+  should be stated honestly: a chain runs at most **14 days** (the duration cap,
+  reached as two 7-day activations or three shorter ones), then a **fixed 14-day
+  cooldown** forces an equal span *outside* emergency before the next chain — a
+  **≤ 50% duty cycle**, and at the 72 h default far less. Because the cooldown
+  (14 d) exceeds `EMERGENCY_MEASURE_GRACE` (7 d), a lapsing measure's grace cannot
+  dovetail straight into the next chain's re-pass. Half-time cycling by a standing
+  two-thirds supermajority — one that also musters the 50% emergency quorum each
+  time — is a real residual, not fully closed; the honest backstops remain the
+  supermajority itself, the raised quorum, the frozen charter (they cannot
+  entrench the cycle), and full visibility. The same 14-day cooldown has a
+  symmetric cost, named for honesty: it will refuse a *genuine* unrelated second
+  crisis inside the fortnight.
 - **Scope is testimony, not enforcement.** `reason`/`scope` are free text; the
   machine cannot verify that an `Emergency` measure is germane. A "flood response"
   declaration can host a measure that is really a power play. The backstops are
@@ -557,9 +662,13 @@ zero, only bounded. The bounds this ADR places on it:
 
 ### Other consequences
 
-- **A real crisis is now serviceable by a stock binary.** A storm-night fuel
-  authorization that must pass in hours can, given a co-present supermajority, and
-  what it passes lapses on its own.
+- **A real crisis is now serviceable by a stock binary — as fast collective
+  *authorization*, not disbursement.** Given a co-present supermajority, a
+  community can pass a binding, visible, self-expiring measure in a day rather
+  than a week. What that measure is, honestly, is *authorization and mandate* — a
+  member still acts on it (governance does not move credit, ADR-0012) — and the
+  24 h floor means it is a day, not the Context's literal "before dawn." The value
+  is real; the ADR just refuses to overstate it as an hours-scale spend.
 - **The Phase-1 `Emergency` kind gains its missing half and loses a latent bug.**
   It already dropped the implementation delay; it now gains the compressed
   *decision* window the code flagged as deferred (only under a declaration), and
@@ -590,7 +699,7 @@ zero, only bounded. The bounds this ADR places on it:
   is a station attestation on the proposal's admission, not a fifth kind.
 - **One predicate, carefully scoped.** `emergency_active` becomes a governance
   input the way `in_grace` did, but — unlike grace — it is deliberately withheld
-  from the ledger, so its blast radius is one window, two freezes, and a measure
+  from the ledger, so its blast radius is one window, a freeze, a pin, and a measure
   cap, no more.
 
 ## Alternatives Considered
@@ -606,6 +715,19 @@ zero, only bounded. The bounds this ADR places on it:
   ladder §2.8 warns against — a standing office that can unilaterally compress
   windows is a coup mechanism with a title. A supermajority collective act (§2)
   keeps the speed without minting a privileged declarer.
+- **No declaration at all: let an Emergency proposal close early on arithmetic
+  certainty.** Since a co-present group can bundle the whole thing at once anyway,
+  a simpler fast lane exists — an `Emergency` proposal closes at the earlier of its
+  ordinary window or the admission of the ballot that makes passage certain
+  against the position-pinned electorate (≥ the approval bar of the whole
+  electorate). Zero new record kinds, no declaration lever to squat, no cooldown.
+  Rejected deliberately, and it is the closest alternative: early-close buys speed
+  but gives up the three things the declaration is *for* — the **notice period**
+  the compressed window still guarantees the absent, the **banner/visibility** that
+  a fast decision is happening, and the **charter freeze + electorate pin** that
+  keep the fast lane from being used to restructure power. Those three are worth
+  the four record kinds; a mechanism that only makes a *certain* vote close sooner
+  protects no one who was not already present. We keep the declaration.
 
 **On what changes (Question 2):**
 
@@ -637,10 +759,15 @@ zero, only bounded. The bounds this ADR places on it:
   burden the overview places on *renewal*, and a mode that must be actively ended
   is a mode that quietly persists. Automatic expiry with the default off is the
   self-terminating shape ADR-0015 established.
-- **Long fixed duration (the overview's 7–14 days as the default).** Rejected as
-  the *default*: a two-week compressed-governance window is a long time to hold
-  the exit runway shut. We keep 14 days as the charter *ceiling* but default to
-  72 h, so the conservative choice ships and the community can opt into the band.
+- **Long fixed duration (the overview's 7–14 days as the default), or a 14-day
+  per-declaration ceiling.** Rejected: a two-week compressed-governance window is
+  a long time to hold the exit runway shut, and a 14-day *single* declaration was
+  an earlier draft's mistake (it borrowed ADR-0021's carriage-latency grace as if
+  it bounded political duration). We derive the ceiling from the ordinary
+  time-to-effect instead (§4): **7 days per declaration, 14 days per chain**, with
+  a 72 h default — so the conservative choice ships, a real multi-week crisis still
+  gets one renewal, and nothing runs longer than the ordinary process it is
+  substituting for.
 - **Trust `stated_renewal_index` for the cap.** Rejected: the declarer chooses the
   field, so a self-reset defeats the cap (§4); proximity-derived counting is the
   only tamper-resistant version.
@@ -693,15 +820,22 @@ zero, only bounded. The bounds this ADR places on it:
   emergency state, mirroring the grace banner.
 - `rrn-cli` — declare / co-sign / lapse / status verbs and display.
 
-**New charter parameters** on `GovernanceStructure`: `emergency_window_secs`,
-`emergency_declaration_pct`, `max_consecutive_renewals`, and the duration
-floor/ceiling — each bounded by a hard constant a charter cannot breach
-(`EMERGENCY_WINDOW_FLOOR_SECS`, `EMERGENCY_DECLARATION_PCT_FLOOR`,
-`EMERGENCY_DURATION_FLOOR/CEILING`, the renewal-cap ceiling), plus
-`EMERGENCY_MEASURE_GRACE` and `EMERGENCY_COOLDOWN_SECS` (the latter `≥` a chain's
-total duration and `>` the grace). The declaration's requested `duration_secs` is
-the sole length source, clamped to the floor/ceiling (no separate charter
-duration param). **Record kinds:** four —
+**Sequencing:** **T2.1.3** (admission-clock conformance for governance — Non-goals)
+must land **before** this ticket, so the emergency path is not built atop
+author-clock windows. **New charter parameters** on `GovernanceStructure`:
+`emergency_window_secs`, `emergency_declaration_pct`, `emergency_quorum_pct`,
+`max_consecutive_renewals` — each bounded by a hard constant a charter cannot
+breach (`EMERGENCY_WINDOW_FLOOR_SECS` = 24 h, `EMERGENCY_DECLARATION_PCT_FLOOR` =
+67%, `EMERGENCY_QUORUM_PCT_FLOOR` = 50%, `EMERGENCY_DURATION_FLOOR` = 24 h /
+`EMERGENCY_DURATION_CEILING` = 7 d, the renewal-cap ceiling) — plus the standalone
+constants `EMERGENCY_MEASURE_GRACE` (7 d), `EMERGENCY_CHAIN_MAX_SECS` (14 d), and
+`EMERGENCY_COOLDOWN_SECS` (14 d fixed). The declaration's requested `duration_secs`
+is the sole length source, clamped to the duration floor/ceiling (no separate
+charter duration param). `tally.rs` applies `emergency_quorum_pct` (not
+`statute_quorum_pct`) on the compressed path; `enacted_statutes` enforces
+`expires_at` kind-wide, bounding an *un*-declared Emergency measure to
+`voting_ends_at + 30 d` (§1). `rrn-station` also serves the derived
+**emergency report** (§6). **Record kinds:** four —
 `rrn.gov.emergency_declaration`, `rrn.gov.emergency_cosign`,
 `rrn.gov.emergency_lapse` (member-signed), and `rrn.gov.emergency_activated`
 (station-signed) — each with a discriminator, canonical dCBOR, roundtrip tests,
