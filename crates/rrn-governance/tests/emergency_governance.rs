@@ -1280,6 +1280,36 @@ fn a_community_rename_amendment_does_not_break_emergency_declaration() {
     );
 }
 
+/// Two members each raising their *own* lapse motion pool their signatures toward a
+/// single lift threshold (ADR-0023 2026-09-10 clarification, option A) — competing
+/// lapse motions can no longer split the supermajority across per-author hashes.
+#[test]
+fn competing_lapse_motions_aggregate_toward_one_lift_threshold() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    let h = activate(&db, &st, &founders, t0);
+
+    // One member's lapse motion is 1 of the 2 needed — not yet lifted.
+    let _l1 = em_lapse(&db, &founders[0], h, t0 + 10);
+    assert!(
+        emergency::active_emergency_at(&db, t0 + 11, u64::MAX)
+            .unwrap()
+            .is_some(),
+        "a single lapse motion (1 of 2) does not lift the emergency"
+    );
+
+    // A *different* member raises a *separate* lapse record. Pooled per-emergency the
+    // two distinct authors reach the 2-of-3 bar, so the emergency lifts — under the
+    // old per-lapse counting neither hash would have crossed.
+    let _l2 = em_lapse(&db, &founders[1], h, t0 + 20);
+    assert!(
+        emergency::active_emergency_at(&db, t0 + 21, u64::MAX)
+            .unwrap()
+            .is_none(),
+        "two competing lapse motions pool toward one threshold and lift the emergency"
+    );
+}
+
 /// A charter's `emergency_window_secs` is clamped to `[floor, ordinary window]` on
 /// use, so a hostile value can neither undercut the floor nor (unbounded above)
 /// overflow `admitted_at + secs`.

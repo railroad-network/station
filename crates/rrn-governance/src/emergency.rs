@@ -841,10 +841,21 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
     Ok(timeline)
 }
 
-/// The log seq at which a lapse for `decl_hash` crossed the supermajority (drawn
-/// from the emergency's own pinned electorate, §4), or `None` if no lapse reached
-/// it. `threshold` is the emergency's own crossing threshold — the lapse answers to
+/// The log seq at which a lift for `decl_hash` crossed the supermajority (drawn from
+/// the emergency's own pinned electorate, §4), or `None` if no lift reached it.
+/// `threshold` is the emergency's own crossing threshold — the lift answers to
 /// exactly the same electorate and bar as the declaration.
+///
+/// Per the 2026-09-10 ADR-0023 clarification (option A), a lift's signatures are
+/// pooled **per emergency, not per lapse record**: every distinct eligible signer
+/// across *all* `emergency_lapse` records targeting this declaration (each lapse's
+/// author) and *all* `emergency_cosign` records targeting any of those lapses counts
+/// once, at the log position it first appears, and the lift crosses at the position
+/// of the `threshold`-th such distinct signer. So two members each raising their own
+/// lapse motion can no longer split the supermajority across two hashes. Aggregation
+/// is over signed records at fixed log positions and eligibility is judged at the
+/// emergency's pin, so it stays replica-deterministic (invariant 1); with a single
+/// lapse record it reduces to the earlier per-lapse crossing.
 #[allow(clippy::too_many_arguments)]
 fn lapse_boundary(
     log: &AppendLog,
@@ -855,10 +866,10 @@ fn lapse_boundary(
     pin_seq: u64,
     threshold: usize,
 ) -> Result<Option<u64>, EmergencyError> {
-    // A lapse targets the declaration; its co-signatures target the lapse's own
-    // hash. Find every lapse record for this declaration and take the earliest that
-    // crosses.
-    let mut earliest: Option<u64> = None;
+    // Pass 1: every self-signed lapse record for this declaration — collect its hash
+    // (a valid co-sign target) and count its author as a candidate signature.
+    let mut lapse_targets = std::collections::HashSet::new();
+    let mut candidates: Vec<(u64, Address)> = Vec::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
         let Ok(lapse) = from_canonical_bytes::<EmergencyLapse>(&entry.payload.bytes) else {
@@ -870,23 +881,43 @@ fn lapse_boundary(
         if Address::from_public_key(entry.payload.signer) != lapse.author {
             continue;
         }
-        let lapse_hash = lapse.hash();
-        let sigs = eligible_signatures(
-            log,
-            db,
-            founders,
-            &lapse_hash,
-            &lapse.author,
-            entry.seq,
-            pin_time,
-            pin_seq,
-            u64::MAX,
-        )?;
-        if let Some(cross) = crossing_seq(&sigs, threshold) {
-            earliest = Some(earliest.map_or(cross, |e| e.min(cross)));
+        lapse_targets.insert(lapse.hash());
+        candidates.push((entry.seq, lapse.author));
+    }
+    if lapse_targets.is_empty() {
+        return Ok(None);
+    }
+
+    // Pass 2: every self-signed co-signature targeting any of those lapse records.
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(cosign) = from_canonical_bytes::<EmergencyCosign>(&entry.payload.bytes) else {
+            continue;
+        };
+        if !lapse_targets.contains(&cosign.declaration_hash) {
+            continue;
+        }
+        if Address::from_public_key(entry.payload.signer) != cosign.signer {
+            continue;
+        }
+        candidates.push((entry.seq, cosign.signer));
+    }
+
+    // Order by log position, then keep each distinct *eligible* signer at the first
+    // position it appears (a signer who both authored a lapse and co-signed another
+    // is counted once, at whichever came first). The crossing is the threshold-th.
+    candidates.sort_by_key(|(seq, _)| *seq);
+    let mut seen = std::collections::HashSet::new();
+    let mut sigs: Vec<(u64, Address)> = Vec::new();
+    for (seq, addr) in candidates {
+        if !is_eligible_asof(db, founders, &addr, pin_time, pin_seq)? {
+            continue;
+        }
+        if seen.insert(addr) {
+            sigs.push((seq, addr));
         }
     }
-    Ok(earliest)
+    Ok(crossing_seq(&sigs, threshold))
 }
 
 // --- Public predicates ------------------------------------------------------
