@@ -2268,6 +2268,89 @@ then lapses* — and withhold every adjacent one.
   will not see until admitted — an honest cost of deciding in a crisis, mitigated but
   not eliminated by the 24 h window floor.
 
+#### Emergency activation + declaration TTL (T2.8.3, ADR-0027)
+
+T2.8.3 hardens *when* an emergency may fire and *how long* a part-signed
+declaration may wait, closing two paths ADR-0027 identified in the T2.8.2
+implementation, and adds two station-signed record kinds
+(`rrn.gov.emergency_refused`, `rrn.gov.emergency_declaration_admitted`).
+
+- *Assets:* the integrity of the **first-crossing** rule (an emergency activates at
+  the first position its supermajority is reached, and only there); of the
+  **declaration TTL** (a stale consent cannot be fired months later); and of the new
+  station-signed markers, which must be replay-derivable at one attested pin each.
+- *Elevation — reviving a cap-refused crisis.* Under T2.8.2 a first crossing that a
+  §4 cap refused left **no record**, so a later co-signature (once the cooldown had
+  passed) re-satisfied the standing condition and activated on consents gathered for
+  the earlier, refused crisis. T2.8.3 writes a station-signed `emergency_refused`
+  marker at the refused crossing — in the **same transaction** as the crossing record
+  (a batched-append log API; a crash between the two commits would otherwise leave a
+  markerless crossing) — and replay maintains a `dead` set: a declaration with a
+  validated refusal never activates and no later append revives it. A within-cooldown
+  *continuation* that the caps admit still activates normally (renewals are not
+  killed). Invariant tests:
+  `a_cap_refused_first_crossing_writes_a_refusal_and_never_revives`,
+  `an_independent_replay_of_a_refused_chain_never_revives`.
+- *Tampering — a stale non-colluding consent.* A member's genuine co-signature on a
+  declaration that fell one short could, months later, be the base a different group
+  fires an emergency on. T2.8.3 bounds the gathering window: a declaration whose first
+  crossing is not reached within `EMERGENCY_DECLARATION_TTL` (7 d) of its
+  **station-signed** admission instant (the eager `emergency_declaration_admitted`
+  anchor) no longer counts. The TTL is measured against the signed anchor, never the
+  per-replica re-stamped `created_at`, so it is replica-identical and survives an
+  outbox re-bootstrap. *Residual (stated in ADR-0027 D2):* a **colluding** faction can
+  still hold the whole signed bundle off-log and courier it in together (admissions
+  near-simultaneous, TTL trivially satisfied); bounding *signature* age — a log-head
+  freshness witness — is deferred future work, not closed here.
+- *Fail-closed on replay.* An `emergency_activated` with **no** validated admission
+  anchor, or one whose crossing is beyond the TTL of that anchor, is ignored on
+  replay — a markerless/anchorless declaration never activates (invariant tests
+  `an_activation_without_a_validated_anchor_never_activates`,
+  `replay_ignores_a_forged_activation_beyond_the_ttl`). Pre-ADR-0027 declarations
+  carry no anchor and so can never activate; acceptable pre-pilot, as no live
+  emergencies exist.
+- *Repudiation — silent dead weight.* A co-signature toward a dead, expired, or
+  already-activated declaration is refused **at the front door** with a typed reason
+  (`DeclarationDead` / `DeclarationExpired` / `AlreadyActivated`), mapped to matching
+  `RefusalReason` variants on the DTN receipt path, so an offline co-signer learns why
+  their courier-carried co-sign did nothing. The §6 report surfaces refused and
+  expired declarations, not only activations.
+- *Residual — station-signer pinning still open, now across five kinds.* The two new
+  markers carry authority **only** "the station said so," yet — like
+  `emergency_activated`, `ProposalWindow`, and `ProposalImplemented` — the derivation
+  does not yet verify their envelope signer is the community's station key. The
+  activation/refusal markers still need a *genuine, re-derived supermajority* to have
+  effect (the crossing is re-checked), but the **admission anchor needs no
+  supermajority at all**: `derive_emergencies` takes the earliest anchor for a
+  declaration hash with no signer or content validation, so a hostile gossip peer that
+  merely learns a declaration's hash (a colluding declarer shares it) can inject
+  `emergency_declaration_admitted { hash, admitted_at }` with an attacker-chosen
+  instant — `admitted_at = 0` makes the genuine crossing read as TTL-expired (the
+  declaration silently never activates, and a replica seeded with the forgery diverges
+  from the writer's tally); a far-future `admitted_at` defeats the TTL entirely. A
+  forged **refusal** likewise validates whenever a genuine crossing exists and the
+  attacker picks a `refused_instant` inside a capped chain's cooldown. So the anchor
+  and refusal are a *supermajority-free* denial/extension lever until pinning lands.
+  Per the maintainer's decision, **uniform station-signer pinning across all station
+  attestations is a separate prerequisite ticket** (ADR-0027 names it a precondition,
+  to land first or alongside); T2.8.3 does not close it and carries it as the tracked
+  residual. Until it lands, emergencies are **not to be trusted against a hostile
+  gossip peer in production**.
+- *Residual — gossip ingest bypasses the front door (pre-existing, T2.8.2/ADR-0020).*
+  `do_append_entries` (the gossip pull path) admits any signature-valid record via
+  `append_raw` with no front-door gate — so a member `emergency_cosign` couriered to a
+  hostile peer instead of the station can reach the writer's log *markerless*,
+  bypassing eligibility, the duplicate-co-sign guard, and the D3 checks. T2.8.3 closes
+  the one consequence its own invariant depends on: `try_activate` writes a marker
+  **only** when the crossing sits at the front-door record it is deciding on, so a
+  markerless (gossiped) crossing is *not activatable* on the writer either — matching
+  replay's fail-closed rule (ADR-0027 D1b), so a later front-door co-signature can no
+  longer revive it. The **broader** bypass — gossip skipping eligibility/duplicate/D3
+  for governance kinds generally — is unchanged and remains a residual for the
+  maintainer (the clean fix, refusing member `rrn.gov.*` kinds in `do_append_entries`
+  since they arrive by DTN/RPC per ADR-0020, is an architectural change beyond this
+  ticket).
+
 ## Mobile client (Phase 1)
 
 The mobile client is new in Phase 1 and, per
