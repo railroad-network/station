@@ -114,13 +114,21 @@ impl Default for GovernanceStructure {
 }
 
 impl GovernanceStructure {
-    /// The compressed emergency window, floored — a charter may raise it, never
-    /// lower it below [`crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS`] (ADR-0023 §3,
-    /// "window floor"). This is the *derive tolerance*: even a hostile charter that
-    /// stored a sub-floor value cannot compress the window below the floor.
+    /// The compressed emergency window, floored *and* ceilinged — a charter may raise
+    /// it above [`crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS`] (ADR-0023 §3, "window
+    /// floor") but never below, and never above the ordinary deliberation window it
+    /// compresses. This is the *derive tolerance*: even a hostile charter that stored a
+    /// sub-floor or absurdly large value (`emergency_window_secs` is the one unbounded
+    /// charter time parameter) cannot escape `[floor, ordinary window]`, so
+    /// `admitted_at + secs` in [`crate::window::compressed_emergency_window`] can
+    /// neither undercut the floor nor overflow.
     pub fn effective_emergency_window_secs(&self) -> i64 {
-        self.emergency_window_secs
-            .max(crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS)
+        let floor = crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS;
+        // An emergency window is a *compression* of the ordinary deliberation window,
+        // so it can never sensibly exceed it; clamp the ceiling up to the floor for a
+        // degenerate charter whose ordinary window is itself below the floor.
+        let ceiling = (i64::from(self.deliberation_window_days) * 86_400).max(floor);
+        self.emergency_window_secs.clamp(floor, ceiling)
     }
 
     /// The declaration supermajority, floored to

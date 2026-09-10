@@ -30,8 +30,8 @@ use rrn_dispute::resolution::{
 use rrn_dispute::verdict::{JurorVerdict, SignedVerdict};
 use rrn_dispute::DisputeParams;
 use rrn_governance::charter::{
-    create_charter, latest_charter, store_charter, store_pending_charter, CharterParams,
-    SignedCharter,
+    create_charter, founder_charter, latest_charter, store_charter, store_pending_charter,
+    CharterParams, SignedCharter,
 };
 use rrn_governance::emergency::{self, EmergencyCosign, EmergencyDeclaration, EmergencyLapse};
 use rrn_governance::proposal::{
@@ -2495,6 +2495,17 @@ impl Core {
         let station = self.station_keypair();
         let now = self.clock.now();
         self.ensure_charter_not_frozen(now)?;
+        // Refuse to mint a second genesis charter (the same guard `charter_begin`
+        // carries). Without it, re-running init-charter writes a fresh v1 charter that
+        // `founder_charter` (highest-version, latest-seq) would then return, silently
+        // moving the community id / founding set that `emergency_timeline` anchors an
+        // active emergency's legitimacy on — rewriting past-activation history and
+        // breaking the replica-determinism the genesis-charter resolution relies on.
+        if latest_charter(&self.db).map_err(internal)?.is_some() {
+            return Err(invalid_params(
+                "a charter already exists for this community (pending or published)",
+            ));
+        }
 
         let founders: Vec<Keypair> = if params.founder_secrets_hex.is_empty() {
             vec![station.clone()]
@@ -2808,21 +2819,26 @@ impl Core {
             activation_instant: e.activation_instant,
             scheduled_expiry: e.scheduled_expiry,
             renewal_count: e.renewal_count,
-            active: e.lapsed_at_seq.is_none()
-                && e.activation_instant < now
-                && now <= e.scheduled_expiry,
+            // Inclusive at the activation instant (`is_active_at`), so the action
+            // that crosses the threshold reports `active: true` on its own tick — not
+            // the strict record-positioning `governs`, which would read false until
+            // the next second.
+            active: e.is_active_at(now),
             lapsed: e.lapsed_at_seq.is_some(),
         }
     }
 
     /// The active emergency, if one holds now, in the banner shape (for `status`
-    /// and `whoami`).
+    /// and `whoami`). Scans the derived timeline with the inclusive `is_active_at`
+    /// state predicate so the banner appears from the activation instant.
     fn active_emergency_status(
         &self,
         now: i64,
     ) -> Result<Option<rpc::EmergencyStatus>, rpc::RpcError> {
-        Ok(emergency::active_emergency_at(&self.db, now, u64::MAX)
+        Ok(emergency::emergency_timeline(&self.db)
             .map_err(internal)?
+            .into_iter()
+            .find(|e| e.is_active_at(now))
             .map(|e| self.emergency_status(&e, now)))
     }
 
@@ -2851,7 +2867,11 @@ impl Core {
         let params: rpc::GovEmergencyDeclareParams = parse_params(req)?;
         let now = self.clock.now();
         let station = self.station_keypair();
-        let charter = effective_charter(&self.db)
+        // The declaration names the **genesis** community — the anchor
+        // `append_declaration` and `emergency_timeline` both resolve emergency
+        // legitimacy against — so a later community-renaming amendment does not make
+        // this RPC build a declaration its own append guard would reject.
+        let genesis = founder_charter(&self.db)
             .map_err(internal)?
             .ok_or_else(|| invalid_params("no charter published; run governance charter-init"))?;
         let previous_declaration_hash = match &params.previous_declaration_hash {
@@ -2859,7 +2879,7 @@ impl Core {
             None => None,
         };
         let decl = EmergencyDeclaration {
-            community_id: charter.community_id,
+            community_id: genesis.charter().community_id.clone(),
             author: self.wallet.address,
             reason: params.reason,
             scope: params.scope,
@@ -2880,13 +2900,25 @@ impl Core {
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
-        let active = emergency::active_emergency_at(&self.db, now, u64::MAX)
-            .map_err(internal)?
-            .is_some_and(|e| e.declaration_hash == declaration_hash);
+        let active = self.declaration_active_now(declaration_hash, now)?;
         ok(&rpc::GovEmergencyActionResult {
             declaration_hash: declaration_hash.to_string(),
             active,
         })
+    }
+
+    /// Whether the emergency for `declaration_hash` is in force as of `now`, using the
+    /// inclusive `is_active_at` state predicate so the crossing action reports it
+    /// active on its own tick (see `emergency_status`).
+    fn declaration_active_now(
+        &self,
+        declaration_hash: Hash,
+        now: i64,
+    ) -> Result<bool, rpc::RpcError> {
+        Ok(emergency::emergency_timeline(&self.db)
+            .map_err(internal)?
+            .iter()
+            .any(|e| e.declaration_hash == declaration_hash && e.is_active_at(now)))
     }
 
     /// `governance_emergency_cosign` — co-sign a declaration (or a lapse), toward its
@@ -2914,9 +2946,7 @@ impl Core {
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
-        let active = emergency::active_emergency_at(&self.db, now, u64::MAX)
-            .map_err(internal)?
-            .is_some_and(|e| e.declaration_hash == target);
+        let active = self.declaration_active_now(target, now)?;
         ok(&rpc::GovEmergencyActionResult {
             declaration_hash: target.to_string(),
             active,
@@ -2948,9 +2978,7 @@ impl Core {
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
-        let active = emergency::active_emergency_at(&self.db, now, u64::MAX)
-            .map_err(internal)?
-            .is_some_and(|e| e.declaration_hash == declaration_hash);
+        let active = self.declaration_active_now(declaration_hash, now)?;
         ok(&rpc::GovEmergencyActionResult {
             declaration_hash: lapse_hash.to_string(),
             active,

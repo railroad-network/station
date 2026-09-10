@@ -17,8 +17,9 @@ use rrn_governance::charter::{
     create_charter, store_charter, AmendmentRules, Charter, CharterParams, GovernanceStructure,
 };
 use rrn_governance::emergency::{
-    self, EmergencyCosign, EmergencyDeclaration, EmergencyLapse, EMERGENCY_CHAIN_MAX_SECS,
-    EMERGENCY_COOLDOWN_SECS, EMERGENCY_MEASURE_GRACE, EMERGENCY_WINDOW_FLOOR_SECS,
+    self, EmergencyActivated, EmergencyCosign, EmergencyDeclaration, EmergencyError,
+    EmergencyLapse, EMERGENCY_CHAIN_MAX_SECS, EMERGENCY_COOLDOWN_SECS, EMERGENCY_MEASURE_GRACE,
+    EMERGENCY_WINDOW_FLOOR_SECS,
 };
 use rrn_governance::proposal::{
     append_cosign, append_proposal, Proposal, ProposalCosign, ProposalError, ProposalKind,
@@ -1036,4 +1037,283 @@ proptest::proptest! {
         let t_raised = emergency::declaration_threshold(n, 80);
         proptest::prop_assert!(t_raised >= t);
     }
+}
+
+// --- Replica determinism against forged/gossiped attestations ---------------
+
+/// A gossiped attestation the timeline does not believe (here, one appended before
+/// the declaration has crossed its supermajority, so no legitimate activation
+/// exists yet) must not suppress the station's genuine activation. Regression for
+/// the writer-path idempotency gate: `try_activate` judges "already activated"
+/// against the re-derived timeline, not against any raw `EmergencyActivated` on the
+/// log.
+#[test]
+fn a_forged_activation_cannot_block_the_real_one() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    let h = declare(&db, &st, &founders[0], 72 * 3600, t0);
+
+    // Only the author has signed (1 of the 2 needed): no legitimate emergency yet.
+    // An attacker replicates a bogus station attestation for the declaration.
+    let attacker = Keypair::generate();
+    let forged = EmergencyActivated {
+        declaration_hash: h,
+        activation_instant: t0,
+        scheduled_expiry: t0 + 72 * 3600,
+        renewal_count: 0,
+    };
+    {
+        let mut log = AppendLog::new(&db);
+        log.append(SignedPayload::sign(forged, &attacker), t0)
+            .unwrap();
+    }
+    // The timeline never believed it — the crossing was not reached at its position.
+    assert!(emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+        .unwrap()
+        .is_none());
+
+    // The genuine crossing co-signature must still activate the emergency.
+    em_cosign(&db, &st, &founders[1], h, t0);
+    let active = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+        .unwrap()
+        .expect("the real activation must not be blocked by the forgery");
+    assert_eq!(active.declaration_hash, h);
+    assert_eq!(active.scheduled_expiry, t0 + 72 * 3600);
+    // Exactly one emergency is derived — the forgery is not double-counted.
+    assert_eq!(emergency::emergency_timeline(&db).unwrap().len(), 1);
+}
+
+/// An attestation whose `scheduled_expiry` does not equal the recomputed
+/// `activation_instant + clamp(duration)` is rejected by the timeline (a forged
+/// over-long expiry cannot stretch an emergency). Built by appending the
+/// declaration and co-signatures as raw records so the crossing is genuine but no
+/// real station attestation exists, then dropping in only the forged one.
+#[test]
+fn a_forged_activation_with_a_wrong_expiry_is_ignored_by_the_timeline() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+
+    // Raw declaration + one co-signature (a genuine 2-of-3 crossing) with no
+    // append-guard, so no station attestation is written.
+    let decl = EmergencyDeclaration {
+        community_id: "commons".into(),
+        author: addr(&founders[0]),
+        reason: "storm".into(),
+        scope: "flood".into(),
+        duration_secs: 72 * 3600,
+        stated_renewal_index: 0,
+        previous_declaration_hash: None,
+        created_at: t0,
+    };
+    let h = decl.hash();
+    let cosign = EmergencyCosign {
+        declaration_hash: h,
+        signer: addr(&founders[1]),
+    };
+    {
+        let mut log = AppendLog::new(&db);
+        log.append(SignedPayload::sign(decl, &founders[0]), t0)
+            .unwrap();
+        log.append(SignedPayload::sign(cosign, &founders[1]), t0)
+            .unwrap();
+    }
+
+    // A forged attestation with an inflated expiry (not activation_instant + 72h).
+    let attacker = Keypair::generate();
+    let forged = EmergencyActivated {
+        declaration_hash: h,
+        activation_instant: t0,
+        scheduled_expiry: t0 + 999 * DAY,
+        renewal_count: 0,
+    };
+    {
+        let mut log = AppendLog::new(&db);
+        log.append(SignedPayload::sign(forged, &attacker), t0)
+            .unwrap();
+    }
+    assert!(
+        emergency::emergency_timeline(&db).unwrap().is_empty(),
+        "an attestation with a mismatched scheduled_expiry is not believed"
+    );
+    let _ = st;
+}
+
+/// An outsider (not in the pinned electorate) is refused at `append_cosign`, so an
+/// ineligible signature can never count toward a declaration's supermajority.
+#[test]
+fn an_ineligible_cosigner_is_refused_at_append() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    let h = declare(&db, &st, &founders[0], 72 * 3600, t0);
+
+    let outsider = Keypair::generate();
+    let c = EmergencyCosign {
+        declaration_hash: h,
+        signer: addr(&outsider),
+    };
+    let mut log = AppendLog::new(&db);
+    let err = emergency::append_cosign(&mut log, SignedPayload::sign(c, &outsider), &db, &st, t0)
+        .unwrap_err();
+    assert!(matches!(err, EmergencyError::NotEligible { .. }));
+}
+
+/// The state predicate `is_active_at` is inclusive at the activation instant — the
+/// action that crosses the threshold reads active on its own tick — while the
+/// record-positioning `governs` stays strict (a record admitted at the exact
+/// activation instant is not retroactively governed).
+#[test]
+fn is_active_at_is_inclusive_at_the_activation_instant() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let e = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        e.is_active_at(e.activation_instant),
+        "active from activation"
+    );
+    assert!(e.is_active_at(e.scheduled_expiry), "active through expiry");
+    assert!(!e.is_active_at(e.activation_instant - 1));
+    assert!(!e.is_active_at(e.scheduled_expiry + 1));
+    // The strict positioning boundary is unchanged.
+    assert!(!e.governs(e.activation_instant, u64::MAX));
+    assert!(e.governs(e.activation_instant + 1, u64::MAX));
+}
+
+/// A community-renaming amendment must not silently make emergencies
+/// un-declarable. `append_declaration` checks the declaration's community against
+/// the **genesis** charter (which `emergency_timeline` also anchors on), so a
+/// declaration naming the founding community is still accepted and activates after
+/// the effective charter has been renamed.
+#[test]
+fn a_community_rename_amendment_does_not_break_emergency_declaration() {
+    let (db, founders, st) = three_founder_community();
+    let charter = rrn_governance::tally::effective_charter(&db)
+        .unwrap()
+        .unwrap();
+    let t0 = 1_000_000;
+
+    // Enact a v2 amendment that renames the community.
+    let mut v2 = charter.clone();
+    v2.version = 2;
+    v2.previous_hash = Some(charter.hash());
+    v2.community_id = "renamed".into();
+    let p = Proposal::new(
+        addr(&founders[0]),
+        "Rename the community".into(),
+        "v2".into(),
+        ProposalKind::CharterAmendment { new_charter: v2 },
+        t0,
+    )
+    .unwrap();
+    let amendment_id = p.proposal_id;
+    {
+        let mut log = AppendLog::new(&db);
+        append_proposal(
+            &mut log,
+            SignedPayload::sign(p, &founders[0]),
+            &db,
+            &st,
+            &charter,
+            t0,
+        )
+        .unwrap();
+    }
+    let amendment =
+        rrn_governance::proposal::proposal_records(&AppendLog::new(&db), &amendment_id, &db)
+            .unwrap()
+            .proposal
+            .unwrap();
+    for c in &founders[1..3] {
+        cosign_prop(&db, c, &amendment, t0);
+    }
+    for f in &founders {
+        vote_prop(&db, f, &amendment, VoteChoice::Yes, t0 + 1);
+    }
+    let due = amendment.implementation_at;
+    rrn_governance::lifecycle::enact_due(&db, &st, due).unwrap();
+    assert_eq!(
+        rrn_governance::tally::effective_charter(&db)
+            .unwrap()
+            .unwrap()
+            .community_id,
+        "renamed",
+        "the effective community has been renamed"
+    );
+
+    // A declaration naming the *renamed* (effective) community is refused — the
+    // genesis community is the anchor.
+    let bad = EmergencyDeclaration {
+        community_id: "renamed".into(),
+        author: addr(&founders[0]),
+        reason: "storm".into(),
+        scope: "flood".into(),
+        duration_secs: 72 * 3600,
+        stated_renewal_index: 0,
+        previous_declaration_hash: None,
+        created_at: due,
+    };
+    {
+        let mut log = AppendLog::new(&db);
+        let err = emergency::append_declaration(
+            &mut log,
+            SignedPayload::sign(bad, &founders[0]),
+            &db,
+            &st,
+            due,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EmergencyError::WrongCommunity { .. }));
+    }
+
+    // A declaration naming the *genesis* community is accepted and can activate — the
+    // rename has not disabled the mechanism.
+    let h = declare(&db, &st, &founders[0], 72 * 3600, due);
+    em_cosign(&db, &st, &founders[1], h, due);
+    assert!(
+        emergency::active_emergency_at(&db, due + 1, u64::MAX)
+            .unwrap()
+            .is_some(),
+        "an emergency in the founding community still activates after a rename"
+    );
+}
+
+/// A charter's `emergency_window_secs` is clamped to `[floor, ordinary window]` on
+/// use, so a hostile value can neither undercut the floor nor (unbounded above)
+/// overflow `admitted_at + secs`.
+#[test]
+fn the_emergency_window_is_clamped_to_floor_and_ordinary_window() {
+    // Absurdly large: capped at the ordinary deliberation window (7 days by default).
+    let huge = GovernanceStructure {
+        emergency_window_secs: i64::MAX,
+        ..Default::default()
+    };
+    assert_eq!(
+        huge.effective_emergency_window_secs(),
+        i64::from(huge.deliberation_window_days) * DAY
+    );
+
+    // Below the floor: raised to the floor.
+    let tiny = GovernanceStructure {
+        emergency_window_secs: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        tiny.effective_emergency_window_secs(),
+        EMERGENCY_WINDOW_FLOOR_SECS
+    );
+
+    // A degenerate charter whose ordinary window is below the floor still yields at
+    // least the floor (the ceiling is clamped up to it).
+    let degenerate = GovernanceStructure {
+        deliberation_window_days: 0,
+        emergency_window_secs: i64::MAX,
+        ..Default::default()
+    };
+    assert_eq!(
+        degenerate.effective_emergency_window_secs(),
+        EMERGENCY_WINDOW_FLOOR_SECS
+    );
 }

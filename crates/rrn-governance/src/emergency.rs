@@ -57,7 +57,7 @@ use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::charter::{founder_charter, CharterError};
 use crate::proposal::{founder_set, is_eligible_asof, ProposalError, ProposalKind};
-use crate::tally::{effective_charter, TallyError};
+use crate::tally::TallyError;
 
 // --- Hard constants: floors, ceilings, and the chain bounds (ADR-0023 §4) ---
 //
@@ -509,6 +509,20 @@ impl ActiveEmergency {
             && admitted_at <= self.scheduled_expiry
             && self.lapsed_at_seq.is_none_or(|lapse| seq < lapse)
     }
+
+    /// Whether this emergency is in force *as a community-wide state* as of station
+    /// instant `now`: activated at or before `now`, not past its scheduled expiry,
+    /// and not ended by a lapse. Unlike [`governs`](Self::governs) — which positions
+    /// a *record* strictly after activation — this is **inclusive** at the activation
+    /// instant, because the emergency is active from the moment it takes force. It is
+    /// a display/state predicate (status banners, action results), never used for
+    /// replay positioning, so the boundary difference cannot affect which window
+    /// governed a past vote.
+    pub fn is_active_at(&self, now: i64) -> bool {
+        self.lapsed_at_seq.is_none()
+            && self.activation_instant <= now
+            && now <= self.scheduled_expiry
+    }
 }
 
 // --- Log reads --------------------------------------------------------------
@@ -554,25 +568,6 @@ fn find_lapse(
             continue;
         }
         return Ok(Some((lapse, entry.seq)));
-    }
-    Ok(None)
-}
-
-/// The first [`EmergencyActivated`] attestation for `decl_hash` and its log seq, or
-/// `None`. A cheap existence check (the station writes one per declaration); the
-/// full legitimacy re-derivation is [`emergency_timeline`].
-fn activation_of(
-    log: &AppendLog,
-    decl_hash: &Hash,
-) -> Result<Option<(EmergencyActivated, u64)>, EmergencyError> {
-    for entry in log.iter_from(1) {
-        let entry = entry?;
-        let Ok(act) = from_canonical_bytes::<EmergencyActivated>(&entry.payload.bytes) else {
-            continue;
-        };
-        if act.declaration_hash == *decl_hash {
-            return Ok(Some((act, entry.seq)));
-        }
     }
     Ok(None)
 }
@@ -1090,11 +1085,17 @@ pub fn append_declaration(
             named: decl.author,
         });
     }
-    if let Some(charter) = effective_charter(db)? {
-        if decl.community_id != charter.community_id {
+    // The community is checked against the immutable **genesis** charter, matching
+    // `emergency_timeline`'s replay resolution. Checking the amendable *effective*
+    // charter here would let a community-renaming amendment silently and permanently
+    // make emergencies un-declarable: the front door would accept a declaration under
+    // the new name while replay (anchored on genesis) would forever skip it.
+    if let Some(genesis) = founder_charter(db)? {
+        let expected = &genesis.charter().community_id;
+        if decl.community_id != *expected {
             return Err(EmergencyError::WrongCommunity {
                 declared: decl.community_id.clone(),
-                expected: charter.community_id,
+                expected: expected.clone(),
             });
         }
     }
@@ -1145,8 +1146,11 @@ pub fn append_cosign(
             (true, time, seq)
         } else if let Some((lapse, _seq)) = find_lapse(log, &target)? {
             // A lapse co-sign: judged at the emergency's activation position — the
-            // same electorate the emergency itself uses (§4).
-            let active = active_emergency_at(db, now, next_admission(log, now)?.0)?
+            // same electorate the emergency itself uses (§4). The emergency is
+            // resolved at the monotone-clamped admission instant (not raw `now`), so
+            // a station clock regression cannot spuriously report no active emergency.
+            let (open_seq, open_time) = next_admission(log, now)?;
+            let active = active_emergency_at(db, open_time, open_seq)?
                 .filter(|e| e.declaration_hash == lapse.declaration_hash)
                 .ok_or(EmergencyError::NotActive(lapse.declaration_hash))?;
             (false, active.activation_instant, active.activation_seq)
@@ -1191,8 +1195,12 @@ pub fn append_lapse(
             named: lapse.author,
         });
     }
-    let (open_seq, _open_time) = next_admission(log, now)?;
-    let active = active_emergency_at(db, now, open_seq)?
+    // Judge activity at the monotone-clamped admission instant the append will
+    // receive (matching `append_proposal`/`record_implementation`), not raw `now`, so
+    // a station clock regression below the activation instant cannot refuse a valid
+    // lapse.
+    let (open_seq, open_time) = next_admission(log, now)?;
+    let active = active_emergency_at(db, open_time, open_seq)?
         .filter(|e| e.declaration_hash == lapse.declaration_hash)
         .ok_or(EmergencyError::NotActive(lapse.declaration_hash))?;
     if !is_eligible_asof(
@@ -1243,7 +1251,16 @@ fn try_activate(
     decl_hash: &Hash,
     now: i64,
 ) -> Result<(), EmergencyError> {
-    if activation_of(log, decl_hash)?.is_some() {
+    // Idempotency is judged against the re-derived timeline — the same
+    // legitimacy-checked view a replica computes — not against a raw
+    // `EmergencyActivated` record on the log. A gossiped/forged attestation the
+    // timeline never believes must not suppress the station's real one: if we
+    // short-circuited on any raw attestation, an attacker who replicated a bogus
+    // `EmergencyActivated{decl}` (which the timeline correctly ignores) would block
+    // this station from ever writing the genuine attestation, and the emergency
+    // would never take force. The timeline is reused below as the chain input.
+    let timeline = emergency_timeline(db)?;
+    if timeline.iter().any(|e| e.declaration_hash == *decl_hash) {
         return Ok(());
     }
     let Some((decl, decl_seq)) = find_declaration(log, decl_hash)? else {
@@ -1272,7 +1289,7 @@ fn try_activate(
     }
 
     let scheduled = act_time + clamp_duration(decl.duration_secs);
-    let existing: Vec<(i64, i64)> = emergency_timeline(db)?
+    let existing: Vec<(i64, i64)> = timeline
         .iter()
         .map(|e| (e.activation_instant, e.scheduled_expiry))
         .collect();
