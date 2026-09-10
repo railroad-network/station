@@ -86,16 +86,23 @@ readings require a fresh signing act; the difference is only *which* record is n
 station admits a first crossing that `chain_decision` refuses, it writes
 
 ```
-emergency_refused { declaration_hash: Hash, crossing_seq: u64, refused_instant: i64 }   // station-signed
+emergency_refused { declaration_hash: Hash, refused_instant: i64 }   // station-signed, kind "rrn.gov.emergency_refused"
 ```
 
-Replay validates it the same way it validates an activation — at the single attested pin
-`(refused_instant, crossing_seq)`: `count(crossing_seq) ≥ threshold(crossing_seq)` **and**
-`chain_decision(prior-legitimate-activations, refused_instant, refused_instant +
-clamp(duration), max_renewals) == None`. `emergency_timeline` keeps a `dead_decls` set
-beside today's `seen_decls`; an `emergency_activated` for a declaration with a validated
-refusal at an earlier position is ignored. Both checks read only signed values at one
-pin, so they are replica-identical.
+Replay validates it the same way it validates an activation — at the refusal record's own
+attested pin `(refused_instant, refused_seq)`, exactly as `emergency_timeline` pins an
+activation at its own `activation_seq`: the declaration's count reaches its threshold by
+`refused_seq` **and** `chain_decision(prior-legitimate-activations, refused_instant,
+refused_instant + clamp(duration), max_renewals) == None`. (No `crossing_seq` field: like
+the activation attestation, the refusal is appended immediately after the crossing record,
+so the crossing is the nearest preceding declaration/co-sign record — a stored seq would
+carry no independently-checkable information, the same redundancy that sinks D1a below.
+Pinning at the refusal's own seq also keeps the convention identical to activation's.)
+`emergency_timeline` keeps a `dead_decls` set beside today's `seen_decls`; an
+`emergency_activated` for a declaration with a validated refusal at an earlier position is
+ignored (and a validated refusal for a declaration already activated earlier is itself
+ignored — the earlier activation stands, mirroring the activation dedup). Both checks read
+only signed values at one pin, so they are replica-identical.
 
 *Rejected: D1a (a `crossing_seq` field on `emergency_activated`, replay recomputing "was
 this the first crossing").* Recomputing the first crossing means evaluating
@@ -103,9 +110,23 @@ this the first crossing").* Recomputing the first crossing means evaluating
 the only value available is the re-stamped `created_at`, and the reputation scorer uses
 time arithmetically (decay), so replicas would disagree on where the first crossing was —
 replay could even reject the station's own legitimate attestation. D1a is also redundant:
-the attestation is appended immediately after the crossing record, so `crossing_seq =
-activation_seq − 1` on every honest path — it carries no independently-checkable
-information. D1b confines every evaluation to one attested pin and so avoids this.
+the attestation is appended immediately after the crossing record, so the crossing is
+always the nearest preceding declaration/co-sign record — a stored `crossing_seq` carries
+no independently-checkable information. D1b confines every evaluation to one attested pin
+and so avoids this.
+
+**The marker must commit atomically with the crossing record.** `AppendLog::append` today
+opens and commits one transaction per call, and `try_activate` appends its attestation in a
+*second* commit after the crossing co-sign. If the process dies between the two, the log
+has a cap-refused crossing with **no** `emergency_refused` record — and a later co-sign,
+finding the declaration neither dead nor activated, would revive it (the very hole D1
+closes). So D1b requires the crossing record **and** its marker (`emergency_activated` or
+`emergency_refused`) to be appended in **one transaction** — a batched-append log API,
+since `rusqlite` will not nest `unchecked_transaction`. And replay **fails closed**: a
+declaration whose count has reached threshold but carries neither a validated activation
+nor a validated refusal is treated as **not activatable** (a startup repair, if wanted,
+must be a station-*initiated* append, never activation "on the admission of an unrelated
+record"). The same atomicity binds D2's declaration + anchor (below).
 
 ### D2. A declaration has a time-to-live
 
@@ -124,20 +145,27 @@ does not claim it does.
 **The signed anchor — the eager admission attestation (chosen).** The station writes
 
 ```
-emergency_declaration_admitted { declaration_hash: Hash, admitted_at: i64 }   // station-signed
+emergency_declaration_admitted { declaration_hash: Hash, admitted_at: i64 }   // station-signed, kind "rrn.gov.emergency_declaration_admitted"
 ```
 
-when it admits the declaration, and both the writer and replay check
-`crossing_instant − admitted_at ≤ EMERGENCY_DECLARATION_TTL` against that signed value.
-This is the shape of `ProposalWindow.admitted_at` and survives station re-bootstrap by
-outbox replay (ADR-0020).
+when it admits the declaration (in the same transaction as the declaration, per the
+atomicity rule above), and both the writer and replay check `crossing_instant − admitted_at
+≤ EMERGENCY_DECLARATION_TTL` against that signed value.
 
-*Rejected: a `declaration_admitted_at` field restated on `emergency_activated`.* It is
-only written when activation is attempted, so the check would read the declaration's
-admission time from the unsigned `created_at`; on a station re-bootstrapped from outbox
-replay every `created_at` is re-stamped to replay time, the TTL silently restarts, and the
-"restated" value the station then signs is wrong with no way for replay to detect it —
-the exact invariant-1 breach D2 exists to prevent.
+*Rejected: a `declaration_admitted_at` field restated on `emergency_activated`.* Not
+because `created_at` is unreliable on a writer — it is not: `station.db` is backed up by
+`VACUUM INTO` (ADR-0016), which preserves `log_entries.created_at`, and outbox replay
+(ADR-0020) re-admits only records that never reached the surviving chain, which would get a
+fresh admission under *either* design; only the read-replica gossip path (`append_raw`)
+re-stamps `created_at`, and a replica never writes attestations. The restated field is
+rejected because it is **insufficient**: it exists only once activation is attempted, so a
+declaration that expires **without** ever activating has no signed admission fact at all —
+and D3's `DeclarationExpired` refusal and the §6 promise to surface expired declarations
+both need that fact to be replica-auditable. The eager attestation is also the
+`ProposalWindow.admitted_at` shape and is the form that survives a future writer rebuilt
+from a peer chain (Phase 3 succession), where `created_at` would genuinely differ. Both
+anchors are equally "the station said so"; the eager one is chosen because it always
+exists, not because the other is forgeable.
 
 ⟨decide⟩ **the boundary** (`≤` vs `<` at exactly the TTL) — pin it, as ADR-0023's
 2026-09-09 clarification (ii) did for the active span. Proposed `≤`.
@@ -163,20 +191,42 @@ Under D1/D2 a declaration has three inert states — **dead** (cap-refused), **e
 typed error** (`DeclarationDead`, `DeclarationExpired`, `AlreadyActivated`), not silently
 appended as dead weight — the same choice ADR-0023 §1(i) made for over-Tier amounts, so a
 member learns why. The §6 accountability report surfaces refused/dead declarations, not
-only activated ones. A cap-refused declaration's honest remedy (when the *duration* cap
-bound) is a fresh declaration with a shorter `duration_secs`; the typed error should say so.
+only activated ones. The typed error names the honest remedy: for a **count-cap** refusal,
+wait out the cooldown and raise a fresh declaration; for a **duration-cap** refusal, a
+fresh declaration with a shorter `duration_secs` — which only helps while
+`EMERGENCY_CHAIN_MAX_SECS − total_active ≥ EMERGENCY_DURATION_FLOOR` (24 h), since
+`clamp_duration` floors a declaration at a day, so near the chain cap the only remedy is
+the cooldown. Because emergency co-signs ride DTN bundles, these refusals must also map to
+the closed `RefusalReason` set couriered back on a rejected record (`rrn-protocol`), else a
+courier-carried co-sign toward a dead/expired declaration loses the "learns why" — a new
+receipt variant per state (with a fixture bump) or an explicit collapse to the generic
+`rejected` is a ⟨decide⟩ for the cost below.
 
 ### Preconditions and pinned edges
 
+- **Accepting D1 ratifies the "continuation unless a cap binds" reading of ADR-0023 §4.**
+  §4 contains both "a continuation inherits the prior chain's count" and "within the
+  cooldown simply does not activate"; the implementation and this ADR resolve them as
+  *a within-cooldown crossing is a continuation, refused only when a count or duration cap
+  binds*. D1's "dead" rule depends on that resolution, so accepting D1 puts it on record
+  (equivalently, a dated ADR-0023 Clarification).
 - **Station-signer pinning.** `emergency_timeline` does not today verify that an
   `emergency_activated` envelope is signed by the station key; its authority rests on "the
   facts it restates." Every record this ADR adds (`emergency_refused`,
   `emergency_declaration_admitted`) has authority **only** "the station said so," so
   signer-pinning of station attestations is a **precondition** of this ADR (it is already
   the noted priority follow-up from the T2.8.2 reviews).
-- **Two new record kinds, both station-signed** — `emergency_refused` and
-  `emergency_declaration_admitted` — bringing ADR-0023's four to six. The mobile side
-  decodes them (fixtures) but never produces them.
+- **New station-signed record kinds** — `rrn.gov.emergency_refused` (D1) and
+  `rrn.gov.emergency_declaration_admitted` (D2), each needing a distinct `kind`
+  discriminator and cross-platform CBOR fixtures (ADR-0023 §2 discipline). **D1 alone adds
+  one** kind (five total); D1+D2 adds two (six total). The mobile side decodes them but
+  never produces them. Written exactly once per declaration on the honest path (the
+  `AlreadyPresent` check precedes the append); replay picks the **earliest validated in log
+  order** if a gossip duplicate ever appears (the `window_and_seq_of` precedent).
+- The TTL and the `DeclarationExpired` arm are **D2-only**; D1+D1b+D3's dead/activated arms
+  stand without D2. So the split is real: D1 is self-contained on today's structures
+  (`clamp_duration`, `chain_pairs`, count/threshold), needing only the atomicity rule and
+  signer-pinning; D2 adds the anchor kind and the TTL constant.
 - The TTL applies to **declarations only**, not lapse motions (a stale lift is the safe
   direction, and `append_lapse` already requires an active emergency).
 - Only **admitted** records are candidate crossing positions; a `SignerMismatch` or
@@ -184,16 +234,21 @@ bound) is a fresh declaration with a shorter `duration_secs`; the typed error sh
 - The writer's crossing instant is `now.max(tail.created_at)` (`next_admission`); pin that
   a station clock regression cannot push it past `admitted_at + TTL` while wall time has
   not (immaterial, but pinned as the 2026-09-09 clarification did for the span).
+- **Migration.** Declarations admitted before this ADR ships carry no anchor and no
+  first-crossing marker; under the fail-closed rule they can never activate. Acceptable
+  pre-pilot (no live emergencies exist), but stated.
 
 ## Consequences
 
 - **Positive.** Closes the cap-refusal revival path (D1b) and the on-log non-colluding
   stale consent (D2); makes "when did this activate / why is it dead" a single, auditable,
   replay-derivable, signer-pinned fact; D3 gives members a reason instead of silence.
-- **Negative / cost.** Two new station-signed record kinds, their CBOR fixtures, and the
-  mobile byte-identical-encoding handoff; the TTL adds a fail-closed way for a
-  slow-carriage declaration to expire; the off-log residual remains (Alternatives names
-  the mechanism that would close it).
+- **Negative / cost.** Up to two new station-signed record kinds (one for D1 alone),
+  their CBOR fixtures, and the mobile byte-identical-encoding handoff; a batched-append log
+  API for the atomicity rule; D3's typed refusals need a `RefusalReason` mapping for
+  couriered co-signs (new receipt variants + fixture bump, or a lossy collapse to
+  `rejected`); the TTL adds a fail-closed way for a slow-carriage declaration to expire;
+  the off-log residual remains (Alternatives names the mechanism that would close it).
 - **Determinism.** Every rule reads a station-signed value at a fixed log position and is
   evaluated at that record's single attested pin, so it is replica-identical — the whole
   point of D1b over D1a and of the eager anchor over the restated field.
@@ -237,6 +292,19 @@ bound) is a fresh declaration with a shorter `duration_secs`; the typed error sh
   **log-head freshness witness** as the live alternative for the off-log residual; made
   station-signer pinning an explicit precondition; and noted D1 may be accepted
   independently of D2.
+- **2026-09-10 — second Fable pass (accept-with-caveats; all prior blockers cleared).**
+  D1b's determinism, spurious-refusal suppression, and the revival walk were traced and
+  confirmed sound. Folded in the caveats: require the crossing record + its marker (and the
+  declaration + its anchor) to **commit in one transaction**, with replay **failing closed**
+  on an anchorless/markerless declaration (the one writer/replay divergence window);
+  **corrected the restated-field rejection reason** (`created_at` is preserved by
+  `VACUUM INTO` backup and normal replay — the field is rejected as *insufficient* for a
+  never-activating declaration, not as forgeable); **dropped `crossing_seq`** from
+  `emergency_refused` and pinned it at its own seq; recorded that accepting D1 **ratifies
+  the "continuation unless a cap binds" reading of §4**; added the DTN `RefusalReason`
+  mapping and the completed count-/duration-cap remedy to D3 and the cost; named the two
+  `rrn.gov.*` discriminators, the D1-alone (five kinds) vs D1+D2 (six) split, the
+  duplicate-anchor "earliest validated" rule, and the pre-0027 migration note.
 
 ## References
 
