@@ -1215,12 +1215,31 @@ pub struct EmergencyReportEntry {
     pub measures: Vec<EmergencyMeasure>,
 }
 
+/// A declaration that gathered support but never took force, for the §6 report
+/// (ADR-0027 D3): cap-refused (dead) or expired past its TTL.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmergencyInertDeclaration {
+    /// The declaration's content address, hex.
+    pub declaration_hash: String,
+    /// The crisis, for display (testimony).
+    pub reason: String,
+    /// The declared domain, for display (testimony).
+    pub scope: String,
+    /// Why it is inert: `"refused"` (a §4 cap bound) or `"expired"` (TTL).
+    pub disposition: String,
+    /// The addresses that co-signed the declaration.
+    pub cosigners: Vec<String>,
+}
+
 /// `governance_emergency_report` result — the derived, station-served review surface
-/// (ADR-0023 §6): no new record kinds, everything replayed from the log.
+/// (ADR-0023 §6, ADR-0027): no new *derivation* logic beyond the log replay.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovEmergencyReportResult {
     /// One entry per legitimate activation, in log order.
     pub activations: Vec<EmergencyReportEntry>,
+    /// Declarations that never took force — cap-refused or expired (ADR-0027 §6).
+    #[serde(default)]
+    pub inert_declarations: Vec<EmergencyInertDeclaration>,
 }
 
 // --- Disputes (T1.10.5) -----------------------------------------------------
