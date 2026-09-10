@@ -88,6 +88,18 @@ pub enum RefusalReason {
     /// past its cap (ADR-0021 §5) — the excess is refused (and is equivocation
     /// evidence, T2.3.3).
     CertOverspent,
+    /// A co-signature targets an emergency declaration whose first threshold
+    /// crossing was refused by a §4 cap: the declaration is dead and never
+    /// revives (ADR-0027 D1/D3). The remedy is a fresh declaration after the
+    /// cooldown (count cap) or with a shorter duration (duration cap).
+    DeclarationDead,
+    /// A co-signature targets an emergency declaration whose first crossing was
+    /// not reached within the declaration TTL of its admission, so it no longer
+    /// counts toward activation (ADR-0027 D2/D3).
+    DeclarationExpired,
+    /// A co-signature targets an emergency declaration that has already taken
+    /// force; further co-signatures are dead weight (ADR-0027 D3).
+    AlreadyActivated,
     /// The engine refused the record for a reason without a more specific slug
     /// (a state-machine or plausibility fault). A machine-stable catch-all so the
     /// closed set need not grow a variant per ledger error.
@@ -114,6 +126,9 @@ impl RefusalReason {
             RefusalReason::CertWrongMember => "cert-wrong-member",
             RefusalReason::CertExpired => "cert-expired",
             RefusalReason::CertOverspent => "cert-overspent",
+            RefusalReason::DeclarationDead => "declaration-dead",
+            RefusalReason::DeclarationExpired => "declaration-expired",
+            RefusalReason::AlreadyActivated => "already-activated",
             RefusalReason::Rejected => "rejected",
         }
     }
@@ -139,6 +154,9 @@ impl RefusalReason {
             "cert-wrong-member" => Some(RefusalReason::CertWrongMember),
             "cert-expired" => Some(RefusalReason::CertExpired),
             "cert-overspent" => Some(RefusalReason::CertOverspent),
+            "declaration-dead" => Some(RefusalReason::DeclarationDead),
+            "declaration-expired" => Some(RefusalReason::DeclarationExpired),
+            "already-activated" => Some(RefusalReason::AlreadyActivated),
             "rejected" => Some(RefusalReason::Rejected),
             _ => None,
         }
@@ -479,6 +497,9 @@ mod tests {
             RefusalReason::CertWrongMember,
             RefusalReason::CertExpired,
             RefusalReason::CertOverspent,
+            RefusalReason::DeclarationDead,
+            RefusalReason::DeclarationExpired,
+            RefusalReason::AlreadyActivated,
             RefusalReason::Rejected,
         ] {
             assert_eq!(RefusalReason::from_slug(reason.as_slug()), Some(reason));
