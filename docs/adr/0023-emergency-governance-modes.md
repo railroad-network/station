@@ -907,3 +907,60 @@ it. Flagged for maintainer ratification alongside this ADR.*
   threshold *numbers* like the ordinary statute bars — still track the effective
   charter). A general position-bounded charter resolution, wanted by the ordinary tally
   thresholds too, is recommended follow-up.
+
+*The two entries below are **open decisions raised by a second review (2026-09-10)**,
+not settled readings: each states the gap and a recommended resolution but changes §2 /
+§4 behaviour, so each needs a maintainer's call and is **not yet implemented**. They are
+recorded here so ratification of this ADR settles them alongside the readings above.*
+
+- **2026-09-10 (T2.8.2 review) — a declaration must activate only on its crossing
+  co-signature, and a part-signed declaration should expire. [Open — pending
+  ratification; not yet implemented.]** Two related gaps in the activation trigger.
+  *(i) The activation instant is the crossing co-signature, and only it.* §2 says an
+  emergency "takes force at the admission of the **co-signature that brings the count
+  to ≥ threshold**." The implementation instead re-evaluates activation on *every*
+  declaration/co-sign append while the count stands at or above the bar, anchoring the
+  instant on whichever append it happens to run for. So a declaration whose crossing
+  co-signature is refused for falling inside a §4 chain cooldown ("simply does not
+  activate") can be **revived** by any later co-signature once the cooldown lapses —
+  activating on consents gathered for the earlier, refused crisis — and every
+  post-crossing co-signature needlessly re-derives the trigger. The intended, narrower
+  rule is the one §2's text already implies: activation is judged **only for the record
+  that is itself the crossing co-signature**, against the §4 caps as of that instant;
+  a declaration the caps refuse at its crossing does not activate and is not retried on
+  a later append. *(ii) A declaration/co-signature time-to-live.* Even under (i),
+  nothing bounds how long a declaration may sit part-signed: a faction can gather
+  `threshold − 1` co-signatures, hold one back, and fire it months later as a
+  pre-signed trigger, crossing on long-stale intent. Re-judging every co-signer's
+  eligibility at the crossing position (which this ADR already requires) *mitigates*
+  this — a signer who has since left the electorate is dropped — but a still-eligible
+  member's months-old signature still counts. ADR-0023 sets no TTL. **Recommended:** a
+  declaration and its co-signatures cease to count toward activation if the threshold
+  is not reached within a bounded window of the declaration's admission — a natural
+  value is `EMERGENCY_DURATION_CEILING` (7 days): a crisis whose supermajority cannot
+  be assembled within the longest single emergency is no longer the same crisis. A TTL
+  measured from admission instants / log positions stays replica-deterministic
+  (invariant 1). The maintainer's call is *whether* to add a TTL and *what* window.
+
+- **2026-09-10 (T2.8.2 review) — competing lapse motions split the lift supermajority.
+  [Open — pending ratification; not yet implemented.]** §4 says a lapse "carries the
+  same co-sign supermajority as a declaration … reusing the `emergency_cosign` kind,
+  whose `declaration_hash` target may be a declaration or a lapse," but does not say how
+  co-signatures aggregate when **more than one** member raises a lapse against the same
+  emergency. The implementation gives each `emergency_lapse` a distinct content hash
+  (`H(declaration_hash, author)`), and a lapse co-signature targets one lapse hash — so
+  two members each raising a lapse split the electorate across two hashes: against a
+  14-of-N bar an 8/7 split ends the emergency by neither, though 15 members want out,
+  and a faction member can pre-empt a genuine lift by raising a decoy lapse to force the
+  split. The emergency still auto-expires, so severity is low, but a minority can
+  frustrate an early lift the supermajority wants. **Recommended:** make a lift's
+  co-signatures aggregate **per emergency, not per lapse record** — count every distinct
+  eligible co-signer across all lapse records targeting the same `declaration_hash`
+  toward one lapse threshold, or have lapse co-signatures target the `declaration_hash`
+  under a "lapse" discriminator so the raiser's identity cannot partition the pool.
+  Either keeps the lift boundary a log position (invariant 1). Relatedly, when two
+  emergencies overlap, a lapse resolves against the *earliest* still-active one
+  (`active_emergency_at` returns the earliest governing emergency), so the later of two
+  overlapping emergencies cannot be lapsed until the earlier ends; overlaps are rare and
+  bounded by expiry, but the maintainer should confirm this ordering is acceptable or
+  ask for lapses to target a specific activation.
