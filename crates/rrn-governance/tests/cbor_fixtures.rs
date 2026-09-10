@@ -15,7 +15,8 @@ use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_governance::emergency::{
-    EmergencyActivated, EmergencyCosign, EmergencyDeclaration, EmergencyLapse,
+    EmergencyActivated, EmergencyCosign, EmergencyDeclaration, EmergencyDeclarationAdmitted,
+    EmergencyLapse, EmergencyRefused,
 };
 use rrn_governance::proposal::{Proposal, ProposalCosign, ProposalKind};
 use rrn_governance::vote::{Vote, VoteChoice};
@@ -100,6 +101,17 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
         scheduled_expiry: AT + 72 * 3600,
         renewal_count: 0,
     };
+    // The two ADR-0027 station-signed kinds: a cap-refusal marker (D1b) and the
+    // eager admission anchor (D2) — byte-locked for the mobile repo, which decodes
+    // both but never produces them.
+    let refused = EmergencyRefused {
+        declaration_hash: decl_hash,
+        refused_instant: AT,
+    };
+    let declaration_admitted = EmergencyDeclarationAdmitted {
+        declaration_hash: decl_hash,
+        admitted_at: AT,
+    };
 
     vec![
         ("rrn.gov.proposal", to_canonical_bytes(proposal)),
@@ -113,6 +125,11 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
         ("rrn.gov.emergency_cosign", to_canonical_bytes(em_cosign)),
         ("rrn.gov.emergency_lapse", to_canonical_bytes(em_lapse)),
         ("rrn.gov.emergency_activated", to_canonical_bytes(activated)),
+        ("rrn.gov.emergency_refused", to_canonical_bytes(refused)),
+        (
+            "rrn.gov.emergency_declaration_admitted",
+            to_canonical_bytes(declaration_admitted),
+        ),
     ]
 }
 
