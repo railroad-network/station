@@ -198,7 +198,7 @@ pub fn proposals_view(
 ) -> Result<Vec<ProposalSummary>, GovernanceViewError> {
     let log = AppendLog::new(db);
     let proposals = all_proposals(&log, db)?;
-    let enacted = enacted_ids(db)?;
+    let enacted = enacted_ids(db, now)?;
     let mut rows = Vec::with_capacity(proposals.len());
     for proposal in proposals {
         rows.push(summarize(db, &log, &proposal, now, &enacted)?);
@@ -217,7 +217,7 @@ pub fn proposal_view(
     let Some(proposal) = records.proposal.clone() else {
         return Ok(None);
     };
-    let summary = summarize(db, &log, &proposal, now, &enacted_ids(db)?)?;
+    let summary = summarize(db, &log, &proposal, now, &enacted_ids(db, now)?)?;
     let mut cosigners: Vec<String> = records.cosigners.iter().map(|a| a.to_string()).collect();
     cosigners.sort();
     Ok(Some(ProposalDetail {
@@ -228,8 +228,8 @@ pub fn proposal_view(
 }
 
 /// The statutes in force, derived from the log.
-pub fn statutes_view(db: &Database) -> Result<Vec<StatuteSummary>, GovernanceViewError> {
-    Ok(enacted_statutes(db)?
+pub fn statutes_view(db: &Database, now: i64) -> Result<Vec<StatuteSummary>, GovernanceViewError> {
+    Ok(enacted_statutes(db, now)?
         .into_iter()
         .map(|s| StatuteSummary {
             proposal_id: s.proposal.proposal_id.to_string(),
@@ -242,8 +242,8 @@ pub fn statutes_view(db: &Database) -> Result<Vec<StatuteSummary>, GovernanceVie
 
 /// The content addresses of every proposal in force, computed once so a browse
 /// listing does not re-derive the (tally-heavy) statutes view per row.
-fn enacted_ids(db: &Database) -> Result<HashSet<ProposalId>, GovernanceViewError> {
-    Ok(enacted_statutes(db)?
+fn enacted_ids(db: &Database, now: i64) -> Result<HashSet<ProposalId>, GovernanceViewError> {
+    Ok(enacted_statutes(db, now)?
         .into_iter()
         .map(|s| s.proposal.proposal_id)
         .collect())

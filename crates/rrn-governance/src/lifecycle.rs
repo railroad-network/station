@@ -326,12 +326,14 @@ mod tests {
         assert!(enact_due(&db, &station, proposal.voting_ends_at + 1)
             .unwrap()
             .is_empty());
-        assert!(enacted_statutes(&db).unwrap().is_empty());
+        assert!(enacted_statutes(&db, proposal.voting_ends_at + 1)
+            .unwrap()
+            .is_empty());
 
         // At implementation_at the sweep puts it into force.
         let enacted = enact_due(&db, &station, proposal.implementation_at).unwrap();
         assert_eq!(enacted, vec![proposal.proposal_id]);
-        let in_force = enacted_statutes(&db).unwrap();
+        let in_force = enacted_statutes(&db, proposal.implementation_at).unwrap();
         assert_eq!(in_force.len(), 1);
         assert_eq!(in_force[0].proposal.proposal_id, proposal.proposal_id);
         assert_eq!(in_force[0].implemented_at, proposal.implementation_at);
@@ -340,7 +342,12 @@ mod tests {
         assert!(enact_due(&db, &station, proposal.implementation_at + MONTH)
             .unwrap()
             .is_empty());
-        assert_eq!(enacted_statutes(&db).unwrap().len(), 1);
+        assert_eq!(
+            enacted_statutes(&db, proposal.implementation_at + MONTH)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -387,7 +394,9 @@ mod tests {
         assert!(enact_due(&db, &station, proposal.implementation_at + MONTH)
             .unwrap()
             .is_empty());
-        assert!(enacted_statutes(&db).unwrap().is_empty());
+        assert!(enacted_statutes(&db, proposal.implementation_at + MONTH)
+            .unwrap()
+            .is_empty());
 
         // And the guard refuses a direct attempt.
         let mut log = AppendLog::new(&db);
@@ -512,6 +521,8 @@ mod tests {
         // The effective charter re-derives passage and refuses to advance.
         assert_eq!(effective_charter(&db).unwrap().unwrap().version, 1);
         // And the statutes view drops the illegitimate record.
-        assert!(enacted_statutes(&db).unwrap().is_empty());
+        assert!(enacted_statutes(&db, amendment.implementation_at)
+            .unwrap()
+            .is_empty());
     }
 }

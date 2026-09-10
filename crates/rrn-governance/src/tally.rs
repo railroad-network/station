@@ -187,7 +187,21 @@ fn count_against(
         return Err(TallyError::UnknownProposal(*proposal_id));
     };
 
-    let (quorum_pct, approval_pct) = thresholds(&proposal.kind, governing);
+    // A compressed-path proposal (an `Emergency` kind admitted under an active
+    // declaration) answers to the raised emergency quorum and pins its electorate at
+    // the emergency's activation position (ADR-0023 §3, §3c). Every other proposal
+    // keeps its ordinary thresholds and its own open position.
+    let emergency = if proposal.kind.is_emergency() {
+        crate::emergency::emergency_for_proposal(db, records.open_time, records.open_seq)
+            .map_err(|e| TallyError::Emergency(Box::new(e)))?
+    } else {
+        None
+    };
+    let (quorum_pct, approval_pct) = thresholds(&proposal.kind, governing, emergency.is_some());
+    let (pin_time, pin_seq) = match &emergency {
+        Some(e) => (e.activation_instant, e.activation_seq),
+        None => (records.open_time, records.open_seq),
+    };
 
     let (mut yes, mut no, mut abstain) = (0u32, 0u32, 0u32);
     for choice in votes(&log, proposal_id, db)?.into_values() {
@@ -203,9 +217,7 @@ fn count_against(
     // log position (T2.1.3), so it is replica-deterministic and cannot be packed
     // by standing manufactured — even with a back-dated timestamp — after the
     // proposal opens. A concluded quorum stays stable on replay.
-    let eligible =
-        grace_electorate_asof(db, &governing.founders, records.open_time, records.open_seq)?.len()
-            as u32;
+    let eligible = grace_electorate_asof(db, &governing.founders, pin_time, pin_seq)?.len() as u32;
     let participation = yes + no + abstain;
     let decisive = yes + no;
 
@@ -237,10 +249,13 @@ fn count_against(
 /// The `(quorum_pct, approval_pct)` the Charter sets for a proposal of this kind.
 ///
 /// A statute and an administrative rule answer to the ordinary statute bars; a
-/// Charter amendment to the higher amendment bars; an emergency to the ordinary
-/// quorum but the raised emergency approval bar (the Charter carries no separate
-/// emergency quorum in Phase 1 — configurable emergency quorum is Phase 2).
-fn thresholds(kind: &ProposalKind, charter: &Charter) -> (u8, u8) {
+/// Charter amendment to the higher amendment bars; an emergency to the raised
+/// emergency approval bar. On the **compressed path** (`under_emergency`) the
+/// emergency's quorum rises to a majority of the pinned electorate
+/// (`emergency_quorum_pct`, floored), so speed does not shrink the deciding body
+/// (ADR-0023 §3, "measure quorum"); an `Emergency` proposal raised with no active
+/// declaration keeps the ordinary statute quorum (its Phase-1 behaviour).
+fn thresholds(kind: &ProposalKind, charter: &Charter, under_emergency: bool) -> (u8, u8) {
     let gs = &charter.governance_structure;
     match kind {
         ProposalKind::Statute | ProposalKind::AdministrativeRule { .. } => {
@@ -250,7 +265,14 @@ fn thresholds(kind: &ProposalKind, charter: &Charter) -> (u8, u8) {
             let ar = &charter.amendment_rules;
             (ar.charter_quorum_pct, ar.charter_approval_pct)
         }
-        ProposalKind::Emergency { .. } => (gs.statute_quorum_pct, gs.emergency_threshold_pct),
+        ProposalKind::Emergency { .. } => {
+            let quorum = if under_emergency {
+                gs.effective_emergency_quorum_pct()
+            } else {
+                gs.statute_quorum_pct
+            };
+            (quorum, gs.emergency_threshold_pct)
+        }
     }
 }
 
@@ -275,6 +297,9 @@ pub enum TallyError {
     /// An error scoring the electorate for the eligible-voter count.
     #[error("reputation: {0}")]
     Reputation(#[from] rrn_reputation::Error),
+    /// An error deriving emergency-governance state (ADR-0023).
+    #[error("emergency: {0}")]
+    Emergency(#[from] Box<crate::emergency::EmergencyError>),
 }
 
 #[cfg(test)]

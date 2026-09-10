@@ -71,7 +71,8 @@ use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 
 use crate::charter::{founder_charter, Charter, CharterError, VotingMechanism};
-use crate::window::{build_window, window_and_seq_of};
+use crate::emergency::{active_emergency_at, EmergencyError, EMERGENCY_UNDECLARED_MEASURE_GRACE};
+use crate::window::{build_window, window_and_seq_of, window_for};
 
 /// Discriminant carried in the `kind` field of a [`Proposal`]'s canonical CBOR,
 /// so log replay can tell a proposal apart from other records.
@@ -649,13 +650,61 @@ pub fn append_proposal(
     if find_proposal(log, &proposal.proposal_id, db)?.is_some() {
         return Err(ProposalError::AlreadyProposed(proposal.proposal_id));
     }
+
+    // Emergency-governance gates (ADR-0023), evaluated on the proposal's admission
+    // `(open_time, open_seq)`. An emergency is *active for this admission* iff a
+    // declaration's span covers it; the window then compresses (§3a), and the
+    // constitution is frozen (§3b) and the measure is time-bounded (§1).
+    let active = active_emergency_at(db, open_time, open_seq)
+        .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
+
+    // §3b — charter freeze: no CharterAmendment is admitted while an emergency holds.
+    if matches!(proposal.kind, ProposalKind::CharterAmendment { .. }) && active.is_some() {
+        return Err(ProposalError::CharterFrozenByEmergency);
+    }
+
+    // §1 — an Emergency measure must lapse. During an emergency its `expires_at` is
+    // bounded by the emergency's *scheduled* expiry plus the measure grace; with no
+    // declaration active, the ordinary-path Emergency kind is bounded to
+    // voting_ends_at + 30 d. Refused at admission with a typed error, never silently
+    // downgraded (§1(i)); enforcement kind-wide is in `statute::enacted_statutes`.
+    if let ProposalKind::Emergency { expires_at } = proposal.kind {
+        let max = match &active {
+            Some(e) => e.scheduled_expiry + crate::emergency::EMERGENCY_MEASURE_GRACE,
+            None => {
+                window_for(charter, &proposal.kind, open_time).0
+                    + EMERGENCY_UNDECLARED_MEASURE_GRACE
+            }
+        };
+        if expires_at > max {
+            return Err(ProposalError::EmergencyMeasureTooLong { expires_at, max });
+        }
+    }
+
     let proposal_id = proposal.proposal_id;
     let kind = proposal.kind.clone();
+    // A compressed window only for an Emergency proposal admitted under an active
+    // declaration (§3a); every other case keeps its ordinary window.
+    let emergency_window_secs = match (&kind, &active) {
+        (ProposalKind::Emergency { .. }, Some(_)) => Some(
+            charter
+                .governance_structure
+                .effective_emergency_window_secs(),
+        ),
+        _ => None,
+    };
     let entry = log.append(signed, now)?;
     // Restate the admission-anchored window in a station-signed record so the
     // window is replica-identical (ADR-0022 §1). Its admission time is the
     // proposal's own admission (entry.created_at == open_time).
-    let window = build_window(station, proposal_id, &kind, charter, entry.created_at);
+    let window = build_window(
+        station,
+        proposal_id,
+        &kind,
+        charter,
+        entry.created_at,
+        emergency_window_secs,
+    );
     log.append(window, now)?;
     Ok(entry)
 }
@@ -757,6 +806,19 @@ pub enum ProposalError {
     /// A proposal with this id is already on the log.
     #[error("proposal {0} is already on the log")]
     AlreadyProposed(ProposalId),
+    /// A CharterAmendment was raised while an emergency is active — the
+    /// constitution is frozen for the emergency's life (ADR-0023 §3b).
+    #[error("the charter is frozen while an emergency is active; amendments are refused")]
+    CharterFrozenByEmergency,
+    /// An `Emergency` measure's `expires_at` exceeds the cap that keeps a
+    /// crisis measure from becoming permanent law (ADR-0023 §1).
+    #[error("emergency measure expires_at {expires_at} exceeds the cap {max}; it must lapse")]
+    EmergencyMeasureTooLong {
+        /// The measure's requested expiry.
+        expires_at: i64,
+        /// The maximum allowed expiry.
+        max: i64,
+    },
     /// No authorized proposal with this id — nothing to co-sign.
     #[error("no proposal {0} on this log")]
     UnknownProposal(ProposalId),
@@ -790,6 +852,9 @@ pub enum ProposalError {
     /// A reputation-scoring error while evaluating the established-member gate.
     #[error("reputation: {0}")]
     Reputation(#[from] rrn_reputation::Error),
+    /// An error deriving emergency-governance state (ADR-0023).
+    #[error("emergency: {0}")]
+    Emergency(#[from] Box<EmergencyError>),
     /// Reading the founder Charter to resolve the genesis founders for the
     /// bootstrap-grace electorate failed (ADR-0015).
     #[error("charter: {0}")]

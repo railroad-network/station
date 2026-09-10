@@ -78,6 +78,22 @@ pub struct GovernanceStructure {
     /// Approval share required for an emergency proposal (a higher bar; takes
     /// effect immediately).
     pub emergency_threshold_pct: u8,
+    /// Seconds an `Emergency`-kind proposal deliberates/votes **while an emergency
+    /// declaration is in force** — the compressed decision window (ADR-0023 §3a).
+    /// Clamped up to [`crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS`] on use, so a
+    /// charter can never shrink the window below the floor.
+    pub emergency_window_secs: i64,
+    /// Share of the electorate whose co-signatures a declaration needs to take
+    /// force (author included), a supermajority (ADR-0023 §2). Clamped up to
+    /// [`crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR`] on use.
+    pub emergency_declaration_pct: u8,
+    /// Quorum an emergency-passed (compressed-path) measure must meet — a majority
+    /// of the pinned electorate, so speed does not shrink the deciding body
+    /// (ADR-0023 §3). Clamped up to [`crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR`].
+    pub emergency_quorum_pct: u8,
+    /// Most consecutive renewals an emergency chain may take (ADR-0023 §4). Clamped
+    /// down to [`crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING`] on use.
+    pub max_consecutive_renewals: u32,
 }
 
 impl Default for GovernanceStructure {
@@ -89,7 +105,53 @@ impl Default for GovernanceStructure {
             deliberation_window_days: 7,
             implementation_delay_days: 7,
             emergency_threshold_pct: 67,
+            emergency_window_secs: crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS,
+            emergency_declaration_pct: crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR,
+            emergency_quorum_pct: crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR,
+            max_consecutive_renewals: crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING,
         }
+    }
+}
+
+impl GovernanceStructure {
+    /// The compressed emergency window, floored *and* ceilinged — a charter may raise
+    /// it above [`crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS`] (ADR-0023 §3, "window
+    /// floor") but never below, and never above the ordinary deliberation window it
+    /// compresses. This is the *derive tolerance*: even a hostile charter that stored a
+    /// sub-floor or absurdly large value (`emergency_window_secs` is the one unbounded
+    /// charter time parameter) cannot escape `[floor, ordinary window]`, so
+    /// `admitted_at + secs` in [`crate::window::compressed_emergency_window`] can
+    /// neither undercut the floor nor overflow.
+    pub fn effective_emergency_window_secs(&self) -> i64 {
+        let floor = crate::emergency::EMERGENCY_WINDOW_FLOOR_SECS;
+        // An emergency window is a *compression* of the ordinary deliberation window,
+        // so it can never sensibly exceed it; clamp the ceiling up to the floor for a
+        // degenerate charter whose ordinary window is itself below the floor.
+        let ceiling = (i64::from(self.deliberation_window_days) * 86_400).max(floor);
+        self.emergency_window_secs.clamp(floor, ceiling)
+    }
+
+    /// The declaration supermajority, floored to
+    /// [`crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR`] (ADR-0023 §2).
+    pub fn effective_emergency_declaration_pct(&self) -> u8 {
+        self.emergency_declaration_pct
+            .max(crate::emergency::EMERGENCY_DECLARATION_PCT_FLOOR)
+    }
+
+    /// The emergency measure quorum, floored to
+    /// [`crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR`] (ADR-0023 §3, "measure
+    /// quorum") — never lower than the declaration's own collective bar.
+    pub fn effective_emergency_quorum_pct(&self) -> u8 {
+        self.emergency_quorum_pct
+            .max(crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR)
+    }
+
+    /// The consecutive-renewal cap, capped at
+    /// [`crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING`] (ADR-0023 §4) — a
+    /// charter may set a *stricter* cap but never a looser one.
+    pub fn effective_max_consecutive_renewals(&self) -> u32 {
+        self.max_consecutive_renewals
+            .min(crate::emergency::MAX_CONSECUTIVE_RENEWALS_CEILING)
     }
 }
 
@@ -487,6 +549,31 @@ impl From<GovernanceStructure> for CBOR {
             g.implementation_delay_days as u64,
         );
         m.insert("emergency_threshold_pct", g.emergency_threshold_pct as u64);
+        // The emergency parameters are **additive** fields on a
+        // content-addressed record: each is omitted from the map when it equals its
+        // default, so a pre-emergency (Phase-1) charter — which never carried these
+        // keys — hashes byte-identically under this encoder, and an unchanged
+        // charter's `charter_hash` does not move (ADR-0010 discipline). A charter
+        // that customises a parameter carries only that key.
+        let d = GovernanceStructure::default();
+        if g.emergency_window_secs != d.emergency_window_secs {
+            m.insert("emergency_window_secs", g.emergency_window_secs);
+        }
+        if g.emergency_declaration_pct != d.emergency_declaration_pct {
+            m.insert(
+                "emergency_declaration_pct",
+                g.emergency_declaration_pct as u64,
+            );
+        }
+        if g.emergency_quorum_pct != d.emergency_quorum_pct {
+            m.insert("emergency_quorum_pct", g.emergency_quorum_pct as u64);
+        }
+        if g.max_consecutive_renewals != d.max_consecutive_renewals {
+            m.insert(
+                "max_consecutive_renewals",
+                g.max_consecutive_renewals as u64,
+            );
+        }
         m.into()
     }
 }
@@ -498,6 +585,7 @@ impl TryFrom<CBOR> for GovernanceStructure {
             CBORCase::Map(map) => map,
             _ => return Err(dcbor::Error::WrongType),
         };
+        let default_gov = GovernanceStructure::default();
         Ok(GovernanceStructure {
             voting_mechanism: map.extract::<&str, VotingMechanism>("voting_mechanism")?,
             statute_quorum_pct: extract_u8(&map, "statute_quorum_pct")?,
@@ -505,6 +593,24 @@ impl TryFrom<CBOR> for GovernanceStructure {
             deliberation_window_days: extract_u8(&map, "deliberation_window_days")?,
             implementation_delay_days: extract_u8(&map, "implementation_delay_days")?,
             emergency_threshold_pct: extract_u8(&map, "emergency_threshold_pct")?,
+            // Additive fields: absent on a pre-emergency charter (and omitted when
+            // default), so each falls back to the default rather than failing decode.
+            emergency_window_secs: match map.get::<&str, CBOR>("emergency_window_secs") {
+                Some(c) => i64::try_from(c).map_err(|_| dcbor::Error::WrongType)?,
+                None => default_gov.emergency_window_secs,
+            },
+            emergency_declaration_pct: match map.get::<&str, CBOR>("emergency_declaration_pct") {
+                Some(_) => extract_u8(&map, "emergency_declaration_pct")?,
+                None => default_gov.emergency_declaration_pct,
+            },
+            emergency_quorum_pct: match map.get::<&str, CBOR>("emergency_quorum_pct") {
+                Some(_) => extract_u8(&map, "emergency_quorum_pct")?,
+                None => default_gov.emergency_quorum_pct,
+            },
+            max_consecutive_renewals: match map.get::<&str, CBOR>("max_consecutive_renewals") {
+                Some(_) => extract_u32(&map, "max_consecutive_renewals")?,
+                None => default_gov.max_consecutive_renewals,
+            },
         })
     }
 }
@@ -990,5 +1096,56 @@ mod tests {
         let db = fresh_db();
         assert!(founder_charter(&db).unwrap().is_none());
         assert!(founder_charter_hash(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn emergency_params_are_additive_default_charter_bytes_unchanged() {
+        // A default charter OMITS every emergency key, so a pre-emergency
+        // (Phase-1) charter — which never carried them — decodes and hashes
+        // identically under this encoder; the `charter_hash` does not move on
+        // upgrade (ADR-0010 additive-field discipline).
+        let gov = GovernanceStructure::default();
+        let cbor = CBOR::from(gov.clone());
+        let CBORCase::Map(map) = cbor.clone().into_case() else {
+            panic!("map");
+        };
+        for key in [
+            "emergency_window_secs",
+            "emergency_declaration_pct",
+            "emergency_quorum_pct",
+            "max_consecutive_renewals",
+        ] {
+            assert!(
+                map.get::<&str, CBOR>(key).is_none(),
+                "{key} must be omitted"
+            );
+        }
+        let back: GovernanceStructure = cbor.try_into().unwrap();
+        assert_eq!(gov, back);
+
+        // Customising one parameter carries just that key and changes the bytes.
+        let custom = GovernanceStructure {
+            emergency_window_secs: 48 * 3600,
+            ..GovernanceStructure::default()
+        };
+        assert_ne!(to_canonical_bytes(gov), to_canonical_bytes(custom.clone()));
+        let back2: GovernanceStructure =
+            from_canonical_bytes(&to_canonical_bytes(custom.clone())).unwrap();
+        assert_eq!(custom, back2);
+    }
+
+    #[test]
+    fn a_pre_emergency_governance_map_decodes_with_defaults() {
+        // A Phase-1 governance_structure map (only the original six keys) must decode
+        // — not hard-fail — with the emergency parameters at their defaults.
+        let mut m = Map::new();
+        m.insert("voting_mechanism", VotingMechanism::Direct);
+        m.insert("statute_quorum_pct", 30u64);
+        m.insert("statute_approval_pct", 50u64);
+        m.insert("deliberation_window_days", 7u64);
+        m.insert("implementation_delay_days", 7u64);
+        m.insert("emergency_threshold_pct", 67u64);
+        let gov: GovernanceStructure = CBOR::from(m).try_into().unwrap();
+        assert_eq!(gov, GovernanceStructure::default());
     }
 }

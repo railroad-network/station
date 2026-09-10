@@ -313,6 +313,11 @@ pub struct StatusResult {
     /// How many members are currently established.
     #[serde(default)]
     pub established_members: u64,
+    /// The active emergency, if one holds (ADR-0023 §6). The mobile shows a
+    /// persistent banner naming it, its reason, and its expiry while set, so a
+    /// member is never told a compressed-window vote was an ordinary one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emergency: Option<EmergencyStatus>,
     /// The connectivity / offline-posture snapshot.
     pub connectivity: ConnectivityBlock,
 }
@@ -420,6 +425,10 @@ pub struct WhoamiResult {
     /// (`rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD`).
     #[serde(default)]
     pub grace_threshold: u64,
+    /// The active emergency, if one holds (ADR-0023). The mobile banners it while
+    /// set — a compressed governance window must never look like an ordinary one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emergency: Option<EmergencyStatus>,
 }
 
 /// `transactions` params — the mobile-facing, member-relative view of the
@@ -1109,6 +1118,109 @@ pub struct GovVoteParams {
     pub proposal_id: String,
     /// `yes`, `no`, or `abstain`.
     pub choice: String,
+}
+
+// --- Emergency governance (ADR-0023) --------------------------------
+
+/// `governance_emergency_declare` params — raise an emergency declaration
+/// (daemon-signed by the station wallet, whose signature counts toward the
+/// supermajority).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovEmergencyDeclareParams {
+    /// The crisis, human-readable (testimony/display only).
+    pub reason: String,
+    /// The declared emergency domain (testimony/display only).
+    pub scope: String,
+    /// Requested lifetime in seconds; clamped to `[24 h, 7 d]` on activation.
+    /// Absent means the 72 h default (ADR-0023 §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<i64>,
+    /// The declaration this renews (hex hash), if any — advisory; the effective
+    /// renewal count is derived from log proximity (ADR-0023 §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_declaration_hash: Option<String>,
+}
+
+/// A `declaration_hash`-addressed emergency action (co-sign or lapse).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovEmergencyTargetParams {
+    /// The hex declaration hash (for a lapse co-sign, the lapse's own hash).
+    pub declaration_hash: String,
+}
+
+/// Result of an emergency declare / co-sign / lapse: the target hash and whether an
+/// emergency for it is now active (the crossing may or may not have happened).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovEmergencyActionResult {
+    /// The declaration (or lapse) content hash, hex.
+    pub declaration_hash: String,
+    /// Whether an emergency is active for the declaration after this action.
+    pub active: bool,
+}
+
+/// One emergency in the derived timeline — the shape the status banner and the
+/// post-emergency report both render.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmergencyStatus {
+    /// The declaration content hash, hex.
+    pub declaration_hash: String,
+    /// The crisis, human-readable (testimony).
+    pub reason: String,
+    /// The declared domain (testimony).
+    pub scope: String,
+    /// The station-attested activation instant.
+    pub activation_instant: i64,
+    /// The station-attested scheduled expiry.
+    pub scheduled_expiry: i64,
+    /// The log-derived renewal count within the proximity chain.
+    pub renewal_count: u32,
+    /// Whether it is active right now (unlapsed and within its scheduled span).
+    pub active: bool,
+    /// Whether it was ended early by a lapse.
+    pub lapsed: bool,
+}
+
+/// `governance_emergency_status` result — the active emergency (if any) and the full
+/// derived timeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovEmergencyStatusResult {
+    /// The currently-active emergency, if one holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<EmergencyStatus>,
+    /// Every emergency that legitimately took force, in log order.
+    #[serde(default)]
+    pub history: Vec<EmergencyStatus>,
+}
+
+/// A measure passed under an emergency, for the post-emergency report (ADR-0023 §6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmergencyMeasure {
+    /// The proposal's content address, hex.
+    pub proposal_id: String,
+    /// Its title.
+    pub title: String,
+    /// When the measure itself lapses (its `expires_at`).
+    pub expires_at: i64,
+}
+
+/// One activation's full accountability record (ADR-0023 §6): the emergency, its
+/// co-signers, and every measure passed under it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmergencyReportEntry {
+    /// The emergency itself.
+    pub emergency: EmergencyStatus,
+    /// The addresses that co-signed the declaration into force.
+    pub cosigners: Vec<String>,
+    /// The Emergency measures admitted under this emergency.
+    pub measures: Vec<EmergencyMeasure>,
+}
+
+/// `governance_emergency_report` result — the derived, station-served review surface
+/// (ADR-0023 §6): no new record kinds, everything replayed from the log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovEmergencyReportResult {
+    /// One entry per legitimate activation, in log order.
+    pub activations: Vec<EmergencyReportEntry>,
 }
 
 // --- Disputes (T1.10.5) -----------------------------------------------------

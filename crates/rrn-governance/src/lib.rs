@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 pub mod charter;
+pub mod emergency;
 pub mod lifecycle;
 pub mod proposal;
 pub mod statute;

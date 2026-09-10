@@ -2183,6 +2183,91 @@ channel.
   so compliance is still a matter of members and operators honoring it (the
   statute→config rule engine is Phase 3).
 
+#### Emergency governance — the coup lever (T2.8.2, ADR-0023)
+
+Emergency governance lets a supermajority of the electorate *compress the
+deliberation/voting window* for a narrow class of measures during a declared
+crisis. It is the one governance mechanism that deliberately spends the §2.4 exit
+runway, so it is the sharpest capture surface in the stack. The design's whole job
+is to hand a community exactly one new power — *decide faster, for a measure that
+then lapses* — and withhold every adjacent one.
+
+- *Assets:* the integrity of the compression gate (nothing compresses without a
+  collective act); of the enforced measure-expiry (a fast vote can never make
+  permanent law); of the position-pinned electorate (denominator + ballot
+  eligibility); and of the station-signed activation boundary (which window
+  governed a past vote must be one replica-identical fact).
+- *Spoofing / squatting the lever.* A single member, or a bare majority, cannot
+  compress anything: activation requires distinct co-signatures reaching a
+  two-thirds supermajority of the electorate (`ceil(2N/3)`, the author's own
+  signature included), re-derived on replay from the signed declaration and
+  co-signatures — a gossiped or forged `emergency_activated` attestation whose
+  declaration never actually crossed is ignored. No new privileged declarer role is
+  minted; the declarers are the ordinary electorate. *Residual:* a standing
+  two-thirds faction is, by construction, able to declare — the supermajority *is*
+  the defense, and a small/bootstrap electorate reaches it at two signatures (named
+  in ADR-0023 Consequences).
+- *Tampering — a durable measure from a fast vote.* An `Emergency` measure's
+  `expires_at` is bounded and **enforced**: refused at admission if it exceeds the
+  emergency's scheduled expiry + 7 d grace (or, with no declaration active,
+  `voting_ends_at + 30 d`), and dropped kind-wide from `enacted_statutes` once
+  expired. Durability always costs the ordinary full-window process.
+- *Tampering — back-dated evidence packing the electorate.* The emergency tally's
+  denominator and ballot eligibility are pinned at the activation co-signature's log
+  **position**, not a wall-clock instant, so a vouch admitted after activation but
+  back-dated earlier (legal under ADR-0022 §3) cannot enter the pinned set — closing
+  the "declare, then manufacture members, then vote" path.
+- *Tampering — restructuring under cover of crisis.* The effective charter is frozen
+  while an emergency holds: a `CharterAmendment` is refused at admission and its
+  enactment deferred until lapse (`record_implementation` / `enact_due`), so the
+  rules of the game cannot be rewritten during the compressed window.
+- *Replica divergence.* The activation instant and scheduled expiry are frozen into
+  the **station-signed** `emergency_activated` attestation (never recomputed from a
+  replica's re-stamped admission clock), and the compressed window is frozen into
+  the proposal's signed `ProposalWindow` attestation; the lapse boundary is a log
+  position. So every replica — including one re-bootstrapped by outbox replay —
+  derives the identical timeline and tally (invariant test:
+  `a_late_replica_derives_the_identical_emergency_state_and_tally`).
+- *Elevation — a perpetual emergency.* A chain is capped at both a renewal count
+  (≤ 2, three activations) and a total active duration (≤ 14 d), both derived from
+  log proximity — a self-reset `stated_renewal_index` buys nothing — and a fixed
+  14-day cooldown then forces an equal span outside emergency before the next chain
+  (a ≤ 50 % duty cycle). A perpetual emergency *state* is impossible.
+- *Denial of service / economic protection.* The emergency state is never read by
+  `rrn-ledger` or `rrn-reputation`: the settlement and dispute windows, the debt
+  floor, certificates, and reputation are untouched, by construction. A flood does
+  not authorize economic restructuring.
+- *Residual — the station signer is not yet pinned on attestations.* The
+  `emergency_activated` attestation (like ADR-0022's `ProposalWindow` and
+  `ProposalImplemented`) is trusted structurally — its declaration must re-derive as
+  having crossed the supermajority — but the derivation does not yet verify the
+  attestation's *signer* is the community's station key. A gossip peer that already
+  holds a genuine supermajority (so the crossing re-derives) could inject an
+  attestation with an attacker-chosen `activation_instant`, shifting the active span
+  by up to one declaration's clamped duration (≤ 7 d); it cannot manufacture an
+  emergency without a real supermajority (co-signatures must be from eligible members,
+  which re-derives). This is why the emergency-*legitimacy* parameters are read from
+  the genesis charter rather than any attestation field. Pinning the station signer
+  uniformly across all three station attestations is recommended follow-up (it is a
+  pre-existing gap, not introduced here). A duplicate/bogus attestation cannot *block*
+  the real one: the "already activated" check runs only after legitimacy passes.
+- *Residual — a renewal re-pins the electorate at its own activation.* Each activation
+  in a chain pins at its own position, so a chain that renews mid-emergency can refresh
+  its pinned electorate up to `MAX_CONSECUTIVE_RENEWALS_CEILING` times — ADR-consistent
+  (each renewal is a fresh collective act), but a standing supermajority could admit
+  members between renewals into the next segment's electorate.
+- *Residual risks (stated plainly in ADR-0023):* a standing two-thirds faction can
+  still (a) *cycle* emergencies at up to a 50 % duty cycle and (b) file an ordinary
+  power measure under a "flood response" declaration — `reason`/`scope` are
+  testimony, not machine-enforced germaneness. The backstops are the raised bar, the
+  frozen charter, the pinned electorate, the enforced measure-expiry, and full
+  visibility (the derived emergency report, and the status/whoami banner while an
+  emergency holds); a community may adopt a mandatory post-emergency review by
+  statute. Emergency structurally favours the connected: a co-present supermajority
+  of the *reachable* electorate can pass fast, temporary measures partitioned members
+  will not see until admitted — an honest cost of deciding in a crisis, mitigated but
+  not eliminated by the 24 h window floor.
+
 ## Mobile client (Phase 1)
 
 The mobile client is new in Phase 1 and, per
