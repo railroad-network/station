@@ -3022,7 +3022,24 @@ impl Core {
                     .collect(),
             })
             .collect();
-        ok(&rpc::GovEmergencyReportResult { activations })
+        let inert_declarations = emergency::inert_declarations(&self.db, now)
+            .map_err(internal)?
+            .into_iter()
+            .map(|d| rpc::EmergencyInertDeclaration {
+                declaration_hash: d.declaration_hash.to_string(),
+                reason: d.reason,
+                scope: d.scope,
+                disposition: match d.disposition {
+                    emergency::InertDisposition::Refused => "refused".into(),
+                    emergency::InertDisposition::Expired => "expired".into(),
+                },
+                cosigners: d.cosigners.iter().map(|c| c.to_string()).collect(),
+            })
+            .collect();
+        ok(&rpc::GovEmergencyReportResult {
+            activations,
+            inert_declarations,
+        })
     }
 
     // --- disputes (T1.10.5) ------------------------------------------------
@@ -4373,6 +4390,17 @@ impl Core {
         match emergency::append_cosign(&mut log, signed, &self.db, &station, now) {
             Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
             Err(emergency::EmergencyError::AlreadyCosigned { .. }) => self.gov_known(bytes),
+            // ADR-0027 D3: a co-sign toward an inert declaration carries a typed
+            // reason back to its offline author, not a generic `rejected`.
+            Err(emergency::EmergencyError::DeclarationDead { .. }) => {
+                Ok(refused_disposition(RefusalReason::DeclarationDead))
+            }
+            Err(emergency::EmergencyError::DeclarationExpired { .. }) => {
+                Ok(refused_disposition(RefusalReason::DeclarationExpired))
+            }
+            Err(emergency::EmergencyError::AlreadyActivated { .. }) => {
+                Ok(refused_disposition(RefusalReason::AlreadyActivated))
+            }
             Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
         }
     }
@@ -7513,6 +7541,65 @@ mod tests {
         assert_eq!(
             acts[0]["measures"][0]["proposal_id"],
             measure.proposal_id.to_string()
+        );
+    }
+
+    /// ADR-0027 D3 over DTN: a co-signature toward a declaration that has expired
+    /// past its TTL comes back on the receipt with the typed `DeclarationExpired`
+    /// reason, not a generic `rejected`, so the offline co-signer learns why.
+    #[test]
+    fn dtn_cosign_toward_an_expired_declaration_is_refused_with_a_typed_reason() {
+        let mut core = test_core(); // clock = 1000
+        let founders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({
+                "community_id": "commons",
+                "founder_secrets_hex": founders
+                    .iter()
+                    .map(|k| hex(&k.secret_key().to_bytes()))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+
+        // founder0 declares; with three founders the bar is two, so the lone
+        // declaration does not activate — it sits part-signed, anchored at ~1000.
+        let decl = EmergencyDeclaration {
+            community_id: "commons".into(),
+            author: Address::from_public_key(founders[0].public_key()),
+            reason: "storm".into(),
+            scope: "flood".into(),
+            duration_secs: 72 * 3600,
+            stated_renewal_index: 0,
+            previous_declaration_hash: None,
+            created_at: 900,
+        };
+        let signed_decl = SignedPayload::sign(decl.clone(), &founders[0]);
+        let e_decl = outbox_entry(&founders[0], 0, zero(), &signed_decl, 900);
+        let receipt = submit_bundle(&mut core, std::slice::from_ref(&e_decl), 1000);
+        assert!(matches!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+
+        // Past the 7-day declaration TTL, a crossing co-signature is dead weight:
+        // the front door refuses it and the DTN reply carries the typed reason.
+        core.clock.advance(7 * 86_400 + 1); // now = 1000 + TTL + 1
+        let now = core.clock.now();
+        let cosign = EmergencyCosign {
+            declaration_hash: decl.hash(),
+            signer: Address::from_public_key(founders[1].public_key()),
+        };
+        let signed_cosign = SignedPayload::sign(cosign, &founders[1]);
+        let e_cosign = outbox_entry(&founders[1], 0, zero(), &signed_cosign, now);
+        let c_receipt = submit_bundle(&mut core, std::slice::from_ref(&e_cosign), now);
+        assert_eq!(
+            c_receipt.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::DeclarationExpired
+            },
+            "a co-sign toward an expired declaration returns the typed DTN reason"
         );
     }
 

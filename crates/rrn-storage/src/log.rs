@@ -174,6 +174,41 @@ impl<'a> AppendLog<'a> {
         })
     }
 
+    /// Begins a [`LogBatch`]: a single SQLite transaction into which several
+    /// payloads can be appended and then committed atomically (ADR-0027).
+    ///
+    /// `append` commits one transaction per call; some records must land
+    /// **together or not at all** — the crossing declaration/co-sign record and
+    /// its station marker, or a declaration and its admission anchor — so that a
+    /// crash can never leave a markerless crossing that a later append would
+    /// revive. `rusqlite` will not nest `unchecked_transaction`, so this opens
+    /// one and hands back a guard the caller appends into.
+    ///
+    /// While the batch is open, reads on the **same** [`Database`] connection
+    /// observe the not-yet-committed entries (SQLite always shows a connection
+    /// its own writes), so a writer can append a crossing co-sign and then
+    /// evaluate the crossing over a log that already contains it, all before the
+    /// single commit. The guard rolls the whole batch back on drop unless
+    /// [`commit`](LogBatch::commit) is called; a mid-batch failure therefore
+    /// leaves the log exactly as it was.
+    ///
+    /// The chain invariants are preserved across the batch just as `append`
+    /// preserves them per call: monotone `seq`, `prev_hash` chained entry to
+    /// entry, and `created_at = now.max(prev.created_at)` clamped against the
+    /// running tail (§6).
+    pub fn begin_batch(&self) -> Result<LogBatch<'a>> {
+        let (prev_hash, prev_created_at) = match self.tail()? {
+            Some(prev) => (prev.content_hash, Some(prev.created_at)),
+            None => (zero_hash(), None),
+        };
+        let tx = self.db.conn().unchecked_transaction()?;
+        Ok(LogBatch {
+            tx,
+            prev_hash,
+            prev_created_at,
+        })
+    }
+
     /// Appends a pre-signed [`StoredPayload`] received from a peer, verbatim.
     ///
     /// Replication (the gossip layer, M0.6) hands over the exact bytes another
@@ -374,6 +409,91 @@ impl<'a> AppendLog<'a> {
         };
         rows.map(|r| r.map_err(Error::from).and_then(decode_entry))
             .collect()
+    }
+}
+
+/// A set of appends committed to the log in a single SQLite transaction
+/// (ADR-0027). Opened by [`AppendLog::begin_batch`].
+///
+/// Each [`append`](Self::append) stamps and inserts one entry inside the open
+/// transaction, chaining `prev_hash`/`created_at` across the batch exactly as
+/// sequential [`AppendLog::append`] calls would. Nothing is durable until
+/// [`commit`](Self::commit); dropping the guard without committing rolls the
+/// whole batch back, so a failure part-way through leaves no partial write.
+pub struct LogBatch<'a> {
+    tx: rusqlite::Transaction<'a>,
+    prev_hash: Hash,
+    /// `created_at` of the running tail (the last entry appended in this batch,
+    /// or the log tail at batch start), or `None` if the log was empty and this
+    /// batch has appended nothing yet.
+    prev_created_at: Option<i64>,
+}
+
+impl LogBatch<'_> {
+    /// Appends one signed value as the next entry in the open transaction and
+    /// returns it. The signature is verified before the row is inserted; an
+    /// entry that does not verify errors without inserting (and, since the batch
+    /// has not committed, rolls back anything appended before it on drop).
+    ///
+    /// `now` is clamped monotone non-decreasing against the running tail, so all
+    /// entries in one batch share a single admission instant when `now` does not
+    /// advance between calls — the same clamp `append` applies (ADR-0022 §6).
+    pub fn append<T: Clone + Into<CBOR>>(
+        &mut self,
+        signed: SignedPayload<T>,
+        now: i64,
+    ) -> Result<LogEntry> {
+        signed.verify().map_err(|_| Error::InvalidSignature)?;
+        let bytes = to_canonical_bytes(signed.payload.clone());
+        self.insert(bytes, signed.signer, signed.signature, now)
+    }
+
+    fn insert(
+        &mut self,
+        bytes: Vec<u8>,
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<LogEntry> {
+        let content_hash = Hash::of(&bytes);
+        let prev_hash = self.prev_hash;
+        let created_at = match self.prev_created_at {
+            Some(prev) => now.max(prev),
+            None => now,
+        };
+        let payload = StoredPayload {
+            bytes,
+            signer,
+            signature,
+        };
+        self.tx.execute(
+            "INSERT INTO log_entries (prev_hash, content_hash, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                prev_hash.to_bytes().as_slice(),
+                content_hash.to_bytes().as_slice(),
+                payload.encode(),
+                created_at,
+            ],
+        )?;
+        let seq = self.tx.last_insert_rowid() as u64;
+        self.prev_hash = content_hash;
+        self.prev_created_at = Some(created_at);
+        tracing::trace!(seq, %content_hash, "appended log entry (batch)");
+        Ok(LogEntry {
+            seq,
+            prev_hash,
+            content_hash,
+            payload,
+            created_at,
+        })
+    }
+
+    /// Commits the batch, making every appended entry durable in one atomic
+    /// transaction. Without this call the guard rolls the batch back on drop.
+    pub fn commit(self) -> Result<()> {
+        self.tx.commit()?;
+        Ok(())
     }
 }
 
@@ -710,6 +830,168 @@ mod tests {
         // not inherit the origin's admission time (ADR-0022 §1).
         let e = dst.append_raw(payload, 1_500).unwrap().expect("appended");
         assert_eq!(e.created_at, 2_000);
+    }
+
+    #[test]
+    fn batch_stamping_equals_sequential_stamping() {
+        // A batch of three appends must produce byte-identical chain state to
+        // three sequential `append`s at the same `now`: same seqs, prev_hashes,
+        // content_hashes, and clamped created_at.
+        let kp = Keypair::generate();
+
+        let seq_db = fresh_log_db();
+        let sequential: Vec<LogEntry> = {
+            let mut log = AppendLog::new(&seq_db);
+            vec![
+                append_note_at(&mut log, &kp, 1, 1_000),
+                append_note_at(&mut log, &kp, 2, 1_000),
+                append_note_at(&mut log, &kp, 3, 1_000),
+            ]
+        };
+
+        let batch_db = fresh_log_db();
+        let batched: Vec<LogEntry> = {
+            let log = AppendLog::new(&batch_db);
+            let mut batch = log.begin_batch().unwrap();
+            let e1 = batch
+                .append(SignedPayload::sign(Note(1), &kp), 1_000)
+                .unwrap();
+            let e2 = batch
+                .append(SignedPayload::sign(Note(2), &kp), 1_000)
+                .unwrap();
+            let e3 = batch
+                .append(SignedPayload::sign(Note(3), &kp), 1_000)
+                .unwrap();
+            batch.commit().unwrap();
+            vec![e1, e2, e3]
+        };
+
+        for (s, b) in sequential.iter().zip(&batched) {
+            assert_eq!(s.seq, b.seq);
+            assert_eq!(s.prev_hash, b.prev_hash);
+            assert_eq!(s.content_hash, b.content_hash);
+            assert_eq!(s.created_at, b.created_at);
+        }
+        assert_eq!(AppendLog::new(&batch_db).verify_chain().unwrap(), 3);
+    }
+
+    #[test]
+    fn batch_chains_onto_a_nonempty_tail_and_clamps() {
+        // A batch opened over a non-empty log chains onto its tail, and a
+        // backwards `now` is clamped up to the tail's created_at across the batch.
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let tail = {
+            let mut log = AppendLog::new(&db);
+            append_note_at(&mut log, &kp, 1, 2_000)
+        };
+        let log = AppendLog::new(&db);
+        let mut batch = log.begin_batch().unwrap();
+        let e2 = batch
+            .append(SignedPayload::sign(Note(2), &kp), 900)
+            .unwrap();
+        let e3 = batch
+            .append(SignedPayload::sign(Note(3), &kp), 900)
+            .unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!((e2.seq, e3.seq), (2, 3));
+        assert_eq!(e2.prev_hash, tail.content_hash);
+        assert_eq!(e3.prev_hash, e2.content_hash);
+        // Clamped up to the tail's 2_000, not the injected 900.
+        assert_eq!((e2.created_at, e3.created_at), (2_000, 2_000));
+        assert_eq!(AppendLog::new(&db).verify_chain().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_mid_batch_failure_rolls_the_whole_batch_back() {
+        // Append one good entry into a batch, then an entry whose signature does
+        // not verify. The second `append` errors, the batch is dropped without a
+        // commit, and nothing — not even the first, already-inserted entry — is
+        // persisted.
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        {
+            let log = AppendLog::new(&db);
+            let mut batch = log.begin_batch().unwrap();
+            batch
+                .append(SignedPayload::sign(Note(1), &kp), NOW)
+                .unwrap();
+
+            let mut bad = SignedPayload::sign(Note(7), &kp);
+            bad.payload = Note(8); // mutate after signing → signature invalid
+            let err = batch.append(bad, NOW).unwrap_err();
+            assert!(matches!(err, Error::InvalidSignature), "{err:?}");
+            // `batch` dropped here without commit → rollback.
+        }
+        // The good entry that was inserted mid-batch was rolled back with it.
+        assert!(AppendLog::new(&db).tail().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_dropped_batch_without_commit_persists_nothing() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        {
+            let log = AppendLog::new(&db);
+            let mut batch = log.begin_batch().unwrap();
+            batch
+                .append(SignedPayload::sign(Note(1), &kp), NOW)
+                .unwrap();
+            batch
+                .append(SignedPayload::sign(Note(2), &kp), NOW)
+                .unwrap();
+            // No commit.
+        }
+        assert!(AppendLog::new(&db).tail().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_single_element_batch_matches_append() {
+        let kp = Keypair::generate();
+
+        let a_db = fresh_log_db();
+        let via_append = {
+            let mut log = AppendLog::new(&a_db);
+            append_note_at(&mut log, &kp, 5, 1_234)
+        };
+
+        let b_db = fresh_log_db();
+        let via_batch = {
+            let log = AppendLog::new(&b_db);
+            let mut batch = log.begin_batch().unwrap();
+            let e = batch
+                .append(SignedPayload::sign(Note(5), &kp), 1_234)
+                .unwrap();
+            batch.commit().unwrap();
+            e
+        };
+
+        assert_eq!(via_append.seq, via_batch.seq);
+        assert_eq!(via_append.prev_hash, via_batch.prev_hash);
+        assert_eq!(via_append.content_hash, via_batch.content_hash);
+        assert_eq!(via_append.created_at, via_batch.created_at);
+    }
+
+    #[test]
+    fn reads_on_the_same_connection_see_uncommitted_batch_entries() {
+        // The property the emergency writer relies on: while a batch is open,
+        // a read through a separate AppendLog over the same Database observes
+        // the entries appended into the batch but not yet committed.
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let log = AppendLog::new(&db);
+        let mut batch = log.begin_batch().unwrap();
+        let e1 = batch
+            .append(SignedPayload::sign(Note(1), &kp), NOW)
+            .unwrap();
+
+        // A fresh handle over the same db sees the uncommitted entry.
+        let seen = AppendLog::new(&db).tail().unwrap().expect("tail visible");
+        assert_eq!(seen.seq, e1.seq);
+        assert_eq!(seen.content_hash, e1.content_hash);
+
+        batch.commit().unwrap();
     }
 
     #[test]

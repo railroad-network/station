@@ -1433,7 +1433,11 @@ fn render_emergency_status(v: &serde_json::Value) -> String {
 /// Renders the post-emergency report: each activation, its co-signers, and measures.
 fn render_emergency_report(v: &serde_json::Value) -> String {
     let activations = v["activations"].as_array().cloned().unwrap_or_default();
-    if activations.is_empty() {
+    let inert = v["inert_declarations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if activations.is_empty() && inert.is_empty() {
         return "no emergencies on record".to_string();
     }
     let mut out = String::new();
@@ -1463,6 +1467,16 @@ fn render_emergency_report(v: &serde_json::Value) -> String {
                 ));
             }
         }
+    }
+    for d in inert {
+        out.push_str(&format!(
+            "inert declaration {} — {} (scope: {}) [{}]\n  co-signers: {}\n",
+            d["declaration_hash"].as_str().unwrap_or(""),
+            d["reason"].as_str().unwrap_or(""),
+            d["scope"].as_str().unwrap_or(""),
+            d["disposition"].as_str().unwrap_or(""),
+            d["cosigners"].as_array().map(|c| c.len()).unwrap_or(0),
+        ));
     }
     out
 }

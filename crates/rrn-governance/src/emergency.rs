@@ -91,6 +91,16 @@ pub const EMERGENCY_DURATION_CEILING: i64 = 7 * 86_400;
 /// 72 h (ADR-0023 §4).
 pub const EMERGENCY_DEFAULT_DURATION_SECS: i64 = 72 * 3600;
 
+/// Hard time-to-live for a part-signed declaration (ADR-0027 D2): a declaration
+/// and its co-signatures cease to count toward activation if the **first
+/// threshold crossing** is not reached within this span of the declaration's
+/// station-signed admission instant. A hard constant equal to
+/// [`EMERGENCY_DURATION_CEILING`] (7 d) — a crisis whose supermajority cannot be
+/// assembled within the longest single emergency is no longer the same crisis.
+/// The boundary is inclusive (`≤`): a crossing at exactly `admitted_at + TTL`
+/// still activates.
+pub const EMERGENCY_DECLARATION_TTL: i64 = EMERGENCY_DURATION_CEILING;
+
 /// Grace added to a compressed-path measure's maximum `expires_at` beyond the
 /// emergency's scheduled expiry: one ordinary implementation delay (7 d), long
 /// enough to legislate a durable replacement through the full process (ADR-0023 §1).
@@ -123,6 +133,11 @@ pub(crate) const COSIGN_KIND: &str = "rrn.gov.emergency_cosign";
 pub(crate) const LAPSE_KIND: &str = "rrn.gov.emergency_lapse";
 /// Discriminant in the `kind` field of an [`EmergencyActivated`]'s canonical CBOR.
 pub(crate) const ACTIVATED_KIND: &str = "rrn.gov.emergency_activated";
+/// Discriminant in the `kind` field of an [`EmergencyRefused`]'s canonical CBOR.
+pub(crate) const REFUSED_KIND: &str = "rrn.gov.emergency_refused";
+/// Discriminant in the `kind` field of an [`EmergencyDeclarationAdmitted`]'s
+/// canonical CBOR.
+pub(crate) const DECLARATION_ADMITTED_KIND: &str = "rrn.gov.emergency_declaration_admitted";
 
 /// A member's signed declaration that a community is in an emergency (ADR-0023 §2).
 ///
@@ -236,6 +251,52 @@ pub struct EmergencyActivated {
 
 /// An [`EmergencyActivated`] signed by the attesting station.
 pub type SignedActivated = SignedPayload<EmergencyActivated>;
+
+/// The station's attestation that a declaration's **first threshold crossing was
+/// refused** by a §4 cap, and so the declaration is dead (ADR-0027 D1b).
+///
+/// Station-signed on append, written in the same transaction as the crossing
+/// record when [`chain_decision`] refuses the first position at which the
+/// distinct-eligible count reaches the threshold (a renewal count cap or the
+/// 14-day total-active duration cap binds). Its authority is the fact it
+/// restates — that the crossing at `(refused_instant, refused_seq)` genuinely
+/// reached the threshold *and* the caps refused it — which the timeline
+/// re-derives. No `crossing_seq` field: like the activation attestation, it is
+/// appended immediately after the crossing record, so the crossing is the
+/// nearest preceding declaration/co-sign record and a stored seq would carry no
+/// independently-checkable information (ADR-0027 D1b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmergencyRefused {
+    /// The declaration whose first crossing was cap-refused.
+    pub declaration_hash: Hash,
+    /// The station's admission-clock reading at the refused crossing (ADR-0022).
+    pub refused_instant: i64,
+}
+
+/// An [`EmergencyRefused`] signed by the attesting station.
+pub type SignedRefused = SignedPayload<EmergencyRefused>;
+
+/// The station's attestation of **when it admitted a declaration** (ADR-0027 D2).
+///
+/// Station-signed and written in the same transaction as the declaration itself
+/// (the eager admission attestation). Both the writer and replay measure the
+/// declaration's time-to-live against this signed `admitted_at` — never against
+/// the per-replica re-stamped `created_at` (ADR-0022 §1) — so the TTL bound is
+/// replica-identical and survives an outbox re-bootstrap (ADR-0020) where a
+/// rebuilt writer's `created_at` would differ. It exists from admission, so a
+/// declaration that expires **without ever activating** still has a
+/// replica-auditable admission fact (which a field restated only on
+/// `emergency_activated` would lack — ADR-0027 D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmergencyDeclarationAdmitted {
+    /// The declaration this anchors.
+    pub declaration_hash: Hash,
+    /// The station's admission-clock reading when it admitted the declaration.
+    pub admitted_at: i64,
+}
+
+/// An [`EmergencyDeclarationAdmitted`] signed by the attesting station.
+pub type SignedDeclarationAdmitted = SignedPayload<EmergencyDeclarationAdmitted>;
 
 // --- Canonical CBOR ---------------------------------------------------------
 
@@ -385,6 +446,60 @@ impl TryFrom<CBOR> for EmergencyActivated {
     }
 }
 
+impl From<EmergencyRefused> for CBOR {
+    fn from(r: EmergencyRefused) -> Self {
+        let mut m = Map::new();
+        m.insert("kind", REFUSED_KIND);
+        m.insert("declaration_hash", hash_to_cbor(r.declaration_hash));
+        m.insert("refused_instant", r.refused_instant);
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for EmergencyRefused {
+    type Error = dcbor::Error;
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        if map.extract::<&str, String>("kind")? != REFUSED_KIND {
+            return Err(dcbor::Error::WrongType);
+        }
+        Ok(EmergencyRefused {
+            declaration_hash: hash_from_cbor(map.extract::<&str, CBOR>("declaration_hash")?)?,
+            refused_instant: map.extract::<&str, i64>("refused_instant")?,
+        })
+    }
+}
+
+impl From<EmergencyDeclarationAdmitted> for CBOR {
+    fn from(a: EmergencyDeclarationAdmitted) -> Self {
+        let mut m = Map::new();
+        m.insert("kind", DECLARATION_ADMITTED_KIND);
+        m.insert("declaration_hash", hash_to_cbor(a.declaration_hash));
+        m.insert("admitted_at", a.admitted_at);
+        m.into()
+    }
+}
+
+impl TryFrom<CBOR> for EmergencyDeclarationAdmitted {
+    type Error = dcbor::Error;
+    fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+        let map = match cbor.into_case() {
+            CBORCase::Map(map) => map,
+            _ => return Err(dcbor::Error::WrongType),
+        };
+        if map.extract::<&str, String>("kind")? != DECLARATION_ADMITTED_KIND {
+            return Err(dcbor::Error::WrongType);
+        }
+        Ok(EmergencyDeclarationAdmitted {
+            declaration_hash: hash_from_cbor(map.extract::<&str, CBOR>("declaration_hash")?)?,
+            admitted_at: map.extract::<&str, i64>("admitted_at")?,
+        })
+    }
+}
+
 /// A reason an emergency record could not be admitted, or a derived read failed.
 #[derive(thiserror::Error, Debug)]
 pub enum EmergencyError {
@@ -427,6 +542,44 @@ pub enum EmergencyError {
     /// A lapse targets a declaration with no active emergency to end.
     #[error("declaration {0} has no active emergency to lapse")]
     NotActive(Hash),
+    /// A co-signature targets a declaration whose first threshold crossing was
+    /// refused by a §4 cap, so the declaration is dead and never revives
+    /// (ADR-0027 D1/D3). The remedy is a fresh declaration once the §4 cooldown
+    /// has passed (count cap), or one with a shorter `duration_secs` while the
+    /// chain still has headroom (duration cap).
+    #[error(
+        "declaration {declaration} is dead (its first crossing was cap-refused); \
+         wait out the §4 cooldown and raise a fresh declaration, or — if the \
+         duration cap bound — a fresh one with a shorter duration_secs"
+    )]
+    DeclarationDead {
+        /// The dead declaration.
+        declaration: Hash,
+    },
+    /// A co-signature targets a declaration whose first threshold crossing was
+    /// not reached within [`EMERGENCY_DECLARATION_TTL`] of its admission, so it
+    /// no longer counts toward activation (ADR-0027 D2/D3). Raise a fresh
+    /// declaration.
+    #[error(
+        "declaration {declaration} has expired (no crossing within the {ttl}s \
+         declaration TTL of its admission); raise a fresh declaration"
+    )]
+    DeclarationExpired {
+        /// The expired declaration.
+        declaration: Hash,
+        /// The TTL that elapsed ([`EMERGENCY_DECLARATION_TTL`]).
+        ttl: i64,
+    },
+    /// A co-signature targets a declaration that has already taken force; its
+    /// supermajority is complete and further co-signatures are dead weight
+    /// (ADR-0027 D3).
+    #[error(
+        "declaration {declaration} has already activated; no further co-signatures are needed"
+    )]
+    AlreadyActivated {
+        /// The already-active declaration.
+        declaration: Hash,
+    },
     /// A reputation-scoring error while evaluating the electorate.
     #[error("reputation: {0}")]
     Reputation(#[from] rrn_reputation::Error),
@@ -568,6 +721,32 @@ fn find_lapse(
             continue;
         }
         return Ok(Some((lapse, entry.seq)));
+    }
+    Ok(None)
+}
+
+/// The `admitted_at` on the earliest (log-order) [`EmergencyDeclarationAdmitted`]
+/// anchor for `decl_hash`, or `None` if the declaration carries no anchor
+/// (a pre-ADR-0027 declaration, or one whose atomic declaration+anchor write
+/// never landed). The earliest validated anchor wins, mirroring
+/// [`crate::window::window_and_seq_of`]'s "first attestation" rule.
+///
+/// The anchor is a station attestation; station-signer pinning of these records
+/// is a tracked residual (a separate ticket, ADR-0027 precondition), so a forged
+/// anchor with a doctored `admitted_at` is not yet rejected here.
+fn declaration_admitted_at(
+    log: &AppendLog,
+    decl_hash: &Hash,
+) -> Result<Option<i64>, EmergencyError> {
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(anchor) = from_canonical_bytes::<EmergencyDeclarationAdmitted>(&entry.payload.bytes)
+        else {
+            continue;
+        };
+        if anchor.declaration_hash == *decl_hash {
+            return Ok(Some(anchor.admitted_at));
+        }
     }
     Ok(None)
 }
@@ -716,6 +895,30 @@ fn clamp_duration(requested: i64) -> i64 {
 /// other input is a log position. So every replica computes the identical timeline
 /// (replica determinism).
 pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, EmergencyError> {
+    Ok(derive_emergencies(db)?.timeline)
+}
+
+/// The full replay of the emergency records: the legitimate activations, the
+/// declarations whose first crossing was **cap-refused** (dead, ADR-0027 D1b),
+/// and every declaration's signed **admission anchor** (ADR-0027 D2). All three
+/// are a pure, replica-deterministic function of the signed log at fixed pins.
+struct EmergencyDerivation {
+    /// Legitimate activations, in log order (the public [`emergency_timeline`]).
+    timeline: Vec<ActiveEmergency>,
+    /// Declarations killed by a validated [`EmergencyRefused`] at their first
+    /// crossing — they never activate and never revive.
+    dead: std::collections::HashSet<Hash>,
+    /// Each declaration's station-signed admission instant, from the earliest
+    /// (log-order) [`EmergencyDeclarationAdmitted`] anchor.
+    anchors: std::collections::HashMap<Hash, i64>,
+}
+
+/// One replay pass over the log, threading the §4 chain state so activations,
+/// refusals, anchors, and TTL are all judged at a single attested pin each
+/// (ADR-0023 §5, ADR-0027). A gossiped or forged marker that should never have
+/// been written is ignored; the earliest **validated** marker (activation or
+/// refusal) for a declaration wins and later ones for it are ignored.
+fn derive_emergencies(db: &Database) -> Result<EmergencyDerivation, EmergencyError> {
     let log = AppendLog::new(db);
     let founders = founder_set(db)?;
 
@@ -753,10 +956,82 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
     let mut timeline: Vec<ActiveEmergency> = Vec::new();
     let mut chain_pairs: Vec<(i64, i64)> = Vec::new();
     let mut seen_decls = std::collections::HashSet::new();
+    let mut dead: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    let mut anchors: std::collections::HashMap<Hash, i64> = std::collections::HashMap::new();
+
+    // Re-derives the distinct-eligible crossing for `decl` at the pin
+    // `(pin_time, pin_seq)`: whether the threshold was reached by `pin_seq`.
+    // Shared by the activation and refusal validators so both judge the crossing
+    // identically.
+    let crossing_reached = |decl: &EmergencyDeclaration,
+                            decl_hash: &Hash,
+                            decl_seq: u64,
+                            pin_time: i64,
+                            pin_seq: u64|
+     -> Result<bool, EmergencyError> {
+        let n = grace_electorate_asof(db, &founders, pin_time, pin_seq)?.len();
+        let threshold = declaration_threshold(n, declaration_pct);
+        let sigs = eligible_signatures(
+            &log,
+            db,
+            &founders,
+            decl_hash,
+            &decl.author,
+            decl_seq,
+            pin_time,
+            pin_seq,
+            pin_seq,
+        )?;
+        Ok(crossing_seq(&sigs, threshold).is_some())
+    };
 
     for entry in log.iter_from(1) {
         let entry = entry?;
-        let Ok(act) = from_canonical_bytes::<EmergencyActivated>(&entry.payload.bytes) else {
+        let bytes = &entry.payload.bytes;
+
+        // The declaration's admission anchor (ADR-0027 D2): record the earliest
+        // one per declaration; it precedes any crossing in log order, so it is
+        // in hand by the time an activation for the declaration is reached.
+        if let Ok(anchor) = from_canonical_bytes::<EmergencyDeclarationAdmitted>(bytes) {
+            anchors
+                .entry(anchor.declaration_hash)
+                .or_insert(anchor.admitted_at);
+            continue;
+        }
+
+        // A cap-refusal marker (ADR-0027 D1b): the declaration's first crossing
+        // reached the threshold at this pin *and* the §4 caps refused it. Kills
+        // the declaration unless it is already decided (an earlier validated
+        // activation or refusal for it stands).
+        if let Ok(refused) = from_canonical_bytes::<EmergencyRefused>(bytes) {
+            let dh = refused.declaration_hash;
+            if seen_decls.contains(&dh) || dead.contains(&dh) {
+                continue;
+            }
+            let Some((decl, decl_seq)) = find_declaration(&log, &dh)? else {
+                continue;
+            };
+            if let Some(community) = &community {
+                if decl.community_id != *community {
+                    continue;
+                }
+            }
+            let pin_time = refused.refused_instant;
+            let refused_seq = entry.seq;
+            if !crossing_reached(&decl, &dh, decl_seq, pin_time, refused_seq)? {
+                continue; // never actually reached the supermajority — not a real refusal
+            }
+            let scheduled = pin_time.saturating_add(clamp_duration(decl.duration_secs));
+            if chain_decision(&chain_pairs, pin_time, scheduled, max_renewals).is_some() {
+                // The caps would have *admitted* this crossing — a genuine refusal
+                // marker is written only when they bind. Ignore a spurious one.
+                continue;
+            }
+            dead.insert(dh);
+            continue;
+        }
+
+        let Ok(act) = from_canonical_bytes::<EmergencyActivated>(bytes) else {
             continue;
         };
         let activation_seq = entry.seq;
@@ -770,37 +1045,44 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
                 continue;
             }
         }
-        // A duplicate legitimate attestation for a declaration already activated is
-        // ignored — but this check is *after* legitimacy, so a gossiped bogus
-        // attestation that fails the checks below never blocks the station's real one.
-        if seen_decls.contains(&act.declaration_hash) {
+        // A declaration already decided — activated earlier (dedup) or killed by a
+        // validated refusal (ADR-0027 D1b) — ignores this attestation. The check is
+        // *after* the declaration/community checks, so a gossiped bogus attestation
+        // that fails the checks below never blocks the station's real one.
+        if seen_decls.contains(&act.declaration_hash) || dead.contains(&act.declaration_hash) {
             continue;
+        }
+
+        // Fail closed on the anchor + TTL (ADR-0027 D2): an activation with **no**
+        // validated admission anchor never activates (a pre-0027 or crash-orphaned
+        // declaration), and one whose first crossing is beyond the declaration TTL
+        // of its signed admission is expired. Both read signed instants at one pin.
+        let Some(&admitted_at) = anchors.get(&act.declaration_hash) else {
+            continue; // markerless/anchorless declaration — never activatable
+        };
+        if act.activation_instant.saturating_sub(admitted_at) > EMERGENCY_DECLARATION_TTL {
+            continue; // expired: crossing not reached within the TTL
         }
 
         // Re-derive the crossing: distinct eligible signatures, pinned at the
         // attestation's own position, must reach the threshold by that position.
         let pin_time = act.activation_instant;
-        let n = grace_electorate_asof(db, &founders, pin_time, activation_seq)?.len();
-        let threshold = declaration_threshold(n, declaration_pct);
-        let sigs = eligible_signatures(
-            &log,
-            db,
-            &founders,
+        if !crossing_reached(
+            &decl,
             &act.declaration_hash,
-            &decl.author,
             decl_seq,
             pin_time,
             activation_seq,
-            activation_seq,
-        )?;
-        if crossing_seq(&sigs, threshold).is_none() {
+        )? {
             continue; // never actually reached the supermajority
         }
 
         // The §4 caps/cooldown must have admitted it, and its scheduled expiry must
         // match `activation_instant + clamp(duration)` (a forged over-long expiry
         // is rejected by recomputing it).
-        let scheduled = act.activation_instant + clamp_duration(decl.duration_secs);
+        let scheduled = act
+            .activation_instant
+            .saturating_add(clamp_duration(decl.duration_secs));
         if act.scheduled_expiry != scheduled {
             continue;
         }
@@ -815,6 +1097,8 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
 
         // Legitimate. Find any lapse that reached its own threshold, pinned at the
         // same activation position (the lapse answers to the same electorate and bar).
+        let n = grace_electorate_asof(db, &founders, pin_time, activation_seq)?.len();
+        let threshold = declaration_threshold(n, declaration_pct);
         let lapsed_at_seq = lapse_boundary(
             &log,
             db,
@@ -838,7 +1122,11 @@ pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, Emergen
             lapsed_at_seq,
         });
     }
-    Ok(timeline)
+    Ok(EmergencyDerivation {
+        timeline,
+        dead,
+        anchors,
+    })
 }
 
 /// The log seq at which a lift for `decl_hash` crossed the supermajority (drawn from
@@ -942,6 +1230,47 @@ pub fn active_emergency_at(
 /// freeze keys off (ADR-0023 §3b). Independent of any one proposal's position.
 pub fn is_emergency_active_now(db: &Database, now: i64) -> Result<bool, EmergencyError> {
     Ok(active_emergency_at(db, now, u64::MAX)?.is_some())
+}
+
+/// A declaration's activation status, as re-derived from the log (ADR-0027).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclarationStatus {
+    /// The declaration has taken force (an activation stands for it).
+    Activated,
+    /// The declaration's first crossing was cap-refused; it is dead and never
+    /// revives (D1b).
+    Dead,
+    /// The declaration's first crossing was not reached within
+    /// [`EMERGENCY_DECLARATION_TTL`] of its signed admission, judged as of the
+    /// probe instant; it no longer counts toward activation (D2).
+    Expired,
+    /// The declaration is still gathering co-signatures — not yet crossed,
+    /// activated, dead, or expired.
+    Pending,
+}
+
+/// The [`DeclarationStatus`] of `decl_hash` as of station instant `probe_instant`
+/// (ADR-0027 D3). `probe_instant` fixes the TTL comparison for the `Expired`
+/// arm; the other arms are `probe_instant`-independent. The single front-door
+/// test for whether a further co-signature toward the declaration is dead weight.
+pub fn declaration_status(
+    db: &Database,
+    decl_hash: &Hash,
+    probe_instant: i64,
+) -> Result<DeclarationStatus, EmergencyError> {
+    let d = derive_emergencies(db)?;
+    if d.timeline.iter().any(|e| e.declaration_hash == *decl_hash) {
+        return Ok(DeclarationStatus::Activated);
+    }
+    if d.dead.contains(decl_hash) {
+        return Ok(DeclarationStatus::Dead);
+    }
+    if let Some(&admitted_at) = d.anchors.get(decl_hash) {
+        if probe_instant.saturating_sub(admitted_at) > EMERGENCY_DECLARATION_TTL {
+            return Ok(DeclarationStatus::Expired);
+        }
+    }
+    Ok(DeclarationStatus::Pending)
 }
 
 /// The emergency governing an [`Emergency`](crate::proposal::ProposalKind::Emergency)
@@ -1061,6 +1390,84 @@ pub fn emergency_report(db: &Database) -> Result<Vec<EmergencyReportActivation>,
     Ok(out)
 }
 
+/// Why a declaration is inert (never took force) in the §6 report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InertDisposition {
+    /// Its first crossing was refused by a §4 cap (dead, ADR-0027 D1b).
+    Refused,
+    /// Its first crossing was not reached within the declaration TTL of its
+    /// admission (expired, ADR-0027 D2), judged as of the report's `now`.
+    Expired,
+}
+
+/// A declaration that gathered support but never activated — surfaced in the §6
+/// accountability report so a cap-refused or expired declaration is visible for
+/// review, not silently dropped (ADR-0027 D3 §6 promise).
+#[derive(Clone, Debug)]
+pub struct InertDeclaration {
+    /// The declaration's content hash.
+    pub declaration_hash: Hash,
+    /// The crisis, for display (testimony).
+    pub reason: String,
+    /// The declared domain, for display (testimony).
+    pub scope: String,
+    /// Why it is inert.
+    pub disposition: InertDisposition,
+    /// Its author and co-signers (distinct, self-signed).
+    pub cosigners: Vec<Address>,
+}
+
+/// Every declaration that is **dead** (cap-refused, D1b) or **expired** (past its
+/// TTL with no activation, D2 — judged as of `now`), in log order, with its
+/// co-signers (ADR-0027 §6). A pure replay; a declaration still gathering support
+/// within its TTL, or one that activated, is not listed here.
+pub fn inert_declarations(
+    db: &Database,
+    now: i64,
+) -> Result<Vec<InertDeclaration>, EmergencyError> {
+    let derived = derive_emergencies(db)?;
+    let log = AppendLog::new(db);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(decl) = from_canonical_bytes::<EmergencyDeclaration>(&entry.payload.bytes) else {
+            continue;
+        };
+        // Self-signed only, and each distinct declaration once (in log order).
+        if Address::from_public_key(entry.payload.signer) != decl.author {
+            continue;
+        }
+        let dh = decl.hash();
+        if !seen.insert(dh) {
+            continue;
+        }
+        // An activation for it stands → not inert.
+        if derived.timeline.iter().any(|e| e.declaration_hash == dh) {
+            continue;
+        }
+        let disposition = if derived.dead.contains(&dh) {
+            InertDisposition::Refused
+        } else if derived
+            .anchors
+            .get(&dh)
+            .is_some_and(|&a| now.saturating_sub(a) > EMERGENCY_DECLARATION_TTL)
+        {
+            InertDisposition::Expired
+        } else {
+            continue; // still pending within its TTL
+        };
+        out.push(InertDeclaration {
+            declaration_hash: dh,
+            reason: decl.reason.clone(),
+            scope: decl.scope.clone(),
+            disposition,
+            cosigners: declaration_cosigners(db, &dh)?,
+        });
+    }
+    Ok(out)
+}
+
 // --- Append guards ----------------------------------------------------------
 
 /// The `(seq, admitted_at)` the next append will receive — the monotone-clamped
@@ -1138,8 +1545,27 @@ pub fn append_declaration(
     if !is_eligible_asof(db, &founder_set(db)?, &decl.author, open_time, open_seq)? {
         return Err(EmergencyError::NotEligible { who: decl.author });
     }
-    let entry = log.append(signed, now)?;
-    try_activate(log, db, station, &decl_hash, now)?;
+    // ADR-0027 D2 atomicity: the declaration and its station-signed admission
+    // anchor commit in one transaction, and — if the author's own signature
+    // already crosses — the crossing marker joins the same commit, so a crash can
+    // never leave a declaration without its anchor or a crossing without its marker.
+    let mut batch = log.begin_batch()?;
+    let entry = batch.append(signed, now)?;
+    let admitted_at = entry.created_at;
+    batch.append(
+        SignedPayload::sign(
+            EmergencyDeclarationAdmitted {
+                declaration_hash: decl_hash,
+                admitted_at,
+            },
+            station,
+        ),
+        now,
+    )?;
+    // The declaration itself carries the author's crossing signature (an N=1 grace
+    // community activates here), so it is the crossing record `try_activate` decides on.
+    try_activate(&mut batch, db, station, &decl_hash, entry.seq, now)?;
+    batch.commit()?;
     Ok(entry)
 }
 
@@ -1192,17 +1618,53 @@ pub fn append_cosign(
     if !is_eligible_asof(db, &founders, &cosign.signer, pin_time, pin_seq)? {
         return Err(EmergencyError::NotEligible { who: cosign.signer });
     }
+    // Idempotent re-carriage is answered before the D3 state check, so a benign
+    // resubmission of a co-sign toward a now-activated declaration is still
+    // `AlreadyCosigned` (Known on DTN), not a fresh `AlreadyActivated` refusal.
     if cosign_already_present(log, &target, &cosign.signer)? {
         return Err(EmergencyError::AlreadyCosigned {
             signer: cosign.signer,
             target,
         });
     }
-    let entry = log.append(signed, now)?;
+    // ADR-0027 D3 front door: a *new* co-signature toward an inert declaration is
+    // refused with a typed reason rather than appended as dead weight. The probe
+    // instant is this co-sign's own prospective admission (`pin_time` for a
+    // declaration target), which fixes the TTL comparison for the expired arm.
     if is_declaration {
-        try_activate(log, db, station, &target, now)?;
+        match declaration_status(db, &target, pin_time)? {
+            DeclarationStatus::Activated => {
+                return Err(EmergencyError::AlreadyActivated {
+                    declaration: target,
+                })
+            }
+            DeclarationStatus::Dead => {
+                return Err(EmergencyError::DeclarationDead {
+                    declaration: target,
+                })
+            }
+            DeclarationStatus::Expired => {
+                return Err(EmergencyError::DeclarationExpired {
+                    declaration: target,
+                    ttl: EMERGENCY_DECLARATION_TTL,
+                })
+            }
+            DeclarationStatus::Pending => {}
+        }
     }
-    Ok(entry)
+    // A declaration co-sign may carry the crossing, so it and any station marker
+    // (activation or D1b refusal) commit atomically; a lapse co-sign never writes
+    // a marker, so it is a plain single append.
+    if is_declaration {
+        let mut batch = log.begin_batch()?;
+        let entry = batch.append(signed, now)?;
+        // This co-signature is the crossing record `try_activate` decides on.
+        try_activate(&mut batch, db, station, &target, entry.seq, now)?;
+        batch.commit()?;
+        Ok(entry)
+    } else {
+        Ok(log.append(signed, now)?)
+    }
 }
 
 /// Appends an [`EmergencyLapse`] against an active emergency. The lapse itself is
@@ -1270,42 +1732,66 @@ fn cosign_already_present(
     Ok(false)
 }
 
-/// Writes the station attestation for a declaration that has just reached its
-/// supermajority and passes the §4 caps — the station-side half of §2. Idempotent
-/// (a declaration already activated is left alone) and silent when the threshold is
-/// not yet met or the caps refuse activation (the declaration "simply does not
-/// activate").
+/// Evaluates the just-appended crossing record (visible uncommitted in `batch`'s
+/// open transaction) and, if it is the declaration's **first threshold crossing**,
+/// writes the station marker into the **same** batch (ADR-0027 D1/D1b):
+/// [`EmergencyActivated`] when the §4 caps admit it, or [`EmergencyRefused`] when a
+/// cap binds. Silent when the threshold is not yet met, when the declaration is
+/// already decided, or when the crossing is beyond the declaration TTL (D2, a
+/// belt-and-suspenders to the front-door expiry refusal — the declaration simply
+/// does not activate).
+///
+/// `crossing_record_seq` is the seq of the record this front-door call just
+/// appended and is deciding on — the declaration (its author's signature) for
+/// [`append_declaration`], or the co-signature for [`append_cosign`]. The marker is
+/// written **only** when the threshold-th distinct signature sits at that seq, i.e.
+/// this record *is* the first crossing. If the count already reached the threshold
+/// at an earlier position that carries no marker — a crossing record that reached
+/// the log by gossip [`append_raw`](rrn_storage::log::AppendLog::append_raw) rather
+/// than through this front door — the crossing is **markerless** and ADR-0027 D1b
+/// makes it *not activatable*: fail closed here, the same way replay does, so a
+/// bypassed crossing can never be revived by a later front-door co-signature. (The
+/// broader "gossip ingest bypasses every front-door gate" surface — eligibility,
+/// duplicate co-signs, D3 — is a pre-existing residual tracked for the maintainer.)
+///
+/// Reads go through a fresh [`AppendLog`] over the same [`Database`] connection,
+/// so they observe the crossing record already appended into the open batch.
 fn try_activate(
-    log: &mut AppendLog,
+    batch: &mut rrn_storage::log::LogBatch,
     db: &Database,
     station: &Keypair,
     decl_hash: &Hash,
+    crossing_record_seq: u64,
     now: i64,
 ) -> Result<(), EmergencyError> {
-    // Idempotency is judged against the re-derived timeline — the same
-    // legitimacy-checked view a replica computes — not against a raw
-    // `EmergencyActivated` record on the log. A gossiped/forged attestation the
-    // timeline never believes must not suppress the station's real one: if we
-    // short-circuited on any raw attestation, an attacker who replicated a bogus
-    // `EmergencyActivated{decl}` (which the timeline correctly ignores) would block
-    // this station from ever writing the genuine attestation, and the emergency
-    // would never take force. The timeline is reused below as the chain input.
-    let timeline = emergency_timeline(db)?;
-    if timeline.iter().any(|e| e.declaration_hash == *decl_hash) {
+    let log = AppendLog::new(db);
+
+    // A declaration already decided — activated earlier, or killed by a validated
+    // refusal (ADR-0027 D1b) — writes no further marker. Judged against the
+    // re-derived view (the same one a replica computes), never against a raw
+    // attestation on the log, so a gossiped bogus marker cannot suppress or fake a
+    // decision. The derivation's activation pairs are reused as the chain input.
+    let derived = derive_emergencies(db)?;
+    if derived.dead.contains(decl_hash)
+        || derived
+            .timeline
+            .iter()
+            .any(|e| e.declaration_hash == *decl_hash)
+    {
         return Ok(());
     }
-    let Some((decl, decl_seq)) = find_declaration(log, decl_hash)? else {
+    let Some((decl, decl_seq)) = find_declaration(&log, decl_hash)? else {
         return Ok(());
     };
     let founders = founder_set(db)?;
-    let (act_seq, act_time) = next_admission(log, now)?;
+    let (act_seq, act_time) = next_admission(&log, now)?;
     let tail_seq = act_seq - 1;
     let (declaration_pct, max_renewals) = emergency_params(db)?;
 
     let n = grace_electorate_asof(db, &founders, act_time, act_seq)?.len();
     let threshold = declaration_threshold(n, declaration_pct);
     let sigs = eligible_signatures(
-        log,
+        &log,
         db,
         &founders,
         decl_hash,
@@ -1315,31 +1801,67 @@ fn try_activate(
         act_seq,
         tail_seq,
     )?;
-    if crossing_seq(&sigs, threshold).is_none() {
+    match crossing_seq(&sigs, threshold) {
+        // This front-door record *is* the first crossing — write its marker.
+        Some(cross) if cross == crossing_record_seq => {}
+        // The threshold was already reached at an earlier position that carries no
+        // marker (a crossing record admitted by gossip `append_raw`, bypassing this
+        // front door). ADR-0027 D1b: a markerless crossing is not activatable — fail
+        // closed, so no later front-door co-signature can revive it.
+        Some(_) => return Ok(()),
+        // Not the crossing yet.
+        None => return Ok(()),
+    }
+
+    // ADR-0027 D2: fail closed on the TTL against the declaration's signed
+    // admission anchor. A crossing later than the TTL does not activate (and the
+    // front door already refuses such a co-sign); a declaration with no anchor
+    // never activates. Saturating arithmetic: `admitted_at` is a signed instant an
+    // unpinned anchor could carry to an extreme value (the signer-pinning residual).
+    let Some(admitted_at) = declaration_admitted_at(&log, decl_hash)? else {
+        return Ok(());
+    };
+    if act_time.saturating_sub(admitted_at) > EMERGENCY_DECLARATION_TTL {
         return Ok(());
     }
 
+    // This is the first crossing. Either the §4 caps admit it — write the
+    // activation — or a cap binds — write the D1b refusal, killing the declaration
+    // for good, in the same transaction as the crossing record.
     let scheduled = act_time + clamp_duration(decl.duration_secs);
-    let existing: Vec<(i64, i64)> = timeline
+    let existing: Vec<(i64, i64)> = derived
+        .timeline
         .iter()
         .map(|e| (e.activation_instant, e.scheduled_expiry))
         .collect();
-    let Some(renewal_count) = chain_decision(&existing, act_time, scheduled, max_renewals) else {
-        return Ok(());
-    };
-
-    log.append(
-        SignedPayload::sign(
-            EmergencyActivated {
-                declaration_hash: *decl_hash,
-                activation_instant: act_time,
-                scheduled_expiry: scheduled,
-                renewal_count,
-            },
-            station,
-        ),
-        now,
-    )?;
+    match chain_decision(&existing, act_time, scheduled, max_renewals) {
+        Some(renewal_count) => {
+            batch.append(
+                SignedPayload::sign(
+                    EmergencyActivated {
+                        declaration_hash: *decl_hash,
+                        activation_instant: act_time,
+                        scheduled_expiry: scheduled,
+                        renewal_count,
+                    },
+                    station,
+                ),
+                now,
+            )?;
+        }
+        None => {
+            batch.append(
+                SignedPayload::sign(
+                    EmergencyRefused {
+                        declaration_hash: *decl_hash,
+                        refused_instant: act_time,
+                    },
+                    station,
+                ),
+                now,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1433,6 +1955,27 @@ mod cbor_tests {
     }
 
     #[test]
+    fn refused_and_admitted_roundtrip() {
+        let r = EmergencyRefused {
+            declaration_hash: h(4),
+            refused_instant: 1_700_000_123,
+        };
+        assert_eq!(
+            r,
+            from_canonical_bytes::<EmergencyRefused>(&to_canonical_bytes(r)).unwrap()
+        );
+
+        let adm = EmergencyDeclarationAdmitted {
+            declaration_hash: h(4),
+            admitted_at: 1_700_000_000,
+        };
+        assert_eq!(
+            adm,
+            from_canonical_bytes::<EmergencyDeclarationAdmitted>(&to_canonical_bytes(adm)).unwrap()
+        );
+    }
+
+    #[test]
     fn kinds_do_not_cross_decode() {
         let c = EmergencyCosign {
             declaration_hash: h(1),
@@ -1442,5 +1985,22 @@ mod cbor_tests {
         assert!(from_canonical_bytes::<EmergencyDeclaration>(&bytes).is_err());
         assert!(from_canonical_bytes::<EmergencyLapse>(&bytes).is_err());
         assert!(from_canonical_bytes::<EmergencyActivated>(&bytes).is_err());
+        assert!(from_canonical_bytes::<EmergencyRefused>(&bytes).is_err());
+        assert!(from_canonical_bytes::<EmergencyDeclarationAdmitted>(&bytes).is_err());
+
+        // The two new station-signed kinds do not cross-decode as each other or as
+        // the activation attestation (distinct `kind` discriminators).
+        let refused_bytes = to_canonical_bytes(EmergencyRefused {
+            declaration_hash: h(2),
+            refused_instant: 5,
+        });
+        assert!(from_canonical_bytes::<EmergencyActivated>(&refused_bytes).is_err());
+        assert!(from_canonical_bytes::<EmergencyDeclarationAdmitted>(&refused_bytes).is_err());
+        let admitted_bytes = to_canonical_bytes(EmergencyDeclarationAdmitted {
+            declaration_hash: h(2),
+            admitted_at: 5,
+        });
+        assert!(from_canonical_bytes::<EmergencyActivated>(&admitted_bytes).is_err());
+        assert!(from_canonical_bytes::<EmergencyRefused>(&admitted_bytes).is_err());
     }
 }
