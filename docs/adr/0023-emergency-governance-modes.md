@@ -909,14 +909,16 @@ it. Flagged for maintainer ratification alongside this ADR.*
   thresholds too, is recommended follow-up.
 
 *The two entries below are **open decisions raised by a second review (2026-09-10)**,
-not settled readings: each states the gap and a recommended resolution but changes §2 /
-§4 behaviour, so each needs a maintainer's call and is **not yet implemented**. They are
-recorded here so ratification of this ADR settles them alongside the readings above.*
+not settled readings: each states a gap the review found. The first is a design sketch
+promoted to its own proposed ADR; the second is implemented (option A) but its reading is
+still pending ratification.*
 
 - **2026-09-10 (T2.8.2 review) — a declaration should activate only at its first
   threshold-crossing position, and a part-signed declaration should expire; both need a
-  station-signed anchor to stay replay-derivable. [Open — pending ratification; not yet
-  implemented.]** Two related gaps in the activation trigger.
+  station-signed anchor to stay replay-derivable. [Open — sketched for ratification in
+  [ADR-0027](0027-emergency-declaration-activation-and-ttl.md) (Proposed); not yet
+  implemented.]** Two related gaps in the activation trigger; ADR-0027 works the design
+  and the sub-choices, and supersedes this entry once accepted.
   *(i) Activation fires at the first crossing position, and is not revived later.* §2
   supports two readings — "takes force at the admission of the **co-signature that
   brings the count to ≥ threshold**" (a specific record) and "takes force only once a
@@ -976,7 +978,8 @@ recorded here so ratification of this ADR settles them alongside the readings ab
   *which* signed anchor it reads.
 
 - **2026-09-10 (T2.8.2 review) — competing lapse motions split the lift supermajority.
-  [Open — pending ratification; not yet implemented.]** §4 says a lapse "carries the
+  [Resolved by option A, implemented; reading pending ratification.]** §4 says a lapse
+  "carries the
   same co-sign supermajority as a declaration … reusing the `emergency_cosign` kind,
   whose `declaration_hash` target may be a declaration or a lapse," but does not say how
   co-signatures aggregate when **more than one** member raises a lapse against the same
@@ -987,14 +990,18 @@ recorded here so ratification of this ADR settles them alongside the readings ab
   (A member may co-sign *both* lapses — `cosign_already_present` dedups per target — so
   a decoy lapse does not *force* a split; the real hazard is a coordination failure,
   most acute under partition.) The emergency still auto-expires, so severity is low, but
-  a minority can frustrate an early lift the supermajority wants. **Recommended:** make a
-  lift's co-signatures aggregate **per emergency, not per lapse record** — count every
-  distinct eligible co-signer across all lapse records targeting the same
-  `declaration_hash` toward one lapse threshold (**option A**, no wire change), or have
-  lapse co-signatures target the `declaration_hash` under a "lapse" discriminator so the
-  raiser's identity cannot partition the pool (**option B**, which changes the
-  `EmergencyCosign` wire shape and needs a new discriminator field + fixtures). Either
-  keeps the lift boundary a log position (invariant 1) and does not disturb the §3c pin.
+  a minority can frustrate an early lift the supermajority wants. **Resolution
+  (implemented — option A, no wire change):** a lift's co-signatures now aggregate **per
+  emergency, not per lapse record** — `lapse_boundary` counts every distinct eligible
+  signer across *all* `emergency_lapse` records targeting the same `declaration_hash`
+  (each lapse's author) and *all* co-signatures targeting any of those lapses, once, at
+  the position it first appears, and the lift crosses at the threshold-th. This needed no
+  wire change and keeps the lift boundary a log position (invariant 1) and the §3c pin
+  intact; with a single lapse it reduces to the earlier per-lapse crossing. (The rejected
+  **option B** — lapse co-signatures targeting the `declaration_hash` under a "lapse"
+  discriminator — would have changed the `EmergencyCosign` wire shape and needed new
+  fixtures.) The *reading* — that §4's "same co-sign supermajority" pools per emergency —
+  is what remains for maintainer ratification.
   Relatedly, when two emergencies overlap, a lapse (or lapse co-sign) is accepted only
   if its `declaration_hash` names the emergency `active_emergency_at` currently returns —
   the *earliest* governing one — and one naming the later overlapping emergency is
