@@ -2,23 +2,32 @@
 
 ## Status
 
-Proposed — revised 2026-09-10 after an adversarial Fable review (see "Review history").
+Accepted — 2026-09-10 (ratified after two adversarial review rounds; see "Review
+history"). Supersedes the two 2026-09-10 open Clarification entries in
+[ADR-0023](0023-emergency-governance-modes.md). **Not yet implemented** — an
+implementation ticket follows; the acceptance locks the design, not the code.
 
 Date: 2026-09-10
 
-This ADR is a **design sketch for ratification**, opened to resolve two findings a
-second review (2026-09-10) raised against [ADR-0023](0023-emergency-governance-modes.md)
-and recorded there as open, ratification-pending Clarifications. It supersedes those two
-Clarification entries once accepted. It is **not yet implemented**; §"Decision" states a
-proposed rule and the specific sub-choices a maintainer must settle before code lands.
+Both parts are accepted together: **D1** (activation is a single first-crossing event,
+via the D1b refusal record) with **D3** (typed front-door refusals), and **D2** (a
+declaration time-to-live via the eager admission attestation). D1 could have been accepted
+alone (it is a corrected reading of ADR-0023 §2); the maintainer chose to accept D2 in the
+same round rather than hold it.
 
-The design carries **two independent parts** — D1 (activation is a single first-crossing
-event) and D2 (a declaration time-to-live). D1 is a corrected reading of ADR-0023 §2 with
-its one open mechanism now settled (D1b, below) and is ready to accept; D2 is a genuinely
-new mechanism whose *justification* and *alternative* the maintainer should weigh. They
-are kept in one ADR because they share the "make it a signed, replay-derivable fact"
-discipline, but **D1 may be accepted independently of D2** — a reviewer suggested a split,
-and a maintainer who wants D1 now can accept §D1/§D3 and hold §D2 for a further round.
+The sub-choices left open in the proposal are resolved as follows (rationale in the
+sections below):
+
+- **TTL value** — `EMERGENCY_DECLARATION_TTL` = **7 days** (a hard constant,
+  `= EMERGENCY_DURATION_CEILING`).
+- **TTL boundary** — **`≤`**: a crossing at exactly `admitted_at + TTL` still counts.
+- **D3 refusal carriage** — add **typed `RefusalReason` variants** (`DeclarationDead` /
+  `DeclarationExpired` / `AlreadyActivated`) rather than collapse to `rejected`, so a
+  courier-carried co-sign toward an inert declaration still tells the member why (accepts
+  the receipt-fixture bump).
+- **Log-head freshness witness** — **deferred as separate future work.** D2 ships as the
+  cheaper on-log defence for the non-colluding stale consent; bounding *signature* age
+  (the off-log residual) is out of scope for this ADR and may be taken up on its own.
 
 ## Context
 
@@ -62,7 +71,7 @@ its own clock** (ADR-0022 §1) — it is the exact reason `emergency_activated` 
 fact at a fixed log position, evaluated at that fact's own single attested pin — the same
 single-pin discipline that makes today's activation replica-deterministic.
 
-## Decision (proposed — sub-choices marked ⟨decide⟩)
+## Decision
 
 ### D1. Activation is the *first* threshold-crossing position, and only it
 
@@ -167,8 +176,8 @@ from a peer chain (Phase 3 succession), where `created_at` would genuinely diffe
 anchors are equally "the station said so"; the eager one is chosen because it always
 exists, not because the other is forgeable.
 
-⟨decide⟩ **the boundary** (`≤` vs `<` at exactly the TTL) — pin it, as ADR-0023's
-2026-09-09 clarification (ii) did for the active span. Proposed `≤`.
+**The boundary is `≤`** (decided): a crossing at exactly `admitted_at + TTL` counts, as
+ADR-0023's 2026-09-09 clarification (ii) pinned the active span's boundary.
 
 **D2 residuals (stated, not resolved).**
 - **Off-log sleeper.** The TTL bounds the *gathering* window between the declaration's
@@ -196,11 +205,12 @@ wait out the cooldown and raise a fresh declaration; for a **duration-cap** refu
 fresh declaration with a shorter `duration_secs` — which only helps while
 `EMERGENCY_CHAIN_MAX_SECS − total_active ≥ EMERGENCY_DURATION_FLOOR` (24 h), since
 `clamp_duration` floors a declaration at a day, so near the chain cap the only remedy is
-the cooldown. Because emergency co-signs ride DTN bundles, these refusals must also map to
-the closed `RefusalReason` set couriered back on a rejected record (`rrn-protocol`), else a
-courier-carried co-sign toward a dead/expired declaration loses the "learns why" — a new
-receipt variant per state (with a fixture bump) or an explicit collapse to the generic
-`rejected` is a ⟨decide⟩ for the cost below.
+the cooldown. Because emergency co-signs ride DTN bundles, these refusals also map to the
+closed `RefusalReason` set couriered back on a rejected record (`rrn-protocol`): **decided
+— a typed variant per state** (`DeclarationDead` / `DeclarationExpired` /
+`AlreadyActivated`), accepting the receipt-fixture bump, rather than a collapse to the
+generic `rejected`, so a courier-carried co-sign toward an inert declaration still tells
+the member why.
 
 ### Preconditions and pinned edges
 
@@ -268,7 +278,7 @@ receipt variant per state (with a fixture bump) or an explicit collapse to the g
 - **TTL from `created_at` directly.** Rejected: `created_at` is re-stamped per replica.
 - **A signed timestamp on `emergency_cosign` to bound signature age.** Rejected:
   reintroduces the author-clock trust ADR-0022 removed.
-- **A log-head freshness witness on the declaration/co-sign (⟨decide⟩ — the live
+- **A log-head freshness witness on the declaration/co-sign (deferred — the live
   alternative for the off-log residual).** Each co-sign (and the declaration) carries the
   hash of a log head the signer had seen; a signer cannot know a future head, so the
   witness is an unforgeable lower bound on signing position that the station verifies
@@ -276,13 +286,14 @@ receipt variant per state (with a fixture bump) or an explicit collapse to the g
   D2 leaves open) rather than the gathering window, at D1b's wire-cost class, penalising
   only a signer whose last sync predates the window — the honest physics ADR-0020/0022
   already accept. It is a **direction, not a finished design**: turning the witness into a
-  *time* bound still needs a station-signed instant near the witnessed head. The maintainer
-  should decide whether to evaluate this before locking D2's admission-anchored TTL, or to
-  ship D2 as the cheaper on-log defence and treat the witness as separate future work.
+  *time* bound still needs a station-signed instant near the witnessed head. **Decided:**
+  D2 ships now as the cheaper on-log defence for the non-colluding stale consent; the
+  witness (which would close the off-log residual by bounding signature age) is **separate
+  future work**, not a blocker for this ADR.
 
 ## Review history
 
-- **2026-09-10 — adversarial Fable review (revise-and-resubmit).** Flipped the preferred
+- **2026-09-10 — adversarial review (revise-and-resubmit).** Flipped the preferred
   activation marker from D1a to **D1b** (D1a's replay verification is not
   replica-deterministic and is redundant); restated the "dead" trigger as *cap-refused*,
   not *within-cooldown* (a continuation is allowed); pinned D2's anchor to the **eager**
@@ -292,7 +303,7 @@ receipt variant per state (with a fixture bump) or an explicit collapse to the g
   **log-head freshness witness** as the live alternative for the off-log residual; made
   station-signer pinning an explicit precondition; and noted D1 may be accepted
   independently of D2.
-- **2026-09-10 — second Fable pass (accept-with-caveats; all prior blockers cleared).**
+- **2026-09-10 — second review pass (accept-with-caveats; all prior blockers cleared).**
   D1b's determinism, spurious-refusal suppression, and the revival walk were traced and
   confirmed sound. Folded in the caveats: require the crossing record + its marker (and the
   declaration + its anchor) to **commit in one transaction**, with replay **failing closed**

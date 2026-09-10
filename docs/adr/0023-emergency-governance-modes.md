@@ -908,17 +908,16 @@ it. Flagged for maintainer ratification alongside this ADR.*
   charter). A general position-bounded charter resolution, wanted by the ordinary tally
   thresholds too, is recommended follow-up.
 
-*The two entries below are **open decisions raised by a second review (2026-09-10)**,
-not settled readings: each states a gap the review found. The first is a design sketch
-promoted to its own proposed ADR; the second is implemented (option A) but its reading is
-still pending ratification.*
+*The two entries below were raised by a second review (2026-09-10). The first is now
+**superseded by the accepted [ADR-0027](0027-emergency-declaration-activation-and-ttl.md)**;
+the second is implemented (option A) with its reading recorded here.*
 
 - **2026-09-10 (T2.8.2 review) — a declaration should activate only at its first
   threshold-crossing position, and a part-signed declaration should expire; both need a
-  station-signed anchor to stay replay-derivable. [Open — sketched for ratification in
-  [ADR-0027](0027-emergency-declaration-activation-and-ttl.md) (Proposed); not yet
-  implemented.]** Two related gaps in the activation trigger; ADR-0027 works the design
-  and the sub-choices, and supersedes this entry once accepted.
+  station-signed anchor to stay replay-derivable. [Superseded by
+  [ADR-0027](0027-emergency-declaration-activation-and-ttl.md) (Accepted 2026-09-10); not
+  yet implemented.]** Two related gaps in the activation trigger; ADR-0027 settles the
+  design and the sub-choices, and this entry is retained only as the pointer to it.
   *(i) Activation fires at the first crossing position, and is not revived later.* §2
   supports two readings — "takes force at the admission of the **co-signature that
   brings the count to ≥ threshold**" (a specific record) and "takes force only once a
