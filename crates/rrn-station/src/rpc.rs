@@ -949,6 +949,99 @@ pub struct CertExportResult {
     pub envelope_hex: String,
 }
 
+// --- Station-originated DTN push (ADR-0013, ADR-0020) ---------------------
+
+/// `dtn_push` params: the bundle to push (`bundle_hex`, the same hex the
+/// `bundle_submit` surface uses) and exactly one peer identifier — a bare
+/// `endpoint_hex` Reticulum destination (the bench path) or an `rrn_address`
+/// resolved through the log-derived binding directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnPushParams {
+    /// The bundle's encoded bytes, hex-encoded.
+    pub bundle_hex: String,
+    /// The peer's Reticulum destination hex (a bare-endpoint push). Mutually
+    /// exclusive with `rrn_address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_hex: Option<String>,
+    /// The peer's `rrn1…` address, resolved to its destination via the binding
+    /// directory (which also pins the returned receipt's signer). Mutually
+    /// exclusive with `endpoint_hex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrn_address: Option<String>,
+}
+
+/// `dtn_push` result — an accepted/**queued** acknowledgement, NOT a delivery
+/// confirmation (delivery is async and confirmed later by the returned receipt;
+/// see `dtn_pushes`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnPushResult {
+    /// The push id (the bundle's presentation hash), hex-encoded.
+    pub push_id_hex: String,
+    /// Whether the push is now awaiting delivery (`true` for a freshly-queued or
+    /// still-pending row; `false` when an identical bundle to the same peer was
+    /// already delivered or abandoned).
+    pub queued: bool,
+    /// The tracked row's state: `"pending"`, `"delivered"`, or `"abandoned"` — an
+    /// identical re-push returns the existing row's state, not a fresh queue.
+    pub state: String,
+    /// How many records the pushed bundle carries.
+    pub records: usize,
+    /// Whether the outbound loop was woken immediately (`false` when the wake
+    /// channel was full/closed — the push is still durable and will be re-scanned).
+    pub signalled: bool,
+}
+
+/// `dtn_bind` params: the station's own Reticulum destination hex, operator-
+/// supplied (the adapter does not report its own hash; compute it offline with
+/// `scripts/spike/lxmf_pingpong.py hash --identity <data_dir>/reticulum/adapter.identity`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnBindParams {
+    /// The Reticulum destination hex this station is reachable at.
+    pub destination_hex: String,
+}
+
+/// `dtn_bind` result — the signed transport-binding record as a portable
+/// `{signer, sig, body}` envelope (see [`rrn_protocol::binding::encode_signed`]),
+/// hex-encoded, for the operator to carry to peers out of band.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnBindResult {
+    /// The binding envelope bytes, hex-encoded.
+    pub binding_hex: String,
+}
+
+/// One tracked outbound push, for `rrn dtn status` (`dtn_pushes` result).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnPushRow {
+    /// The push id (presentation hash), hex-encoded.
+    pub push_id_hex: String,
+    /// The carrier destination the push was sent to.
+    pub peer: String,
+    /// How many records the bundle carries.
+    pub records: usize,
+    /// `"pending"`, `"delivered"`, or `"abandoned"`.
+    pub state: String,
+    /// How many times the loop has (re-)sent this push.
+    pub attempts: i64,
+    /// Admission-clock reading when first queued.
+    pub queued_at: i64,
+    /// Admission-clock reading when a receipt was correlated, if delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<i64>,
+    /// Admission-clock reading when abandoned past its TTL, if abandoned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_at: Option<i64>,
+    /// A one-line summary of the correlated receipt's outcomes, if delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_summary: Option<String>,
+}
+
+/// `dtn_pushes` result — every tracked outbound push, newest first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DtnPushesResult {
+    /// The tracked pushes.
+    pub pushes: Vec<DtnPushRow>,
+}
+
 // --- Governance (T1.9.7b) ---------------------------------------------------
 
 /// `governance_init_charter` params — publish a community's genesis Charter.

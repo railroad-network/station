@@ -29,6 +29,8 @@
 //! app-layer sealed/signed envelope, never on this binding or on Reticulum.
 
 use dcbor::prelude::*;
+use rrn_crypto::keypair::{PublicKey, Signature};
+use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 
@@ -104,6 +106,62 @@ impl TryFrom<CBOR> for TransportBinding {
             issued_at: map.extract::<&str, i64>("issued_at")?,
         })
     }
+}
+
+/// Encodes a signed transport binding as portable `{signer, sig, body}` envelope
+/// bytes, where `body` is the canonical dCBOR of the [`TransportBinding`] the
+/// identity signed — the same framing [`crate::receipt::encode_signed`] and
+/// [`crate::bundle::EntryEnvelope`] use. This is what `rrn dtn bind` hands the
+/// operator to carry a station's own reachability handle to peers out of band.
+/// The signature covers only the payload's canonical bytes (ADR-0002), so the
+/// envelope may be re-framed freely without invalidating it.
+pub fn encode_signed(signed: &SignedBinding) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("signer", CBOR::to_byte_string(signed.signer.to_bytes()));
+    m.insert("sig", CBOR::to_byte_string(signed.signature.to_bytes()));
+    m.insert(
+        "body",
+        CBOR::to_byte_string(to_canonical_bytes(signed.payload.clone())),
+    );
+    CBOR::from(m).to_cbor_data()
+}
+
+/// Decodes portable binding-envelope bytes (see [`encode_signed`]) back into a
+/// [`SignedBinding`]. Does **not** verify — call [`validate`] on the result.
+pub fn decode_signed(bytes: &[u8]) -> Result<SignedBinding> {
+    let cbor = checked_from_data(bytes).map_err(|e| Error::Cbor(e.to_string()))?;
+    let map = match cbor.into_case() {
+        CBORCase::Map(map) => map,
+        _ => return Err(Error::Cbor("binding envelope is not a CBOR map".into())),
+    };
+    let signer_bytes: [u8; 32] = map
+        .extract::<&str, CBOR>("signer")
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .try_into_byte_string()
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Cbor("signer is not 32 bytes".into()))?;
+    let sig_bytes: [u8; 64] = map
+        .extract::<&str, CBOR>("sig")
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .try_into_byte_string()
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Cbor("sig is not 64 bytes".into()))?;
+    let body = map
+        .extract::<&str, CBOR>("body")
+        .map_err(|e| Error::Cbor(e.to_string()))?
+        .try_into_byte_string()
+        .map_err(|e| Error::Cbor(e.to_string()))?;
+    let payload: TransportBinding = from_canonical_bytes(body.as_slice())?;
+    Ok(SignedPayload {
+        payload,
+        signer: PublicKey::from_bytes(signer_bytes)
+            .map_err(|_| Error::Cbor("bad signer".into()))?,
+        signature: Signature::from_bytes(sig_bytes).map_err(|_| Error::Cbor("bad sig".into()))?,
+    })
 }
 
 /// Validates a signed binding: the signature verifies, and the signer is the
@@ -268,6 +326,22 @@ mod tests {
         let kp = Keypair::generate();
         let signed = binding_for(&kp, "deadbeef", 1);
         validate(&signed).unwrap();
+    }
+
+    #[test]
+    fn signed_envelope_roundtrips_and_still_validates() {
+        let kp = Keypair::generate();
+        let signed = binding_for(&kp, "a1b2c3d4e5f6", 1_700_000_000);
+        let envelope = encode_signed(&signed);
+        let back = decode_signed(&envelope).unwrap();
+        assert_eq!(back.payload, signed.payload);
+        assert_eq!(back.signer, signed.signer);
+        validate(&back).unwrap();
+    }
+
+    #[test]
+    fn decode_signed_rejects_junk() {
+        assert!(decode_signed(b"not cbor at all").is_err());
     }
 
     #[test]

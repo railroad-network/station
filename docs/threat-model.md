@@ -3211,9 +3211,10 @@ to any system that *uses* it; an operator who enables the sidecar runs
 field-restricted software. This is documented for operators, not resolved in code;
 see ADR-0026.
 
-### DTN transport over a constrained carrier (station, T2.6.2, ADR-0013/0026)
+### DTN transport over a constrained carrier (station, T2.6.2/T2.6.4, ADR-0013/0026)
 
-*Implemented in T2.6.2.* The `DtnSyncer` moves bundles and receipts over any
+*Inbound carriage implemented in T2.6.2; outbound origination + receipt
+correlation + the binding directory in T2.6.4.* The `DtnSyncer` moves bundles and receipts over any
 `FrameTransport` — the Reticulum sidecar via a supervised Python LXMF adapter
 (`rrn-station::reticulum`) in production — pacing outbound frames through a
 token-bucket airtime budgeter and reassembling inbound ones, with a small
@@ -3246,7 +3247,51 @@ correctness of identity→destination routing.
   destination, and redirecting to a wrong destination only *denies* delivery — the
   misrouted bundle is still sealed/signed and cannot be read or forged by whoever
   receives it. (The daemon wiring that appends and reads bindings from the log
-  rides with the outbound path; the record + validation land in T2.6.2.)
+  landed in **T2.6.4**: a `rrn.net.binding` is admitted through the same DTN front
+  door as any record — self-signed by the bound identity, else a per-record
+  `Rejected` refusal — and the routing directory is derived by log replay,
+  keeping per address the binding with the highest `issued_at` (log order breaking
+  ties). That ordering is a member's choice among their **own** reachability
+  handles — never a window, deadline, or eligibility input — so it stays inside
+  ADR-0022's trust model while still surviving a stale binding arriving late by
+  courier after a fresh one.)
+
+#### Outbound origination and receipt correlation (T2.6.4)
+
+- *Threat:* a malicious carrier **replays or forges a delivery receipt** to make a
+  sender believe an undelivered economic bundle landed, so the sender stops
+  retrying and the payment is silently lost; or it induces the sender's outbound
+  queue to exhaust memory / amplify traffic.
+- *Mitigation:* a station that *originates* a push tracks it in a local, unsigned
+  `dtn_pushes` row and marks it delivered only when a returned receipt clears
+  **every** check: the receipt must verify, be signed by the very station it names
+  (`signer == payload.station`), enumerate the **exact presented record set** (its
+  presentation hash — a pure function of the ordered record hashes — is the push
+  id, so a receipt for a different record set correlates to nothing), arrive from
+  the **peer we pushed to** (`Completed.source`), and — when the push was addressed
+  by `rrn_address` — be signed by the **expected station** resolved from the
+  binding directory. Any mismatch is logged and ignored (dumb carrier; ADR-0013).
+  Correlation is idempotent: a re-sent receipt after a lost ack, or a duplicate, is
+  a no-op, never a second state change. Outbound-queue exhaustion is bounded — the
+  wake channel is a fixed-size best-effort signal (a full channel drops the signal,
+  never blocks; the durable row is re-scanned), and a re-presented bundle costs the
+  receiver only `known` outcomes (ADR-0020 §3), never a second admission.
+- *Residual — a peer that ingests but withholds a receipt:* an availability
+  residual, not an integrity one. The push row stays `pending`, is re-sent on every
+  loop start and on the periodic re-scan (`[lora] push_rescan_secs`), and after
+  `[lora] push_ttl_secs` is marked **abandoned** and surfaced by `rrn dtn status`
+  — economic payload fails **legibly**, never silently; the paper fallback is the
+  next rung.
+- *Residual — receipt-signer pinning is absent for a bare-`endpoint_hex` push:* a
+  push addressed to a raw destination has no identity to pin, so its receipt is
+  verified only as internally consistent (signer == the station it names) — the
+  answering station is whoever holds that destination. Use `rrn_address` pushes
+  (which pin the expected station) outside the bench; the bare-endpoint form is the
+  bring-up / bench path.
+- *Single-writer invariant (ADR-0020):* originating a push appends **nothing** to
+  the community log — the carried records were already signed by their authors, and
+  only the *receiving* station's front door admits them. The `dtn_pushes` table is
+  local delivery metadata, never a second log writer, never replayed by a replica.
 
 #### Denial of service — announce storms, jamming, and backpressure
 

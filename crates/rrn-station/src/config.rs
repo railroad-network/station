@@ -181,10 +181,26 @@ pub struct LoraSection {
     /// `"python3"` on `PATH`.
     #[serde(default = "default_adapter_python")]
     pub adapter_python: String,
+    /// How often (seconds) the outbound loop re-scans the `dtn_pushes` table for
+    /// undelivered pushes gone quiet, re-sending them. Defaults to 1 hour.
+    #[serde(default = "default_push_rescan_secs")]
+    pub push_rescan_secs: i64,
+    /// How long (seconds) an undelivered outbound push is retried before it is
+    /// marked **abandoned** — never silently dropped; shown by `rrn dtn status`.
+    /// Defaults to 7 days.
+    #[serde(default = "default_push_ttl_secs")]
+    pub push_ttl_secs: i64,
 }
 
 fn default_adapter_python() -> String {
     "python3".to_string()
+}
+
+fn default_push_rescan_secs() -> i64 {
+    60 * 60
+}
+fn default_push_ttl_secs() -> i64 {
+    7 * 24 * 60 * 60
 }
 
 fn default_raw_bytes_per_sec() -> f64 {
@@ -209,6 +225,8 @@ impl Default for LoraSection {
             frame_bytes: default_lora_frame_bytes(),
             adapter_script: None,
             adapter_python: default_adapter_python(),
+            push_rescan_secs: default_push_rescan_secs(),
+            push_ttl_secs: default_push_ttl_secs(),
         }
     }
 }

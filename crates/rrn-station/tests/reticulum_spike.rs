@@ -48,7 +48,10 @@ use rrn_identity::address::Address;
 use rrn_protocol::bundle::{Bundle, EntryEnvelope};
 use rrn_protocol::outbox::OutboxEntry;
 use rrn_station::gossip::ConnectivityState;
+use rrn_station::rpc_client::UnixClient;
 use rrn_station::sidecar::{self, SidecarConfig};
+use rrn_station::station::{Station, StationParams};
+use rrn_station::Clock;
 
 /// A tiny signed inner record so the spike carries a *real* signed `Bundle`, not
 /// an opaque blob — the same shape the DTN path moves in production.
@@ -339,4 +342,172 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// The production LXMF adapter the station spawns (`scripts/reticulum/lxmf_adapter.py`).
+fn adapter_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/reticulum/lxmf_adapter.py")
+}
+
+/// Writes a station `config.toml` that supervises `rnsd` against a **pre-written**
+/// Reticulum config dir and runs the DTN transport over the production adapter.
+fn write_station_config(data_dir: &Path, reticulum_dir: &Path) {
+    let text = format!(
+        "[network]\nlisten = \"127.0.0.1:0\"\n\n\
+         [mobile]\nlisten = \"127.0.0.1:0\"\nadvertise = false\n\n\
+         [sidecar]\n\
+         enabled = true\n\
+         rnsd_path = \"{rnsd}\"\n\
+         config_dir = \"{cfg}\"\n\
+         pinned_version = \"1.5\"\n\n\
+         [lora]\n\
+         adapter_script = \"{adapter}\"\n\
+         adapter_python = \"{python}\"\n\
+         frame_bytes = 400\n\
+         push_rescan_secs = 15\n",
+        rnsd = rnsd_bin(),
+        cfg = reticulum_dir.display(),
+        adapter = adapter_script().display(),
+        python = python_bin(),
+    );
+    std::fs::write(data_dir.join("config.toml"), text).unwrap();
+}
+
+/// T2.6.4: originate → ingest → receipt → delivered over two **real** supervised
+/// `rnsd` instances on local TCP, through the **production** path (RPC → outbound
+/// channel → `run_dtn_syncer` → LXMF adapter). The first end-to-end exercise of a
+/// station *originating* an outbound DTN push over a real Reticulum instance
+/// (still TCP, not radio — radio is T2.6.3's human-gated field run).
+///
+/// Run it exactly like the T2.6.1 spike (same pinned venv), with:
+/// ```sh
+/// RRN_SPIKE_RNSD=/tmp/rns/bin/rnsd RRN_SPIKE_PYTHON=/tmp/rns/bin/python \
+///   cargo test -p rrn-station --test reticulum_spike -- --ignored --nocapture \
+///   originate_receipt_round_trip_over_two_real_rnsd
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "non-hermetic: needs pinned rnsd + lxmf; run in the reticulum-spike CI lane"]
+async fn originate_receipt_round_trip_over_two_real_rnsd() {
+    const PASSPHRASE: &str = "spike-passphrase";
+    let work = tempfile::tempdir().unwrap();
+    let dir = work.path();
+
+    // Two station data dirs; each station's Reticulum config dir sits under it so
+    // the adapter identity lands at <data>/reticulum/adapter.identity.
+    let data_a = dir.join("station-a");
+    let data_b = dir.join("station-b");
+    std::fs::create_dir_all(&data_a).unwrap();
+    std::fs::create_dir_all(&data_b).unwrap();
+    let ret_a = data_a.join("reticulum");
+    let ret_b = data_b.join("reticulum");
+
+    // A serves a TCP link; B dials it. Distinct shared-instance ports (two nodes,
+    // one host).
+    let link_port = free_port();
+    write_spike_config(
+        &ret_a,
+        "a",
+        &format!(
+            "  [[Spike TCP Server]]\n    type = TCPServerInterface\n    \
+             interface_enabled = True\n    listen_ip = 127.0.0.1\n    listen_port = {link_port}",
+        ),
+        37428,
+    );
+    write_spike_config(
+        &ret_b,
+        "b",
+        &format!(
+            "  [[Spike TCP Client]]\n    type = TCPClientInterface\n    \
+             interface_enabled = True\n    target_host = 127.0.0.1\n    target_port = {link_port}",
+        ),
+        37430,
+    );
+
+    // Compute B's adapter destination offline against the identity file B's adapter
+    // will load on boot — creating it now, so we can address it before B is up.
+    let b_identity = ret_b.join("adapter.identity");
+    let hash_out = run_helper(&["hash", "--identity", b_identity.to_str().unwrap()]).await;
+    assert!(
+        hash_out.status.success(),
+        "hash role failed: {}",
+        String::from_utf8_lossy(&hash_out.stderr)
+    );
+    let b_hash = String::from_utf8_lossy(&hash_out.stdout).trim().to_string();
+    assert_eq!(b_hash.len(), 32, "expected a 16-byte dest hash hex");
+
+    // Init wallets, then write the station configs (sidecar + adapter).
+    Station::init(&data_a, PASSPHRASE).unwrap();
+    Station::init(&data_b, PASSPHRASE).unwrap();
+    write_station_config(&data_a, &ret_a);
+    write_station_config(&data_b, &ret_b);
+
+    // Boot both stations (each spawns its supervised rnsd + adapter + DTN loop).
+    let clock = Clock::system();
+    let station_a = Station::open(StationParams {
+        data_dir: data_a.clone(),
+        passphrase: PASSPHRASE.into(),
+        clock: clock.clone(),
+    })
+    .await
+    .unwrap();
+    let station_b = Station::open(StationParams {
+        data_dir: data_b.clone(),
+        passphrase: PASSPHRASE.into(),
+        clock: clock.clone(),
+    })
+    .await
+    .unwrap();
+    // Give the sidecars + adapters time to come up and the TCP link to form.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let client_a = UnixClient::new(station_a.socket_path());
+    let bundle = build_bundle(2);
+    let bundle_hex = hex_encode(&bundle.encode());
+
+    // A originates the push to B's destination through the production RPC path.
+    let queued = client_a
+        .call(
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex, "endpoint_hex": b_hash }),
+        )
+        .await
+        .expect("dtn_push");
+    assert_eq!(queued["queued"], true);
+    let push_id = queued["push_id_hex"].as_str().unwrap().to_string();
+
+    // Poll A's push status until the returned receipt flips it to delivered.
+    let mut delivered = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(150) {
+        let status = client_a
+            .call("dtn_pushes", serde_json::json!({}))
+            .await
+            .unwrap();
+        if let Some(rows) = status["pushes"].as_array() {
+            if rows.iter().any(|p| {
+                p["push_id_hex"] == serde_json::Value::String(push_id.clone())
+                    && p["state"] == "delivered"
+            }) {
+                delivered = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    station_a.shutdown().await;
+    station_b.shutdown().await;
+    assert!(
+        delivered,
+        "A's push must flip to delivered once B's receipt returns over Reticulum"
+    );
+}
+
+/// Lowercase hex of a byte slice.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }

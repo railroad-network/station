@@ -59,6 +59,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "receipt_deliveries",
         sql: include_str!("../migrations/0007_receipt_deliveries.sql"),
     },
+    Migration {
+        version: 8,
+        name: "dtn_pushes",
+        sql: include_str!("../migrations/0008_dtn_pushes.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -149,6 +154,7 @@ mod tests {
         let expected_tables: BTreeSet<String> = [
             "attestations",
             "balances",
+            "dtn_pushes",
             "identities",
             "issued_receipts",
             "kv",
@@ -168,6 +174,7 @@ mod tests {
         assert_eq!(tables, expected_tables);
 
         let expected_indexes: BTreeSet<String> = [
+            "dtn_pushes_pending",
             "idx_attestations_signer",
             "idx_log_entries_content_hash",
             "idx_outbox_pending",
