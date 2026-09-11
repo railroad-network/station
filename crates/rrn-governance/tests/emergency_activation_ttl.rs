@@ -52,11 +52,16 @@ fn publish_charter(db: &Database, founders: &[Keypair]) {
     store_charter(&mut log, &founders[0], signed, 0).unwrap();
 }
 
+fn station() -> Keypair {
+    // Fixed so the reader pins (T2.1.4) match the write helpers' station key.
+    Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
+}
+
 fn three_founder_community() -> (Database, Vec<Keypair>, Keypair) {
     let db = fresh_db();
     let founders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
     publish_charter(&db, &founders);
-    (db, founders, Keypair::generate())
+    (db, founders, station())
 }
 
 fn declare(db: &Database, st: &Keypair, author: &Keypair, duration_secs: i64, at: i64) -> Hash {
@@ -98,7 +103,7 @@ fn cosign(db: &Database, st: &Keypair, signer: &Keypair, target: Hash, at: i64) 
 }
 
 fn is_active(db: &Database, decl: Hash, now: i64) -> bool {
-    emergency::active_emergency_at(db, now, u64::MAX)
+    emergency::active_emergency_at(db, now, u64::MAX, &station().public_key())
         .unwrap()
         .is_some_and(|e| e.declaration_hash == decl)
 }
@@ -135,7 +140,7 @@ fn chain_to_a_cap_refusal(db: &Database, founders: &[Keypair], st: &Keypair) -> 
     for _ in 0..3 {
         let h = declare(db, st, &founders[0], DAY, instant);
         cosign(db, st, &founders[1], h, instant);
-        let e = emergency::active_emergency_at(db, instant + 1, u64::MAX)
+        let e = emergency::active_emergency_at(db, instant + 1, u64::MAX, &station().public_key())
             .unwrap()
             .unwrap();
         instant = e.scheduled_expiry + 1; // within the 14-day cooldown ⇒ continuation
@@ -157,7 +162,7 @@ fn a_cap_refused_first_crossing_writes_a_refusal_and_never_revives() {
     assert!(has_refused_marker(&db, dead), "a refusal marker is written");
     assert!(!is_active(&db, dead, refused_at + 1));
     assert_eq!(
-        emergency::declaration_status(&db, &dead, refused_at + 1).unwrap(),
+        emergency::declaration_status(&db, &dead, refused_at + 1, &station().public_key()).unwrap(),
         DeclarationStatus::Dead
     );
 
@@ -196,7 +201,13 @@ fn an_independent_replay_of_a_refused_chain_never_revives() {
         .unwrap();
 
     assert_eq!(
-        emergency::declaration_status(&replica, &dead, refused_at + 31 * DAY).unwrap(),
+        emergency::declaration_status(
+            &replica,
+            &dead,
+            refused_at + 31 * DAY,
+            &station().public_key()
+        )
+        .unwrap(),
         DeclarationStatus::Dead,
         "the dead set survives replication; the extra co-sign does not revive it"
     );
@@ -211,7 +222,7 @@ fn a_within_cooldown_continuation_activates_without_a_refusal() {
     let t0 = 1_000_000;
     let d0 = declare(&db, &st, &founders[0], DAY, t0);
     cosign(&db, &st, &founders[1], d0, t0);
-    let e0 = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+    let e0 = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
 
@@ -220,7 +231,7 @@ fn a_within_cooldown_continuation_activates_without_a_refusal() {
     let t1 = e0.scheduled_expiry + 1;
     let d1 = declare(&db, &st, &founders[0], DAY, t1);
     cosign(&db, &st, &founders[1], d1, t1);
-    let e1 = emergency::active_emergency_at(&db, t1 + 1, u64::MAX)
+    let e1 = emergency::active_emergency_at(&db, t1 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
     assert_eq!(e1.declaration_hash, d1);
@@ -259,7 +270,7 @@ fn a_crossing_past_the_ttl_is_refused_and_never_activates() {
     // expired, and the declaration never activates.
     let past = t0 + EMERGENCY_DECLARATION_TTL + 1;
     assert_eq!(
-        emergency::declaration_status(&db, &d, past).unwrap(),
+        emergency::declaration_status(&db, &d, past, &station().public_key()).unwrap(),
         DeclarationStatus::Expired
     );
     let err = try_cosign(&db, &st, &founders[1], d, past).unwrap_err();
@@ -390,13 +401,19 @@ fn a_declaration_lands_with_its_anchor_and_a_crossing_with_its_marker() {
     // append_declaration commits the declaration and its anchor together.
     let d = declare(&db, &st, &founders[0], DAY, t0);
     assert_eq!(
-        emergency::declaration_status(&db, &d, t0).unwrap(),
+        emergency::declaration_status(&db, &d, t0, &station().public_key()).unwrap(),
         DeclarationStatus::Pending,
         "one co-signer short of the bar, but anchored and live"
     );
     // The anchor is present (else the status probe could never report Expired).
     assert_ne!(
-        emergency::declaration_status(&db, &d, t0 + EMERGENCY_DECLARATION_TTL + 1).unwrap(),
+        emergency::declaration_status(
+            &db,
+            &d,
+            t0 + EMERGENCY_DECLARATION_TTL + 1,
+            &station().public_key()
+        )
+        .unwrap(),
         DeclarationStatus::Pending,
         "past the TTL the anchored declaration reads Expired, proving the anchor landed"
     );
@@ -404,7 +421,7 @@ fn a_declaration_lands_with_its_anchor_and_a_crossing_with_its_marker() {
     // The crossing co-sign commits with its activation marker.
     cosign(&db, &st, &founders[1], d, t0);
     assert_eq!(
-        emergency::declaration_status(&db, &d, t0 + 1).unwrap(),
+        emergency::declaration_status(&db, &d, t0 + 1, &station().public_key()).unwrap(),
         DeclarationStatus::Activated
     );
 }
@@ -436,7 +453,7 @@ fn the_section_six_report_surfaces_dead_and_expired_declarations() {
     let expired = declare(&db, &st, &founders[0], DAY, refused_at + 1);
 
     let now = refused_at + 1 + EMERGENCY_DECLARATION_TTL + DAY;
-    let inert = emergency::inert_declarations(&db, now).unwrap();
+    let inert = emergency::inert_declarations(&db, now, &station().public_key()).unwrap();
 
     let dead_entry = inert
         .iter()
@@ -463,7 +480,7 @@ fn a_markerless_gossip_crossing_is_not_activatable_by_a_later_front_door_cosign(
     let t0 = 1_000_000;
     let d = declare(&db, &st, &founders[0], DAY, t0); // 1 of 2, anchored
     assert_eq!(
-        emergency::declaration_status(&db, &d, t0).unwrap(),
+        emergency::declaration_status(&db, &d, t0, &station().public_key()).unwrap(),
         DeclarationStatus::Pending
     );
 
@@ -486,7 +503,7 @@ fn a_markerless_gossip_crossing_is_not_activatable_by_a_later_front_door_cosign(
         "markerless crossing: replay fails closed"
     );
     assert_eq!(
-        emergency::declaration_status(&db, &d, t0 + 1).unwrap(),
+        emergency::declaration_status(&db, &d, t0 + 1, &station().public_key()).unwrap(),
         DeclarationStatus::Pending,
         "markerless, not dead and not active"
     );
@@ -540,7 +557,7 @@ fn replay_ignores_a_refusal_whose_crossing_was_never_reached() {
         )
         .unwrap();
     assert_eq!(
-        emergency::declaration_status(&db, &d, t0 + 1).unwrap(),
+        emergency::declaration_status(&db, &d, t0 + 1, &station().public_key()).unwrap(),
         DeclarationStatus::Pending,
         "a refusal without a genuine crossing does not stick"
     );
