@@ -2037,20 +2037,16 @@ channel.
   and is a follow-up; the alternative — re-gating on the replica-local clock — is the
   divergence bug this ticket removed, so it is not an option.
   `vote.rs::replay_counts_a_ballot_present_on_the_log` pins the trusted-log behaviour.
-  Separately, the window attestation's authority is the station's signature, and —
-  as with the existing `ProposalImplemented` record — governance does not re-verify the
-  attestation's signer against a pinned station identity, because it has no
-  station-identity concept in Phase 1. The forge impact is **higher** than
-  `ProposalImplemented`, though: that record is a cheap existence check whose real
-  consequence (a proposal passed) is re-derived from the vote, whereas a forged
-  `rrn.gov.proposal_window` injected *before* the genuine one wins `window_of`'s
-  earliest-match and directly sets `voting_ends_at`/`implementation_at`/`admitted_at` —
-  moving the outcome gate and the eligibility instant. Only a configured gossip peer can
-  inject one (DTN refuses both kinds as `UnroutableKind`), and pinning `open_seq` to the
-  *attestation's* seq already denies a peer control of the open position; pinning the
-  signer of both records against a station identity is the remaining follow-up, and is
-  the higher priority of the two. A station-signed governance identity concept arrives
-  with ADR-0023's `emergency_activated` (T2.8.2). The station clock at admission remains the operational trust root
+  Separately, the window attestation's authority is the station's signature. A forged
+  `rrn.gov.proposal_window` injected *before* the genuine one would, if believed, win
+  `window_of`'s earliest-match and directly set
+  `voting_ends_at`/`implementation_at`/`admitted_at` — moving the outcome gate and the
+  eligibility instant. **Closed by T2.1.4:** the reader now pins the attestation's
+  envelope signer to the community station key and skips any other, so the earliest
+  *validated* (station-signed) window wins and a forged one is invisible — the same pin
+  now applies to `ProposalImplemented` and the three emergency attestations (see
+  "Emergency activation + declaration TTL" below for the consolidated residual list).
+  The station clock at admission remains the operational trust root
   (ADR-0022 §6). The dispute-escalation electorate still uses the *time*-based
   `grace_electorate` and shares the residual back-dating vector this ticket closed only
   for the governance path; `grace_electorate_asof` is now the tool to close it there too
@@ -2237,20 +2233,19 @@ then lapses* — and withhold every adjacent one.
   `rrn-ledger` or `rrn-reputation`: the settlement and dispute windows, the debt
   floor, certificates, and reputation are untouched, by construction. A flood does
   not authorize economic restructuring.
-- *Residual — the station signer is not yet pinned on attestations.* The
+- *Mitigated (T2.1.4) — the station signer is now pinned on the attestations.* The
   `emergency_activated` attestation (like ADR-0022's `ProposalWindow` and
-  `ProposalImplemented`) is trusted structurally — its declaration must re-derive as
-  having crossed the supermajority — but the derivation does not yet verify the
-  attestation's *signer* is the community's station key. A gossip peer that already
-  holds a genuine supermajority (so the crossing re-derives) could inject an
-  attestation with an attacker-chosen `activation_instant`, shifting the active span
-  by up to one declaration's clamped duration (≤ 7 d); it cannot manufacture an
-  emergency without a real supermajority (co-signatures must be from eligible members,
-  which re-derives). This is why the emergency-*legitimacy* parameters are read from
-  the genesis charter rather than any attestation field. Pinning the station signer
-  uniformly across all three station attestations is recommended follow-up (it is a
-  pre-existing gap, not introduced here). A duplicate/bogus attestation cannot *block*
-  the real one: the "already activated" check runs only after legitimacy passes.
+  `ProposalImplemented`) was trusted structurally — its declaration must re-derive as
+  having crossed the supermajority — and the derivation now **also** verifies the
+  attestation's *signer* is the community's station key, skipping any other. This
+  closes the last supermajority-free shift: a gossip peer holding a genuine
+  supermajority can no longer inject an attestation with an attacker-chosen
+  `activation_instant` to shift the active span, because its non-station envelope is
+  skipped. The emergency-*legitimacy* parameters are still read from the genesis
+  charter rather than any attestation field (defence in depth). A duplicate/bogus
+  attestation still cannot *block* the real one: the "already activated" check runs only
+  after legitimacy passes. The consolidated post-T2.1.4 residual list is under
+  "Emergency activation + declaration TTL" below.
 - *Residual — a renewal re-pins the electorate at its own activation.* Each activation
   in a chain pins at its own position, so a chain that renews mid-emergency can refresh
   its pinned electorate up to `MAX_CONSECUTIVE_RENEWALS_CEILING` times — ADR-consistent
@@ -2315,27 +2310,48 @@ implementation, and adds two station-signed record kinds
   `RefusalReason` variants on the DTN receipt path, so an offline co-signer learns why
   their courier-carried co-sign did nothing. The §6 report surfaces refused and
   expired declarations, not only activations.
-- *Residual — station-signer pinning still open, now across five kinds.* The two new
-  markers carry authority **only** "the station said so," yet — like
-  `emergency_activated`, `ProposalWindow`, and `ProposalImplemented` — the derivation
-  does not yet verify their envelope signer is the community's station key. The
-  activation/refusal markers still need a *genuine, re-derived supermajority* to have
-  effect (the crossing is re-checked), but the **admission anchor needs no
-  supermajority at all**: `derive_emergencies` takes the earliest anchor for a
-  declaration hash with no signer or content validation, so a hostile gossip peer that
-  merely learns a declaration's hash (a colluding declarer shares it) can inject
-  `emergency_declaration_admitted { hash, admitted_at }` with an attacker-chosen
-  instant — `admitted_at = 0` makes the genuine crossing read as TTL-expired (the
-  declaration silently never activates, and a replica seeded with the forgery diverges
-  from the writer's tally); a far-future `admitted_at` defeats the TTL entirely. A
-  forged **refusal** likewise validates whenever a genuine crossing exists and the
-  attacker picks a `refused_instant` inside a capped chain's cooldown. So the anchor
-  and refusal are a *supermajority-free* denial/extension lever until pinning lands.
-  Per the maintainer's decision, **uniform station-signer pinning across all station
-  attestations is a separate prerequisite ticket** (ADR-0027 names it a precondition,
-  to land first or alongside); T2.8.3 does not close it and carries it as the tracked
-  residual. Until it lands, emergencies are **not to be trusted against a hostile
-  gossip peer in production**.
+- *Mitigated (T2.1.4) — station-signer pinning, across all five station-signed
+  governance kinds.* The residual T2.8.3 carried — that a forged station attestation
+  could move a window, an electorate pin, a TTL anchor, or an activation/refusal
+  decision — is **closed**. Replay now verifies the envelope signer of every
+  station-signed governance record (`ProposalWindow`, `ProposalImplemented`,
+  `emergency_declaration_admitted`, `emergency_activated`, `emergency_refused`) is the
+  community's station key at **every** read (`window::window_and_seq_of`,
+  `statute::{implementation_of, enacted_statutes}`, and the three reads in
+  `emergency::{declaration_admitted_at, derive_emergencies}`); a record signed by any
+  other key is **skipped** exactly as a forged member record is (the
+  `Address::from_public_key(signer) != …` idiom, now a direct `PublicKey` compare).
+  This closes the supermajority-free levers T2.8.3 named: a hostile gossip peer that
+  learns a declaration's hash can no longer inject an `emergency_declaration_admitted`
+  with `admitted_at = 0` (to fake TTL-expiry) or a far-future instant (to defeat the
+  TTL), nor a forged `emergency_refused` (to kill a live declaration), nor a forged
+  `ProposalWindow`/`ProposalImplemented` (to open a spurious window, move the
+  electorate pin, block a genuine enactment, or fold a phantom amendment). A forged
+  record is invisible to derivation, never a hard error, so a hostile peer cannot wedge
+  replay either (skip-not-halt). The invariant suite is
+  `tests/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
+  attests) already made this decision, so no new ADR was needed.
+- *Residual — surviving after T2.1.4.* Four same-class gaps remain, all narrower than
+  the one just closed:
+  1. **Ledger station-signed records are still unpinned.** `SettlementRecord`,
+     `ContractCharge`, and headroom certificates (`rrn-ledger`) are station-signed and
+     replay-trusted with no signer pin — the same injection vector (gossip `append_raw`)
+     and a higher-value target (a forged `SettlementRecord` settles a `Confirmed` tx at
+     an attacker-chosen instant). Scoped to a **sibling ticket** by the T2.1.4 decision
+     (governance-only); the pilot mitigation is the same "no untrusted gossip peers."
+  2. **The equivocation verdict pins to the equivocation *record's* signer, not the
+     community key** (`reputation/scoring.rs:347`) — same class, tracked follow-up.
+  3. **A gossip read-replica cannot derive governance until it is told the writer's
+     key.** Per the T2.1.4 decision (a), the pin is against the writer's own key; a
+     second-`init`ed peer that derives under a *different* key gets the **genesis
+     charter and nothing else** — no windows, proposals, tallies, statutes, or
+     emergencies — a **loud, diagnosable** failure, never a silent partial (pinned by
+     `deriving_under_a_different_key_yields_genesis_and_nothing_else`). This already held
+     for marketplace station attestations; the pilot runs a single writer station, so no
+     replica derives governance in production. (An in-log genesis station-key binding —
+     which would let a replica pin correctly — needs its own ADR and is out of scope.)
+  4. **The log-head freshness / stale-signature witness** that ADR-0027 defers is
+     unchanged: pinning proves *who* signed, not that the signer's view was fresh.
 - *Residual — gossip ingest bypasses the front door (pre-existing, T2.8.2/ADR-0020).*
   `do_append_entries` (the gossip pull path) admits any signature-valid record via
   `append_raw` with no front-door gate — so a member `emergency_cosign` couriered to a
