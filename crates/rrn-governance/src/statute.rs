@@ -36,7 +36,7 @@
 //! idempotency and the amendment fold), never as proof a statute is in force.
 
 use dcbor::prelude::*;
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_storage::db::Database;
@@ -51,9 +51,11 @@ pub(crate) const IMPLEMENTED_KIND: &str = "rrn.gov.proposal_implemented";
 
 /// A station's record that a passed proposal has been put into force.
 ///
-/// Station-signed on append. Its authority is not the signature but the facts it
-/// points at: a proposal that passed and whose implementation time had come. Those
-/// are re-derived wherever the record is believed (see the module docs).
+/// Station-signed on append. Its envelope signer is pinned to the community station
+/// key at every read (T2.1.4), so a forged enactment record is skipped and cannot
+/// mark a statute in force; on top of that pin, the facts it points at — a proposal
+/// that passed and whose implementation time had come — are re-derived wherever the
+/// record is believed (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProposalImplemented {
     /// The proposal put into force.
@@ -83,6 +85,7 @@ pub struct EnactedStatute {
 pub(crate) fn implementation_of(
     log: &AppendLog,
     proposal_id: &ProposalId,
+    station: &PublicKey,
 ) -> Option<ProposalImplemented> {
     for entry in log.iter_from(1) {
         let Ok(entry) = entry else {
@@ -91,6 +94,11 @@ pub(crate) fn implementation_of(
         let Ok(record) = from_canonical_bytes::<ProposalImplemented>(&entry.payload.bytes) else {
             continue;
         };
+        // T2.1.4: a non-station enactment record is skipped, so it can neither mark
+        // a statute in force nor block a genuine enactment via the sweep guard.
+        if entry.payload.signer != *station {
+            continue;
+        }
         if record.proposal_id == *proposal_id {
             return Some(record);
         }
@@ -98,9 +106,14 @@ pub(crate) fn implementation_of(
     None
 }
 
-/// Whether the log already carries an enactment record for `proposal_id`.
-pub(crate) fn is_implemented(log: &AppendLog, proposal_id: &ProposalId) -> bool {
-    implementation_of(log, proposal_id).is_some()
+/// Whether the log already carries a station-signed enactment record for
+/// `proposal_id`.
+pub(crate) fn is_implemented(
+    log: &AppendLog,
+    proposal_id: &ProposalId,
+    station: &PublicKey,
+) -> bool {
+    implementation_of(log, proposal_id, station).is_some()
 }
 
 /// Enacts a passed proposal: appends a station-signed [`ProposalImplemented`].
@@ -116,7 +129,8 @@ pub fn record_implementation(
     proposal: &Proposal,
     now: i64,
 ) -> Result<LogEntry, StatuteError> {
-    if is_implemented(log, &proposal.proposal_id) {
+    let station_pk = station.public_key();
+    if is_implemented(log, &proposal.proposal_id, &station_pk) {
         return Err(StatuteError::AlreadyImplemented(proposal.proposal_id));
     }
     // §3b — the constitution is frozen while an emergency holds: a CharterAmendment's
@@ -130,12 +144,13 @@ pub fn record_implementation(
         None => now,
     };
     if matches!(proposal.kind, ProposalKind::CharterAmendment { .. })
-        && crate::emergency::is_emergency_active_now(db, admitted_at)
+        && crate::emergency::is_emergency_active_now(db, admitted_at, &station_pk)
             .map_err(|e| StatuteError::Emergency(Box::new(e)))?
     {
         return Err(StatuteError::CharterFrozenByEmergency(proposal.proposal_id));
     }
-    if tally(db, &proposal.proposal_id, now)?.outcome != Some(ProposalOutcome::Passed) {
+    if tally(db, &proposal.proposal_id, now, &station_pk)?.outcome != Some(ProposalOutcome::Passed)
+    {
         return Err(StatuteError::NotPassed(proposal.proposal_id));
     }
     if now < proposal.implementation_at {
@@ -161,7 +176,11 @@ pub fn record_implementation(
 /// an [`Emergency`](ProposalKind::Emergency) measure — enforces its `expires_at`
 /// kind-wide: an expired measure has no effect and is dropped as of `now` (ADR-0023
 /// §1). Returned in log order, each proposal once.
-pub fn enacted_statutes(db: &Database, now: i64) -> Result<Vec<EnactedStatute>, StatuteError> {
+pub fn enacted_statutes(
+    db: &Database,
+    now: i64,
+    station: &PublicKey,
+) -> Result<Vec<EnactedStatute>, StatuteError> {
     let log = AppendLog::new(db);
     let mut out = Vec::new();
     for entry in log.iter_from(1) {
@@ -169,8 +188,14 @@ pub fn enacted_statutes(db: &Database, now: i64) -> Result<Vec<EnactedStatute>, 
         let Ok(record) = from_canonical_bytes::<ProposalImplemented>(&entry.payload.bytes) else {
             continue;
         };
+        // T2.1.4: a non-station enactment record is skipped — a forged one never
+        // enters the in-force set.
+        if entry.payload.signer != *station {
+            continue;
+        }
         // The enactment must name a proposal this log holds as authorized...
-        let Some(proposal) = proposal_records(&log, &record.proposal_id, db)?.proposal else {
+        let Some(proposal) = proposal_records(&log, &record.proposal_id, db, station)?.proposal
+        else {
             continue;
         };
         // ...that genuinely passed, at or after its implementation time.
@@ -185,7 +210,7 @@ pub fn enacted_statutes(db: &Database, now: i64) -> Result<Vec<EnactedStatute>, 
                 continue;
             }
         }
-        if tally(db, &record.proposal_id, record.implemented_at)?.outcome
+        if tally(db, &record.proposal_id, record.implemented_at, station)?.outcome
             != Some(ProposalOutcome::Passed)
         {
             continue;

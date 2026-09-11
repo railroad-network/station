@@ -60,7 +60,7 @@ use std::collections::HashSet;
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -470,6 +470,7 @@ fn find_proposal(
     log: &AppendLog,
     proposal_id: &ProposalId,
     db: &Database,
+    station: &PublicKey,
 ) -> Result<Option<(Proposal, u64, i64)>, ProposalError> {
     let founders = founder_set(db)?;
     for entry in log.iter_from(1) {
@@ -491,8 +492,9 @@ fn find_proposal(
         // A proposal with no attestation is not yet windowed — not authorized to
         // read — so skip it rather than fall back to this replica's re-stamped
         // `entry.created_at`, which differs per replica and would split the derived
-        // window, electorate, and outcome across replicas (T2.1.3 acceptance 1).
-        let Some((w, open_seq)) = window_and_seq_of(log, proposal_id) else {
+        // window, electorate, and outcome across replicas (T2.1.3 acceptance 1). The
+        // attestation's own signer is pinned to the station (T2.1.4).
+        let Some((w, open_seq)) = window_and_seq_of(log, proposal_id, station) else {
             continue;
         };
         proposal.voting_ends_at = w.voting_ends_at;
@@ -523,8 +525,10 @@ pub fn proposal_records(
     log: &AppendLog,
     proposal_id: &ProposalId,
     db: &Database,
+    station: &PublicKey,
 ) -> Result<ProposalRecords, ProposalError> {
-    let Some((proposal, open_seq, open_time)) = find_proposal(log, proposal_id, db)? else {
+    let Some((proposal, open_seq, open_time)) = find_proposal(log, proposal_id, db, station)?
+    else {
         return Ok(ProposalRecords::default());
     };
     let author = proposal.author;
@@ -571,7 +575,11 @@ pub fn proposal_records(
 /// that dodged the guards is not returned. The
 /// enactment sweep ([`crate::lifecycle::enact_due`]) walks this to find the passed
 /// proposals it is due to put into force.
-pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, ProposalError> {
+pub fn all_proposals(
+    log: &AppendLog,
+    db: &Database,
+    station: &PublicKey,
+) -> Result<Vec<Proposal>, ProposalError> {
     let founders = founder_set(db)?;
     let mut seen = HashSet::new();
     let mut proposals = Vec::new();
@@ -588,8 +596,9 @@ pub fn all_proposals(log: &AppendLog, db: &Database) -> Result<Vec<Proposal>, Pr
         }
         // The window (and the admission instant it carries) comes from the station
         // attestation, never this replica's re-stamped `created_at`; a proposal
-        // with no attestation is not yet windowed and is not returned (T2.1.3).
-        let Some((w, open_seq)) = window_and_seq_of(log, &proposal.proposal_id) else {
+        // with no attestation is not yet windowed and is not returned (T2.1.3). The
+        // attestation's own signer is pinned to the station (T2.1.4).
+        let Some((w, open_seq)) = window_and_seq_of(log, &proposal.proposal_id, station) else {
             continue;
         };
         proposal.voting_ends_at = w.voting_ends_at;
@@ -634,6 +643,7 @@ pub fn append_proposal(
         });
     }
     proposal.validate()?;
+    let station_pk = station.public_key();
     // The proposal's open position is the admission it is about to receive: the
     // next seq, at the monotone-clamped admission time. Eligibility is judged
     // there, matching the replay path (find_proposal), not the author's clock.
@@ -647,7 +657,7 @@ pub fn append_proposal(
             composite: composite_at_position(db, &proposal.author, open_time, open_seq)?,
         });
     }
-    if find_proposal(log, &proposal.proposal_id, db)?.is_some() {
+    if find_proposal(log, &proposal.proposal_id, db, &station_pk)?.is_some() {
         return Err(ProposalError::AlreadyProposed(proposal.proposal_id));
     }
 
@@ -655,7 +665,7 @@ pub fn append_proposal(
     // `(open_time, open_seq)`. An emergency is *active for this admission* iff a
     // declaration's span covers it; the window then compresses (§3a), and the
     // constitution is frozen (§3b) and the measure is time-bounded (§1).
-    let active = active_emergency_at(db, open_time, open_seq)
+    let active = active_emergency_at(db, open_time, open_seq, &station_pk)
         .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
 
     // §3b — charter freeze: no CharterAmendment is admitted while an emergency holds.
@@ -720,6 +730,7 @@ pub fn append_cosign(
     log: &mut AppendLog,
     signed: SignedCosign,
     db: &Database,
+    station: &PublicKey,
     now: i64,
 ) -> Result<LogEntry, ProposalError> {
     let cosign = &signed.payload;
@@ -730,7 +741,7 @@ pub fn append_cosign(
             cosigner: cosign.cosigner,
         });
     }
-    let records = proposal_records(log, &cosign.proposal_id, db)?;
+    let records = proposal_records(log, &cosign.proposal_id, db, station)?;
     let Some(proposal) = records.proposal.as_ref() else {
         return Err(ProposalError::UnknownProposal(cosign.proposal_id));
     };
@@ -1139,16 +1150,47 @@ mod tests {
         p
     }
 
-    /// Test helper: a drop-in for the old `propose(log, signed, db, at)`
-    /// that supplies a station keypair and the default test charter (the window
-    /// attestation's signer is not verified in replay, so a fresh key is fine).
+    /// The fixed station key the tests' window attestations are signed by. Replay
+    /// now pins the window signer (T2.1.4), so the reader wrappers below pin against
+    /// this same key — a deterministic key, not a throwaway.
+    fn test_station() -> Keypair {
+        Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
+    }
+
+    /// Test helper: a drop-in for the old `propose(log, signed, db, at)` that
+    /// supplies the fixed [`test_station`] keypair and the default test charter.
     fn propose(
         log: &mut AppendLog,
         signed: SignedProposal,
         db: &Database,
         at: i64,
     ) -> Result<LogEntry, ProposalError> {
-        append_proposal(log, signed, db, &Keypair::generate(), &test_charter(), at)
+        append_proposal(log, signed, db, &test_station(), &test_charter(), at)
+    }
+
+    // Wrappers injecting the fixed test-station pin (T2.1.4), so test bodies keep
+    // their pre-pin call shape.
+    fn append_cosign(
+        log: &mut AppendLog,
+        signed: SignedCosign,
+        db: &Database,
+        at: i64,
+    ) -> Result<LogEntry, ProposalError> {
+        super::append_cosign(log, signed, db, &test_station().public_key(), at)
+    }
+    fn find_proposal(
+        log: &AppendLog,
+        proposal_id: &ProposalId,
+        db: &Database,
+    ) -> Result<Option<(Proposal, u64, i64)>, ProposalError> {
+        super::find_proposal(log, proposal_id, db, &test_station().public_key())
+    }
+    fn proposal_records(
+        log: &AppendLog,
+        proposal_id: &ProposalId,
+        db: &Database,
+    ) -> Result<ProposalRecords, ProposalError> {
+        super::proposal_records(log, proposal_id, db, &test_station().public_key())
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedCosign {

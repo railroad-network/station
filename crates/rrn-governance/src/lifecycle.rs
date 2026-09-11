@@ -36,20 +36,21 @@ pub fn enact_due(
     station: &Keypair,
     now: i64,
 ) -> Result<Vec<ProposalId>, LifecycleError> {
+    let station_pk = station.public_key();
     let proposals = {
         let log = AppendLog::new(db);
-        all_proposals(&log, db)?
+        all_proposals(&log, db, &station_pk)?
     };
 
     let mut log = AppendLog::new(db);
     let mut enacted = Vec::new();
     for proposal in proposals {
-        if is_implemented(&log, &proposal.proposal_id) {
+        if is_implemented(&log, &proposal.proposal_id, &station_pk) {
             continue;
         }
         // A proposal we cannot tally this tick (e.g. no Charter yet) is not due to
         // be enacted; leave it for later rather than failing the whole sweep.
-        let Ok(counted) = tally(db, &proposal.proposal_id, now) else {
+        let Ok(counted) = tally(db, &proposal.proposal_id, now, &station_pk) else {
             continue;
         };
         if counted.outcome != Some(ProposalOutcome::Passed) || now < proposal.implementation_at {
@@ -78,10 +79,9 @@ mod tests {
     use crate::charter::{
         create_charter, AmendmentRules, Charter, CharterParams, GovernanceStructure,
     };
-    use crate::proposal::{append_cosign, append_proposal, Proposal, ProposalCosign, ProposalKind};
-    use crate::statute::{enacted_statutes, record_implementation, StatuteError};
-    use crate::tally::{effective_charter, effective_charter_hash};
-    use crate::vote::{append_vote, SignedVote, Vote, VoteChoice};
+    use crate::proposal::{append_proposal, Proposal, ProposalCosign, ProposalKind};
+    use crate::statute::{record_implementation, StatuteError};
+    use crate::vote::{SignedVote, Vote, VoteChoice};
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::signed::SignedPayload;
     use rrn_identity::address::Address;
@@ -299,14 +299,46 @@ mod tests {
         db: &Database,
         at: i64,
     ) -> Result<rrn_storage::log::LogEntry, crate::proposal::ProposalError> {
-        append_proposal(
-            log,
-            signed,
-            db,
-            &Keypair::generate(),
-            &charter_body(1, None),
-            at,
-        )
+        append_proposal(log, signed, db, &test_station(), &charter_body(1, None), at)
+    }
+
+    /// The fixed station key the tests' window/enactment attestations are signed by,
+    /// so the reader wrappers pin against it (T2.1.4).
+    fn test_station() -> Keypair {
+        Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
+    }
+
+    // Wrappers injecting the fixed test-station pin (T2.1.4), so test bodies keep
+    // their pre-pin call shape.
+    fn append_cosign(
+        log: &mut AppendLog,
+        signed: SignedPayload<ProposalCosign>,
+        db: &Database,
+        at: i64,
+    ) -> Result<rrn_storage::log::LogEntry, ProposalError> {
+        crate::proposal::append_cosign(log, signed, db, &test_station().public_key(), at)
+    }
+    fn append_vote(
+        log: &mut AppendLog,
+        signed: SignedVote,
+        db: &Database,
+        at: i64,
+    ) -> Result<rrn_storage::log::LogEntry, crate::vote::VoteError> {
+        crate::vote::append_vote(log, signed, db, &test_station().public_key(), at)
+    }
+    fn effective_charter(db: &Database) -> Result<Option<Charter>, crate::tally::TallyError> {
+        crate::tally::effective_charter(db, &test_station().public_key())
+    }
+    fn effective_charter_hash(
+        db: &Database,
+    ) -> Result<Option<rrn_crypto::hash::Hash>, crate::tally::TallyError> {
+        crate::tally::effective_charter_hash(db, &test_station().public_key())
+    }
+    fn enacted_statutes(
+        db: &Database,
+        now: i64,
+    ) -> Result<Vec<crate::statute::EnactedStatute>, StatuteError> {
+        crate::statute::enacted_statutes(db, now, &test_station().public_key())
     }
 
     // --- The sweep -----------------------------------------------------------
@@ -314,7 +346,7 @@ mod tests {
     #[test]
     fn a_passed_statute_is_deferred_until_its_time_then_enacted() {
         let db = fresh_db();
-        let station = Keypair::generate();
+        let station = test_station();
         let members = established_members(&db, &station, 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
@@ -353,7 +385,7 @@ mod tests {
     #[test]
     fn an_emergency_is_enacted_the_moment_it_passes() {
         let db = fresh_db();
-        let station = Keypair::generate();
+        let station = test_station();
         let members = established_members(&db, &station, 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
@@ -383,7 +415,7 @@ mod tests {
     #[test]
     fn a_failed_proposal_is_never_enacted() {
         let db = fresh_db();
-        let station = Keypair::generate();
+        let station = test_station();
         let members = established_members(&db, &station, 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
@@ -414,7 +446,7 @@ mod tests {
     #[test]
     fn the_guard_refuses_an_early_enactment() {
         let db = fresh_db();
-        let station = Keypair::generate();
+        let station = test_station();
         let members = established_members(&db, &station, 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
@@ -438,7 +470,7 @@ mod tests {
     #[test]
     fn an_enacted_amendment_supersedes_the_charter() {
         let db = fresh_db();
-        let station = Keypair::generate();
+        let station = test_station();
         let members = established_members(&db, &station, 4, NOW);
         let v1_hash = publish_genesis(&db, &members);
         let v1 = charter_body(1, None);
@@ -480,7 +512,7 @@ mod tests {
     #[test]
     fn a_failed_amendment_does_not_supersede_even_if_a_record_is_forged() {
         let db = fresh_db();
-        let station = Keypair::generate();
+        let station = test_station();
         let members = established_members(&db, &station, 4, NOW);
         let v1_hash = publish_genesis(&db, &members);
         let v1 = charter_body(1, None);

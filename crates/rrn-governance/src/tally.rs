@@ -47,6 +47,7 @@
 //! when the ballots and the electorate are both frozen. A proposal that never
 //! published has no counting ballots and concludes [`Failed`](ProposalOutcome::Failed).
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_reputation::staking::grace_electorate_asof;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
@@ -99,9 +100,14 @@ pub struct VoteTally {
 /// [`TallyError::UnknownProposal`] if the log has no authorized record of the
 /// proposal, and [`TallyError::NoCharter`] if no Charter has been published to
 /// supply the thresholds.
-pub fn tally(db: &Database, proposal_id: &ProposalId, now: i64) -> Result<VoteTally, TallyError> {
-    let charter = effective_charter(db)?.ok_or(TallyError::NoCharter)?;
-    count_against(db, proposal_id, now, &charter)
+pub fn tally(
+    db: &Database,
+    proposal_id: &ProposalId,
+    now: i64,
+    station: &PublicKey,
+) -> Result<VoteTally, TallyError> {
+    let charter = effective_charter(db, station)?.ok_or(TallyError::NoCharter)?;
+    count_against(db, proposal_id, now, &charter, station)
 }
 
 /// The community's effective Charter: the [founder root](crate::charter::founder_charter)
@@ -118,7 +124,10 @@ pub fn tally(db: &Database, proposal_id: &ProposalId, now: i64) -> Result<VoteTa
 /// The amendment is judged against the *prior* Charter — the one already in hand —
 /// never against [`tally`] (which would resolve the effective Charter again), so
 /// there is no recursion.
-pub fn effective_charter(db: &Database) -> Result<Option<Charter>, TallyError> {
+pub fn effective_charter(
+    db: &Database,
+    station: &PublicKey,
+) -> Result<Option<Charter>, TallyError> {
     let Some(root) = crate::charter::founder_charter(db)? else {
         return Ok(None);
     };
@@ -126,7 +135,7 @@ pub fn effective_charter(db: &Database) -> Result<Option<Charter>, TallyError> {
     let mut current_hash = root.charter_hash();
 
     let log = AppendLog::new(db);
-    let amendments: Vec<Proposal> = all_proposals(&log, db)?
+    let amendments: Vec<Proposal> = all_proposals(&log, db, station)?
         .into_iter()
         .filter(|p| matches!(p.kind, ProposalKind::CharterAmendment { .. }))
         .collect();
@@ -139,12 +148,13 @@ pub fn effective_charter(db: &Database) -> Result<Option<Charter>, TallyError> {
             };
             if new_charter.version != current.version + 1
                 || new_charter.previous_hash != Some(current_hash)
-                || !is_implemented(&log, &p.proposal_id)
+                || !is_implemented(&log, &p.proposal_id, station)
             {
                 continue;
             }
             // Re-derive passage against the Charter this amendment supersedes.
-            let passed = count_against(db, &p.proposal_id, p.implementation_at, &current)?.outcome
+            let passed = count_against(db, &p.proposal_id, p.implementation_at, &current, station)?
+                .outcome
                 == Some(ProposalOutcome::Passed);
             if !passed {
                 continue;
@@ -164,8 +174,11 @@ pub fn effective_charter(db: &Database) -> Result<Option<Charter>, TallyError> {
 /// The `charter_hash` of the [effective Charter](effective_charter), or `None` if
 /// none is published. The content address the community profile and treaty
 /// partners pin, reflecting any enacted amendment.
-pub fn effective_charter_hash(db: &Database) -> Result<Option<rrn_crypto::hash::Hash>, TallyError> {
-    Ok(effective_charter(db)?.map(|c| c.hash()))
+pub fn effective_charter_hash(
+    db: &Database,
+    station: &PublicKey,
+) -> Result<Option<rrn_crypto::hash::Hash>, TallyError> {
+    Ok(effective_charter(db, station)?.map(|c| c.hash()))
 }
 
 /// Counts a proposal's ballots as of `now` against an explicit `governing`
@@ -179,10 +192,11 @@ fn count_against(
     proposal_id: &ProposalId,
     now: i64,
     governing: &Charter,
+    station: &PublicKey,
 ) -> Result<VoteTally, TallyError> {
     let log = AppendLog::new(db);
 
-    let records = proposal_records(&log, proposal_id, db)?;
+    let records = proposal_records(&log, proposal_id, db, station)?;
     let Some(proposal) = records.proposal.as_ref() else {
         return Err(TallyError::UnknownProposal(*proposal_id));
     };
@@ -192,7 +206,7 @@ fn count_against(
     // the emergency's activation position (ADR-0023 §3, §3c). Every other proposal
     // keeps its ordinary thresholds and its own open position.
     let emergency = if proposal.kind.is_emergency() {
-        crate::emergency::emergency_for_proposal(db, records.open_time, records.open_seq)
+        crate::emergency::emergency_for_proposal(db, records.open_time, records.open_seq, station)
             .map_err(|e| TallyError::Emergency(Box::new(e)))?
     } else {
         None
@@ -204,7 +218,7 @@ fn count_against(
     };
 
     let (mut yes, mut no, mut abstain) = (0u32, 0u32, 0u32);
-    for choice in votes(&log, proposal_id, db)?.into_values() {
+    for choice in votes(&log, proposal_id, db, station)?.into_values() {
         match choice {
             VoteChoice::Yes => yes += 1,
             VoteChoice::No => no += 1,
@@ -306,8 +320,8 @@ pub enum TallyError {
 mod tests {
     use super::*;
     use crate::charter::{create_charter, AmendmentRules, CharterParams, GovernanceStructure};
-    use crate::proposal::{append_cosign, append_proposal, Proposal, ProposalCosign, ProposalKind};
-    use crate::vote::{append_vote, SignedVote, Vote};
+    use crate::proposal::{append_proposal, Proposal, ProposalCosign, ProposalKind};
+    use crate::vote::{SignedVote, Vote};
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::signed::SignedPayload;
     use rrn_identity::address::Address;
@@ -479,22 +493,44 @@ mod tests {
         p
     }
 
-    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies a
-    /// station keypair and the test charter body for the window attestation.
+    /// The fixed station key the tests' window attestations are signed by — so the
+    /// reader wrappers below can pin against it (T2.1.4). A deterministic key, not a
+    /// throwaway, precisely because replay now pins the window signer.
+    fn test_station() -> Keypair {
+        Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
+    }
+
+    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies the fixed
+    /// [`test_station`] keypair and the test charter body for the window attestation.
     fn propose(
         log: &mut AppendLog,
         signed: crate::proposal::SignedProposal,
         db: &Database,
         at: i64,
     ) -> Result<rrn_storage::log::LogEntry, crate::proposal::ProposalError> {
-        append_proposal(
-            log,
-            signed,
-            db,
-            &Keypair::generate(),
-            &test_charter_body(),
-            at,
-        )
+        append_proposal(log, signed, db, &test_station(), &test_charter_body(), at)
+    }
+
+    // Reader/writer wrappers that inject the fixed test-station pin (T2.1.4), so the
+    // test bodies keep their pre-pin call shape.
+    fn append_cosign(
+        log: &mut AppendLog,
+        signed: SignedPayload<ProposalCosign>,
+        db: &Database,
+        at: i64,
+    ) -> Result<rrn_storage::log::LogEntry, ProposalError> {
+        crate::proposal::append_cosign(log, signed, db, &test_station().public_key(), at)
+    }
+    fn append_vote(
+        log: &mut AppendLog,
+        signed: SignedVote,
+        db: &Database,
+        at: i64,
+    ) -> Result<rrn_storage::log::LogEntry, VoteError> {
+        crate::vote::append_vote(log, signed, db, &test_station().public_key(), at)
+    }
+    fn tally(db: &Database, id: &ProposalId, now: i64) -> Result<VoteTally, TallyError> {
+        super::tally(db, id, now, &test_station().public_key())
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedPayload<ProposalCosign> {
