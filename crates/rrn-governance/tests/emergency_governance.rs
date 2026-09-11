@@ -41,7 +41,9 @@ fn addr(kp: &Keypair) -> Address {
 }
 
 fn station() -> Keypair {
-    Keypair::generate()
+    // Fixed so the reader pins can be given the same station key the
+    // write helpers sign attestations with.
+    Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
 }
 
 /// Publishes a founder-signed genesis charter for community `commons` with the
@@ -100,7 +102,14 @@ fn em_lapse(db: &Database, author: &Keypair, decl_hash: Hash, at: i64) -> Hash {
     };
     let hash = l.hash();
     let mut log = AppendLog::new(db);
-    emergency::append_lapse(&mut log, SignedPayload::sign(l, author), db, at).unwrap();
+    emergency::append_lapse(
+        &mut log,
+        SignedPayload::sign(l, author),
+        db,
+        &station().public_key(),
+        at,
+    )
+    .unwrap();
     hash
 }
 
@@ -135,10 +144,15 @@ fn propose_emergency(
         at,
     )
     .unwrap();
-    rrn_governance::proposal::proposal_records(&AppendLog::new(db), &id, db)
-        .unwrap()
-        .proposal
-        .unwrap()
+    rrn_governance::proposal::proposal_records(
+        &AppendLog::new(db),
+        &id,
+        db,
+        &station().public_key(),
+    )
+    .unwrap()
+    .proposal
+    .unwrap()
 }
 
 fn cosign_prop(db: &Database, cosigner: &Keypair, p: &Proposal, at: i64) {
@@ -148,7 +162,14 @@ fn cosign_prop(db: &Database, cosigner: &Keypair, p: &Proposal, at: i64) {
         cosigned_at: at,
     };
     let mut log = AppendLog::new(db);
-    append_cosign(&mut log, SignedPayload::sign(c, cosigner), db, at).unwrap();
+    append_cosign(
+        &mut log,
+        SignedPayload::sign(c, cosigner),
+        db,
+        &station().public_key(),
+        at,
+    )
+    .unwrap();
 }
 
 fn vote_prop(db: &Database, voter: &Keypair, p: &Proposal, choice: VoteChoice, at: i64) {
@@ -159,7 +180,14 @@ fn vote_prop(db: &Database, voter: &Keypair, p: &Proposal, choice: VoteChoice, a
         cast_at: at,
     };
     let mut log = AppendLog::new(db);
-    append_vote(&mut log, SignedPayload::sign(v, voter), db, at).unwrap();
+    append_vote(
+        &mut log,
+        SignedPayload::sign(v, voter),
+        db,
+        &station().public_key(),
+        at,
+    )
+    .unwrap();
 }
 
 /// A 3-founder grace community, charter published, plus a station keypair.
@@ -176,7 +204,7 @@ fn activate(db: &Database, st: &Keypair, founders: &[Keypair], at: i64) -> Hash 
     let h = declare(db, st, &founders[0], 72 * 3600, at);
     em_cosign(db, st, &founders[1], h, at);
     assert!(
-        emergency::active_emergency_at(db, at + 1, u64::MAX)
+        emergency::active_emergency_at(db, at + 1, u64::MAX, &station().public_key())
             .unwrap()
             .is_some(),
         "author + one co-sign should cross the two-thirds bar for N=3"
@@ -193,17 +221,20 @@ fn a_declaration_needs_the_supermajority_and_then_compresses_the_window() {
     let h = declare(&db, &st, &founders[0], 72 * 3600, t0);
 
     // The author's lone signature is 1 of the 2 needed (ceil(2*3/3)); not active yet.
-    assert!(emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
-        .unwrap()
-        .is_none());
+    assert!(
+        emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_none()
+    );
 
     em_cosign(&db, &st, &founders[1], h, t0);
-    let active = emergency::active_emergency_at(&db, t0 + 1, u64::MAX).unwrap();
+    let active =
+        emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key()).unwrap();
     assert!(active.is_some());
     assert_eq!(active.unwrap().scheduled_expiry, t0 + 72 * 3600);
 
     // An Emergency proposal admitted now runs the compressed 24 h window, not 7 d.
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t1 = t0 + 10;
@@ -222,7 +253,7 @@ fn an_emergency_proposal_with_no_declaration_keeps_the_full_phase1_window() {
     // its ordinary 7-day window and immediate effect — the intersection is what
     // compresses, never the kind alone.
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -237,7 +268,7 @@ fn compressed_window_anchors_on_admission_not_the_author_clock() {
     let (db, founders, st) = three_founder_community();
     let t0 = 5_000_000;
     activate(&db, &st, &founders, t0);
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     // `propose_emergency` sets an absurd created_at (-999_999); the window must run
@@ -254,12 +285,12 @@ fn an_emergency_measure_that_would_not_lapse_is_refused_at_admission() {
     let (db, founders, st) = three_founder_community();
     let t0 = 1_000_000;
     let h = activate(&db, &st, &founders, t0);
-    let scheduled = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+    let scheduled = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap()
         .scheduled_expiry;
     let _ = h;
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let at = t0 + 10;
@@ -296,7 +327,7 @@ fn an_emergency_measure_that_would_not_lapse_is_refused_at_admission() {
 #[test]
 fn an_undeclared_emergency_measure_is_bounded_to_thirty_days() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let at = 1_000_000;
@@ -346,18 +377,20 @@ fn a_hostile_sub_floor_charter_cannot_lower_the_window_or_the_bars() {
     // The floored two-thirds bar still needs 2 of 3: a lone author does not activate.
     let h = declare(&db, &st, &founders[0], 72 * 3600, t0);
     assert!(
-        emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+        emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
             .unwrap()
             .is_none(),
         "the 10% declaration pct must not lower the bar below two-thirds"
     );
     em_cosign(&db, &st, &founders[1], h, t0);
-    assert!(emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
-        .unwrap()
-        .is_some());
+    assert!(
+        emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_some()
+    );
 
     // The window stays at the 24 h floor, not the charter's 60 s.
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let at = t0 + 10;
@@ -370,7 +403,7 @@ fn a_hostile_sub_floor_charter_cannot_lower_the_window_or_the_bars() {
 #[test]
 fn charter_amendments_are_frozen_during_an_emergency_and_admit_after_lapse() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -405,7 +438,7 @@ fn charter_amendments_are_frozen_during_an_emergency_and_admit_after_lapse() {
     let lapse = em_lapse(&db, &founders[0], h, t0 + 20);
     em_cosign(&db, &st, &founders[1], lapse, t0 + 20);
     assert!(
-        emergency::active_emergency_at(&db, t0 + 21, u64::MAX)
+        emergency::active_emergency_at(&db, t0 + 21, u64::MAX, &station().public_key())
             .unwrap()
             .is_none(),
         "the lapse should end the emergency"
@@ -432,12 +465,16 @@ fn an_emergency_expires_exactly_at_its_scheduled_bound() {
     let expiry = t0 + 72 * 3600;
     // One second before the bound: active. One second past: expired — with no
     // renewal record extending it.
-    assert!(emergency::active_emergency_at(&db, expiry, u64::MAX)
-        .unwrap()
-        .is_some());
-    assert!(emergency::active_emergency_at(&db, expiry + 1, u64::MAX)
-        .unwrap()
-        .is_none());
+    assert!(
+        emergency::active_emergency_at(&db, expiry, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        emergency::active_emergency_at(&db, expiry + 1, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -451,7 +488,7 @@ fn a_chain_cannot_exceed_the_duration_cap() {
     let t0 = 1_000_000;
     let h1 = declare(&db, &st, &founders[0], seven_d, t0);
     em_cosign(&db, &st, &founders[1], h1, t0);
-    let e1 = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+    let e1 = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
 
@@ -459,7 +496,7 @@ fn a_chain_cannot_exceed_the_duration_cap() {
     let t1 = e1.scheduled_expiry + 1; // still < end + 14 d cooldown → continuation
     let h2 = declare(&db, &st, &founders[0], seven_d, t1);
     em_cosign(&db, &st, &founders[1], h2, t1);
-    let e2 = emergency::active_emergency_at(&db, t1 + 1, u64::MAX)
+    let e2 = emergency::active_emergency_at(&db, t1 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
     assert_eq!(e2.renewal_count, 1);
@@ -471,7 +508,7 @@ fn a_chain_cannot_exceed_the_duration_cap() {
     let h3 = declare(&db, &st, &founders[0], seven_d, t2);
     em_cosign(&db, &st, &founders[1], h3, t2);
     assert!(
-        emergency::active_emergency_at(&db, t2 + 1, u64::MAX)
+        emergency::active_emergency_at(&db, t2 + 1, u64::MAX, &station().public_key())
             .unwrap()
             .is_none(),
         "a third 7-day continuation exceeds the 14-day chain cap and must not activate"
@@ -487,7 +524,7 @@ fn the_cooldown_refuses_a_fresh_declaration_too_soon_after_a_chain() {
     let t0 = 1_000_000;
     let h1 = declare(&db, &st, &founders[0], DAY, t0); // 24 h
     em_cosign(&db, &st, &founders[1], h1, t0);
-    let e1 = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+    let e1 = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
 
@@ -498,7 +535,7 @@ fn the_cooldown_refuses_a_fresh_declaration_too_soon_after_a_chain() {
     let far = e1.scheduled_expiry + EMERGENCY_COOLDOWN_SECS + 1;
     let h2 = declare(&db, &st, &founders[0], DAY, far);
     em_cosign(&db, &st, &founders[1], h2, far);
-    let e2 = emergency::active_emergency_at(&db, far + 1, u64::MAX)
+    let e2 = emergency::active_emergency_at(&db, far + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
     assert_eq!(e2.renewal_count, 0, "beyond the cooldown, a fresh chain");
@@ -509,7 +546,7 @@ fn the_cooldown_refuses_a_fresh_declaration_too_soon_after_a_chain() {
 #[test]
 fn a_ballot_admitted_before_close_counts_even_after_the_emergency_lapses() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -526,9 +563,11 @@ fn a_ballot_admitted_before_close_counts_even_after_the_emergency_lapses() {
     let lapse_at = at + 100;
     let lapse = em_lapse(&db, &founders[0], h, lapse_at);
     em_cosign(&db, &st, &founders[1], lapse, lapse_at);
-    assert!(emergency::active_emergency_at(&db, lapse_at + 1, u64::MAX)
-        .unwrap()
-        .is_none());
+    assert!(
+        emergency::active_emergency_at(&db, lapse_at + 1, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_none()
+    );
 
     // Ballots admitted AFTER the lapse but BEFORE the proposal's own close still
     // count — the emergency's lapse does not retroactively shut an open compressed
@@ -539,7 +578,7 @@ fn a_ballot_admitted_before_close_counts_even_after_the_emergency_lapses() {
     vote_prop(&db, &founders[1], &p, VoteChoice::Yes, vote_at);
     vote_prop(&db, &founders[2], &p, VoteChoice::Yes, vote_at);
 
-    let t = tally(&db, &p.proposal_id, close + 1).unwrap();
+    let t = tally(&db, &p.proposal_id, close + 1, &station().public_key()).unwrap();
     assert_eq!(
         t.yes_count, 3,
         "ballots before close count despite the lapse"
@@ -556,7 +595,7 @@ fn a_ballot_admitted_before_close_counts_even_after_the_emergency_lapses() {
 #[test]
 fn a_late_replica_derives_the_identical_emergency_state_and_tally() {
     let (db1, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db1)
+    let charter = rrn_governance::tally::effective_charter(&db1, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -570,8 +609,8 @@ fn a_late_replica_derives_the_identical_emergency_state_and_tally() {
     }
     let close = p.voting_ends_at;
 
-    let tl1 = emergency::emergency_timeline(&db1).unwrap();
-    let ty1 = tally(&db1, &p.proposal_id, close + 1).unwrap();
+    let tl1 = emergency::emergency_timeline(&db1, &station().public_key()).unwrap();
+    let ty1 = tally(&db1, &p.proposal_id, close + 1, &station().public_key()).unwrap();
     assert_eq!(tl1.len(), 1);
     assert_eq!(ty1.outcome, Some(ProposalOutcome::Passed));
 
@@ -587,8 +626,8 @@ fn a_late_replica_derives_the_identical_emergency_state_and_tally() {
             dst.append_raw(entry.unwrap().payload, late).unwrap();
         }
     }
-    let tl2 = emergency::emergency_timeline(&db2).unwrap();
-    let ty2 = tally(&db2, &p.proposal_id, close + 1).unwrap();
+    let tl2 = emergency::emergency_timeline(&db2, &station().public_key()).unwrap();
+    let ty2 = tally(&db2, &p.proposal_id, close + 1, &station().public_key()).unwrap();
     assert_eq!(tl1, tl2, "two replicas must derive the identical timeline");
     assert_eq!(
         (ty1.outcome, ty1.eligible_voters, ty1.yes_count),
@@ -598,7 +637,10 @@ fn a_late_replica_derives_the_identical_emergency_state_and_tally() {
     let _ = h;
 
     // Repeated derives on the same db are stable.
-    assert_eq!(tl1, emergency::emergency_timeline(&db1).unwrap());
+    assert_eq!(
+        tl1,
+        emergency::emergency_timeline(&db1, &station().public_key()).unwrap()
+    );
 }
 
 // --- §1 kind-wide expiry enforcement ----------------------------------------
@@ -606,7 +648,7 @@ fn a_late_replica_derives_the_identical_emergency_state_and_tally() {
 #[test]
 fn an_expired_emergency_measure_drops_out_of_the_in_force_set() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -624,9 +666,14 @@ fn an_expired_emergency_measure_drops_out_of_the_in_force_set() {
     rrn_governance::lifecycle::enact_due(&db, &st, close + 1).unwrap();
 
     // In force before its expiry, gone after (kind-wide §1 enforcement).
-    assert_eq!(enacted_statutes(&db, close + 1).unwrap().len(), 1);
+    assert_eq!(
+        enacted_statutes(&db, close + 1, &station().public_key())
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(
-        enacted_statutes(&db, measure_expiry + 1)
+        enacted_statutes(&db, measure_expiry + 1, &station().public_key())
             .unwrap()
             .is_empty(),
         "an expired emergency measure has no effect"
@@ -638,7 +685,7 @@ fn an_expired_emergency_measure_drops_out_of_the_in_force_set() {
 #[test]
 fn the_raised_emergency_quorum_binds_where_the_statute_quorum_would_pass() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -651,7 +698,13 @@ fn the_raised_emergency_quorum_binds_where_the_statute_quorum_would_pass() {
     cosign_prop(&db, &founders[1], &em, at);
     cosign_prop(&db, &founders[2], &em, at);
     vote_prop(&db, &founders[0], &em, VoteChoice::Yes, at + 1);
-    let t = tally(&db, &em.proposal_id, em.voting_ends_at + 1).unwrap();
+    let t = tally(
+        &db,
+        &em.proposal_id,
+        em.voting_ends_at + 1,
+        &station().public_key(),
+    )
+    .unwrap();
     assert_eq!(t.eligible_voters, 3);
     assert!(!t.quorum_met, "1 of 3 is below the 50% emergency quorum");
     assert_eq!(t.outcome, Some(ProposalOutcome::Failed));
@@ -678,15 +731,26 @@ fn the_raised_emergency_quorum_binds_where_the_statute_quorum_would_pass() {
             at,
         )
         .unwrap();
-        rrn_governance::proposal::proposal_records(&AppendLog::new(&db), &id, &db)
-            .unwrap()
-            .proposal
-            .unwrap()
+        rrn_governance::proposal::proposal_records(
+            &AppendLog::new(&db),
+            &id,
+            &db,
+            &station().public_key(),
+        )
+        .unwrap()
+        .proposal
+        .unwrap()
     };
     cosign_prop(&db, &founders[1], &statute, at);
     cosign_prop(&db, &founders[2], &statute, at);
     vote_prop(&db, &founders[0], &statute, VoteChoice::Yes, at + 1);
-    let ts = tally(&db, &statute.proposal_id, statute.voting_ends_at + 1).unwrap();
+    let ts = tally(
+        &db,
+        &statute.proposal_id,
+        statute.voting_ends_at + 1,
+        &station().public_key(),
+    )
+    .unwrap();
     assert!(ts.quorum_met, "1 of 3 clears the 30% statute quorum");
     assert_eq!(ts.outcome, Some(ProposalOutcome::Passed));
 }
@@ -703,7 +767,7 @@ fn the_consecutive_renewal_count_cap_refuses_a_fourth_activation() {
     for _ in 0..3 {
         let h = declare(&db, &st, &founders[0], DAY, instant);
         em_cosign(&db, &st, &founders[1], h, instant);
-        let e = emergency::active_emergency_at(&db, instant + 1, u64::MAX)
+        let e = emergency::active_emergency_at(&db, instant + 1, u64::MAX, &station().public_key())
             .unwrap()
             .unwrap();
         renewals.push(e.renewal_count);
@@ -715,7 +779,7 @@ fn the_consecutive_renewal_count_cap_refuses_a_fourth_activation() {
     let h4 = declare(&db, &st, &founders[0], DAY, instant);
     em_cosign(&db, &st, &founders[1], h4, instant);
     assert!(
-        emergency::active_emergency_at(&db, instant + 1, u64::MAX)
+        emergency::active_emergency_at(&db, instant + 1, u64::MAX, &station().public_key())
             .unwrap()
             .is_none(),
         "a fourth consecutive activation exceeds the renewal count cap"
@@ -727,7 +791,7 @@ fn the_consecutive_renewal_count_cap_refuses_a_fourth_activation() {
 #[test]
 fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -757,11 +821,15 @@ fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
         )
         .unwrap();
     }
-    let amendment =
-        rrn_governance::proposal::proposal_records(&AppendLog::new(&db), &amendment_id, &db)
-            .unwrap()
-            .proposal
-            .unwrap();
+    let amendment = rrn_governance::proposal::proposal_records(
+        &AppendLog::new(&db),
+        &amendment_id,
+        &db,
+        &station().public_key(),
+    )
+    .unwrap()
+    .proposal
+    .unwrap();
     for c in &founders[1..3] {
         cosign_prop(&db, c, &amendment, t0);
     }
@@ -782,9 +850,11 @@ fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
     );
     let h = declare(&db, &st, &founders[0], 7 * DAY, act_at);
     em_cosign(&db, &st, &founders[1], h, act_at);
-    assert!(emergency::active_emergency_at(&db, due, u64::MAX)
-        .unwrap()
-        .is_some());
+    assert!(
+        emergency::active_emergency_at(&db, due, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_some()
+    );
 
     let enacted = rrn_governance::lifecycle::enact_due(&db, &st, due).unwrap();
     assert!(
@@ -792,7 +862,7 @@ fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
         "the amendment must not enact while the emergency is active"
     );
     assert_eq!(
-        rrn_governance::tally::effective_charter(&db)
+        rrn_governance::tally::effective_charter(&db, &station().public_key())
             .unwrap()
             .unwrap()
             .version,
@@ -806,13 +876,15 @@ fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
     assert!(lapse_at < act_at + 7 * DAY, "lapse before natural expiry");
     let lapse = em_lapse(&db, &founders[0], h, lapse_at);
     em_cosign(&db, &st, &founders[1], lapse, lapse_at);
-    assert!(emergency::active_emergency_at(&db, lapse_at + 1, u64::MAX)
-        .unwrap()
-        .is_none());
+    assert!(
+        emergency::active_emergency_at(&db, lapse_at + 1, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_none()
+    );
     let enacted = rrn_governance::lifecycle::enact_due(&db, &st, lapse_at + 1).unwrap();
     assert!(enacted.contains(&amendment.proposal_id));
     assert_eq!(
-        rrn_governance::tally::effective_charter(&db)
+        rrn_governance::tally::effective_charter(&db, &station().public_key())
             .unwrap()
             .unwrap()
             .version,
@@ -826,7 +898,7 @@ fn amendment_enactment_is_deferred_during_emergency_then_enacts_after_lapse() {
 #[test]
 fn a_ballot_admitted_after_the_compressed_close_is_refused() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -847,6 +919,7 @@ fn a_ballot_admitted_after_the_compressed_close_is_refused() {
         &mut log,
         SignedPayload::sign(v, &founders[0]),
         &db,
+        &station().public_key(),
         p.voting_ends_at + 1,
     )
     .unwrap_err();
@@ -966,13 +1039,15 @@ mod reputation {
         let h = declare(&db, &st, &members[0], 72 * 3600, AT);
         em_cosign(&db, &st, &members[1], h, AT);
         em_cosign(&db, &st, &members[2], h, AT);
-        assert!(emergency::active_emergency_at(&db, AT + 1, u64::MAX)
-            .unwrap()
-            .is_some());
+        assert!(
+            emergency::active_emergency_at(&db, AT + 1, u64::MAX, &station().public_key())
+                .unwrap()
+                .is_some()
+        );
 
         // A compressed Emergency proposal, published (default bar 3 co-signers, grace
         // off) by three of the four established members.
-        let charter = rrn_governance::tally::effective_charter(&db)
+        let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
             .unwrap()
             .unwrap();
         let p = propose_emergency(&db, &st, &charter, &members[0], AT + 3600, AT + 5);
@@ -998,8 +1073,14 @@ mod reputation {
             cast_at: AT + 20,
         };
         let mut log = AppendLog::new(&db);
-        let err =
-            append_vote(&mut log, SignedPayload::sign(v, &newcomer), &db, AT + 20).unwrap_err();
+        let err = append_vote(
+            &mut log,
+            SignedPayload::sign(v, &newcomer),
+            &db,
+            &station().public_key(),
+            AT + 20,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             rrn_governance::vote::VoteError::VoterNotEstablished { .. }
@@ -1009,7 +1090,13 @@ mod reputation {
         for c in &members[0..2] {
             vote_prop(&db, c, &p, VoteChoice::Yes, AT + 20);
         }
-        let t = tally(&db, &p.proposal_id, p.voting_ends_at + 1).unwrap();
+        let t = tally(
+            &db,
+            &p.proposal_id,
+            p.voting_ends_at + 1,
+            &station().public_key(),
+        )
+        .unwrap();
         assert_eq!(
             t.eligible_voters, 4,
             "the emergency denominator is pinned at activation — the newcomer is excluded"
@@ -1054,8 +1141,10 @@ fn a_forged_activation_cannot_block_the_real_one() {
     let h = declare(&db, &st, &founders[0], 72 * 3600, t0);
 
     // Only the author has signed (1 of the 2 needed): no legitimate emergency yet.
-    // An attacker replicates a bogus station attestation for the declaration.
-    let attacker = Keypair::generate();
+    // A bogus *station-signed* attestation for the declaration is injected — signed
+    // by the station key so it passes the signer pin and the structural gate
+    // (the crossing re-derivation) is what must reject it; the non-station-signer case
+    // is covered in tests/station_signer_pinning.rs.
     let forged = EmergencyActivated {
         declaration_hash: h,
         activation_instant: t0,
@@ -1064,23 +1153,29 @@ fn a_forged_activation_cannot_block_the_real_one() {
     };
     {
         let mut log = AppendLog::new(&db);
-        log.append(SignedPayload::sign(forged, &attacker), t0)
-            .unwrap();
+        log.append(SignedPayload::sign(forged, &st), t0).unwrap();
     }
     // The timeline never believed it — the crossing was not reached at its position.
-    assert!(emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
-        .unwrap()
-        .is_none());
+    assert!(
+        emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
+            .unwrap()
+            .is_none()
+    );
 
     // The genuine crossing co-signature must still activate the emergency.
     em_cosign(&db, &st, &founders[1], h, t0);
-    let active = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+    let active = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .expect("the real activation must not be blocked by the forgery");
     assert_eq!(active.declaration_hash, h);
     assert_eq!(active.scheduled_expiry, t0 + 72 * 3600);
     // Exactly one emergency is derived — the forgery is not double-counted.
-    assert_eq!(emergency::emergency_timeline(&db).unwrap().len(), 1);
+    assert_eq!(
+        emergency::emergency_timeline(&db, &station().public_key())
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// An attestation whose `scheduled_expiry` does not equal the recomputed
@@ -1118,8 +1213,9 @@ fn a_forged_activation_with_a_wrong_expiry_is_ignored_by_the_timeline() {
             .unwrap();
     }
 
-    // A forged attestation with an inflated expiry (not activation_instant + 72h).
-    let attacker = Keypair::generate();
+    // A *station-signed* attestation with an inflated expiry (not activation_instant +
+    // 72h): signed by the station key so the signer pin passes and the expiry recompute
+    // is what rejects it (the non-station case is in tests/station_signer_pinning.rs).
     let forged = EmergencyActivated {
         declaration_hash: h,
         activation_instant: t0,
@@ -1128,14 +1224,14 @@ fn a_forged_activation_with_a_wrong_expiry_is_ignored_by_the_timeline() {
     };
     {
         let mut log = AppendLog::new(&db);
-        log.append(SignedPayload::sign(forged, &attacker), t0)
-            .unwrap();
+        log.append(SignedPayload::sign(forged, &st), t0).unwrap();
     }
     assert!(
-        emergency::emergency_timeline(&db).unwrap().is_empty(),
+        emergency::emergency_timeline(&db, &station().public_key())
+            .unwrap()
+            .is_empty(),
         "an attestation with a mismatched scheduled_expiry is not believed"
     );
-    let _ = st;
 }
 
 /// An outsider (not in the pinned electorate) is refused at `append_cosign`, so an
@@ -1166,7 +1262,7 @@ fn is_active_at_is_inclusive_at_the_activation_instant() {
     let (db, founders, st) = three_founder_community();
     let t0 = 1_000_000;
     activate(&db, &st, &founders, t0);
-    let e = emergency::active_emergency_at(&db, t0 + 1, u64::MAX)
+    let e = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &station().public_key())
         .unwrap()
         .unwrap();
 
@@ -1190,7 +1286,7 @@ fn is_active_at_is_inclusive_at_the_activation_instant() {
 #[test]
 fn a_community_rename_amendment_does_not_break_emergency_declaration() {
     let (db, founders, st) = three_founder_community();
-    let charter = rrn_governance::tally::effective_charter(&db)
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
         .unwrap()
         .unwrap();
     let t0 = 1_000_000;
@@ -1221,11 +1317,15 @@ fn a_community_rename_amendment_does_not_break_emergency_declaration() {
         )
         .unwrap();
     }
-    let amendment =
-        rrn_governance::proposal::proposal_records(&AppendLog::new(&db), &amendment_id, &db)
-            .unwrap()
-            .proposal
-            .unwrap();
+    let amendment = rrn_governance::proposal::proposal_records(
+        &AppendLog::new(&db),
+        &amendment_id,
+        &db,
+        &station().public_key(),
+    )
+    .unwrap()
+    .proposal
+    .unwrap();
     for c in &founders[1..3] {
         cosign_prop(&db, c, &amendment, t0);
     }
@@ -1235,7 +1335,7 @@ fn a_community_rename_amendment_does_not_break_emergency_declaration() {
     let due = amendment.implementation_at;
     rrn_governance::lifecycle::enact_due(&db, &st, due).unwrap();
     assert_eq!(
-        rrn_governance::tally::effective_charter(&db)
+        rrn_governance::tally::effective_charter(&db, &station().public_key())
             .unwrap()
             .unwrap()
             .community_id,
@@ -1273,7 +1373,7 @@ fn a_community_rename_amendment_does_not_break_emergency_declaration() {
     let h = declare(&db, &st, &founders[0], 72 * 3600, due);
     em_cosign(&db, &st, &founders[1], h, due);
     assert!(
-        emergency::active_emergency_at(&db, due + 1, u64::MAX)
+        emergency::active_emergency_at(&db, due + 1, u64::MAX, &station().public_key())
             .unwrap()
             .is_some(),
         "an emergency in the founding community still activates after a rename"
@@ -1292,7 +1392,7 @@ fn competing_lapse_motions_aggregate_toward_one_lift_threshold() {
     // One member's lapse motion is 1 of the 2 needed — not yet lifted.
     let _l1 = em_lapse(&db, &founders[0], h, t0 + 10);
     assert!(
-        emergency::active_emergency_at(&db, t0 + 11, u64::MAX)
+        emergency::active_emergency_at(&db, t0 + 11, u64::MAX, &station().public_key())
             .unwrap()
             .is_some(),
         "a single lapse motion (1 of 2) does not lift the emergency"
@@ -1303,7 +1403,7 @@ fn competing_lapse_motions_aggregate_toward_one_lift_threshold() {
     // old per-lapse counting neither hash would have crossed.
     let _l2 = em_lapse(&db, &founders[1], h, t0 + 20);
     assert!(
-        emergency::active_emergency_at(&db, t0 + 21, u64::MAX)
+        emergency::active_emergency_at(&db, t0 + 21, u64::MAX, &station().public_key())
             .unwrap()
             .is_none(),
         "two competing lapse motions pool toward one threshold and lift the emergency"

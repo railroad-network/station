@@ -65,6 +65,7 @@
 use std::collections::HashMap;
 
 use dcbor::prelude::*;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -127,8 +128,9 @@ pub fn votes(
     log: &AppendLog,
     proposal_id: &ProposalId,
     db: &Database,
+    station: &PublicKey,
 ) -> Result<HashMap<Address, VoteChoice>, VoteError> {
-    let records = proposal_records(log, proposal_id, db)?;
+    let records = proposal_records(log, proposal_id, db, station)?;
     if records.proposal.is_none() {
         return Ok(HashMap::new());
     }
@@ -145,7 +147,7 @@ pub fn votes(
         .as_ref()
         .is_some_and(|p| p.kind.is_emergency());
     let (pin_time, pin_seq) =
-        crate::emergency::electorate_pin(db, is_emergency, open_time, open_seq)
+        crate::emergency::electorate_pin(db, is_emergency, open_time, open_seq, station)
             .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
 
     let founders = founder_set(db)?;
@@ -200,6 +202,7 @@ pub fn append_vote(
     log: &mut AppendLog,
     signed: SignedVote,
     db: &Database,
+    station: &PublicKey,
     now: i64,
 ) -> Result<LogEntry, VoteError> {
     let vote = &signed.payload;
@@ -211,7 +214,7 @@ pub fn append_vote(
         });
     }
 
-    let records = proposal_records(log, &vote.proposal_id, db)?;
+    let records = proposal_records(log, &vote.proposal_id, db, station)?;
     let Some(proposal) = records.proposal.as_ref() else {
         return Err(VoteError::UnknownProposal(vote.proposal_id));
     };
@@ -236,9 +239,14 @@ pub fn append_vote(
 
     // The governing electorate pin: emergency activation for a compressed-path
     // proposal (ADR-0023 §3c), the proposal's own open otherwise.
-    let (pin_time, pin_seq) =
-        crate::emergency::electorate_pin(db, proposal.kind.is_emergency(), open_time, open_seq)
-            .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
+    let (pin_time, pin_seq) = crate::emergency::electorate_pin(
+        db,
+        proposal.kind.is_emergency(),
+        open_time,
+        open_seq,
+        station,
+    )
+    .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
     if !is_eligible_asof(db, &founder_set(db)?, &vote.voter, pin_time, pin_seq)? {
         return Err(VoteError::VoterNotEstablished {
             voter: vote.voter,
@@ -246,7 +254,7 @@ pub fn append_vote(
         });
     }
 
-    if votes(log, &vote.proposal_id, db)?.contains_key(&vote.voter) {
+    if votes(log, &vote.proposal_id, db, station)?.contains_key(&vote.voter) {
         return Err(VoteError::AlreadyVoted {
             proposal_id: vote.proposal_id,
             voter: vote.voter,
@@ -376,7 +384,7 @@ impl TryFrom<CBOR> for Vote {
 mod tests {
     use super::*;
     use crate::charter::{AmendmentRules, Charter, GovernanceStructure};
-    use crate::proposal::{append_cosign, append_proposal, Proposal, ProposalCosign, ProposalKind};
+    use crate::proposal::{append_proposal, Proposal, ProposalCosign, ProposalKind};
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::serialize::to_canonical_bytes;
     use rrn_identity::attestation::Attestation;
@@ -518,15 +526,47 @@ mod tests {
         p
     }
 
-    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies a
-    /// station keypair and the default test charter for the window attestation.
+    /// The fixed station key the tests' window attestations are signed by, so the
+    /// reader wrappers can pin against it.
+    fn test_station() -> Keypair {
+        Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
+    }
+
+    /// Drop-in for the old `append_proposal(log, signed, db, at)`: supplies the fixed
+    /// [`test_station`] keypair and the default test charter for the window attestation.
     fn propose(
         log: &mut AppendLog,
         signed: crate::proposal::SignedProposal,
         db: &Database,
         at: i64,
     ) -> Result<LogEntry, ProposalError> {
-        append_proposal(log, signed, db, &Keypair::generate(), &test_charter(), at)
+        append_proposal(log, signed, db, &test_station(), &test_charter(), at)
+    }
+
+    // Wrappers injecting the fixed test-station pin, so test bodies keep
+    // their pre-pin call shape.
+    fn append_cosign(
+        log: &mut AppendLog,
+        signed: SignedPayload<ProposalCosign>,
+        db: &Database,
+        at: i64,
+    ) -> Result<LogEntry, ProposalError> {
+        crate::proposal::append_cosign(log, signed, db, &test_station().public_key(), at)
+    }
+    fn append_vote(
+        log: &mut AppendLog,
+        signed: SignedVote,
+        db: &Database,
+        at: i64,
+    ) -> Result<LogEntry, VoteError> {
+        super::append_vote(log, signed, db, &test_station().public_key(), at)
+    }
+    fn votes(
+        log: &AppendLog,
+        proposal_id: &ProposalId,
+        db: &Database,
+    ) -> Result<HashMap<Address, VoteChoice>, VoteError> {
+        super::votes(log, proposal_id, db, &test_station().public_key())
     }
 
     fn cosign(cosigner: &Keypair, proposal: &Proposal, at: i64) -> SignedPayload<ProposalCosign> {

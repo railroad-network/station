@@ -18,7 +18,7 @@
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_storage::log::AppendLog;
@@ -74,11 +74,14 @@ pub fn window_for(charter: &Charter, kind: &ProposalKind, admitted_at: i64) -> (
 /// A station's attestation of the window a proposal runs under, anchored on the
 /// station's admission of that proposal (ADR-0022).
 ///
-/// Station-signed on append. Its authority is not the signature but the facts it
-/// restates: the admission time it observed and the effective Charter it applied,
-/// both re-derivable. Carrying `charter_hash` records *which* Charter's windows
-/// were applied, so a later amendment cannot appear to have moved a live
-/// proposal's window on replay.
+/// Station-signed on append. Its authority **is** the station's signature: the
+/// admission instant it carries is station-local and re-stamped per replica
+/// ([`rrn_storage::log::LogEntry::created_at`]), so a replica cannot re-derive it
+/// from the author's `created_at` — the signed attestation is the only
+/// replica-identical statement of the window, and every reader pins its envelope
+/// signer to the community station key before believing it. Carrying
+/// `charter_hash` records *which* Charter's windows were applied, so a later
+/// amendment cannot appear to have moved a live proposal's window on replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProposalWindow {
     /// The proposal this window governs.
@@ -143,11 +146,15 @@ pub fn build_window(
     )
 }
 
-/// The window attestation for `proposal_id`, if the log carries one. Returns the
-/// earliest in log order (the station writes exactly one per proposal, on
-/// admission).
-pub fn window_of(log: &AppendLog, proposal_id: &ProposalId) -> Option<ProposalWindow> {
-    window_and_seq_of(log, proposal_id).map(|(w, _)| w)
+/// The window attestation for `proposal_id`, if the log carries one, pinned to the
+/// community `station` key. Returns the earliest in log order (the station writes
+/// exactly one per proposal, on admission).
+pub fn window_of(
+    log: &AppendLog,
+    proposal_id: &ProposalId,
+    station: &PublicKey,
+) -> Option<ProposalWindow> {
+    window_and_seq_of(log, proposal_id, station).map(|(w, _)| w)
 }
 
 /// Like [`window_of`], but also returns the log seq of the attestation entry —
@@ -158,9 +165,15 @@ pub fn window_of(log: &AppendLog, proposal_id: &ProposalId) -> Option<ProposalWi
 /// pre-injects the author's proposal bytes early over gossip cannot move the open
 /// position (it cannot forge the station's signature). Governance pins the
 /// electorate at this seq (ADR-0022 §5, "the attestation's log seq").
+///
+/// An entry whose envelope signer is not the community `station` key is **skipped**
+/// A forged window attestation is invisible to derivation exactly as a
+/// forged member record is, so it can never open a window or move the electorate
+/// pin. The first entry that both decodes *and* passes the station pin wins.
 pub fn window_and_seq_of(
     log: &AppendLog,
     proposal_id: &ProposalId,
+    station: &PublicKey,
 ) -> Option<(ProposalWindow, u64)> {
     for entry in log.iter_from(1) {
         let Ok(entry) = entry else {
@@ -169,6 +182,9 @@ pub fn window_and_seq_of(
         let Ok(record) = from_canonical_bytes::<ProposalWindow>(&entry.payload.bytes) else {
             continue;
         };
+        if entry.payload.signer != *station {
+            continue;
+        }
         if record.proposal_id == *proposal_id {
             return Some((record, entry.seq));
         }

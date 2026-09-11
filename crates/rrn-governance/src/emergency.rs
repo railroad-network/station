@@ -47,7 +47,7 @@
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -731,12 +731,14 @@ fn find_lapse(
 /// never landed). The earliest validated anchor wins, mirroring
 /// [`crate::window::window_and_seq_of`]'s "first attestation" rule.
 ///
-/// The anchor is a station attestation; station-signer pinning of these records
-/// is a tracked residual (a separate ticket, ADR-0027 precondition), so a forged
-/// anchor with a doctored `admitted_at` is not yet rejected here.
+/// The anchor is a station attestation; its envelope signer is pinned to the
+/// community `station` key, so a forged anchor carrying a doctored
+/// `admitted_at` is skipped and the genuine station anchor is the earliest
+/// validated one.
 fn declaration_admitted_at(
     log: &AppendLog,
     decl_hash: &Hash,
+    station: &PublicKey,
 ) -> Result<Option<i64>, EmergencyError> {
     for entry in log.iter_from(1) {
         let entry = entry?;
@@ -744,6 +746,9 @@ fn declaration_admitted_at(
         else {
             continue;
         };
+        if entry.payload.signer != *station {
+            continue;
+        }
         if anchor.declaration_hash == *decl_hash {
             return Ok(Some(anchor.admitted_at));
         }
@@ -894,8 +899,11 @@ fn clamp_duration(requested: i64) -> i64 {
 /// attestation, not recomputed from this replica's re-stamped admission clock; every
 /// other input is a log position. So every replica computes the identical timeline
 /// (replica determinism).
-pub fn emergency_timeline(db: &Database) -> Result<Vec<ActiveEmergency>, EmergencyError> {
-    Ok(derive_emergencies(db)?.timeline)
+pub fn emergency_timeline(
+    db: &Database,
+    station: &PublicKey,
+) -> Result<Vec<ActiveEmergency>, EmergencyError> {
+    Ok(derive_emergencies(db, station)?.timeline)
 }
 
 /// The full replay of the emergency records: the legitimate activations, the
@@ -918,7 +926,10 @@ struct EmergencyDerivation {
 /// (ADR-0023 §5, ADR-0027). A gossiped or forged marker that should never have
 /// been written is ignored; the earliest **validated** marker (activation or
 /// refusal) for a declaration wins and later ones for it are ignored.
-fn derive_emergencies(db: &Database) -> Result<EmergencyDerivation, EmergencyError> {
+fn derive_emergencies(
+    db: &Database,
+    station: &PublicKey,
+) -> Result<EmergencyDerivation, EmergencyError> {
     let log = AppendLog::new(db);
     let founders = founder_set(db)?;
 
@@ -988,6 +999,18 @@ fn derive_emergencies(db: &Database) -> Result<EmergencyDerivation, EmergencyErr
     for entry in log.iter_from(1) {
         let entry = entry?;
         let bytes = &entry.payload.bytes;
+
+        // Every marker this loop consumes — the admission anchor, the D1b
+        // refusal, and the activation — is a station attestation, trusted precisely
+        // because the station signed it (ADR-0022 §2). An entry whose envelope signer
+        // is not the community station key is skipped here, exactly as a forged member
+        // record is skipped in `find_declaration`, so a forged anchor/refusal/
+        // activation is invisible to derivation and can move no window, TTL, or
+        // activation decision. (Member records are not station-signed and never decode
+        // as these kinds anyway, so the early skip changes nothing for them.)
+        if entry.payload.signer != *station {
+            continue;
+        }
 
         // The declaration's admission anchor (ADR-0027 D2): record the earliest
         // one per declaration; it precedes any crossing in log order, so it is
@@ -1219,8 +1242,9 @@ pub fn active_emergency_at(
     db: &Database,
     admitted_at: i64,
     seq: u64,
+    station: &PublicKey,
 ) -> Result<Option<ActiveEmergency>, EmergencyError> {
-    Ok(emergency_timeline(db)?
+    Ok(emergency_timeline(db, station)?
         .into_iter()
         .find(|e| e.governs(admitted_at, seq)))
 }
@@ -1228,8 +1252,12 @@ pub fn active_emergency_at(
 /// Whether *any* emergency is active (declared, unlapsed, and within its scheduled
 /// span) as of station instant `now` — the community-wide predicate the charter
 /// freeze keys off (ADR-0023 §3b). Independent of any one proposal's position.
-pub fn is_emergency_active_now(db: &Database, now: i64) -> Result<bool, EmergencyError> {
-    Ok(active_emergency_at(db, now, u64::MAX)?.is_some())
+pub fn is_emergency_active_now(
+    db: &Database,
+    now: i64,
+    station: &PublicKey,
+) -> Result<bool, EmergencyError> {
+    Ok(active_emergency_at(db, now, u64::MAX, station)?.is_some())
 }
 
 /// A declaration's activation status, as re-derived from the log (ADR-0027).
@@ -1257,8 +1285,9 @@ pub fn declaration_status(
     db: &Database,
     decl_hash: &Hash,
     probe_instant: i64,
+    station: &PublicKey,
 ) -> Result<DeclarationStatus, EmergencyError> {
-    let d = derive_emergencies(db)?;
+    let d = derive_emergencies(db, station)?;
     if d.timeline.iter().any(|e| e.declaration_hash == *decl_hash) {
         return Ok(DeclarationStatus::Activated);
     }
@@ -1282,8 +1311,9 @@ pub fn emergency_for_proposal(
     db: &Database,
     admitted_at: i64,
     window_seq: u64,
+    station: &PublicKey,
 ) -> Result<Option<ActiveEmergency>, EmergencyError> {
-    active_emergency_at(db, admitted_at, window_seq)
+    active_emergency_at(db, admitted_at, window_seq, station)
 }
 
 /// The `(pin_time, pin_seq)` a proposal's **ballot eligibility and quorum
@@ -1297,9 +1327,10 @@ pub fn electorate_pin(
     is_emergency: bool,
     open_time: i64,
     open_seq: u64,
+    station: &PublicKey,
 ) -> Result<(i64, u64), EmergencyError> {
     if is_emergency {
-        if let Some(e) = emergency_for_proposal(db, open_time, open_seq)? {
+        if let Some(e) = emergency_for_proposal(db, open_time, open_seq, station)? {
             return Ok((e.activation_instant, e.activation_seq));
         }
     }
@@ -1353,15 +1384,19 @@ pub fn declaration_cosigners(
 /// honest superset, so a measure that was raised under the emergency and *failed* is
 /// still surfaced for review, not hidden; whether each passed is the tally's call. A
 /// pure read of the log — no new record kinds.
-pub fn emergency_report(db: &Database) -> Result<Vec<EmergencyReportActivation>, EmergencyError> {
-    let timeline = emergency_timeline(db)?;
+pub fn emergency_report(
+    db: &Database,
+    station: &PublicKey,
+) -> Result<Vec<EmergencyReportActivation>, EmergencyError> {
+    let timeline = emergency_timeline(db, station)?;
     let log = AppendLog::new(db);
     // Every Emergency-kind proposal, with its station-attested admission and window
     // position, so each can be attributed to the emergency that governed it.
     let mut emergency_proposals = Vec::new();
-    for p in crate::proposal::all_proposals(&log, db)? {
+    for p in crate::proposal::all_proposals(&log, db, station)? {
         if let ProposalKind::Emergency { expires_at } = p.kind {
-            if let Some((w, seq)) = crate::window::window_and_seq_of(&log, &p.proposal_id) {
+            if let Some((w, seq)) = crate::window::window_and_seq_of(&log, &p.proposal_id, station)
+            {
                 emergency_proposals.push((
                     p.proposal_id,
                     p.title.clone(),
@@ -1424,8 +1459,9 @@ pub struct InertDeclaration {
 pub fn inert_declarations(
     db: &Database,
     now: i64,
+    station: &PublicKey,
 ) -> Result<Vec<InertDeclaration>, EmergencyError> {
-    let derived = derive_emergencies(db)?;
+    let derived = derive_emergencies(db, station)?;
     let log = AppendLog::new(db);
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1590,6 +1626,7 @@ pub fn append_cosign(
             named: cosign.signer,
         });
     }
+    let station_pk = station.public_key();
     let founders = founder_set(db)?;
     let target = cosign.declaration_hash;
 
@@ -1607,7 +1644,7 @@ pub fn append_cosign(
             // resolved at the monotone-clamped admission instant (not raw `now`), so
             // a station clock regression cannot spuriously report no active emergency.
             let (open_seq, open_time) = next_admission(log, now)?;
-            let active = active_emergency_at(db, open_time, open_seq)?
+            let active = active_emergency_at(db, open_time, open_seq, &station_pk)?
                 .filter(|e| e.declaration_hash == lapse.declaration_hash)
                 .ok_or(EmergencyError::NotActive(lapse.declaration_hash))?;
             (false, active.activation_instant, active.activation_seq)
@@ -1632,7 +1669,7 @@ pub fn append_cosign(
     // instant is this co-sign's own prospective admission (`pin_time` for a
     // declaration target), which fixes the TTL comparison for the expired arm.
     if is_declaration {
-        match declaration_status(db, &target, pin_time)? {
+        match declaration_status(db, &target, pin_time, &station_pk)? {
             DeclarationStatus::Activated => {
                 return Err(EmergencyError::AlreadyActivated {
                     declaration: target,
@@ -1678,6 +1715,7 @@ pub fn append_lapse(
     log: &mut AppendLog,
     signed: SignedLapse,
     db: &Database,
+    station: &PublicKey,
     now: i64,
 ) -> Result<LogEntry, EmergencyError> {
     let lapse = &signed.payload;
@@ -1693,7 +1731,7 @@ pub fn append_lapse(
     // a station clock regression below the activation instant cannot refuse a valid
     // lapse.
     let (open_seq, open_time) = next_admission(log, now)?;
-    let active = active_emergency_at(db, open_time, open_seq)?
+    let active = active_emergency_at(db, open_time, open_seq, station)?
         .filter(|e| e.declaration_hash == lapse.declaration_hash)
         .ok_or(EmergencyError::NotActive(lapse.declaration_hash))?;
     if !is_eligible_asof(
@@ -1765,13 +1803,14 @@ fn try_activate(
     now: i64,
 ) -> Result<(), EmergencyError> {
     let log = AppendLog::new(db);
+    let station_pk = station.public_key();
 
     // A declaration already decided — activated earlier, or killed by a validated
     // refusal (ADR-0027 D1b) — writes no further marker. Judged against the
     // re-derived view (the same one a replica computes), never against a raw
     // attestation on the log, so a gossiped bogus marker cannot suppress or fake a
     // decision. The derivation's activation pairs are reused as the chain input.
-    let derived = derive_emergencies(db)?;
+    let derived = derive_emergencies(db, &station_pk)?;
     if derived.dead.contains(decl_hash)
         || derived
             .timeline
@@ -1816,9 +1855,10 @@ fn try_activate(
     // ADR-0027 D2: fail closed on the TTL against the declaration's signed
     // admission anchor. A crossing later than the TTL does not activate (and the
     // front door already refuses such a co-sign); a declaration with no anchor
-    // never activates. Saturating arithmetic: `admitted_at` is a signed instant an
-    // unpinned anchor could carry to an extreme value (the signer-pinning residual).
-    let Some(admitted_at) = declaration_admitted_at(&log, decl_hash)? else {
+    // never activates. The anchor's signer is pinned to the station, so a
+    // forged anchor cannot supply a doctored `admitted_at`; saturating arithmetic
+    // keeps the subtraction well-defined for any in-range instant regardless.
+    let Some(admitted_at) = declaration_admitted_at(&log, decl_hash, &station_pk)? else {
         return Ok(());
     };
     if act_time.saturating_sub(admitted_at) > EMERGENCY_DECLARATION_TTL {
