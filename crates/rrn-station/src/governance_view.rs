@@ -16,6 +16,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_governance::proposal::{
     all_proposals, effective_cosign_threshold, phase, proposal_records, Proposal, ProposalId,
     ProposalKind, ProposalPhase, DEFAULT_COSIGN_THRESHOLD,
@@ -147,8 +148,11 @@ pub struct StatuteSummary {
 
 /// The effective Charter as a view, or an unpublished placeholder while the
 /// community is still bootstrapping.
-pub fn charter_view(db: &Database) -> Result<CharterView, rrn_governance::tally::TallyError> {
-    let Some(charter) = effective_charter(db)? else {
+pub fn charter_view(
+    db: &Database,
+    station: &PublicKey,
+) -> Result<CharterView, rrn_governance::tally::TallyError> {
+    let Some(charter) = effective_charter(db, station)? else {
         return Ok(CharterView {
             published: false,
             version: 0,
@@ -195,13 +199,14 @@ pub fn charter_view(db: &Database) -> Result<CharterView, rrn_governance::tally:
 pub fn proposals_view(
     db: &Database,
     now: i64,
+    station: &PublicKey,
 ) -> Result<Vec<ProposalSummary>, GovernanceViewError> {
     let log = AppendLog::new(db);
-    let proposals = all_proposals(&log, db)?;
-    let enacted = enacted_ids(db, now)?;
+    let proposals = all_proposals(&log, db, station)?;
+    let enacted = enacted_ids(db, now, station)?;
     let mut rows = Vec::with_capacity(proposals.len());
     for proposal in proposals {
-        rows.push(summarize(db, &log, &proposal, now, &enacted)?);
+        rows.push(summarize(db, &log, &proposal, now, &enacted, station)?);
     }
     Ok(rows)
 }
@@ -211,13 +216,21 @@ pub fn proposal_view(
     db: &Database,
     proposal_id: &ProposalId,
     now: i64,
+    station: &PublicKey,
 ) -> Result<Option<ProposalDetail>, GovernanceViewError> {
     let log = AppendLog::new(db);
-    let records = proposal_records(&log, proposal_id, db)?;
+    let records = proposal_records(&log, proposal_id, db, station)?;
     let Some(proposal) = records.proposal.clone() else {
         return Ok(None);
     };
-    let summary = summarize(db, &log, &proposal, now, &enacted_ids(db, now)?)?;
+    let summary = summarize(
+        db,
+        &log,
+        &proposal,
+        now,
+        &enacted_ids(db, now, station)?,
+        station,
+    )?;
     let mut cosigners: Vec<String> = records.cosigners.iter().map(|a| a.to_string()).collect();
     cosigners.sort();
     Ok(Some(ProposalDetail {
@@ -228,8 +241,12 @@ pub fn proposal_view(
 }
 
 /// The statutes in force, derived from the log.
-pub fn statutes_view(db: &Database, now: i64) -> Result<Vec<StatuteSummary>, GovernanceViewError> {
-    Ok(enacted_statutes(db, now)?
+pub fn statutes_view(
+    db: &Database,
+    now: i64,
+    station: &PublicKey,
+) -> Result<Vec<StatuteSummary>, GovernanceViewError> {
+    Ok(enacted_statutes(db, now, station)?
         .into_iter()
         .map(|s| StatuteSummary {
             proposal_id: s.proposal.proposal_id.to_string(),
@@ -242,8 +259,12 @@ pub fn statutes_view(db: &Database, now: i64) -> Result<Vec<StatuteSummary>, Gov
 
 /// The content addresses of every proposal in force, computed once so a browse
 /// listing does not re-derive the (tally-heavy) statutes view per row.
-fn enacted_ids(db: &Database, now: i64) -> Result<HashSet<ProposalId>, GovernanceViewError> {
-    Ok(enacted_statutes(db, now)?
+fn enacted_ids(
+    db: &Database,
+    now: i64,
+    station: &PublicKey,
+) -> Result<HashSet<ProposalId>, GovernanceViewError> {
+    Ok(enacted_statutes(db, now, station)?
         .into_iter()
         .map(|s| s.proposal.proposal_id)
         .collect())
@@ -257,8 +278,9 @@ fn summarize(
     proposal: &Proposal,
     now: i64,
     enacted: &HashSet<ProposalId>,
+    station: &PublicKey,
 ) -> Result<ProposalSummary, GovernanceViewError> {
-    let records = proposal_records(log, &proposal.proposal_id, db)?;
+    let records = proposal_records(log, &proposal.proposal_id, db, station)?;
     // The publish bar clamps down during bootstrap grace (ADR-0015 § 3), so a
     // small founder set is not shown as forever un-published. The electorate is
     // pinned at the proposal's open log position (T2.1.3).
@@ -270,7 +292,7 @@ fn summarize(
         .to_string();
     // A tally needs a published Charter; before one exists (bootstrapping) there is
     // nothing to count against, so show an empty tally rather than failing the row.
-    let tally_view = match tally(db, &proposal.proposal_id, now) {
+    let tally_view = match tally(db, &proposal.proposal_id, now, station) {
         Ok(t) => tally_view(&t),
         Err(_) => TallyView {
             yes: 0,

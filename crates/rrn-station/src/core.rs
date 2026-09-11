@@ -2454,12 +2454,14 @@ impl Core {
     // --- governance (T1.9.7b) ----------------------------------------------
 
     fn m_governance_charter(&self) -> Result<serde_json::Value, rpc::RpcError> {
-        ok(&governance_view::charter_view(&self.db).map_err(internal)?)
+        let station = self.wallet.address.public_key();
+        ok(&governance_view::charter_view(&self.db, station).map_err(internal)?)
     }
 
     fn m_governance_proposals(&self) -> Result<serde_json::Value, rpc::RpcError> {
-        let proposals =
-            governance_view::proposals_view(&self.db, self.clock.now()).map_err(internal)?;
+        let station = self.wallet.address.public_key();
+        let proposals = governance_view::proposals_view(&self.db, self.clock.now(), station)
+            .map_err(internal)?;
         Ok(serde_json::json!({ "proposals": proposals }))
     }
 
@@ -2469,7 +2471,10 @@ impl Core {
     ) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::GovProposalParams = parse_params(req)?;
         let id = parse_proposal_id(&params.proposal_id)?;
-        match governance_view::proposal_view(&self.db, &id, self.clock.now()).map_err(internal)? {
+        let station = self.wallet.address.public_key();
+        match governance_view::proposal_view(&self.db, &id, self.clock.now(), station)
+            .map_err(internal)?
+        {
             Some(detail) => ok(&detail),
             None => Err(invalid_params(format!(
                 "no proposal {}",
@@ -2479,8 +2484,9 @@ impl Core {
     }
 
     fn m_governance_statutes(&self) -> Result<serde_json::Value, rpc::RpcError> {
-        let statutes =
-            governance_view::statutes_view(&self.db, self.clock.now()).map_err(internal)?;
+        let station = self.wallet.address.public_key();
+        let statutes = governance_view::statutes_view(&self.db, self.clock.now(), station)
+            .map_err(internal)?;
         Ok(serde_json::json!({ "statutes": statutes }))
     }
 
@@ -2679,7 +2685,7 @@ impl Core {
         let now = self.clock.now();
         // §3b founder-charter freeze: do not advance the founding ceremony while an
         // emergency is active (ADR-0023 §3b).
-        if emergency::is_emergency_active_now(&self.db, now)
+        if emergency::is_emergency_active_now(&self.db, now, &station.public_key())
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
         {
             return Err((
@@ -2729,7 +2735,7 @@ impl Core {
         let params: rpc::GovProposeParams = parse_params(req)?;
         let now = self.clock.now();
         let station = self.station_keypair();
-        let charter = effective_charter(&self.db)
+        let charter = effective_charter(&self.db, &station.public_key())
             .map_err(internal)?
             .ok_or_else(|| invalid_params("no charter published; run governance charter-init"))?;
         let kind = parse_proposal_kind(&params)?;
@@ -2769,12 +2775,17 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(cosign, &station),
             &self.db,
+            &station.public_key(),
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
-        let records =
-            rrn_governance::proposal::proposal_records(&AppendLog::new(&self.db), &id, &self.db)
-                .map_err(internal)?;
+        let records = rrn_governance::proposal::proposal_records(
+            &AppendLog::new(&self.db),
+            &id,
+            &self.db,
+            &station.public_key(),
+        )
+        .map_err(internal)?;
         ok(&rpc::GovCosignResult {
             cosigner_count: records.cosigner_count(),
         })
@@ -2801,6 +2812,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(vote, &station),
             &self.db,
+            &station.public_key(),
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
@@ -2835,11 +2847,13 @@ impl Core {
         &self,
         now: i64,
     ) -> Result<Option<rpc::EmergencyStatus>, rpc::RpcError> {
-        Ok(emergency::emergency_timeline(&self.db)
-            .map_err(internal)?
-            .into_iter()
-            .find(|e| e.is_active_at(now))
-            .map(|e| self.emergency_status(&e, now)))
+        Ok(
+            emergency::emergency_timeline(&self.db, self.wallet.address.public_key())
+                .map_err(internal)?
+                .into_iter()
+                .find(|e| e.is_active_at(now))
+                .map(|e| self.emergency_status(&e, now)),
+        )
     }
 
     /// §3b founder-charter freeze: no founder charter is published (or its ceremony
@@ -2848,7 +2862,8 @@ impl Core {
     /// Phase 1 (the ceremony pins version 1 and refuses once a charter exists), but
     /// enforced here so the freeze is on the asset, not one of its doors.
     fn ensure_charter_not_frozen(&self, now: i64) -> Result<(), rpc::RpcError> {
-        if emergency::is_emergency_active_now(&self.db, now).map_err(internal)? {
+        let station = self.wallet.address.public_key();
+        if emergency::is_emergency_active_now(&self.db, now, station).map_err(internal)? {
             return Err(invalid_params(
                 "the charter is frozen while an emergency is active (ADR-0023 §3b)",
             ));
@@ -2915,10 +2930,12 @@ impl Core {
         declaration_hash: Hash,
         now: i64,
     ) -> Result<bool, rpc::RpcError> {
-        Ok(emergency::emergency_timeline(&self.db)
-            .map_err(internal)?
-            .iter()
-            .any(|e| e.declaration_hash == declaration_hash && e.is_active_at(now)))
+        Ok(
+            emergency::emergency_timeline(&self.db, self.wallet.address.public_key())
+                .map_err(internal)?
+                .iter()
+                .any(|e| e.declaration_hash == declaration_hash && e.is_active_at(now)),
+        )
     }
 
     /// `governance_emergency_cosign` — co-sign a declaration (or a lapse), toward its
@@ -2975,6 +2992,7 @@ impl Core {
             &mut log,
             rrn_crypto::signed::SignedPayload::sign(lapse, &station),
             &self.db,
+            &station.public_key(),
             now,
         )
         .map_err(|e| invalid_params(e.to_string()))?;
@@ -2989,7 +3007,8 @@ impl Core {
     /// derived timeline.
     fn m_governance_emergency_status(&self) -> Result<serde_json::Value, rpc::RpcError> {
         let now = self.clock.now();
-        let timeline = emergency::emergency_timeline(&self.db).map_err(internal)?;
+        let timeline = emergency::emergency_timeline(&self.db, self.wallet.address.public_key())
+            .map_err(internal)?;
         let history = timeline
             .iter()
             .map(|e| self.emergency_status(e, now))
@@ -3005,7 +3024,8 @@ impl Core {
     /// under it. No new record kinds — a pure replay of the log.
     fn m_governance_emergency_report(&self) -> Result<serde_json::Value, rpc::RpcError> {
         let now = self.clock.now();
-        let activations = emergency::emergency_report(&self.db)
+        let station = self.wallet.address.public_key();
+        let activations = emergency::emergency_report(&self.db, station)
             .map_err(internal)?
             .into_iter()
             .map(|a| rpc::EmergencyReportEntry {
@@ -3022,7 +3042,7 @@ impl Core {
                     .collect(),
             })
             .collect();
-        let inert_declarations = emergency::inert_declarations(&self.db, now)
+        let inert_declarations = emergency::inert_declarations(&self.db, now, station)
             .map_err(internal)?
             .into_iter()
             .map(|d| rpc::EmergencyInertDeclaration {
@@ -3065,19 +3085,23 @@ impl Core {
     /// electorate seat founders while the community is in bootstrap grace
     /// (ADR-0015); once three members establish, the set is ignored.
     fn dispute_founders(&self) -> Result<Vec<Address>, rpc::RpcError> {
-        Ok(effective_charter(&self.db)
-            .map_err(internal)?
-            .map(|c| c.founders)
-            .unwrap_or_default())
+        Ok(
+            effective_charter(&self.db, self.wallet.address.public_key())
+                .map_err(internal)?
+                .map(|c| c.founders)
+                .unwrap_or_default(),
+        )
     }
 
     /// [`dispute_founders`] for the channel write path, whose errors are the
     /// `(code, message)` pair the mobile handlers return.
     fn dispute_founders_pair(&self) -> Result<Vec<Address>, (i32, String)> {
-        Ok(effective_charter(&self.db)
-            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
-            .map(|c| c.founders)
-            .unwrap_or_default())
+        Ok(
+            effective_charter(&self.db, self.wallet.address.public_key())
+                .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+                .map(|c| c.founders)
+                .unwrap_or_default(),
+        )
     }
 
     fn m_disputes(&self) -> Result<serde_json::Value, rpc::RpcError> {
@@ -3332,10 +3356,10 @@ impl Core {
         // The window attestation is computed against the effective Charter at
         // admission (ADR-0022 / T2.1.3); without a published Charter there is no
         // window to anchor, so governance is not yet operable.
-        let charter = effective_charter(&self.db)
+        let station = self.station_keypair();
+        let charter = effective_charter(&self.db, &station.public_key())
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
             .ok_or((rpc::INVALID_PARAMS, "no Charter has been published".into()))?;
-        let station = self.station_keypair();
         let mut log = AppendLog::new(&self.db);
         append_proposal(&mut log, signed, &self.db, &station, &charter, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
@@ -3359,12 +3383,17 @@ impl Core {
         }
         let id = signed.payload.proposal_id;
         let now = self.clock.now();
+        let station = self.wallet.address.public_key();
         let mut log = AppendLog::new(&self.db);
-        append_cosign(&mut log, signed, &self.db, now)
+        append_cosign(&mut log, signed, &self.db, station, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
-        let records =
-            rrn_governance::proposal::proposal_records(&AppendLog::new(&self.db), &id, &self.db)
-                .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        let records = rrn_governance::proposal::proposal_records(
+            &AppendLog::new(&self.db),
+            &id,
+            &self.db,
+            station,
+        )
+        .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "cosigner_count": records.cosigner_count() }))
     }
 
@@ -3404,8 +3433,9 @@ impl Core {
             ));
         }
         let now = self.clock.now();
+        let station = self.wallet.address.public_key();
         let mut log = AppendLog::new(&self.db);
-        append_vote(&mut log, signed, &self.db, now)
+        append_vote(&mut log, signed, &self.db, station, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         Ok(serde_json::json!({ "ok": true }))
     }
@@ -3599,7 +3629,7 @@ impl Core {
         let anchor = self.dispute_anchor();
         // Founders seat the grace electorate; if the charter cannot be read the
         // sweep still runs on the established set alone rather than stalling.
-        let founders = match effective_charter(&self.db) {
+        let founders = match effective_charter(&self.db, &station.public_key()) {
             Ok(charter) => charter.map(|c| c.founders).unwrap_or_default(),
             Err(e) => {
                 tracing::warn!(error = %e, "dispute resolution sweep: reading founders failed");
@@ -4273,12 +4303,12 @@ impl Core {
             signer,
             signature,
         };
-        let Some(charter) =
-            effective_charter(&self.db).map_err(|e| BundleIngestError::Internal(e.to_string()))?
+        let station = self.station_keypair();
+        let Some(charter) = effective_charter(&self.db, &station.public_key())
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?
         else {
             return Ok(refused_disposition(RefusalReason::UnroutableKind));
         };
-        let station = self.station_keypair();
         let mut log = AppendLog::new(&self.db);
         match append_proposal(&mut log, signed, &self.db, &station, &charter, now) {
             Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
@@ -4306,7 +4336,13 @@ impl Core {
             signature,
         };
         let mut log = AppendLog::new(&self.db);
-        match append_cosign(&mut log, signed, &self.db, now) {
+        match append_cosign(
+            &mut log,
+            signed,
+            &self.db,
+            self.wallet.address.public_key(),
+            now,
+        ) {
             Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
             Err(rrn_governance::proposal::ProposalError::AlreadyCosigned { .. }) => {
                 self.gov_known(bytes)
@@ -4333,7 +4369,13 @@ impl Core {
             signature,
         };
         let mut log = AppendLog::new(&self.db);
-        match append_vote(&mut log, signed, &self.db, now) {
+        match append_vote(
+            &mut log,
+            signed,
+            &self.db,
+            self.wallet.address.public_key(),
+            now,
+        ) {
             Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
             Err(rrn_governance::vote::VoteError::AlreadyVoted { .. }) => self.gov_known(bytes),
             Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
@@ -4423,7 +4465,13 @@ impl Core {
             signature,
         };
         let mut log = AppendLog::new(&self.db);
-        match emergency::append_lapse(&mut log, signed, &self.db, now) {
+        match emergency::append_lapse(
+            &mut log,
+            signed,
+            &self.db,
+            self.wallet.address.public_key(),
+            now,
+        ) {
             Ok(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
             Err(emergency::EmergencyError::AlreadyPresent) => self.gov_known(bytes),
             Err(_) => Ok(refused_disposition(RefusalReason::Rejected)),
@@ -9983,7 +10031,11 @@ mod tests {
         );
         // A Charter is published (the station derives the proposal's window from
         // it on admission; the author no longer signs the window, T2.1.3).
-        assert!(effective_charter(&core.db).unwrap().is_some());
+        assert!(
+            effective_charter(&core.db, core.wallet.address.public_key())
+                .unwrap()
+                .is_some()
+        );
 
         // member[0] authors a statute over the mobile channel.
         let proposal = Proposal::new(
