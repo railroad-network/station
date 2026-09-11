@@ -175,6 +175,9 @@ every push/PR. `cargo fmt --check` is also enforced locally via a pre-commit hoo
   (CRDT merge laws, sign/verify roundtrips, canonicalization stability); cross-crate
   integration tests in `/tests`.
 - **Commits**: lightweight conventional commits.
+- **No Claude session links**: never put a `claude.ai/code/session_...` link in a PR
+  description, commit message, or any file. The "Generated with Claude Code" attribution
+  line is fine; the session URL below it is not — omit it.
 - **Time**: Unix seconds as signed `i64` throughout. **Injected clocks** — ledger/settlement
   code takes `now: i64` as a parameter rather than reading the system clock, so tests
   fast-forward without sleeping.
