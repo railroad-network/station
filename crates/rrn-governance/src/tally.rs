@@ -494,7 +494,7 @@ mod tests {
     }
 
     /// The fixed station key the tests' window attestations are signed by — so the
-    /// reader wrappers below can pin against it (T2.1.4). A deterministic key, not a
+    /// reader wrappers below can pin against it. A deterministic key, not a
     /// throwaway, precisely because replay now pins the window signer.
     fn test_station() -> Keypair {
         Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
@@ -511,7 +511,7 @@ mod tests {
         append_proposal(log, signed, db, &test_station(), &test_charter_body(), at)
     }
 
-    // Reader/writer wrappers that inject the fixed test-station pin (T2.1.4), so the
+    // Reader/writer wrappers that inject the fixed test-station pin, so the
     // test bodies keep their pre-pin call shape.
     fn append_cosign(
         log: &mut AppendLog,

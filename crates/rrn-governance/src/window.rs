@@ -79,7 +79,7 @@ pub fn window_for(charter: &Charter, kind: &ProposalKind, admitted_at: i64) -> (
 /// ([`rrn_storage::log::LogEntry::created_at`]), so a replica cannot re-derive it
 /// from the author's `created_at` — the signed attestation is the only
 /// replica-identical statement of the window, and every reader pins its envelope
-/// signer to the community station key (T2.1.4) before believing it. Carrying
+/// signer to the community station key before believing it. Carrying
 /// `charter_hash` records *which* Charter's windows were applied, so a later
 /// amendment cannot appear to have moved a live proposal's window on replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,7 +167,7 @@ pub fn window_of(
 /// electorate at this seq (ADR-0022 §5, "the attestation's log seq").
 ///
 /// An entry whose envelope signer is not the community `station` key is **skipped**
-/// (T2.1.4): a forged window attestation is invisible to derivation exactly as a
+/// A forged window attestation is invisible to derivation exactly as a
 /// forged member record is, so it can never open a window or move the electorate
 /// pin. The first entry that both decodes *and* passes the station pin wins.
 pub fn window_and_seq_of(

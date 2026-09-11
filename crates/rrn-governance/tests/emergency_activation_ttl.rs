@@ -53,7 +53,7 @@ fn publish_charter(db: &Database, founders: &[Keypair]) {
 }
 
 fn station() -> Keypair {
-    // Fixed so the reader pins (T2.1.4) match the write helpers' station key.
+    // Fixed so the reader pins match the write helpers' station key.
     Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
 }
 

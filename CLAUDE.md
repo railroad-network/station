@@ -178,6 +178,11 @@ every push/PR. `cargo fmt --check` is also enforced locally via a pre-commit hoo
 - **No Claude session links**: never put a `claude.ai/code/session_...` link in a PR
   description, commit message, or any file. The "Generated with Claude Code" attribution
   line is fine; the session URL below it is not — omit it.
+- **No ticket numbers in code**: never write ticket identifiers (e.g. `T2.1.4`, `T1.9.7b`)
+  into source, comments, doc-comments, commit messages, or PR descriptions. Tickets are
+  ephemeral and gitignored; the code must stand on its own. Cite the durable record instead
+  — the ADR (`ADR-00NN`) or a plain description of the behavior. (Existing pre-`T2.1.4`
+  references are legacy; do not add new ones.)
 - **Time**: Unix seconds as signed `i64` throughout. **Injected clocks** — ledger/settlement
   code takes `now: i64` as a parameter rather than reading the system clock, so tests
   fast-forward without sleeping.

@@ -41,7 +41,7 @@ fn addr(kp: &Keypair) -> Address {
 }
 
 fn station() -> Keypair {
-    // Fixed so the reader pins (T2.1.4) can be given the same station key the
+    // Fixed so the reader pins can be given the same station key the
     // write helpers sign attestations with.
     Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
 }
@@ -1142,7 +1142,7 @@ fn a_forged_activation_cannot_block_the_real_one() {
 
     // Only the author has signed (1 of the 2 needed): no legitimate emergency yet.
     // A bogus *station-signed* attestation for the declaration is injected — signed
-    // by the station key so it passes the T2.1.4 signer pin and the structural gate
+    // by the station key so it passes the signer pin and the structural gate
     // (the crossing re-derivation) is what must reject it; the non-station-signer case
     // is covered in tests/station_signer_pinning.rs.
     let forged = EmergencyActivated {
@@ -1214,7 +1214,7 @@ fn a_forged_activation_with_a_wrong_expiry_is_ignored_by_the_timeline() {
     }
 
     // A *station-signed* attestation with an inflated expiry (not activation_instant +
-    // 72h): signed by the station key so the T2.1.4 pin passes and the expiry recompute
+    // 72h): signed by the station key so the signer pin passes and the expiry recompute
     // is what rejects it (the non-station case is in tests/station_signer_pinning.rs).
     let forged = EmergencyActivated {
         declaration_hash: h,

@@ -493,7 +493,7 @@ fn find_proposal(
         // read — so skip it rather than fall back to this replica's re-stamped
         // `entry.created_at`, which differs per replica and would split the derived
         // window, electorate, and outcome across replicas (T2.1.3 acceptance 1). The
-        // attestation's own signer is pinned to the station (T2.1.4).
+        // attestation's own signer is pinned to the station.
         let Some((w, open_seq)) = window_and_seq_of(log, proposal_id, station) else {
             continue;
         };
@@ -597,7 +597,7 @@ pub fn all_proposals(
         // The window (and the admission instant it carries) comes from the station
         // attestation, never this replica's re-stamped `created_at`; a proposal
         // with no attestation is not yet windowed and is not returned (T2.1.3). The
-        // attestation's own signer is pinned to the station (T2.1.4).
+        // attestation's own signer is pinned to the station.
         let Some((w, open_seq)) = window_and_seq_of(log, &proposal.proposal_id, station) else {
             continue;
         };
@@ -1151,7 +1151,7 @@ mod tests {
     }
 
     /// The fixed station key the tests' window attestations are signed by. Replay
-    /// now pins the window signer (T2.1.4), so the reader wrappers below pin against
+    /// now pins the window signer, so the reader wrappers below pin against
     /// this same key — a deterministic key, not a throwaway.
     fn test_station() -> Keypair {
         Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
@@ -1168,7 +1168,7 @@ mod tests {
         append_proposal(log, signed, db, &test_station(), &test_charter(), at)
     }
 
-    // Wrappers injecting the fixed test-station pin (T2.1.4), so test bodies keep
+    // Wrappers injecting the fixed test-station pin, so test bodies keep
     // their pre-pin call shape.
     fn append_cosign(
         log: &mut AppendLog,

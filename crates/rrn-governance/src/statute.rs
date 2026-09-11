@@ -52,7 +52,7 @@ pub(crate) const IMPLEMENTED_KIND: &str = "rrn.gov.proposal_implemented";
 /// A station's record that a passed proposal has been put into force.
 ///
 /// Station-signed on append. Its envelope signer is pinned to the community station
-/// key at every read (T2.1.4), so a forged enactment record is skipped and cannot
+/// key at every read, so a forged enactment record is skipped and cannot
 /// mark a statute in force; on top of that pin, the facts it points at — a proposal
 /// that passed and whose implementation time had come — are re-derived wherever the
 /// record is believed (see the module docs).
@@ -94,7 +94,7 @@ pub(crate) fn implementation_of(
         let Ok(record) = from_canonical_bytes::<ProposalImplemented>(&entry.payload.bytes) else {
             continue;
         };
-        // T2.1.4: a non-station enactment record is skipped, so it can neither mark
+        // A non-station enactment record is skipped, so it can neither mark
         // a statute in force nor block a genuine enactment via the sweep guard.
         if entry.payload.signer != *station {
             continue;
@@ -188,7 +188,7 @@ pub fn enacted_statutes(
         let Ok(record) = from_canonical_bytes::<ProposalImplemented>(&entry.payload.bytes) else {
             continue;
         };
-        // T2.1.4: a non-station enactment record is skipped — a forged one never
+        // A non-station enactment record is skipped — a forged one never
         // enters the in-force set.
         if entry.payload.signer != *station {
             continue;

@@ -303,12 +303,12 @@ mod tests {
     }
 
     /// The fixed station key the tests' window/enactment attestations are signed by,
-    /// so the reader wrappers pin against it (T2.1.4).
+    /// so the reader wrappers pin against it.
     fn test_station() -> Keypair {
         Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([0x5a; 32]))
     }
 
-    // Wrappers injecting the fixed test-station pin (T2.1.4), so test bodies keep
+    // Wrappers injecting the fixed test-station pin, so test bodies keep
     // their pre-pin call shape.
     fn append_cosign(
         log: &mut AppendLog,

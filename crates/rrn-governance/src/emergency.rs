@@ -732,7 +732,7 @@ fn find_lapse(
 /// [`crate::window::window_and_seq_of`]'s "first attestation" rule.
 ///
 /// The anchor is a station attestation; its envelope signer is pinned to the
-/// community `station` key (T2.1.4), so a forged anchor carrying a doctored
+/// community `station` key, so a forged anchor carrying a doctored
 /// `admitted_at` is skipped and the genuine station anchor is the earliest
 /// validated one.
 fn declaration_admitted_at(
@@ -1000,7 +1000,7 @@ fn derive_emergencies(
         let entry = entry?;
         let bytes = &entry.payload.bytes;
 
-        // T2.1.4: every marker this loop consumes — the admission anchor, the D1b
+        // Every marker this loop consumes — the admission anchor, the D1b
         // refusal, and the activation — is a station attestation, trusted precisely
         // because the station signed it (ADR-0022 §2). An entry whose envelope signer
         // is not the community station key is skipped here, exactly as a forged member
@@ -1855,7 +1855,7 @@ fn try_activate(
     // ADR-0027 D2: fail closed on the TTL against the declaration's signed
     // admission anchor. A crossing later than the TTL does not activate (and the
     // front door already refuses such a co-sign); a declaration with no anchor
-    // never activates. The anchor's signer is pinned to the station (T2.1.4), so a
+    // never activates. The anchor's signer is pinned to the station, so a
     // forged anchor cannot supply a doctored `admitted_at`; saturating arithmetic
     // keeps the subtraction well-defined for any in-range instant regardless.
     let Some(admitted_at) = declaration_admitted_at(&log, decl_hash, &station_pk)? else {

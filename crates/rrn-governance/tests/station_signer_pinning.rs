@@ -1,4 +1,4 @@
-//! Station-signer pinning conformance suite (T2.1.4).
+//! Station-signer pinning conformance suite.
 //!
 //! Every governance record whose authority is "the station said so" — the proposal
 //! window, the enactment record, and the three emergency attestations (admission
@@ -50,7 +50,7 @@ fn addr(kp: &Keypair) -> Address {
     Address::from_public_key(kp.public_key())
 }
 
-/// The community's fixed station key (the writer's key, per T2.1.4 decision (a)).
+/// The community's fixed station key (the writer's key, per the maintainer decision (a)).
 fn station() -> Keypair {
     Keypair::from_secret(SecretKey::from_bytes([0x11; 32]))
 }
