@@ -364,7 +364,7 @@ pub struct ConnectivityBlock {
 /// (ADR-0013), so nothing here is signed or authoritative.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SidecarStatus {
-    /// One of `disabled`, `running`, `degraded`, `restarting`.
+    /// One of `disabled`, `starting`, `running`, `degraded`, `restarting`.
     pub state: String,
     /// The managed `rnsd` version, present only while `running`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

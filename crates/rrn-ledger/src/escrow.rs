@@ -423,9 +423,10 @@ pub struct CertificateState {
     /// Whether it is still outstanding or has been returned.
     pub status: CertificateStatus,
     /// Cumulative admitted cert-backed spend against it, in centicommons.
-    /// **Always 0 in this ticket** — T2.3.2 populates it once cert-backed spends
-    /// land; the reservation arithmetic already subtracts it so no follow-up
-    /// touches [`crate::credit`].
+    /// Populated by replay from admitted cert-backed proposals and **monotone**:
+    /// a cancelled spend stays consumed (ADR-0021 §5), so the remaining allowance
+    /// an offline receiver is shown is a true floor. The reservation arithmetic in
+    /// [`crate::credit`] subtracts it from the reserved cap.
     pub consumed_centi: i64,
 }
 
@@ -817,8 +818,8 @@ pub type SignedEquivocationRecord = SignedPayload<EquivocationRecord>;
 /// scoring can read a ruling deterministically from the log (a
 /// [`Overturn`](VerdictDecision::Overturn) neutralizes the equivocation as a
 /// scoring input). The jury *that produces* this record — sortition, panel,
-/// windows — is a follow-up ticket (T2.3.4); until then the record is defined and
-/// verifiable but never appended by this codebase. An unruled case lapses to a
+/// windows — lives in `rrn-dispute::equivocation` (ADR-0025), and the station
+/// appends one verdict per attached record on a majority. An unruled case lapses to a
 /// distinct `Lapsed` state (ADR-0025 §5), **never a synthesized `Confirm`**: the
 /// reputation penalty already applies at record verification, so a lapse leaving
 /// it standing is ADR-0014's fail-open with the status quo correctly identified.

@@ -16,6 +16,8 @@ By the end you will have:
 3. A ratified founding Charter, so governance and disputes work from day one.
 4. Encrypted backups and a social key-recovery net, so no single lost laptop,
    forgotten passphrase, or stolen phone can destroy the community's history.
+5. A plan for the day the network goes away — certificates, couriers, paper,
+   radio, and a rehearsed outage drill (Part 6).
 
 Read the whole thing once before you start. Part 4 (backups and recovery) is
 not optional homework for later — do it the same day you found the community.
@@ -775,6 +777,259 @@ nothing happened.)
 
 ---
 
+## Part 6 — Resilience: when the network goes away
+
+*Added 2026-09-13 at the close of Phase 2 (single-community resilience,
+ADR-0017). This part is the operator's story for the day the internet, the
+Wi-Fi, or the power is gone. Everything in it runs on the same station and
+phones you already have; nothing here needs federation.*
+
+The design principle to hold onto: **the station is the only thing that writes
+the ledger** (ADR-0020). When members cannot reach it, they do not stop — they
+keep signing on their phones, and their signed records travel to the station
+later over whatever still works: another member's phone, a radio, a text
+message, or a printed sheet. Nothing *settles* until the record arrives, and
+every settlement window is served in full from arrival (ADR-0022). Offline mode
+is normal mode, running late.
+
+### 6.1 The "before the storm" ritual — headroom certificates
+
+A member who will be out of reach and expects to *pay* someone should reserve a
+**headroom certificate** first, while still connected (ADR-0021). A certificate
+sets aside part of the member's credit headroom so a later offline payment
+against it is accepted on arrival no matter what else happened in the meantime
+— the receiver can hand over the goods knowing the credit was already reserved.
+
+What the numbers are, and where they come from (`config.toml` `[credit]`,
+defaults shown):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `cert_max_cap_centi` | 1000 (10 Commons) | The most one certificate can reserve. |
+| `cert_max_outstanding` | 4 | How many live certificates one member may hold. |
+| `cert_validity_seconds` | 7 days | How long a certificate can be spent against. |
+| `cert_delivery_grace_seconds` | 14 days | How late a spend against it may *arrive* and still be admitted. |
+
+The trade: **reserved headroom is idle headroom.** A member holding a 10-Common
+certificate has 10 Commons less to spend online until it expires or they return
+it. So the ritual is: reserve before a market day, a storm warning, a trip up
+the valley; return what you did not use when you are back.
+
+Members do this from their phones. The station's own wallet can do it from the
+console (the same rules apply to the steward):
+
+```sh
+rrn cert request 10          # reserve a 10-Common certificate (Commons, not centicommons)
+rrn cert list                # what is outstanding, with caps and expiries
+rrn paper cert --cert-id <hex> --out cards/   # print it as a wallet card (Part 5)
+```
+
+What a receiver checks offline, on their phone, before handing over goods: the
+certificate is station-signed, it belongs to the payer, the payment fits the
+remaining cap, and it has not expired. The phone also shows the payer's earlier
+spends against that certificate — but only the ones the payer *presents*. A
+payer can hide earlier spends; the cap still bounds what the community can lose
+per certificate, and the double-spend is refused and recorded as **provable
+equivocation** when the records reach the station: the member's standing drops
+to nothing, they can issue no new certificates, and a jury case opens
+(ADR-0025). Tell members this plainly. It is the one fraud the system cannot
+prevent offline, only price.
+
+### 6.2 The courier workflow
+
+A **courier** is anyone who physically moves records between a cut-off member
+and the station: a neighbour walking to the community hall, the person who
+drives to town, a bicycle. Couriers need no trust — every record is signed by
+its author and the station re-checks every signature. A courier can lose,
+delay, or duplicate what they carry; they cannot forge or alter it.
+
+The three kinds of thing a courier carries:
+
+- **A bundle**: one or more members' signed records, going *to* the station.
+  On a phone, this is the app's outbox exported for carriage; on paper it is a
+  printed sheet.
+- **Delivery receipts**: the station's signed answer, going *back* to each
+  author, saying per record whether it was admitted, was already known, or was
+  refused and why. A member whose phone has not seen a receipt simply re-sends;
+  re-sending is always safe.
+- **Certificates and credential cards**: printed once (Part 5), carried by
+  their owner.
+
+At the station, the courier's arrival is:
+
+```sh
+# A paper sheet, scanned to text (one QR payload per line):
+rrn paper ingest --in scanned.txt --out carryback/
+#   → per-record outcome (admitted / known / refused) + receipts to carry back
+
+# Receipts for a member who is about to walk home:
+rrn paper export-receipts --author rrn1… --out receipts/
+```
+
+A courier phone paired with the station submits its carried bundles itself when
+it comes into Wi-Fi range; you do not need to do anything at the console.
+
+Rules of thumb for members: **a receipt is proof; the absence of a receipt is
+not proof of anything.** Keep re-sending until the receipt comes back. Two
+couriers carrying the same bundle is fine. A refused record names its reason;
+the commonest are `nonce-gap` (an earlier record has not arrived yet — wait) and
+`debt-floor` (the payer was at their credit limit and had no certificate).
+
+### 6.3 Radio and text message
+
+Two electronic carriers sit between "Wi-Fi to the station" and "paper":
+
+- **LoRa radio via Reticulum** — the station supervises a Reticulum daemon and,
+  with an RNode-class radio attached, can push bundles to and receive them from
+  another station or a member's radio, kilometres away with no infrastructure.
+  Bring-up, spectrum compliance (your responsibility, per region), and the field
+  acceptance checklist are in [the LoRa radio bring-up
+  guide](lora-radio-bringup.md). Watch a push cross with `rrn dtn status`.
+  The radio is **off unless you configure it** (`[lora.rnode]` has no default
+  frequency or power, on purpose).
+- **SMS** — a phone with cellular text but no data can text its records to the
+  station's number as `rrnp:` chunks, and the station texts the receipt back.
+  The codec, the sender registry (`[sms] allowed_senders = "paired"` — spam
+  control, not security), the per-sender rate cap, and money-first pacing are
+  built and tested against a mock gateway. **The physical modem gateway is not
+  built yet** ([`spec/sms-carrier.md`](spec/sms-carrier.md) §7 records what is
+  reserved), so today SMS is a tested seam, not a carrier you can switch on.
+
+Both are dumb carriers: they see only signed, already-public records. What they
+leak is *metadata* — a phone number's association with the community, a radio's
+location. A community under surveillance pressure should prefer paper (Part 5)
+for sensitive traffic; the honest trade is spelled out in the threat model.
+
+### 6.4 Seizure drills
+
+If your community runs the encrypted profile (§4.4), practise the two things
+that only work if practised:
+
+| Drill | How often | Command |
+| --- | --- | --- |
+| The unlock ceremony, with the real holders | After arming, after every holder change, and at least twice a year | `station unlock` (K holders present, fingerprint read aloud) |
+| The community-continues path (restore from backup on fresh storage) | Quarterly, and before any upgrade | `scripts/drill-seizure-recovery.sh --profile plaintext` |
+| The brick property (the closed container leaks nothing) | After arming and after every re-key | `scripts/drill-seizure-recovery.sh --profile encrypted` (Linux) |
+| The UPS | Monthly: pull the mains and confirm the station shuts down cleanly on low battery rather than losing power | — |
+
+The ceremony drill matters most. The failure mode is not cryptographic; it is
+three holders who cannot be found, or who have never actually scanned the
+request before. Under the plaintext profile only the second row applies.
+
+### 6.5 Emergency governance — deciding faster, and nothing else
+
+In a real crisis a seven-day proposal window is too slow. Emergency governance
+(ADR-0023, ADR-0027) lets the community **compress the decision window** for a
+narrow class of temporary measures — and deliberately does nothing else. It is
+the sharpest capture lever in the system, so know exactly what it does:
+
+- **Declaring takes a supermajority.** A declaration activates only once
+  distinct electorate members' signatures reach two-thirds of the electorate
+  (`ceil(2N/3)`, the author's own included). One person, or a bare majority,
+  compresses nothing.
+- **What it compresses:** the deliberation/voting window for `Emergency`-kind
+  proposals admitted while the declaration is active — down to 24 hours (the
+  floor; a charter cannot go lower). Everything else runs its normal window.
+- **What it freezes and pins:** no charter amendment can be admitted or enacted
+  while the emergency holds, and the electorate (who counts, who may vote) is
+  pinned at the moment of activation, so nobody can be minted into it
+  mid-crisis.
+- **What it never touches:** settlement and dispute windows, the debt floor,
+  certificates, reputation. A flood does not authorize economic restructuring.
+- **How it ends:** by itself. Default 72 hours, at most 7 days per declaration,
+  at most 14 days per chain of renewals (each renewal needs the full
+  supermajority again), then a fixed 14-day cooldown. A part-signed declaration
+  expires after 7 days. Every measure passed under it carries an enforced
+  expiry. A community can also lift it early with the same supermajority.
+
+The console commands (members do the same from their phones; declarations and
+co-signatures also travel by courier):
+
+```sh
+rrn governance emergency-declare "Flood — river road closed" "logistics" \
+    --duration-secs 172800                 # request 48 h (clamped to 24 h … 7 d)
+rrn governance emergency-cosign <declaration-hash>   # each electorate member
+rrn governance emergency-status            # active? reason, expiry, pinned electorate
+rrn governance propose "…" "…" --kind emergency --expires-at <unix-secs>
+rrn governance emergency-lapse <declaration-hash>    # start an early lift; needs co-signs too
+rrn governance emergency-report            # afterwards: who declared, who signed, what passed
+```
+
+`rrn governance emergency-status` is the console banner; `rrn status` and
+`rrn whoami` carry the same `emergency` field in their `--format json` output
+(the plain text renderers do not print it), and the phones show a banner. Read
+the report together when it is over; the design relies on that review being
+*possible*, not on it being compulsory.
+
+### 6.6 The outage drill — a facilitator's guide
+
+The software's 72-hour outage scenario runs in seconds
+([`phase-2-exit-evidence.md`](phase-2-exit-evidence.md)). The community's
+version takes a half-day and real people, and it is the only way to learn where
+*your* community actually breaks. Run it before you need it. This guide is for
+the person facilitating.
+
+**What you need.** The station on a UPS or battery; a printer and a phone
+scanner app (Part 5); optionally a LoRa pair (6.3); paper and pens; about 8–20
+members; four hours. Take a `station backup` first.
+
+**Roles.** Assign before the day:
+
+- *Facilitator* — runs the clock, calls the phases, keeps the log sheet.
+- *Steward* — at the station console the whole time (ingest, export, status).
+- *Two couriers* — one on foot, one "slow" (deliberately delays and reorders
+  what they carry).
+- *A merchant and a customer or two* — trade for real, with real goods (lunch
+  works).
+- *A holder quorum* — if you run the encrypted profile, the K key-holders.
+- *One adversary* — briefed privately (below).
+- *Everyone else* — members who transact, vote, and try to break things.
+
+**Timeline.**
+
+| Time | Phase | What happens |
+| --- | --- | --- |
+| T−1 day | Prepare | Every member who will pay reserves a certificate (6.1). Steward prints credential cards for anyone who wants one. Facilitator briefs the adversary. |
+| 0:00 | Normal | Fifteen minutes of ordinary trade on Wi-Fi. Steward notes `rrn balance` for a few members and the log length (`rrn history`). |
+| 0:15 | **Cut** | Turn off the Wi-Fi access point. Phones can no longer reach the station. Announce it. |
+| 0:15–2:15 | Outage | Trade continues *offline*: certificate-backed payments accepted on phones, plain payments signed and queued, a vouch or two, a governance vote if one is open. Couriers carry bundles to the steward on foot; the steward ingests and hands back receipt sheets. The slow courier holds one bundle back deliberately. One member's phone "dies" (turn it off) after signing. If you have radios, push at least one bundle over LoRa. |
+| 1:15 | **Emergency** (optional) | Declare a drill emergency (6.5) and co-sign it in person; pass one temporary measure through the compressed window. Watch the banner appear. |
+| 2:15 | Power loss (encrypted profile only) | Pull the station's power. Convene the holders and run `station unlock` — read the fingerprint aloud. Time it. |
+| 2:45 | **Reconnect** | Wi-Fi back on. Phones drain their queues; the slow courier finally delivers. |
+| 3:00 | Reconcile | Steward reads every receipt outcome aloud: admitted / known / refused (and why). The adversary reveals what they tried. |
+| 3:30 | Settle & debrief | Wait out the settlement window if you shortened it for the drill (`[settlement]` uniform override), or read the pending list. Debrief. |
+
+**The adversary's brief** (choose two or three; the software should catch every one):
+
+1. Sign the same certificate twice to two different receivers (expect the
+   second refused as an overspend and the member's standing gone — do this
+   with a throwaway identity or accept the consequence).
+2. Hand a courier a bundle with one record deleted (expect: the rest lands,
+   the author re-sends the missing one later).
+3. Re-scan the same sheet twice (expect: same receipt, nothing double-counted).
+4. Edit one character of a QR payload line before ingest (expect: refused,
+   `bad-signature`).
+5. Try to co-sign the emergency declaration with a phone that is not in the
+   electorate (expect: refused).
+
+**The log sheet.** Record, per event: time, who, what carrier, and the receipt
+outcome. Afterwards verify with the steward:
+
+- every value is conserved — balances still sum to zero (`rrn balance` across
+  members; the harness's `assert_conservation` is the software version);
+- no record was silently lost — everything on the log sheet has a receipt or a
+  known re-send;
+- exactly the planted double-spend was flagged, and nothing honest was;
+- no settlement happened before its window elapsed from *arrival*;
+- the ceremony completed with the holders you actually had.
+
+**What you are really testing** is not the software. It is: does everyone know
+how to reserve a certificate; can the couriers find the steward; do the holders
+answer the phone; does the merchant trust an offline payment. Write down what
+surprised you and fix the people-side before the storm.
+
+---
+
 ## Appendix — command quick reference
 
 ```sh
@@ -802,13 +1057,23 @@ station recovery restore [--from-backup <archive>]       # the ceremony
 
 # seizure resistance — encrypted at-rest profile (optional, Linux; §4.4)
 station status                                            # at-rest profile + unlock state
-station encrypt-in-place --threshold K --holder <addr> …  # migrate to the encrypted profile
+station encrypt-in-place --holder <addr> … [--threshold K]  # migrate; K defaults to config (3)
 station unlock                                            # boot ceremony → mount the volume
-station vmk status | refresh --threshold K --holder <addr> …
+station vmk status | refresh --holder <addr> … [--threshold K]
 scripts/drill-seizure-recovery.sh --profile plaintext|encrypted
 
+# resilience (Part 6)
+rrn cert request <commons> | list [<addr>]                # headroom certificates (§6.1)
+rrn paper ingest --in <txt> --out <dir>                   # courier arrival (§6.2, Part 5)
+rrn paper export-receipts --author <addr> --out <dir>     # receipts to carry back
+rrn dtn push --peer <hex|addr> --bundle <file> | status | bind --destination <hex>
+rrn governance emergency-declare <reason> <scope> [--duration-secs N]
+rrn governance emergency-cosign <hash> | emergency-lapse <hash>
+rrn governance emergency-status | emergency-report
+scripts/demo-phase-2-outage.sh [1|2|3]                    # the narrated 72-hour simulation
+
 # everyday admin / poking around
-rrn whoami | balance | history | transactions
+rrn whoami | balance | history | transactions | status
 rrn governance list | show | statutes
 rrn dispute list | show
 ```

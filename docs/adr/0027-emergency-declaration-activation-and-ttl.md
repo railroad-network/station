@@ -4,8 +4,12 @@
 
 Accepted — 2026-09-10 (ratified after two adversarial review rounds; see "Review
 history"). Supersedes the two 2026-09-10 open Clarification entries in
-[ADR-0023](0023-emergency-governance-modes.md). **Not yet implemented** — an
-implementation ticket follows; the acceptance locks the design, not the code.
+[ADR-0023](0023-emergency-governance-modes.md). At acceptance this was not yet
+implemented; **implemented 2026-09-10** (`rrn-governance::emergency`: D1/D1b
+first-crossing with the `emergency_refused` marker, D2's
+`emergency_declaration_admitted` anchor and 7-day TTL, D3 typed refusals, the
+batched `LogBatch` append for atomicity), with the station-signer-pinning
+precondition landing on 2026-09-11.
 
 Date: 2026-09-10
 
