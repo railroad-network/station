@@ -386,6 +386,7 @@ impl Station {
                 restart_backoff: Duration::from_secs(config.sidecar.restart_backoff_secs.max(1)),
                 tcp_listen: config.sidecar.tcp_listen.clone(),
                 tcp_peers: config.sidecar.tcp_peers.clone(),
+                rnode: config.lora.rnode.clone(),
                 shutdown_grace: Duration::from_secs(crate::sidecar::SHUTDOWN_GRACE_SECS),
             };
             tracing::info!(

@@ -562,9 +562,10 @@ phone's job. See the end-to-end walkthrough in
 Between paper and full internet sits a middle rung: carrying traffic over
 **Reticulum**, the mesh/LoRa/packet-radio stack the network adopted as its
 federation and collapse-mode carrier (ADR-0013). In this build the station can
-*supervise* the Reticulum daemon (`rnsd`) as a managed background service; the
-actual message transport over it lands in a later milestone (T2.6.2), so today
-this is plumbing you can stand up and watch, not yet a way to move payments.
+*supervise* the Reticulum daemon (`rnsd`) as a managed background service and
+carry delay-tolerant traffic over it — including over a LoRa radio. To take a
+station onto a radio end to end (flashing, config, and a scripted field
+acceptance), follow [the LoRa radio bring-up guide](lora-radio-bringup.md).
 
 It is **off unless you turn it on** (`[sidecar] enabled = false` by default), and
 turning it on asks something of you first:

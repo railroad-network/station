@@ -3122,8 +3122,8 @@ backlog.
 
 ### Reticulum transport sidecar (station, ADR-0013 / ADR-0026)
 
-*Supervisor implemented in T2.6.1; the `FrameTransport` wiring over it is T2.6.2,
-the RNode/LoRa interface T2.6.3.* The station may run the Python Reticulum daemon
+*Supervisor implemented in T2.6.1; the `FrameTransport` wiring over it is T2.6.2;
+the RNode/LoRa radio interface config + field-acceptance tooling is T2.6.3.* The station may run the Python Reticulum daemon
 (`rnsd`) as an **external, supervised, version-pinned OS service** to carry
 federation and collapse-mode traffic (ADR-0013). It is off by default
 (`[sidecar] enabled = false`); when on, `rrn-station::sidecar` runs it as an
@@ -3200,6 +3200,31 @@ now runs a second, unaudited runtime and process.
   plausible. The outer Reticulum link encryption (Ed25519/X25519, AES-256-CBC +
   HMAC) is treated as a *bonus* layer only; the confidentiality guarantee is the
   app-layer XChaCha20-Poly1305 seal, never Reticulum's unaudited crypto.
+
+#### The physical radio interface — spectrum misuse and RF exposure (T2.6.3)
+
+- *Threat:* enabling a LoRa radio adds a physical **RF transmit** surface the earlier
+  TCP-only carrier never had. Misconfiguration can transmit on an illegal frequency
+  or above the legal radiated-power cap for the operator's region (a regulatory and
+  interference hazard); a wrong region/power can also self-jam the very link it is
+  meant to carry. RF is inherently broadcast, so an attacker within radio range can
+  intercept the (opaque, app-sealed) byte stream, jam the channel, or direction-find
+  a transmitting station's physical location.
+- *Mitigation:* the radio is **off unless deliberately configured** — `[lora.rnode]`
+  is absent by default, and `frequency_hz`/`tx_power_dbm` carry **no defaults**, so a
+  half-specified radio is a loud config error and an unconfigured station never keys
+  up (the generated Reticulum config carries only a *commented* example plus a
+  pointer to the bring-up runbook and its regional compliance table). App-layer
+  integrity and confidentiality are unchanged by the carrier being a radio: bundles
+  are signed per-entry and sealed at the app layer (ADR-0002/0008/0020), so RF
+  interception yields only ciphertext + metadata, exactly the sidecar residual above.
+- *Residual risk:* **spectrum compliance is the operator's responsibility per
+  geography** and cannot be enforced in code — the runbook carries the regional
+  table and citations, and ADR-0017 flagged this as the long pole. RF metadata
+  exposure and physical location disclosure via direction-finding are inherent to
+  radio and are not mitigated; a community under a physical-seizure or RF-hunting
+  threat should weigh whether to transmit at all (paper/courier remain the fallback).
+  Jamming degrades to a connectivity event, never a correctness one.
 
 **Distribution posture (open-source check, ADR-0013 → ADR-0026).** `rnsd` is a
 **separately operator-installed** runtime dependency (`pipx install rns`), never a
