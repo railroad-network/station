@@ -2,33 +2,34 @@
 
 This is a **living document**. It grew incrementally as each crate was built:
 every crate's task spec included a "threat model entry" acceptance item, which
-is where that crate's section was filled in. As of M0.7 (audit prep) it has had
-a comprehensive end-to-end pass: every Phase 0 crate has a populated section,
-the cross-cutting threats are analyzed, and the residual risks and known
-limitations are stated explicitly.
+is where that crate's section was filled in. It has had three end-to-end passes:
+at M0.7 (Phase 0 audit prep), across Phase 1 as each crate landed, and a
+**Phase 2 consolidation on 2026-09-13** that reconciled the per-ticket sections
+added during single-community resilience work, wrote the [Phase 2
+summary](#phase-2-summary--the-resilience-surface), and rewrote [Known
+limitations](#known-limitations) to say what Phase 2 closed and what it opened.
 
-**Phase 1 (from M1.0) is now being layered on top.** The sections it adds — the
-mobile client and its transport to the station, and the marketplace, reputation,
-and governance crates — describe threats against code that is largely still
-*scaffolding*. To keep the auditor's "every mitigation claim is traceable to
-code" contract intact, these sections mark their defenses as **Planned
-mitigation** and name the task that will implement them, rather than claiming a
-protection that does not yet exist. As each Phase 1 crate lands, its
-implementation task promotes the relevant entries from *planned* to *shipped*
-(with the concrete function/module, exactly as the Phase 0 sections do).
+**Phase numbering.** This document uses the ADR-0017 numbering throughout:
+Phase 2 = single-community resilience (this pass), Phase 3 = multi-community
+federation. ADRs 0001–0016 and `security/audit-2026-08.md` are point-in-time
+records written under the *old* numbering, where "Phase 2" meant federation;
+read them with that in mind. ADRs 0017 onward use the new numbering.
 
 **Auditors should read this document first.** Every mitigation claim is meant to
 be traceable to specific code; where a claim names a behavior (`verify_strict`,
 `append_raw` re-chaining, idempotent settlement), the corresponding code lives
 in the named crate/module and is covered by a unit or property test. If you find
 a claim here that the code does not support, that discrepancy is itself a
-finding — report it.
+finding — report it. The companion
+[`security/phase-2-redteam.md`](security/phase-2-redteam.md) turns the Phase 2
+sections into an attacker-organized checklist with the file and test each
+defense lives in.
 
-The `rrn-protocol` section was deliberately empty through Phase 0–1, when the
-crate was a stub. As of Phase 2 (T2.2.1) it covers the delay-tolerant-submission
-wire layer (outbox chains, bundles, delivery receipts — ADR-0020) as built. The
-remaining *federation* surface (cross-community forks, Sybil federation, treaty
-abuse) is Phase 3 work and is still marked as such rather than guessed at.
+A note on the mobile-client sections: the client lives in the sibling `mobile`
+repository, so the "shipped"/"planned" markers there reflect the state at the
+milestone each subsection names and are verified in that repository, not this
+one. The station-side halves of every mobile surface (the sealed channel, the
+FFI crate, DTN ingest) are verified here.
 
 ## Scope
 
@@ -61,25 +62,49 @@ Phase 1 (from M1.0) extends the scope with:
   (`rrn-reputation`)
 - **Governance** — a signed Charter, proposals, and one-established-member-one-vote
   balloting (`rrn-governance`)
+- **Dispute resolution** — a deterministic sortition jury with a governance
+  backstop (`rrn-dispute`, ADR-0014)
+
+Phase 2 (single-community resilience, ADR-0017) extends it with — see the
+[Phase 2 summary](#phase-2-summary--the-resilience-surface) for the map:
+
+- **Delay-tolerant submission** — per-device outbox chains, bundles, and
+  station-signed delivery receipts (`rrn-protocol`, `rrn-storage::{outbox,dtn}`,
+  station ingest and receipt relay — ADR-0020)
+- **The admission clock** — the station's clock at admission as the only
+  window-bearing clock; party timestamps as testimony (ADR-0022)
+- **Headroom certificates and equivocation** — escrowed offline spending,
+  provable double-commitment, its reputation consequence and jury path
+  (`rrn-ledger::escrow`, `rrn-dispute::equivocation` — ADR-0021, ADR-0025)
+- **Emergency governance** — a supermajority-declared, self-expiring compressed
+  decision window (`rrn-governance::emergency` — ADR-0023, ADR-0027)
+- **Carriers** — the Reticulum/LoRa sidecar and transport, SMS, and the paper/QR
+  layer, all dumb carriers (`rrn-station::{sidecar,reticulum,sms}`,
+  `rrn_protocol::{framing,paper}`, `rrn paper` — ADR-0013, ADR-0026)
+- **At-rest encryption** — the optional member-keyed encrypted volume and its
+  boot ceremony (`rrn-station::storage` — ADR-0024)
 
 ## Out of Scope
 
-Deferred to Phase 1 and beyond:
+Deferred to Phase 3 (multi-community federation) and beyond:
 
-- **Federation protocol** — cross-community sync, treaties, gossip beyond the
-  Phase 0 stub (`rrn-protocol` contains stubs only in Phase 0)
+- **Federation protocol** — cross-community sync, treaties, gossip between
+  communities, Conductor formalization, cross-replica fork resolution and
+  rollback detection. Within one community there is a single log writer
+  (ADR-0020), so "no ledger forks" holds by construction; the multi-writer
+  questions land at the inter-community boundary.
 - **Oracle mechanisms above Tier 2** — physical evidence (Tier 3), and
   cross-community validation / governance approval (Tier 4); see design
-  overview Section 4.3, "The Tiered Oracle Model". Phase 0 only needs Tier
-  1/2 (bilateral confirmation + settlement window + reputation stake)
-- **Governance beyond direct balloting** — dispute tribunals, non-direct voting
-  (liquid/sortition/quadratic/consent), and a statute→config rule engine; Phase
-  1's `rrn-governance` covers a signed Charter, proposals, and
-  one-established-member-one-vote direct voting, not tribunal adjudication,
-  alternative voting mechanisms, or oracle escalation above Tier 2
-- **Radio (LoRa) and mesh transport-specific threats** — Phase 0 runs over
-  local network/loopback only; Phase 1's mobile↔station transport section
-  covers the *local-network* case, not radio/mesh links
+  overview Section 4.3. Tier 3+ amounts (≥ 50 Commons) are *refused*, never
+  clamped.
+- **Governance beyond direct balloting** — non-direct voting
+  (liquid/quadratic/consent), ballot secrecy, and a statute→config rule engine.
+- **Real-world carrier operation** — multi-hop mesh behavior at scale, antenna
+  and RF tuning, regulatory sign-off, and the physical SMS modem gateway (the
+  SMS codec, registry, and relay are built against a mock gateway; the modem
+  backend is not). These are field work, not code.
+- **The mobile client's device surface** — analyzed here from the station's
+  side; the device-side implementation is the sibling repository's.
 
 ## Trust Assumptions
 
@@ -108,8 +133,94 @@ Deferred to Phase 1 and beyond:
   payloads to any parsing boundary.
 - Cannot break Ed25519, Blake3, or XChaCha20-Poly1305 (assumed
   cryptographically hard); cannot forge a signature without the private key.
-- May physically seize a node's storage media (see design overview
-  Section 10.8, "Physical node seizure").
+- May physically seize a node's storage media, powered off or running (see
+  design overview Section 10.8 and [Encrypted at-rest
+  storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024)).
+- Phase 2 adds: may **carry** any bundle (a courier is untrusted by design);
+  may hold a member key and sign **conflicting** records while partitioned; may
+  **own the carrier** — the Reticulum sidecar process, the SMS path including
+  the sender number, the radio channel (jam, intercept, direction-find), or a
+  printed sheet; may step the **station clock** if they are the operator.
+
+## Phase 2 summary — the resilience surface
+
+Phase 2 made one community keep working with no internet: members sign records
+on their phones and those records travel to the station later, over whatever
+carrier still works. Everything below is the consequence of three locked
+decisions, and an auditor who holds them in mind can predict most of this
+section: **one log, one writer** (ADR-0020 — the station remains the sole
+admission point; resilience is delayed *submission*, never a second ledger);
+**the admission clock** (ADR-0022 — the station's clock when it appends a record
+is the only clock any window, deadline, ordering, or eligibility reads; every
+party-asserted timestamp is testimony); and **carriers are dumb** (ADR-0008/0013
+— integrity and authenticity are the per-record `SignedPayload` signatures the
+station re-verifies at its front door, never a property of any transport). The
+new surface, STRIDE by STRIDE:
+
+- **Spoofing.** Nothing new can be forged without a member key. A bundle is
+  unsigned and grants nothing; an outbox entry needs the author's key and its
+  embedded record needs the record signer's; a Reticulum destination or an SMS
+  number is a reachability handle bound to an identity only by that identity's
+  own signature (`rrn.net.binding`, `rrn.net.sms_binding`); a delivery receipt,
+  a headroom certificate, an equivocation record, and every governance
+  attestation are station-signed, and the governance ones are **signer-pinned**
+  on replay. Forging the station's *ledger* records (settlement, certificate,
+  contract charge) is the one signer-pin gap that remains, reachable only
+  through a hostile gossip peer (`rrn-governance`, residual list).
+- **Tampering.** The carried bytes are the signed bytes. Tampering with a record
+  breaks its signature; with an outbox link, the chain (`ChainBroken`); with a
+  frame, the CRC and the Blake3 payload id; with a sheet, the paper reassembler's
+  hash check. The **time** a record claims cannot move anything: windows run
+  from admission, the sortition and governance electorates are pinned at log
+  *positions*, and a clock step by the operator distorts every window uniformly
+  and visibly rather than any member's selectively. The one thing a member *can*
+  tamper with is their own commitment history — signing two spends against one
+  certificate, or two entries at one outbox position — and that is made
+  **provable equivocation** rather than prevented (ADR-0021 §5, ADR-0025).
+- **Repudiation.** Strengthened, not weakened. A member cannot deny a carried
+  record (their signature), a courier cannot suppress one undetectably (the
+  chain gap), the station cannot deny admitting one (the signed receipt), and an
+  equivocator cannot deny double-committing (the station-signed record embeds
+  their own signed proofs and any replica re-verifies them). The jury that hears
+  the case is drawn from a content-independent seed and fails to a `Lapsed`
+  state that leaves the already-applied penalty standing, never to a verdict no
+  juror signed.
+- **Information disclosure.** This is where Phase 2 traded most. Bundles,
+  receipts, and sheets are **cleartext to whoever carries them**; SMS is
+  cleartext to the carrier and exposes which numbers talk to the station; radio
+  exposes traffic timing and the transmitter's location. The content is already
+  community-public, so the residual is *metadata* — who transacted with whom,
+  when, where — and it is accepted, with the degradation ladder itself as the
+  mitigation (a community under surveillance uses paper). In the other
+  direction Phase 2 closed the oldest disclosure residual: the optional
+  **encrypted at-rest profile** makes a powered-off station a member-keyed brick
+  with no wrapped key and no holder list on the device. A running station is
+  still not defended.
+- **Denial of service.** Every carrier gets bounded reassembly, bounded
+  bundles, bounded evidence, bounded queues, and an airtime budget that sends
+  money before anything else; the sidecar cannot take the station down; a
+  jammed radio or a withheld receipt is a *legible* connectivity event (a push
+  goes `pending` → `abandoned`), never a silent one. What is still missing is
+  **per-member rate limiting** on any surface, the same gap Phase 1 carried,
+  now with more surfaces behind it. The **station is the liveness single point
+  of failure** by decision (ADR-0020): members' outboxes preserve everything
+  signed while it is down, and the encrypted profile deliberately trades
+  availability (a boot ceremony after every power loss) for seizure resistance.
+- **Elevation of privilege.** No carrier, courier, or sidecar can gain
+  authority by relaying — admission happens at one front door with the same
+  checks as a live submission (signature, nonce, tier, floor, the Tier-2 staking
+  gate, governance eligibility), with **one deliberate bypass**: a
+  certificate-backed spend skips the fresh debt-floor check because the floor
+  was debited at issuance, gated on six checks against the signed certificate.
+  Emergency governance is the sharpest new lever and is bounded on every axis a
+  coup would need — a supermajority to declare, no lowered bar, a raised quorum,
+  a frozen charter, a position-pinned electorate, an enforced measure expiry,
+  first-crossing-only activation, a declaration TTL, and a hard duty cycle. Its
+  residuals (a standing two-thirds faction; a tiny grace electorate; scope as
+  testimony) are stated in ADR-0023 and repeated below.
+
+The per-component sections that follow carry the file, function, and test for
+each claim above.
 
 ## Per-Component Threats
 
@@ -207,8 +318,9 @@ of content hashes.
   pre-scan never panics on arbitrary bytes and a 50 000-deep vector is refused
   rather than crashing.
 - *Residual risk:* other CBOR decode work is bounded by input length; very
-  large (but shallow) inputs are a caller/transport concern (message size
-  limits live in `rrn-protocol`, Phase 1+).
+  large (but shallow) inputs are a caller/transport concern — the carriage
+  layer bounds them (`MAX_BUNDLE_BYTES`, the framing and paper caps in
+  `rrn-protocol`, `MOBILE_BODY_LIMIT` on the mobile listener).
 
 #### Elevation of privilege
 
@@ -281,10 +393,11 @@ of committed writes.
   declared `STRICT` so column types are enforced rather than coerced.
 - *Residual risk:* the hash chain proves *integrity and order within one log*,
   not *uniqueness* — two replicas can still fork (conflicting valid chains).
-  Fork detection across replicas is out of scope for Phase 0 (Phase 1+
-  `rrn-protocol`). An attacker who truncates the log to a prior valid prefix
-  produces a still-consistent shorter chain; detecting rollback needs external
-  anchoring (later).
+  Within a community this cannot happen by construction, because only the
+  station writes (ADR-0020); across communities, fork detection is Phase 3
+  (`rrn-protocol` federation). An attacker who truncates the log to a prior
+  valid prefix produces a still-consistent shorter chain; detecting rollback
+  needs external anchoring (Phase 3).
 
 #### Repudiation
 
@@ -352,13 +465,13 @@ of committed writes.
   applied idempotently, and a station reporting a *different* outcome for a record
   it already answered trips `ConflictingAck` — a tamper/equivocation tripwire the
   ADR-0021 equivocation work (T2.3.3) builds on.
-- *Residual risk:* outbox rows are **local plaintext state**, the same posture as
-  the log — a seized or imaged device discloses the carried records and the social
-  graph they imply, and a local writer with direct SQL access can still corrupt
-  rows (caught by the validating caller on read, not prevented at the row level).
-  At-rest encryption for this local state is deferred to the seizure-resistance
-  work (T2.9.x, pending ADR-0024). The `authored_at` column is party testimony
-  (ADR-0022 §3) and is never load-bearing for any window or ordering decision.
+- *Residual risk:* outbox rows share the database's at-rest posture — plaintext
+  under the default profile, inside the member-keyed container under the
+  encrypted profile (ADR-0024; see [Information disclosure](#information-disclosure)
+  just below) — and a local writer with direct SQL access can still corrupt
+  rows (caught by the validating caller on read, not prevented at the row
+  level). The `authored_at` column is party testimony (ADR-0022 §3) and is never
+  load-bearing for any window or ordering decision.
 
 #### Information disclosure
 
@@ -367,11 +480,17 @@ of committed writes.
   sensitive social graph), or a seized device discloses all of it.
 - *Mitigation:* at-rest encryption of secret key material is `rrn-identity`'s
   responsibility (argon2id + XChaCha20-Poly1305); this crate stores no secret
-  keys. Whole-database encryption for the social-graph metadata is noted as
-  future work (physical-seizure mitigation, design overview §10.8).
-- *Residual risk:* in Phase 0 the database is plaintext on disk; the metadata it
-  contains is exposed to a local attacker or seized media. Accepted for now per
-  the device-trust assumption.
+  keys. Whole-database encryption is the station's **encrypted at-rest
+  profile** (ADR-0024): the database, its WAL, the wallet, the outbox tables,
+  the search index, and the Reticulum adapter identity all live inside a
+  member-keyed LUKS2 container that a powered-off node cannot open (see
+  [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024)).
+  This crate is unchanged by it — SQLite sees an ordinary filesystem.
+- *Residual risk:* the encrypted profile is **opt-in and Linux-only**; under the
+  default plaintext profile the database is plaintext on disk and its metadata
+  is exposed to a local attacker or seized media, accepted per the device-trust
+  assumption. Under either profile a node seized *while running* has the data
+  mapped and readable.
 
 #### Denial of service
 
@@ -427,8 +546,9 @@ authenticity of vouches (a forged vouch is a fake social relationship).
   the matching secret key — reducible to the `rrn-crypto` forgery assumption.
 - *Residual risk:* authenticity is not authority. A *validly signed* vouch from a
   real-but-malicious identity, or a Sybil cluster of mutually-vouching keys, is
-  cryptographically sound; defending against that is reputation/Sybil analysis
-  deferred to Phase 1+, not a signature problem.
+  cryptographically sound; defending against that is `rrn-reputation`'s
+  velocity cap and anchoring (Phase 1) and graph analysis (Phase 3), not a
+  signature problem.
 
 #### Tampering — altered wallet, altered address, altered vouch
 
@@ -646,7 +766,8 @@ transition; the derivability of all state from the log.
 - *Residual risk:* anyone holding a party's secret key acts as that party — non-
   repudiation rests on the `rrn-crypto` key-secrecy assumption. The single
   Phase 0 station is trusted to decide *when* to settle (it cannot forge a
-  proposal or confirmation); multi-station settlement authority is Phase 1+.
+  proposal or confirmation); it is the community's sole writer (ADR-0020), and
+  multi-station settlement authority is Phase 3.
 
 #### Tampering — altering an amount, a balance, or the lifecycle
 
@@ -678,10 +799,13 @@ transition; the derivability of all state from the log.
 - *Threat:* the transaction graph (who paid whom, how much, with what memo) is a
   privacy-sensitive social/economic graph; reading the database exposes it.
 - *Mitigation:* this crate stores no secret keys. Amounts and memos live in the
-  log and `transactions`/`balances` tables in plaintext; whole-database
-  encryption is deferred (noted under `rrn-storage`).
-- *Residual risk:* in Phase 0 the ledger is plaintext on disk and exposed to a
-  local attacker or seized media. Accepted per the device-trust assumption.
+  log and `transactions`/`balances` tables; whole-database encryption is the
+  station's optional encrypted at-rest profile (ADR-0024, noted under
+  `rrn-storage`).
+- *Residual risk:* under the default plaintext profile the ledger is plaintext
+  on disk and exposed to a local attacker or seized media, accepted per the
+  device-trust assumption; the encrypted profile closes this for a powered-off
+  node only.
 
 #### Denial of service
 
@@ -709,10 +833,12 @@ transition; the derivability of all state from the log.
   Settlement is **idempotent**: `Settler::settle` checks the derived state is
   not already `Settled` *before* any balance write, so settling twice can never
   double-apply (T0.5.5, T0.5.7).
-- *Residual risk:* the nonce is per-sender on a single replica; cross-replica
-  nonce coordination (a sender acting on two stations) is a Phase 1+ federation
-  problem. The ±5 minute drift window is a deliberate usability/security
-  trade-off recorded here.
+- *Residual risk:* the nonce is per-sender on a single writer; within a
+  community that is the only writer (ADR-0020), so a sender "acting on two
+  stations" is a Phase 3 federation problem. The ±5 minute drift window is a
+  deliberate usability/security trade-off recorded here; under DTN carriage it
+  bounds only *future*-dating, since arbitrarily old records are legal
+  (ADR-0022 §3).
 
 #### Tampering — backdating `confirmed_at` to shrink the dispute window (retired by ADR-0022)
 
@@ -810,13 +936,16 @@ transition; the derivability of all state from the log.
 
 #### Elevation of privilege — offline overspend and reserved headroom (ADR-0021)
 
-Headroom certificates (`rrn-ledger::escrow`, T2.3.1) extend the debt floor to
-survive a partition: a member reserves capacity to commit *while connected*, so a
-later cert-backed spend can be admitted under partition without a fresh floor
-check. T2.3.1 delivered issuance, return, and the reservation arithmetic; **T2.3.2
-adds the cert-backed spend itself** — a `TransactionProposal` carrying an additive
-`cert_id` (`rrn-ledger::transaction`), admitted against the escrow — and the
-equivocation *consequences* remain T2.3.3.
+Headroom certificates (`rrn-ledger::escrow`) extend the debt floor to survive a
+partition: a member reserves capacity to commit *while connected*, so a later
+cert-backed spend can be admitted under partition without a fresh floor check.
+Three pieces, all shipped: issuance, return, and the reservation arithmetic;
+the cert-backed spend itself — a `TransactionProposal` carrying an additive
+`cert_id` (`rrn-ledger::transaction`), admitted against the escrow; and the
+equivocation consequences and jury path (ADR-0021 §5, ADR-0025 — the next two
+subsections). The record kinds are `rrn.credit.cert_request`,
+`rrn.credit.certificate`, and `rrn.credit.cert_return`, with cross-platform
+fixtures in `tests/fixtures/cross_platform_certificates.json`.
 
 - *Threat: a certificate reserving headroom the member does not have.* A member
   requests certificates whose caps jointly exceed their floor headroom, so the
@@ -835,7 +964,7 @@ equivocation *consequences* remain T2.3.3.
 - *Mitigation:* the reservation releases the instant a spend against the
   certificate could no longer be admitted — `escrow::spend_admissible_until`
   (`expires_at` + DTN delivery grace + clock-skew tolerance), the **single shared
-  boundary** the T2.3.2 admission bound will also enforce. Deriving both from one
+  boundary** the admission check (`check_cert_backed`) also enforces. Deriving both from one
   function is the coupling that prevents over-reservation (headroom held after
   spends are refused) and under-reservation (a spend admitted after the headroom
   released, which could breach the floor); a dedicated boundary test asserts they
@@ -860,7 +989,7 @@ equivocation *consequences* remain T2.3.3.
   config until governance can tune it, so an operator can raise a community's
   offline exposure up to the Tier-2 ceiling the station enforces. Deliberate,
   *bounded* offline overspend — burning standing to double-commit one
-  certificate's cap — is not preventable without connectivity; T2.3.3 makes it
+  certificate's cap — is not preventable without connectivity; it is
   provable equivocation and a reputation event (see "Provable equivocation"
   below), and the cap bounds the exposure. The receiver's offline verification is only as good as the spend
   history a spender presents (ADR-0021 Consequences); the cap still bounds the
@@ -903,8 +1032,9 @@ equivocation *consequences* remain T2.3.3.
 - *Residual risk (hidden history):* the offline receiver's check remains only as
   good as the spend history the holder presents; a holder can conceal earlier
   cert-backed spends from a new receiver, up to the cap. The cap bounds the damage
-  per certificate, the overspend refusal + T2.3.3 evidence convict the equivocator,
-  and T2.4.2 gives receivers a verification API. Replay tolerates a hostile log
+  per certificate, the overspend refusal + the equivocation evidence convict the
+  equivocator, and the mobile FFI (`offline_spend_verify`) gives receivers a
+  verification API. Replay tolerates a hostile log
   copy naming an unknown certificate by counting no consumption and logging a warn
   (replicas re-derive, never re-enforce — ADR-0018); a well-formed single-writer
   log cannot contain such a record, because the engine admits a cert-backed spend
@@ -918,8 +1048,10 @@ an outbox-chain fork, it appends a station-signed `EquivocationRecord`
 (`rrn-ledger::escrow`) bundling the member-signed artifacts that jointly prove
 the conflict. A verified record **zeroes both of the equivocator's live
 reputation dimensions** (trade reliability and attestation accuracy — ADR-0009),
-de-establishing them, and in a follow-up ticket (T2.3.4) auto-opens a jury case
-and disqualifies them from issuing new certificates until overturned (ADR-0025).
+de-establishing them, opens a jury case, and disqualifies them from issuing new
+certificates until overturned (ADR-0025; the jury path is the next subsection).
+The record kinds are `rrn.credit.equivocation` and
+`rrn.credit.equivocation_verdict` (fixture `cross_platform_equivocation.json`).
 
 - *Threat: a malicious or buggy station fabricating an equivocation to destroy a
   member's standing.* A station appends an `EquivocationRecord` naming an honest
@@ -937,16 +1069,17 @@ and disqualifies them from issuing new certificates until overturned (ADR-0025).
   one-record-per-offence dedup slot (which would otherwise suppress the genuine
   record — a slot-poisoning evasion), nor surface through the counterparty accessor
   (all tested). The jury **overturn** verdict is the human backstop for the residual
-  case a bug or a key compromise could still create; until the jury path lands (see
-  limitation below) the evidence re-verification is the standing guard.
+  case a bug or a key compromise could still create; the evidence
+  re-verification is the standing guard beneath it.
 - *Threat: a peer-gossiped member-signed `Overturn` lifting a genuine penalty.*
   Once cross-station sync admits foreign records, a member could relay a self-signed
   `Overturn` to neutralize their own equivocation.
 - *Mitigation / residual:* not reachable today — the verdict kind is refused
   (`UnroutableKind`) on DTN and has no RPC surface, so only the station can append
-  one. T2.3.4 gates `overturned_equivocations` on the station signer before the
-  jury path can produce verdicts (a `// T2.3.4:` marker flags the spot). Stated as a
-  known limitation until then.
+  one — and both reputation (`overturned_equivocations`) and the snapshot honor
+  an `Overturn` only from the signer of the equivocation record it names. That
+  is a record-author gate, not a pin to the community key; see the residual in
+  the jury subsection below.
 - *Threat: evidence-size denial of service.* A record padded with many or huge
   evidence blobs bloats the log and every replica's replay.
 - *Mitigation:* front-door caps — at most `MAX_EVIDENCE_ITEMS` (16) items, each at
@@ -964,11 +1097,11 @@ and disqualifies them from issuing new certificates until overturned (ADR-0025).
   fragmented across more than `MAX_EVIDENCE_ITEMS − 1` admitted cert spends cannot
   be proven within the evidence-count cap, so no record is appended. (2) An
   admitted spend carrying an oversized `memo` cannot be embedded. Both are the DoS
-  cap doing its job (a bounded record) at the cost of completeness. Closing them
-  is a front-door admission-rule change — cap the proposal `memo`/record size well
-  under 64 KiB, and/or engine-refuse a cert's `MAX_EVIDENCE_ITEMS`-th admitted
-  spend as a distinct reason so every overspend stays provable in ≤ 16 items — and
-  is deferred to T2.3.4 / a follow-up (surfaced to the maintainer, not slipped in).
+  cap doing its job (a bounded record) at the cost of completeness. **Both gaps
+  are now closed** by two front-door admission rules described in the jury
+  subsection: the proposal `memo` is capped at `MAX_MEMO_BYTES`, and a
+  certificate's `MAX_EVIDENCE_ITEMS`-th admitted spend is refused
+  (`CertBackedSpendLimit`), so every overspend stays provable in ≤ 16 items.
 - *Threat: duplicate records amplifying one offence.* Repeated overspend attempts,
   or repeated presentations of a fork, appending a record each time.
 - *Mitigation:* one record per `(member, certificate)` and per `(member, fork
@@ -986,9 +1119,9 @@ and disqualifies them from issuing new certificates until overturned (ADR-0025).
   `Lapsed`, never as a `Confirm` no juror signed, so any consequence heavier than
   the reputation penalty that the jury path later gains requires an affirmative
   `Confirmed`.
-- *Design note — the jury path (T2.3.4).* The sortition/panel/verdict machinery
-  that *produces* an `EquivocationVerdictRecord` shipped in T2.3.4 (see the next
-  subsection). **Compensating the stranded receiver** of a refused cert-backed
+- *Design note — the jury path.* The sortition/panel/verdict machinery
+  that *produces* an `EquivocationVerdictRecord` is the next
+  subsection. **Compensating the stranded receiver** of a refused cert-backed
   spend remains out of scope (a governance question; ADR-0021 residual) — the
   receiver can *see* the proof (`equivocation_for_cert`), but making them whole is
   future work.
@@ -1114,12 +1247,15 @@ it.
   fact. While a community is bootstrapping (< 3 established members) the floor is
   relaxed to *any* member so the community is not deadlocked; that grace sunsets
   automatically by condition.
-- *Residual risk:* in Phase 1 the stake is **consequence-free** — there is no
-  dispute-resolution or forfeiture path yet (Phase 3), so the stake functions as
-  an eligibility filter and an audit anchor, not a live financial deterrent. The
-  bootstrap grace is a genuine window in which a small colluding founding group
-  can attest to each other's Tier-2 transactions; it is bounded by the
-  three-established-member sunset and accepted for bootstrap usability.
+- *Residual risk:* the stake now **bites through reputation, not through a
+  locked balance** (ADR-0014): a dispute upheld against the confirmed
+  transaction voids the transfer and folds "confirmation proven wrong" into the
+  confirmer's attestation-accuracy dimension on replay. There is no separate
+  forfeiture balance, and no penalty yet on a *raiser* who loses a dispute
+  opened in bad faith (deferred by ADR-0014). The bootstrap grace is a genuine
+  window in which a small colluding founding group can attest to each other's
+  Tier-2 transactions; it is bounded by the three-established-member sunset and
+  accepted for bootstrap usability.
 
 - *Threat: bilateral collusion.* The two counterparties (Tier 1 or Tier 2) simply
   agree to a fraudulent transaction; both "confirm" honestly from the protocol's
@@ -1204,7 +1340,8 @@ ingest path against oversized carriage.
   evidence primitive ADR-0021/T2.3.3 turn into an automatic dispute. Same
   position *and* same hash is a duplicate, not a fork (idempotent re-carriage).
 - *Residual risk:* fork *detection* here is the primitive only; the consequence
-  (dispute, reputation input) is T2.3.3. A member who never lets an entry reach
+  (the station-signed record, reputation input, jury case) is the `rrn-ledger`
+  "Provable equivocation" section. A member who never lets an entry reach
   the station leaves no fork evidence — but also achieves no admission.
 
 #### Information disclosure
@@ -1212,12 +1349,15 @@ ingest path against oversized carriage.
 - *Threat:* bundles carried by outside couriers expose the community's
   transaction graph (who paid whom, memos) in cleartext.
 - *Mitigation:* the carried records were already log-public *within the
-  community*, so a bundle leaks nothing new to a community member. Bundles are
-  cleartext in T2.2.1; sealing a bundle to the station key (privacy against an
-  outside courier, ADR-0008 sealed envelopes) is a noted future upgrade
-  (`dtn-bundles.md` §6), deliberately out of scope here.
-- *Residual risk:* an outside courier physically holding a cleartext bundle sees
-  its contents. Accepted for T2.2.1; the sealing upgrade path is recorded.
+  community*, so a bundle leaks nothing new to a community member. Bundles
+  **and delivery receipts** are cleartext on every carrier (paper, SMS, radio,
+  a courier's phone); sealing them to the station/author key (ADR-0008 sealed
+  envelopes) is a recorded future upgrade (`dtn-bundles.md` §6) that no Phase 2
+  ticket took up.
+- *Residual risk (accepted for Phase 2):* an outside courier holding a bundle
+  or receipt sees who transacted with whom, memos, and each record's fate. The
+  SMS carrier additionally exposes this to the phone network (see [SMS as a DTN
+  carrier](#sms-as-a-dtn-carrier-station-t271)).
 
 #### Denial of service
 
@@ -1229,8 +1369,8 @@ ingest path against oversized carriage.
   indefinite lengths, unsorted keys). A receipt's refusal reason is a closed set
   of bounded slugs (`RefusalReason`), never attacker-controlled free text.
 - *Residual risk:* a carrier can still present many separate in-bound bundles;
-  rate-limiting and admission back-pressure at the ingest edge are T2.2.3/T2.4.1,
-  not this pure-data layer.
+  per-member rate-limiting at the ingest edge was not built in Phase 2 and is a
+  [known limitation](#known-limitations), not this pure-data layer's concern.
 
 #### Elevation of privilege
 
@@ -1305,10 +1445,12 @@ reorder, and duplication.
 
 **Residual / out of scope:** transport-level authentication and encryption of the
 carrier itself (the sealed-envelope boundary above it is the security guarantee;
-the Reticulum sidecar is T2.6.x), a per-carrier *retransmit protocol* (`missing()`
-is the primitive; the loop is the carrier's, T2.6.2/T2.7.1), airtime-budget
-enforcement (T2.6.2 consumes `sustained_bytes_per_sec`), ingest rate-limiting and
-persistence (T2.2.3/T2.4.1), and the federation surface (Phase 3).
+the Reticulum sidecar is analyzed below), the federation surface (Phase 3), and
+per-member ingest rate-limiting (a known limitation). The retransmit loop
+(`DtnSyncer`'s `RRNC` request-missing/ack over `missing()`) and the airtime
+budget (`rrn_protocol::airtime`, consuming `sustained_bytes_per_sec`) are built
+and analyzed under [DTN transport over a constrained
+carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026).
 
 #### Paper / QR text encodings (T2.5.1)
 
@@ -1357,8 +1499,9 @@ malicious oversized single-QR string.
   every other dCBOR decode boundary in the workspace.
 - *Elevation / spoofing.* None available — the codec confers no authority. A paper
   payload is admitted only after the station's front-door signature checks, exactly
-  as an electronically-carried one; `classify` routes strictly by known prefix and
-  rejects (never guesses) an unknown one.
+  as an electronically-carried one; `classify` routes strictly by known prefix
+  (the three carriage forms plus the `rrnrecovery:` shard, `rrn:address?…` URI,
+  and bare-address forms) and reports anything else as `Unknown`, never guessing.
 
 *Residual / out of scope:* QR image rendering, PDF layout, and camera scanning
 (T2.5.2 CLI; mobile repo for phones); sealed/private paper forms (a `rrnspend:`
@@ -1380,8 +1523,15 @@ daemon (one local user, one writer).
 
 > Populated in M0.6. The CLI and the gossip layer speak the same line-delimited
 > JSON envelope ([`rpc`]) over two different transports. The gossip stub is
-> deliberately minimal (T0.6.6) and is replaced wholesale in Phase 2; several
-> residual risks below are explicitly its problem to solve.
+> deliberately minimal (T0.6.6). Phase 2 **retired it in place** rather than
+> replacing it (ADR-0020 §7): read-replica gossip still exists for replica
+> copies of the chain, but the DTN bundle path is the canonical resilience
+> mechanism, and the pilot runs with `[peers] list = []`. The gossip residuals
+> below therefore still stand; the consolidated statement is the "gossip ingest
+> bypasses the front door" residual at the end of the
+> [`rrn-governance`](#rrn-governance) section, and [Known
+> limitations](#known-limitations) carries it under the unpinned
+> station-signed ledger records.
 
 #### Spoofing — impersonating the CLI user, or a peer
 
@@ -1397,9 +1547,13 @@ daemon (one local user, one writer).
   is dropped (and never aborts the batch).
 - *Residual risk:* a valid signature only proves *authorship*, not *authority*.
   A peer can serve a correctly-signed entry that is semantically hostile (a
-  station-signed settlement crediting itself); Phase 0's two-station demo runs
-  between trusting parties, and authority/fork resolution is Phase 1+. The peer
-  TCP port has no transport authentication or encryption at all.
+  station-signed settlement crediting itself, or a member governance record
+  that skipped the front door's eligibility and duplicate checks); the gossip
+  path applies no front-door gate. Governance station attestations are now
+  signer-pinned on replay, ledger ones are not (see `rrn-governance`, residual
+  list). Cross-community authority/fork resolution is Phase 3. The peer TCP
+  port has no transport authentication or encryption at all, and the pilot
+  configures no peers.
 
 #### Tampering — the IPC channel, and peer-supplied entries
 
@@ -1414,8 +1568,10 @@ daemon (one local user, one writer).
   from settlement records keyed by `proposal_id`, so a replayed or duplicated
   settlement record cannot double-apply.
 - *Residual risk:* fork detection across replicas is out of scope (the gossip
-  stub logs a warning and skips conflicting entries). The local DB and socket
-  are plaintext on disk per the device-trust assumption.
+  stub logs a warning and skips conflicting entries) — within a community there
+  is one writer, so a fork is a Phase 3 inter-community question. The local DB
+  is plaintext on disk under the default profile (the encrypted profile,
+  ADR-0024, is the alternative).
 
 #### Repudiation
 
@@ -1455,10 +1611,13 @@ daemon (one local user, one writer).
   task but funnels through the single-threaded core, so there is no data race;
   the core processes commands serially. Peer reads are bounded by line framing,
   and a peer that errors only fails *that* gossip round.
-- *Residual risk:* there is no rate-limiting, connection cap, or message-size
-  cap on either the socket or the peer port (Phase 0 logs are small and the
-  demo is local/trusted); the gossip stub pulls a peer's whole log each round,
-  which does not scale. Both are explicitly Phase 2's to fix.
+- *Residual risk:* there is no rate-limiting or connection cap on the socket,
+  the peer port, or the mobile listener, and the gossip stub still pulls a
+  peer's whole log each round (`gossip::gossip_with_peer`), which does not
+  scale. Phase 2 bounded the *size* of what each surface accepts (bundle caps,
+  `MOBILE_BODY_LIMIT`, framing/paper/SMS reassembly bounds) and the *time* an
+  unreachable peer can cost (`PEER_DIAL_TIMEOUT`), but did **not** add rate
+  limiting; that remains a [known limitation](#known-limitations).
 
 #### Elevation of privilege
 
@@ -1970,13 +2129,14 @@ channel.
 
 - *Threat:* one person casts many votes by controlling many identities, or stands
   up enough fake "members" to swing or manufacture a quorum.
-- *Mitigation (shipped, T1.9.5/T1.9.6):* only an established member may vote —
-  `append_vote` and the `votes` replay both gate each ballot on `is_established`
-  (composite ≥ 2.0) *as of the ballot's own `cast_at`* — and a second ballot from
-  the same voter on the same proposal is dropped (first ballot wins, `votes`
-  keys by address). The tally's denominator is the established-member count, not
-  the raw identity count, so unanchored Sybils inflate neither numerator nor
-  denominator.
+- *Mitigation (shipped, T1.9.5/T1.9.6; re-anchored to the admission clock per ADR-0022):* only an
+  established member may vote — `append_vote` and the `votes` replay both gate
+  each ballot on eligibility (composite ≥ 2.0) *as of the proposal's open log
+  position* (`is_eligible_asof`; the ballot's own `cast_at` is testimony nothing
+  reads) — and a second ballot from the same voter on the same proposal is
+  dropped (first ballot wins, `votes` keys by address). The tally's denominator
+  is the established-member count at that same position, not the raw identity
+  count, so unanchored Sybils inflate neither numerator nor denominator.
 - *Residual risk:* **governance is exactly as Sybil-resistant as
   `rrn-reputation`, no more.** Establishing an identity means clearing the
   anchoring cap, and that section's central residual risk — a patient collusion
@@ -2057,12 +2217,16 @@ channel.
 - *Threat:* extending the DTN router to admit `rrn.gov.*` records could let a
   courier-carried proposal, co-signature, or ballot bypass a gate the live RPC
   enforces.
-- *Mitigation (shipped, T2.1.3):* `route_dtn_record` admits the three governance
-  kinds through the **same append guards** (`append_proposal`/`append_cosign`/
-  `append_vote`) the RPC uses — identical eligibility, publication, window, and
-  duplicate checks — so DTN is not a bypass; the window still anchors on *this*
-  admission. A re-carried record already on the log is the idempotent `known`
-  disposition, not a second admission.
+- *Mitigation (shipped with the ADR-0022 conformance pass; extended for ADR-0023):* `route_dtn_record` admits
+  the six member-signed governance kinds — proposal, co-sign, vote, and the
+  emergency declaration, co-sign, and lapse — through the **same append
+  guards** (`append_proposal`/`append_cosign`/`append_vote`,
+  `emergency::append_*`) the RPC uses — identical eligibility, publication,
+  window, and duplicate checks — so DTN is not a bypass; the window still
+  anchors on *this* admission. Every station-signed governance kind (window,
+  enactment, emergency anchor/activation/refusal) and the Charter record are
+  `UnroutableKind` on DTN. A re-carried record already on the log is the
+  idempotent `known` disposition, not a second admission.
 - *Residual risk:* the same as any DTN ingress — availability depends on couriers,
   and a governance record authored offline is only as timely as its carriage
   (ADR-0020); a proposal carried past its (admission-anchored) window simply
@@ -2080,7 +2244,9 @@ channel.
   *distinct established* members other than the author co-sign it (`append_cosign`
   + `proposal_records`). A motion nobody else with standing will endorse never
   opens for voting, so the flood a lone attacker can create is un-cosigned noise
-  that `phase` leaves in Deliberation.
+  that `phase` leaves in Deliberation. During bootstrap grace the threshold is
+  clamped to `min(3, electorate − 1)` (`effective_cosign_threshold`), so a
+  one-member electorate publishes with no co-signers — the ADR-0015 grace cost.
 - *Residual risk:* there is **no per-identity rate limit** on proposal or
   co-signature submission yet, so an established member (or a colluding cosigned
   group of them) can still author many proposals and consume community attention;
@@ -2110,8 +2276,10 @@ channel.
   ballots do not support, to fake an outcome.
 - *Mitigation (shipped, T1.9.6):* a tally is never stored — `tally` recomputes it
   from the signed ballots in the log every time, counting only votes that
-  `votes` admits (self-signed by the voter, on a published proposal, inside the
-  voting window, from an established member). Quorum and approval are decided by
+  `votes` admits (self-signed by the voter, on a published proposal, admitted
+  after the proposal's open position, from a member eligible at that position;
+  the voting-window close is enforced on the write path, see the admission-clock
+  entry above). Quorum and approval are decided by
   integer cross-multiplication (`participation·100 ≥ quorum_pct·eligible`;
   `yes·100 ≥ approval_pct·decisive`, with `decisive > 0` required), so every
   replica reaches a bit-identical verdict with no float drift, and the outcome is
@@ -2120,11 +2288,12 @@ channel.
 - *Residual risk:* correctness rests on log integrity — a fork or rollback that
   hid real ballots or resurrected withdrawn ones would change a tally (see
   [Log fork / rollback](#log-fork--rollback)). The eligible-voter denominator is
-  pinned at `voting_ends_at` so a concluded outcome stays stable as the community
-  grows, but the per-kind thresholds are read from the *current* effective Charter
-  at tally time rather than snapshotted at proposal creation, so an amendment that
-  lands mid-flight can shift the bar a proposal is judged against (a known
-  Phase-1 simplification).
+  pinned at the proposal's open log position (ADR-0022 §5) so a concluded outcome
+  stays stable as the community grows, but the per-kind thresholds are read
+  from the *current* effective Charter at tally time rather than snapshotted at
+  proposal creation, so an amendment that lands mid-flight can shift the bar a
+  proposal is judged against (a known simplification; the amendment window
+  itself defaults to 30 days).
 
 #### Illegitimate Charter founding and amendment capture
 
@@ -2213,10 +2382,20 @@ then lapses* — and withhold every adjacent one.
   **position**, not a wall-clock instant, so a vouch admitted after activation but
   back-dated earlier (legal under ADR-0022 §3) cannot enter the pinned set — closing
   the "declare, then manufacture members, then vote" path.
-- *Tampering — restructuring under cover of crisis.* The effective charter is frozen
-  while an emergency holds: a `CharterAmendment` is refused at admission and its
-  enactment deferred until lapse (`record_implementation` / `enact_due`), so the
-  rules of the game cannot be rewritten during the compressed window.
+- *Tampering — restructuring under cover of crisis.* The charter is frozen on
+  the **amendment** path while an emergency holds: a `CharterAmendment` is
+  refused at admission (`CharterFrozenByEmergency`) and its enactment deferred
+  until lapse (`record_implementation` / `enact_due`), so the rules of the game
+  cannot be rewritten through governance during the compressed window.
+  *Residual (found in the 2026-09-13 consolidation):* ADR-0023 §3(b) also
+  requires freezing the **founder-charter** door — `effective_charter` roots on
+  the highest-version founder-authorized charter (`charter::founder_charter`),
+  and neither `store_charter` nor that selection checks for an active
+  emergency. The door is latent: the RPC pins the founder charter at version 1
+  and the Charter kind is `UnroutableKind` on DTN, so the only way a v+1
+  founder charter reaches the log today is the gossip `append_raw` path
+  (`[peers] list = []` in the pilot). It is a conformance gap against the ADR,
+  tracked for a follow-up, not a live lever in a single-writer deployment.
 - *Replica divergence.* The activation instant and scheduled expiry are frozen into
   the **station-signed** `emergency_activated` attestation (never recomputed from a
   replica's re-stamped admission clock), and the compressed window is frozen into
@@ -2241,14 +2420,17 @@ then lapses* — and withhold every adjacent one.
   closes the last supermajority-free shift: a gossip peer holding a genuine
   supermajority can no longer inject an attestation with an attacker-chosen
   `activation_instant` to shift the active span, because its non-station envelope is
-  skipped. The emergency-*legitimacy* parameters are still read from the genesis
-  charter rather than any attestation field (defence in depth). A duplicate/bogus
+  skipped. The emergency-*legitimacy* parameters (declaration bar, renewal cap,
+  community id) are read from the **founder-authorized** charter
+  (`charter::founder_charter`, the highest-version one on the log — not
+  strictly "genesis") rather than any attestation field or the amendable
+  effective charter (defence in depth, and replica-determinism). A duplicate/bogus
   attestation still cannot *block* the real one: the "already activated" check runs only
   after legitimacy passes. The consolidated post-T2.1.4 residual list is under
   "Emergency activation + declaration TTL" below.
 - *Residual — a renewal re-pins the electorate at its own activation.* Each activation
   in a chain pins at its own position, so a chain that renews mid-emergency can refresh
-  its pinned electorate up to `MAX_CONSECUTIVE_RENEWALS_CEILING` times — ADR-consistent
+  its pinned electorate up to `MAX_CONSECUTIVE_RENEWALS_CEILING` (2) times — ADR-consistent
   (each renewal is a fresh collective act), but a standing supermajority could admit
   members between renewals into the next segment's electorate.
 - *Residual risks (stated plainly in ADR-0023):* a standing two-thirds faction can
@@ -2256,8 +2438,10 @@ then lapses* — and withhold every adjacent one.
   power measure under a "flood response" declaration — `reason`/`scope` are
   testimony, not machine-enforced germaneness. The backstops are the raised bar, the
   frozen charter, the pinned electorate, the enforced measure-expiry, and full
-  visibility (the derived emergency report, and the status/whoami banner while an
-  emergency holds); a community may adopt a mandatory post-emergency review by
+  visibility (the derived emergency report, the `emergency` field on the
+  status/whoami RPC results and the phone banner while an emergency holds, and
+  `rrn governance emergency-status` at the console); a community may adopt a
+  mandatory post-emergency review by
   statute. Emergency structurally favours the connected: a co-present supermajority
   of the *reachable* electorate can pass fast, temporary measures partitioned members
   will not see until admitted — an honest cost of deciding in a crisis, mitigated but
@@ -2329,7 +2513,7 @@ implementation, and adds two station-signed record kinds
   electorate pin, block a genuine enactment, or fold a phantom amendment). A forged
   record is invisible to derivation, never a hard error, so a hostile peer cannot wedge
   replay either (skip-not-halt). The invariant suite is
-  `tests/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
+  `crates/rrn-governance/tests/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
   attests) already made this decision, so no new ADR was needed.
 - *Residual — surviving after T2.1.4.* Four same-class gaps remain, all narrower than
   the one just closed:
@@ -2340,7 +2524,8 @@ implementation, and adds two station-signed record kinds
      an attacker-chosen instant). Scoped to a **sibling ticket** by the T2.1.4 decision
      (governance-only); the pilot mitigation is the same "no untrusted gossip peers."
   2. **The equivocation verdict pins to the equivocation *record's* signer, not the
-     community key** (`reputation/scoring.rs:347`) — same class, tracked follow-up.
+     community key** (`rrn-reputation::scoring::overturned_equivocations`, and
+     the snapshot's `equivocation_verdict`) — same class, tracked follow-up.
   3. **A gossip read-replica cannot derive governance until it is told the writer's
      key.** Per the T2.1.4 decision (a), the pin is against the writer's own key; a
      second-`init`ed peer that derives under a *different* key gets the **genesis
@@ -2377,11 +2562,13 @@ pocket and onto a consumer OS, which is a materially different environment from
 the station's. Two surfaces matter: the device itself, and the link from the
 device to the station.
 
-> Phase 1, M1.1 in progress. The crypto/FFI layer has begun landing — the
-> `SecureStore` component below is **implemented** (T1.1.2), and its subsection
-> reflects shipped behaviour. The remaining mitigations are still **planned**,
-> named by the task (M1.1 crypto/FFI, M1.2 auth/UI, M1.3 transport, M1.3.3
-> pairing) that will ship them.
+> The subsections below were written as the mobile milestones landed (M1.1
+> crypto/FFI, M1.2 auth/UI, M1.3 transport and pairing, M1.4 vouching, M2.4 DTN
+> and certificates). Each states whether its mitigations are **shipped** or
+> **planned** as of its milestone; the client code lives in the sibling
+> `mobile` repository and is verified there (see the note at the top of this
+> document). The station-side halves — the sealed channel, `rrn-mobile-ffi`,
+> DTN ingest — are verified here.
 
 ### Device attack surface
 
@@ -2945,8 +3132,9 @@ availability of the single-threaded core.
   the read-path DoS note calls out); at 20-member pilot scale the pairing gate is
   the accepted bound. The `seen_outbox_entries`/`outbox_forks` tables also grow
   with carried volume (one row per distinct seen position, plus retained fork
-  envelopes) — unbounded pruning is deferred; the local-plaintext-state posture
-  matches the outbox store above (at-rest encryption is T2.9.x).
+  envelopes) — pruning of these is deferred (only `receipt_deliveries` is
+  pruned); their at-rest posture is the database's (plaintext by default, inside
+  the container under the encrypted profile — ADR-0024).
 
 #### Elevation of privilege — the Tier-2 confirmation staking gate
 
@@ -3001,9 +3189,8 @@ receipt discloses.
   design (ADR-0008/0013) — it moves bytes it cannot forge or alter (the station
   signature covers the receipt; ADR-0002). *Residual:* receipts are **not
   sealed** to the author, so a courier learns who transacted with whom at the
-  hash level; sealed/encrypted receipts are explicitly out of scope for T2.2.4
-  and tracked as backlog. At 20-member pilot scale, with all state already
-  local-plaintext (at-rest encryption is T2.9.x), this is the accepted posture.
+  hash level; sealed/encrypted receipts are tracked as backlog (no Phase 2
+  ticket took them up). At 20-member pilot scale this is the accepted posture.
 - *Repudiation — a malicious courier drops a receipt it carried.* A courier that
   fetches a receipt and never delivers it, or discards it, cannot suppress it:
   the delivery row stays **unconfirmed** (only the author's own authenticated
@@ -3183,9 +3370,12 @@ now runs a second, unaudited runtime and process.
   `Degraded` and the daemon **runs on without the carrier**; a crashing child is
   restarted with exponential backoff (base 5s, doubling, cap 300s) so a hard crash
   loop cannot busy-spin. Version drift is *refused* by default (appliance
-  discipline: run degraded rather than manage an unpinned carrier). Announce-budget
-  tuning on constrained links is deferred to T2.6.2, where the `FrameTransport`
-  pacing layer lands; it is named here as a known residual until then.
+  discipline: run degraded rather than manage an unpinned carrier). The `status`
+  block reports `disabled` / `starting` / `running` / `degraded` /
+  `restarting`. Announce-budget pressure on constrained links is handled by the
+  airtime budgeter in the transport section below (Reticulum's own control
+  traffic is external load the budget treats as bulk-class pressure); measuring
+  its real cost on a live LoRa link remains a field-test item.
 
 #### Information disclosure — initiator anonymity and truncated-hash addressing
 
@@ -3343,10 +3533,15 @@ correctness of identity→destination routing.
 - **Metadata:** the carrier still sees traffic volume and timing between
   destinations (initiator anonymity covers source *addresses*, not traffic
   analysis); unchanged from the sidecar section's residual.
-- **Adapter identity at rest:** the LXMF adapter's Reticulum identity is a
-  persisted private key deciding who may *receive* for this station (not an RRN
-  key); its at-rest custody is deferred to T2.9.1, noted here as a residual until
-  then (ADR-0026 §7).
+- **Adapter identity at rest:** the LXMF adapter's Reticulum identity
+  (`<reticulum_dir>/adapter.identity`) is a persisted private key deciding who
+  may *receive* for this station (not an RRN key). Under the encrypted profile
+  the whole Reticulum directory lives **inside** the container
+  (`storage::layout::reticulum_dir`), and `encrypt-in-place` moves and erases
+  the plaintext copy (ADR-0024, closing the custody item ADR-0026 §7 assigned
+  to it); under the default plaintext profile it is plaintext on disk like the
+  rest of the data directory. Losing it to a seizure costs a signed re-bind
+  ("bind, do not collapse"), never identity recovery.
 
 ### SMS as a DTN carrier (station, T2.7.1)
 
@@ -3393,9 +3588,9 @@ communication-metadata privacy.
   and the victim is nuisance-texted).
 - *Mitigation:* a per-sender fixed-1-hour-window cap (`[sms] max_inbound_per_hour`, default
   60) drops the excess with a **single rate-limited log line** (never one per text);
-  the per-sender reassembly and rate state are evicted once idle past the window, so
-  the tracking maps stay bounded to senders active within the last hour (a
-  spoofed-number flood cannot grow relay memory without limit); and a truncated or
+  the per-sender reassembly and rate state are evicted once idle past the window
+  and hard-capped at `MAX_TRACKED_SENDERS` (512) distinct senders, so the
+  tracking maps stay bounded whatever a spoofed-number flood does; and a truncated or
   corrupt chunk fails its base64/length check or its reassembly hash and is
   **refused**, so the reassembler simply waits for a re-send rather than accepting
   wrong bytes. There is no station-side retransmit protocol: the member re-sends until
@@ -3576,7 +3771,7 @@ the boot-dir descriptor.
   keyslot. `< K` shards reveal nothing (ADR-0004), and the boot-dir descriptor
   discloses only the VMK address and `K`/`N` — **never the holder set** (a coercion
   map). The brick property is asserted on raw container bytes with a plaintext
-  positive control (`tests/at_rest_dmcrypt.rs`, `scripts/drill-seizure-recovery.sh`).
+  positive control (`crates/rrn-station/tests/at_rest_dmcrypt.rs`, `scripts/drill-seizure-recovery.sh`).
 - *Information disclosure (key handling):* the reconstructed VMK is never written to
   disk, is held in a `ZeroizeOnDrop` type with a redacting `Debug`, is passed to the
   mount helper **by file descriptor** (`/dev/stdin`, never argv/env/temp file), and is
@@ -3589,7 +3784,7 @@ the boot-dir descriptor.
   unlocked would otherwise create a fresh plaintext `station.db` on the unencrypted
   root and serve it. *Mitigation:* `Station::open` verifies the state dir is a **live
   `dm-crypt` mount** (an unprivileged `/proc/self/mountinfo` check) *before touching
-  any file*, and refuses otherwise (`tests/at_rest_dmcrypt.rs`,
+  any file*, and refuses otherwise (`crates/rrn-station/tests/at_rest_dmcrypt.rs`,
   `station_open_refuses_an_unmounted_state_dir_and_writes_nothing`).
 - *Denial of service:* every power loss unmaps the volume, so the node is a locked
   brick until `K` holders converge — the availability cost, paid by design. A UPS is
@@ -3603,10 +3798,13 @@ the boot-dir descriptor.
   recover it. The answer is physical (custody, tamper-evident enclosure) plus rapid
   re-bootstrap on new hardware (ADR-0016), not this profile. Swap and core dumps can
   page out VMK bytes or plaintext DB pages — the runbook requires disabling swap (or
-  encrypted swap) and suppressing core dumps. Backup/migration temporaries must be
-  written to tmpfs or inside the container, never the plaintext root (the migration
-  snapshots straight into the container via `VACUUM INTO`). Secure erase of the old
-  plaintext media is unreliable on wear-levelled flash/SD — destroy the card.
+  encrypted swap) and suppressing core dumps. Backup/migration temporaries are
+  written **inside the container**, never the plaintext root: `station backup`
+  snapshots via `VACUUM INTO` a temporary directory under the mounted state dir
+  (tmpfs was considered and rejected — RAM-capped, with a silent `/tmp`
+  fallback), and the migration snapshots straight into the container. Secure
+  erase of the old plaintext media is unreliable on wear-levelled flash/SD —
+  destroy the card.
 
 ## Cross-cutting threats
 
@@ -3633,9 +3831,12 @@ property of any one signature but of the *log + ledger* enforcing single use:
 - Replicated entries arrive via `AppendLog::append_raw`, which **dedupes by
   Blake3 content hash** before writing, so a replayed log entry is dropped.
 
-*Residual:* the nonce sequence is per-sender on a *single* replica. A sender
+*Residual:* the nonce sequence is per-sender on a *single* writer. A sender
 acting on two stations, or cross-replica nonce coordination generally, is a
-Phase 1+ federation problem (no global ordering in Phase 0).
+Phase 3 federation problem; within a community ADR-0020 guarantees one writer
+and one order. Under DTN the same protections apply to carried records, and
+ingest adds a third layer: the presentation-hash receipt cache and the log's
+`admission_of` dedup, so re-carriage can only ever produce `known`.
 
 ### Log fork / rollback
 
@@ -3647,11 +3848,17 @@ tail rather than importing a peer's `prev_hash` — a peer cannot inject a break
 into our chain. What is *not* defended:
 
 - **Forking** — two replicas extending into conflicting-but-individually-valid
-  chains. The Phase 0 gossip stub logs a warning and skips conflicting entries;
-  real fork *resolution* is Phase 1+ (`rrn-protocol`).
+  chains. Within a community this is ruled out by construction (one writer,
+  ADR-0020; the outage harness asserts `assert_no_forks`); the Phase 0 gossip
+  stub logs a warning and skips conflicting entries; real fork *resolution*
+  is Phase 3 (`rrn-protocol` federation).
 - **Rollback / truncation** — truncating the log to an earlier valid prefix
   yields a shorter but still-consistent chain. Detecting this needs external
-  anchoring (e.g. cross-replica checkpoints), also Phase 1+.
+  anchoring (e.g. cross-replica checkpoints), also Phase 3. A station restored
+  from a backup taken at time *T* has genuinely rolled back its DTN bookkeeping
+  (seen chains, receipts), and ADR-0024 notes the re-bootstrap drill must
+  reconcile members' receipts rather than treat the resulting `ConflictingAck`
+  as tampering.
 
 ### Key-compromise impact analysis
 
@@ -3666,11 +3873,24 @@ assumption:
   `zeroize`. Social recovery (`recovery`) is the mitigation for *loss*, not for
   *theft* — a thief with the live key needs no recovery.
 - **The station key**: authority to author settlement/cancellation records
-  (ADR-0005) and to sign gossip handshakes. A compromised station can settle
-  eligible confirmed transactions and serve hostile-but-valid entries to peers;
-  it **cannot** forge a sender's proposal or a receiver's confirmation (those
-  need the parties' keys). The single Phase 0 station is trusted to decide
-  *when* to settle.
+  (ADR-0005), headroom certificates, equivocation records and verdicts,
+  delivery receipts, and the governance attestations (windows, enactments,
+  emergency anchors/activations/refusals), and to sign gossip handshakes. A
+  compromised station can settle eligible confirmed transactions, issue
+  certificates (still floor-bounded — issuance is a front-door debit), sign
+  receipts for records it never admitted, and serve hostile-but-valid entries
+  to peers; it **cannot** forge a sender's proposal, a receiver's confirmation,
+  a co-signature, a ballot, or an equivocation's *evidence* (those need the
+  parties' keys, and `verify_evidence` re-checks them on every replica). The
+  single station is trusted to decide *when* to settle (ADR-0022 §6).
+- **The Volume Master Key (encrypted profile)**: opens the at-rest container.
+  Never on disk; reconstructed by a `K`-of-`N` holder quorum at boot and
+  zeroized once the volume is mapped. `K` colluding holders equal a powered-off
+  seizure of a plaintext node — the trust model, not an attack. Distinct from
+  the station key, rotated independently (ADR-0024).
+- **The Reticulum adapter identity**: decides who may *receive* for this
+  station over Reticulum; not an RRN key. Compromise costs a signed re-bind
+  (`rrn.net.binding`), never recovery (ADR-0013 "bind, do not collapse").
 - **A recovery shard holder's key**: lets that holder decrypt *their own* shard.
   Inherent to entrusting them a shard, and bounded by the `K`-of-`N` threshold —
   an attacker needs `K` compromised/colluding holders to reconstruct the key;
@@ -3720,7 +3940,7 @@ network boundary is the gossip stub; the CLI↔daemon boundary is local.
               peer entries: NOT trusted by source; every entry
               re-verified (signature + content hash) and re-chained
               onto the local tail by append_raw before it is stored.
-              No transport auth/encryption in Phase 0 (Phase 1+).
+              No transport auth/encryption (still none; Phase 3).
 ```
 
 The load-bearing invariant: **untrusted bytes never become trusted state
@@ -3728,141 +3948,249 @@ without passing through `rrn-crypto` verification** — at the ledger boundary
 *and* again at the log write (`append`/`append_raw`). State is always *derived
 from* the verified log, never written authoritatively around it.
 
+**Phase 1 and Phase 2 added boundaries.** The diagram above is the Phase 0
+picture; the boundaries that now exist, each analyzed in its own section:
+
+| Boundary | Enters as | Trust established by | Section |
+|---|---|---|---|
+| Mobile ↔ station (`/rpc`, `/subscribe`, plain HTTP on the LAN) | a sealed, signed dCBOR envelope | the mobile's signature + the pairing bond; sealed to the station key | [Mobile–station transport](#mobilestation-transport) |
+| DTN bundle ingest (`bundle_submit` over the operator socket, the mobile channel, Reticulum, SMS, or paper) | an unsigned bundle of signed outbox entries | `outbox::validate` per entry, then the engine front door | [DTN bundle ingest](#dtn-bundle-ingest-station-adr-0020) |
+| Reticulum: `rnsd` sidecar + LXMF adapter co-process (length-prefixed pipe) | opaque frames | nothing — a dumb carrier; framing CRC/Blake3 then the signatures inside | [Reticulum transport sidecar](#reticulum-transport-sidecar-station-adr-0013--adr-0026), [DTN transport over a constrained carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026) |
+| SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station-t271) |
+| Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli-t252) |
+| Gossip peer TCP (`[peers]`, loopback by default, empty in the pilot) | line-JSON `WireEntry` | signature + content hash in `append_raw`; **no front-door gate** | [`rrn-station`](#rrn-station--rrn-cli) |
+| Encrypted volume: `sudo -n` mount helper, the console unlock ceremony | holders' pasted `rrnrecover-resp:` lines | the console fingerprint, then the reconstructed VMK's address | [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) |
+
+Every carrier row shares one property: **the carrier establishes no trust**.
+Whatever it delivers is untrusted bytes until `rrn-crypto` verifies the
+signatures inside at the station's single front door.
+
 ## Known limitations
 
-Things Phase 0 explicitly does **not** mitigate, and why. Stating these plainly
+Things the code explicitly does **not** mitigate, and why. Stating these plainly
 is deliberate — the audit covers what is built, and these are the documented
-edges of that scope.
+edges of that scope. Rewritten at the Phase 2 consolidation (2026-09-13): the
+first group records what Phase 2 closed, the rest is the standing list, every
+entry citing its ADR or the section that owns it.
+
+### Closed by Phase 2
+
+- **Plaintext at rest is no longer the only option.** The optional encrypted
+  profile (ADR-0024, `[storage] at_rest = "encrypted"`) makes a powered-off
+  station a member-keyed LUKS2 brick; see the standing entry below for what it
+  still does not cover.
+- **Backdating a confirmation to shrink the dispute window is retired**, not
+  bounded (ADR-0022): windows run from admission time, and the ADR-0019
+  freshness bound that would have refused every carried record is gone. The
+  same anchoring now covers dispute sortition/resolution, escalation, ordinary
+  governance windows and electorates (the ADR-0022 conformance pass), and
+  emergency governance.
+- **Unbounded offline overspend is bounded and provable** (ADR-0021, ADR-0025):
+  the per-certificate cap bounds the exposure, an overspend is refused and
+  recorded with the member's own signed proofs, and a jury path exists.
+- **Forged station governance attestations are invisible on replay**
+  (station-signer pinning; `rrn-governance` residual list for what is still
+  unpinned).
+- **The daemon's offline posture is tested** (`crates/rrn-station/tests/offline_lifecycle.rs`): no
+  internet, no NTP, an unreachable peer is bounded by `PEER_DIAL_TIMEOUT` (3 s),
+  and `rrn status` exposes a derived `connectivity` block. *Residual:* a peer
+  configured as a **hostname** resolves via `getaddrinfo` on a blocking thread
+  the dial timeout cannot cancel; if the resolver is dead, process *exit* can
+  wait out its timeout. Configure peers by IP.
+- **Every untrusted decode boundary is depth-guarded** (`MAX_CBOR_DEPTH`), and
+  every carrier bounds what it will reassemble.
+
+### Identity, reputation, and governance (standing)
 
 - **Partial Sybil resistance.** Vouch *authenticity* is enforced
-  cryptographically; vouch *trust* is not. M1.5 adds two defenses — the 0.5/week
-  velocity cap, which makes manufactured standing slow (ten weeks to max a
-  dimension) and flags implausible gains for human review, and identity anchoring,
-  which holds an unvouched identity at 1.0 per dimension. Together they stop a
-  lone fake identity, but a *pair* of colluding identities can trade with each
-  other to raise the uncapped composites that qualify them to anchor each other,
-  and mutually-vouching keys remain cryptographically valid (see
-  [Sybil clusters and manufactured standing](#sybil-clusters-and-manufactured-standing-m15)).
-  Statistical graph analysis is Phase 3.
-- **No federation security.** Eclipse attacks, cross-replica ledger forks,
-  rollback detection, and treaty abuse are out of scope (see
-  [Log fork / rollback](#log-fork--rollback) and `rrn-protocol`).
-- **At-rest encryption is opt-in (ADR-0024), and Linux-only.** The default
-  **plaintext** profile still leaves balances, the transaction graph, memos, and
-  the social-vouch graph plaintext on disk — exposed to a local attacker or seized
-  media. The optional **encrypted** profile (`[storage] at_rest = "encrypted"`)
-  closes this for a *powered-off* node — the whole data directory (ledger, wallet,
-  adapter identity, index) becomes a member-keyed LUKS2 brick with no wrapped key on
-  the device — but it runs only on Linux (kernel `dm-crypt`), costs a boot ceremony
-  after every power loss, and does **not** defend a node seized *while running* (the
-  key is in kernel memory). See [Encrypted at-rest storage and the boot
-  ceremony](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024).
-- **No memory hardening beyond `zeroize`.** Keys are necessarily plaintext in
-  RAM while in use; no `mlock`. Under the encrypted profile the runbook requires
-  disabling swap (or encrypted swap) and suppressing core dumps — but this is
-  operator hardening, not enforced by the daemon. A same-user code-execution attacker
-  or physical memory access defeats secrecy (per the device-trust assumption).
-  `RRN_PASSPHRASE`, if used, is visible in the process environment.
-- **Debt is bounded, not managed.** The debt floor (ADR-0018, default
-  −20 Commons) caps how far a member can sign themselves into debt, but the
-  contract-charge path is not floor-checked, the floor is operator config
-  rather than governance, and exit-with-debt policy (who absorbs a departed
-  member's balance) is unanswered — see the `rrn-ledger` elevation-of-privilege
-  section.
-- **No rate limiting or resource caps** on the IPC socket or the gossip port,
-  and no message-size cap; the gossip stub pulls a peer's whole log each round.
-  O(N) full-log replay has no snapshotting yet. All Phase 1/2.
-- **Availability — the daemon's offline posture is now tested (T2.4.1).** The
-  `station` daemon needs no internet: it reaches its serving state, runs the full
-  Phase-1 + DTN lifecycle, and shuts down cleanly with no route to anything but
-  loopback (`tests/offline_lifecycle.rs`, a black-hole peer + a cert-backed spend
-  over `bundle_submit`, in <60s). An unreachable peer is non-fatal and bounded by
-  `PEER_DIAL_TIMEOUT` (3s), so it can neither stall a gossip round nor the daemon's
-  shutdown; a peer flipping reachable↔unreachable logs one `info`, and ordinary
-  offline rounds stay at `debug`, so an offline month does not fill the log. The
-  `status` RPC / `rrn status` exposes a derived `connectivity` block (per-peer
-  reachability, mobile-listener state, pending outbox/receipt depths) so isolation
-  is legible. The **only** deliberate non-loopback emission is mDNS advertising
-  when `[mobile] advertise = true` (best-effort, fail-open: an advertise error
-  warns once and the daemon serves regardless); the clock is a local syscall with
-  **no NTP dependency**, and the CLI reaches the daemon only over the local Unix
-  socket. The "zero non-loopback connections" claim is TCP-connect scoped.
-  *Residual:* a peer configured as a **hostname** (not an IP literal) resolves via
-  `getaddrinfo`, which Tokio runs on a blocking thread the dial timeout cannot
-  cancel; the gossip round itself stays bounded, but if the host's resolver is
-  itself dead, process *exit* can wait out the resolver's own timeout. Configuring
-  peers by IP (as offline/mesh deployments do) avoids it; a resolver bound is
-  future work.
-- **The marketplace has no admission control, and its stated requirements are
-  not enforced.** Individual listings are bounded (200-byte title, 8 KiB
-  description, controlled category vocabulary), but nothing bounds how *many* a
-  member may publish onto a permanently replicated log, and low search ranking
-  hides a flood without removing its storage cost. A listing's `Requirements` —
-  `min_reputation` and `community_member_only` — are validated as *reachable* at
-  creation but checked against no buyer anywhere, so they are provider intent, not
-  access control, until the T1.7.4 inquiry flow enforces them. Marketplace
-  **reads** are now network-reachable (T1.7.0: `marketplace_search` /
-  `marketplace_listing` to paired mobiles) with the page size clamped and the
-  expiry sweep wired; **writes** are not yet, so admission control is still owed by
-  the T1.7.2/T1.7.3 publishing path, and nothing rate-limits reads. See
-  [`rrn-marketplace`](#rrn-marketplace).
+  cryptographically; vouch *trust* is not. The 0.5/week velocity cap and
+  identity anchoring stop a lone fake identity, but a *pair* of colluding
+  identities can trade with each other to raise the uncapped composites that
+  qualify them to anchor each other (see [Sybil clusters and manufactured
+  standing](#sybil-clusters-and-manufactured-standing-m15)). Statistical graph
+  analysis is Phase 3.
 - **Governance has no spam bound, no ballot secrecy, and a capturable bootstrap
-  electorate.** Authorship and voting are gated on established standing and a
-  three-cosigner publication threshold, but nothing rate-limits how many
-  proposals a standing member may submit onto the permanently replicated log, and
-  the cosign threshold is a fixed constant a community cannot raise. Ballots are
-  signed records carrying the voter's address in clear, so votes are attributable
-  — enabling coercion as much as accountability; ballot secrecy is Phase 3. A
-  community with only one or two established members has a one- or two-person
-  electorate that trivially passes statutes, an accepted ADR-0012 tradeoff with no
-  minimum-electorate floor. And an enacted statute is only *recorded* as in force —
-  there is no engine that turns it into an enforced configuration change. See
-  [`rrn-governance`](#rrn-governance).
-- **Unclamped wallet KDF parameters.** A hostile `.rrnwallet` can specify a very
-  large argon2 `m_cost`, forcing a large allocation on `decrypt` (accepted: you
-  only decrypt your own wallet; clamping is a noted future hardening). This is
-  the documented caveat the `wallet_decrypt` fuzz target may surface.
-- **GF(256) table-lookup timing in Shamir.** Field multiplication indexes
-  `LOG`/`EXP` tables by secret bytes; full cache-timing resistance is not
-  claimed. Recovery is a rare, local, interactive operation with no co-resident
-  remote attacker in the Phase 0 model. Constant-time table-free multiplication
-  is a noted future hardening.
+  electorate.** Nothing rate-limits proposals from a standing member; the
+  cosign threshold is a fixed constant (clamped *down* during grace); ballots
+  carry the voter's address in clear; a one- or two-member electorate trivially
+  passes statutes (ADR-0012, ADR-0015); an enacted statute is only *recorded*
+  as in force. See [`rrn-governance`](#rrn-governance).
+- **Emergency governance's residuals are structural** (ADR-0023 Consequences,
+  ADR-0027 D2): a standing two-thirds faction can cycle emergencies at up to a
+  50 % duty cycle and file an ordinary power measure under a crisis label
+  (`scope` is testimony); a ≤ 2-member grace electorate declares at two
+  signatures; the 7-day declaration TTL does not bound a colluding faction that
+  holds a fully-signed bundle off-log; the **founder-charter door is not
+  frozen** during an emergency (a conformance gap against ADR-0023 §3(b),
+  latent because that door is reachable only via gossip today — see the
+  emergency section). A renewal re-pins the electorate at its own activation.
+- **Station-signed ledger records are replay-trusted with no signer pin**
+  (`SettlementRecord`, `ContractCharge`, `HeadroomCertificate`); the
+  equivocation `Overturn` gate pins to the record's author, not the community
+  key; a gossip read-replica cannot derive governance until told the writer's
+  key. All three are in the `rrn-governance` residual list (whose fourth item,
+  the log-head freshness witness ADR-0027 deferred, belongs with the emergency
+  residuals above); the pilot mitigation is a single writer and no gossip
+  peers.
+- **The dispute-escalation and jury electorates are time-bounded, not
+  position-bounded** (`rrn-dispute` still calls `grace_electorate(at)`, not
+  `grace_electorate_asof`): admission-anchored, so ADR-0022 holds, but the
+  back-dated-vouch electorate-packing vector the ADR-0022 conformance pass
+  closed for governance is open here (follow-up).
+- **Equivocation: two count-bounded evasions are closed, two policy gaps
+  remain.** After an `Overturn`, a later genuine overspend on the same
+  certificate is refused but records no fresh proof or penalty (first-wins
+  dedup); compensating the stranded receiver is a governance question
+  (ADR-0021). Juror ballots and re-seats are not DTN-routable and have no mobile
+  surface, so in Phase 2 the operator wallet is the only juror that can act.
+- **Debt is bounded, not managed.** The debt floor (ADR-0018) caps how far a
+  member can sign themselves into debt, but the contract-charge path is not
+  floor-checked, the floor and the certificate caps are operator config rather
+  than governance (ADR-0021), and exit-with-debt policy is unanswered.
+
+### Resilience surface (standing, opened by Phase 2)
+
+- **Hidden certificate history.** An offline receiver's verdict is only as good
+  as the spend history the spender presents; the cap bounds the loss and the
+  overspend is later provable (ADR-0021 Consequences; `rrn-mobile-ffi`
+  `offline_spend_verify`).
+- **The station is the liveness single point of failure** (ADR-0020
+  Consequences). Nothing settles, no window runs, and no tally closes while it
+  is unreachable; members' outboxes preserve everything signed, and recovery is
+  ADR-0016 restore plus outbox replay (or the ADR-0024 ceremony). Multi-station
+  availability is Phase 3.
+- **Bundles, receipts, and sheets are cleartext to whoever carries them**; SMS
+  is cleartext to the phone network and exposes which numbers talk to the
+  station. Content is community-public; the residual is metadata (`rrn-protocol`
+  Information disclosure; `docs/spec/sms-carrier.md` §6). Sealing is backlog.
+- **Radio exposes traffic timing and the transmitter's location**, jamming is
+  unmitigable at the transport layer, and spectrum compliance is the operator's
+  per geography (`docs/lora-radio-bringup.md`). Bulk traffic may starve under
+  sustained economic load by design.
+- **Encrypted at-rest storage is opt-in, Linux-only, and defends a powered-off
+  node only.** The default plaintext profile leaves the ledger, memos, and vouch
+  graph on disk in the clear. The encrypted profile costs a `K`-of-`N` holder
+  ceremony after every power loss, requires operator hardening the daemon does
+  not enforce (no swap, no core dumps, destroy the old card), relies on holders
+  checking the console fingerprint, and does **not** defend a node seized while
+  running (ADR-0024 "Not covered").
+- **No memory hardening beyond `zeroize`.** Keys are plaintext in RAM while in
+  use; no `mlock`. `RRN_PASSPHRASE`, if used, is visible in the process
+  environment.
+- **No per-member rate limiting anywhere.** Phase 2 bounded the *size* of every
+  input (bundle, frame, sheet, SMS chunk, mobile body) and the *time* an
+  unreachable peer can cost, but no surface — bundle submission, receipt fetch,
+  marketplace, governance, vouches, the socket, the peer port — limits how
+  *often* one identity may call it. The transport-level exceptions are the SMS
+  per-sender cap and the LoRa airtime budget. The pairing gate bounds *who*, not
+  *how often*; at pilot scale that is the accepted bound. The gossip stub still
+  pulls a peer's whole log each round; `seen_outbox_*`/`outbox_forks` are never
+  pruned; O(N) replay has no snapshotting.
+- **Some Phase 2 deliverables stop at a software seam.** The SMS *modem
+  gateway* is not built (only the codec, registry, relay, and a mock gateway);
+  the RNode/LoRa field round-trip is bench-verified but the human field sign-off
+  is pending; there is no station-side outbox export (`rrn paper export-outbox`
+  / a CLI wallet — needs an ADR), so a full propose → confirm → settle payment
+  round-trip over radio is not yet field-provable; `rrn paper show` on a spend
+  voucher is a structural check only. See
+  [`phase-2-exit-evidence.md`](phase-2-exit-evidence.md).
+
+### Marketplace and mobile (standing, from Phase 1)
+
+- **The marketplace has no admission control, and its stated requirements are
+  not enforced.** Listings are size-bounded but not count-bounded; a listing's
+  `Requirements` are provider intent, not access control, until the inquiry
+  flow enforces them. See [`rrn-marketplace`](#rrn-marketplace).
+- **The mobile sealed channel has no forward secrecy** (ADR-0008; Noise_KK is
+  the named upgrade), the pairing bond is TOFU with an in-person code
+  comparison, and the opt-in background-sync credential is a full-power signing
+  wallet.
+
+### Cryptographic edges (standing, from Phase 0)
+
+- **Unclamped wallet KDF parameters.** A hostile `.rrnwallet` can specify a
+  very large argon2 `m_cost` (accepted: you only decrypt your own wallet).
+- **GF(256) table-lookup timing in Shamir.** Full cache-timing resistance is not
+  claimed; recovery is a rare, local, interactive operation.
 - **No key revocation.** Compromise of any key is non-recoverable by
-  cryptography alone in Phase 0 (see [Key-compromise impact
-  analysis](#key-compromise-impact-analysis)).
-- **No formal verification.** Correctness rests on unit tests, `proptest` for
-  algebraic properties (CRDT laws, sign/verify, canonicalization), cross-crate
-  integration tests, and the fuzz harnesses — not on machine-checked proofs.
+  cryptography alone (see [Key-compromise impact
+  analysis](#key-compromise-impact-analysis)); re-keying means a new identity,
+  a re-split, or — for the VMK — a new container.
+- **No federation security** (Phase 3): eclipse attacks, cross-community ledger
+  forks, rollback detection, treaty abuse.
+- **No formal verification.** Correctness rests on unit tests, `proptest`,
+  cross-crate integration tests, the outage harness, and the fuzz harnesses —
+  not on machine-checked proofs.
 
 ## Mitigations summary
 
 The mitigations are documented inline per component and per cross-cutting threat
 above; this is the index. Anticipated mitigations from the design overview
-(Section 10.8, "Security Architecture") map to Phase 0 as follows:
+(Section 10.8, "Security Architecture") map to the built system as follows:
 
-- **Replay attack** → per-sender monotonic nonce + ±5-minute timestamp window +
-  content-addressed ids in `rrn-ledger` (T0.5.6), idempotent exactly-once
-  settlement (T0.5.5/T0.5.7), content-hash dedupe on replication
-  (`append_raw`). See [Replay across crates](#replay-across-crates).
+- **Replay attack** → per-sender monotonic nonce + ±5-minute future-dating bound
+  + content-addressed ids in `rrn-ledger`, idempotent exactly-once settlement,
+  content-hash dedupe on replication (`append_raw`) and on DTN ingest
+  (`admission_of`, the presentation-hash receipt cache). See [Replay across
+  crates](#replay-across-crates).
 - **Tampering / forgery** → `verify_strict` over canonical CBOR via
   `SignedPayload`, re-verified at the log write; hash-chained log detected by
-  `verify_chain`; state derived from the log, never written around it.
+  `verify_chain`; state derived from the log, never written around it; on every
+  carrier, `outbox::validate` then the same front door.
+- **Time manipulation** → the admission clock (ADR-0022): windows, deadlines,
+  ordering, and eligibility read only the station's clock at admission (clamped
+  monotone) or a log *position*; party timestamps are testimony.
+- **Offline double-spend** → escrowed headroom certificates (ADR-0021): the cap
+  is debited at issuance, spends are admitted in arrival order to the cap, the
+  excess is refused and recorded as provable equivocation with a reputation
+  consequence, a certificate-issuance gate, and a jury path (ADR-0025).
+- **Courier suppression / forgery** → per-device outbox chains (gaps are
+  visible), station-signed delivery receipts, idempotent ingest (ADR-0020).
+- **Carrier compromise (sidecar, SMS, radio, paper)** → dumb-carrier posture
+  (ADR-0013): no key, no plaintext of consequence, no authority; bounded
+  reassembly; the airtime budget sends money first; a lost carrier is a
+  connectivity event.
+- **Governance capture in a crisis** → ADR-0023/0027: supermajority
+  declaration, no lowered bar, raised quorum, frozen amendment path, pinned
+  electorate, enforced measure expiry, duty-cycle caps, first-crossing
+  activation, declaration TTL, station-signer-pinned attestations.
 - **Physical node seizure** → wallet key always encrypted at rest (argon2id +
-  XChaCha20-Poly1305, `0o600`, atomic write). The optional encrypted profile
-  (ADR-0024, Linux) additionally makes a *powered-off* node a member-keyed LUKS2
-  brick — ledger, wallet, and adapter identity all inside it, no wrapped key on the
-  device, unlocked by a `K`-of-`N` boot ceremony — while the default plaintext
-  profile leaves the database in the clear. A node seized *while running* is not
-  defended by either (see [Encrypted at-rest
-  storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) and
-  [Known limitations](#known-limitations)).
-- **Eclipse attack, ledger fork, Sybil federation** → deferred to Phase 1+
-  (`rrn-protocol`), out of scope for the Phase 0 audit per [Scope](#scope).
+  XChaCha20-Poly1305, `0o600`, atomic write); the optional encrypted profile
+  (ADR-0024, Linux) makes a *powered-off* node a member-keyed LUKS2 brick —
+  ledger, wallet, and adapter identity inside, no wrapped key on the device,
+  unlocked by a `K`-of-`N` boot ceremony. A node seized *while running* is not
+  defended by either.
+- **Eclipse attack, ledger fork, Sybil federation** → Phase 3
+  (`rrn-protocol` federation), out of scope per [Scope](#scope).
 
 ## References
 
 - Design overview, Section 4.1 — "The Attack Surface" (oracle attacks)
 - Design overview, Section 4.3 — "The Tiered Oracle Model"
+- Design overview, Section 10.3 — "Transport Layer — Graceful Degradation"
 - Design overview, Section 10.8 — "Security Architecture"
+- [`security/phase-2-redteam.md`](security/phase-2-redteam.md) — the Phase 2
+  sections of this document as an attacker-organized checklist
+- [`security/audit-2026-08.md`](security/audit-2026-08.md) — the August 2026
+  internal review (old phase numbering)
+- [`phase-2-exit-evidence.md`](phase-2-exit-evidence.md) — the 72-hour outage
+  harness and the Phase 2 exit statement
+- [`spec/dtn-bundles.md`](spec/dtn-bundles.md), [`spec/qr-payloads.md`](spec/qr-payloads.md),
+  [`spec/sms-carrier.md`](spec/sms-carrier.md), [`spec/vmk-boot-ceremony.md`](spec/vmk-boot-ceremony.md)
+  — the Phase 2 wire and ceremony specs
 - [ADR-0001](adr/0001-rust-workspace-and-dual-license.md) — Rust workspace
   and dual license
+- [ADR-0017](adr/0017-resilience-before-federation.md) — Phase 2 = resilience
+  before federation (and the numbering hazard)
+- [ADR-0020](adr/0020-single-writer-log-dtn-submission.md),
+  [ADR-0021](adr/0021-escrowed-offline-spending-certificates.md),
+  [ADR-0022](adr/0022-admission-clock-time-trust.md) — the three decisions the
+  Phase 2 surface follows from
+- [ADR-0023](adr/0023-emergency-governance-modes.md),
+  [ADR-0027](adr/0027-emergency-declaration-activation-and-ttl.md) — emergency
+  governance
+- [ADR-0024](adr/0024-station-at-rest-encryption-key-ceremony.md) — at-rest
+  encryption and the boot ceremony
+- [ADR-0025](adr/0025-equivocation-dispute-cases.md) — equivocation jury cases
+- [ADR-0013](adr/0013-federation-transport-reticulum.md),
+  [ADR-0026](adr/0026-reticulum-sidecar-ratified.md) — the Reticulum carrier

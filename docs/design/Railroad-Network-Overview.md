@@ -837,6 +837,22 @@ IDENTITY LAYER
 | **No internet — LoRa** | Low-power radio via Reticulum/RNode, 5-15km range, ~250 bytes/second raw. Credit transactions, governance votes, and identity work. Marketplace degraded. |
 | **Complete isolation** | Store-and-forward via physical carriers. Conductors carry sync payloads (LXMF, or QR/paper). Ledgers reconcile on reconnect. |
 
+> **Updated 2026-09-13 (Phase 2 close).** What each rung is *today*, for one
+> community (ADR-0020: the station stays the sole ledger writer on every rung;
+> everything below is delay-tolerant *submission* to it, with signed delivery
+> receipts back):
+>
+> | Rung | Built | Not built / caveat |
+> |---|---|---|
+> | Full internet / LAN | Phones ↔ station over the sealed channel on the local network; couriers' phones submit carried bundles. | No inter-community sync (Phase 3). |
+> | Partial / regional | Reticulum over TCP links via the supervised `rnsd` sidecar (ADR-0026); station-originated bundle push with receipt correlation; airtime-budgeted, money first. | Propagation-node (LXMF `PROPAGATED`) store-and-forward with neither endpoint online is not exercised. |
+> | Local network only | Wi-Fi to the station. | Bluetooth mesh is not built. |
+> | LoRa | RNode radio templated from `[lora.rnode]`; bench-verified over the air (2026-09-11); sustained ≈ 2.5 B/s at the EU 1 % duty cycle, paced economic-first. | Human field sign-off pending; a full payment round-trip over radio waits on a station-side outbox export (no CLI wallet yet). |
+> | Complete isolation | Paper/QR end to end (bundles, receipts, certificates, credential cards); SMS codec, sender registry, and relay against a mock gateway. | The SMS modem gateway is not built. Conductors as *inter*-community carriers are Phase 3. |
+>
+> The automated proof that a community reconciles after a 72-hour loss over
+> courier, paper, and a lossy radio model is `docs/phase-2-exit-evidence.md`.
+
 **LoRa (Long Range radio)** achieves 5-15km range at very low power. The raw ~250 bytes per second is further reduced by legal duty-cycle limits (e.g. 1% on EU 868 MHz — sustained throughput closer to single-digit bytes/second, budgeted honestly in the Phase 2 plan), which is still enough for credit transactions, governance votes, and identity attestations — the economic backbone of the system. Communities stay economically connected when the internet is entirely gone.
 
 ### 10.4 Consensus Layer
@@ -917,7 +933,7 @@ Each protocol is a defined message format plus a state machine. Any node impleme
 |---|---|
 | **Class 1 — Full node** | Raspberry Pi 4, 4GB RAM, 128GB storage. Runs full ledger, all protocols, local API server. Solar-powered. Community's primary node. ~$80 hardware cost. |
 | **Class 2 — Light node** | Smartphone or low-power laptop. Holds personal wallet and identity. Connects to full node via local WiFi or Bluetooth. |
-| **Class 3 — Minimal node** | Basic phone with SMS capability. Interacts via structured SMS commands to a community hub. Functional for core credit transactions and governance votes. |
+| **Class 3 — Minimal node** | Basic phone with SMS capability. Interacts via structured SMS commands to a community hub. Functional for core credit transactions and governance votes. *(Updated 2026-09-13: the "structured SMS commands" model would require the hub to hold the member's keys, which ADR-0006 forbids; what Phase 2 built is SMS as a **carrier** for records a smartphone already signed — see `spec/sms-carrier.md` §7. A true feature-phone node needs a custody decision in a new ADR.)* |
 | **Class 4 — Paper fallback** | Printed QR codes representing signed transaction records. Physically carried between communities by conductors. Scanned and ingested on reconnect. |
 
 ### 10.8 Security Architecture
@@ -928,7 +944,7 @@ Each protocol is a defined message format plus a state machine. Any node impleme
 | **Ledger fork** | Raft quorum prevents accidental forks; a malicious leader can still equivocate, so every entry is signed and hash-chained — equivocation is automatically detectable, attributable to its signer, and punishable through governance |
 | **Sybil federation** | Community reputation scores are slow to build; new communities have limited governance weight during probation |
 | **Replay attack** | Every transaction includes a monotonically increasing nonce per identity plus a timestamp; nodes reject previously-seen nonces |
-| **Physical node seizure** | **Target (Phase 2 deliverable), not current state:** data at rest encrypted with keys held by community members, not stored on the node, so a seized powered-off node yields an encrypted brick. **Today** only the wallet key is encrypted — the ledger (balances, memos, the vouch graph) is plaintext on disk (threat model, "Known limitations"); what exists now is the encrypted *backup* archive with Shamir-recoverable keys (ADR-0016). Residual risk either way: a node seized while running has keys in memory — the mitigations there are physical custody and rapid re-bootstrap, not encryption. Note the availability trade the target design buys: member-held keys mean every reboot needs a key ceremony |
+| **Physical node seizure** | **Current state (updated 2026-09-13, ADR-0024 shipped in Phase 2):** the optional **encrypted at-rest profile** (`[storage] at_rest = "encrypted"`, Linux) puts the ledger, memos, vouch graph, station wallet, radio identity, and search index inside a LUKS2 container whose key is Shamir-split among community members and never stored on the node — a seized powered-off node is an encrypted brick with no keyslot and no holder list on the device. The default profile is still plaintext (only the wallet key encrypted; the encrypted *backup* archive with Shamir-recoverable keys, ADR-0016, covers it). The availability trade is real and chosen knowingly: every power loss needs a `K`-of-`N` holder ceremony, so a UPS is near-mandatory. Residual either way: a node seized **while running** has the key in kernel memory — the mitigations there are physical custody and rapid re-bootstrap, not encryption (threat model, "Encrypted at-rest storage") |
 
 ### 10.9 The Technology Stack
 
@@ -1200,6 +1216,14 @@ after multi-node sync ships means a wire-format break:
 > partition) remains open: ADR-0021 specifies escrowed headroom certificates,
 > but the implementation is still owed (T2.3.x).
 
+> **Updated 2026-09-13.** Criterion 1 is discharged: escrowed headroom
+> certificates, certificate-backed spends, and provable equivocation with its
+> reputation consequence and jury path shipped (ADR-0021, ADR-0025). All three
+> entrance criteria are therefore met by code, and the floor invariant — after
+> any admission sequence, no member's committed position is below the debt
+> floor — is asserted by a property test and re-derived from the log after
+> every entry of the 72-hour simulation.
+
 **Deliverables:**
 - Offline-first hardening — full functionality with zero connectivity
 - Delay-tolerant networking — store and forward between disconnected nodes within a community
@@ -1208,6 +1232,21 @@ after multi-node sync ships means a wire-format break:
 - Physical credential layer — QR code printed cards, paper fallback
 - Emergency governance modes — fast decision making under crisis conditions
 - Node seizure resistance — encrypted at-rest data, rapid re-bootstrap
+
+> **Updated 2026-09-13 — what shipped, per deliverable.** *Offline-first
+> hardening*: shipped (the daemon needs no internet or NTP; tested). *Delay-
+> tolerant networking*: shipped (outbox chains, bundles, receipts, courier relay,
+> station-originated push — ADR-0020). *LoRa*: software shipped and bench-
+> verified over the air; the human field sign-off is pending, and a full payment
+> round-trip over radio waits on a station-side outbox export. *SMS*: the codec,
+> sender registry, and relay shipped against a mock gateway; the modem gateway is
+> not built; "basic transactions via text" means carrying phone-signed records,
+> not feature-phone commands (ADR-0006). *Physical credential layer*: shipped
+> end to end. *Emergency governance*: shipped (ADR-0023, ADR-0027). *Seizure
+> resistance*: shipped as the optional encrypted profile (ADR-0024, Linux); rapid
+> re-bootstrap is ADR-0016 restore plus outbox replay. The 72-hour simulation,
+> the red-team checklist (`security/phase-2-redteam.md`), and the criterion-by-
+> criterion exit statement are in **`docs/phase-2-exit-evidence.md`**.
 
 **Testing methodology:** Deliberately take the community offline for 72-hour simulated
 outages with real economic activity. Does everything reconcile correctly on reconnect?
