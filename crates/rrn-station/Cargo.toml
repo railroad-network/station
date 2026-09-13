@@ -69,6 +69,10 @@ base64 = "0.22"
 # (T1.11.3): the live database is copied to a throwaway file, read into the
 # encrypted archive, and the temp dir is removed on drop.
 tempfile = "3"
+# Zeroizing the reconstructed Volume Master Key after it has been handed to the
+# kernel mount helper (ADR-0024). The same crate the crypto/identity crates use
+# for secret material; here only the transient VMK bytes need wiping.
+zeroize = { version = "1", features = ["derive"] }
 
 # Send SIGTERM to the supervised `rnsd` sidecar for a graceful stop before
 # SIGKILL (T2.6.1) — tokio's `Child` only exposes SIGKILL (`start_kill`). Unix

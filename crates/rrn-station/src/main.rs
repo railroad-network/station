@@ -88,6 +88,48 @@ enum Command {
         #[command(subcommand)]
         cmd: RecoveryCmd,
     },
+    /// Report the at-rest storage profile, and (encrypted profile) whether the
+    /// state volume is currently unlocked. Works with the daemon stopped.
+    Status,
+    /// Migrate this plaintext station to the encrypted at-rest profile: provision a
+    /// member-keyed LUKS container, move the wallet and ledger inside, and split the
+    /// Volume Master Key across holders (ADR-0024). Linux only. One-way — keep a
+    /// backup first, and destroy the old media afterward (secure erase is unreliable
+    /// on flash/SD).
+    EncryptInPlace {
+        /// A VMK holder's `rrn1…` address. Repeat once per holder (N total).
+        #[arg(long = "holder", required = true, value_name = "ADDRESS")]
+        holders: Vec<String>,
+        /// K — how many holders must cooperate at each boot ceremony (2 ≤ K ≤ N).
+        #[arg(long)]
+        threshold: u8,
+    },
+    /// Run the boot ceremony and unlock (mount) the encrypted state volume, so the
+    /// daemon can then be started (ADR-0024). Linux only. Prints a request QR and a
+    /// console fingerprint for holders to confirm, then reads their responses.
+    Unlock,
+    /// Manage the Volume Master Key custody (encrypted profile, ADR-0024).
+    Vmk {
+        #[command(subcommand)]
+        cmd: VmkCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmkCmd {
+    /// Show the VMK descriptor (address, K/N) and, when the volume is mounted, the
+    /// current holder set.
+    Status,
+    /// Re-split the VMK to a new holder set, revoking the old shards. Runs a boot
+    /// ceremony (the volume must already be unlocked) and prints the new shard QRs.
+    Refresh {
+        /// The new holder set: an `rrn1…` address, repeated once per holder.
+        #[arg(long = "holder", required = true, value_name = "ADDRESS")]
+        holders: Vec<String>,
+        /// The new threshold K (2 ≤ K ≤ N).
+        #[arg(long)]
+        threshold: u8,
+    },
 }
 
 #[derive(Subcommand)]
@@ -157,7 +199,194 @@ fn main() -> Result<()> {
                 cmd_recovery_restore(&data_dir, from_backup.as_deref(), force)
             }
         },
+        Command::Status => cmd_status(&data_dir),
+        Command::EncryptInPlace { holders, threshold } => {
+            cmd_encrypt_in_place(&data_dir, &holders, threshold)
+        }
+        Command::Unlock => cmd_unlock(&data_dir),
+        Command::Vmk { cmd } => match cmd {
+            VmkCmd::Status => cmd_vmk_status(&data_dir),
+            VmkCmd::Refresh { holders, threshold } => {
+                cmd_vmk_refresh(&data_dir, &holders, threshold)
+            }
+        },
     }
+}
+
+/// `station status` — the at-rest profile and (encrypted) unlock state.
+fn cmd_status(data_dir: &std::path::Path) -> Result<()> {
+    let report = rrn_station::storage::admin::status(data_dir)?;
+    println!("at-rest profile: {}", report.profile);
+    if let Some(enc) = report.encrypted {
+        println!(
+            "state volume:    {}",
+            if enc.mounted {
+                "UNLOCKED (mounted)"
+            } else {
+                "LOCKED (not mounted)"
+            }
+        );
+        println!("state dir:       {}", enc.state_dir);
+        match (enc.vmk_address, enc.threshold, enc.total) {
+            (Some(addr), Some(k), Some(n)) => {
+                println!("VMK address:     {addr}");
+                println!("VMK custody:     {k}-of-{n} holders");
+            }
+            _ => println!("VMK:             not armed (no descriptor)"),
+        }
+        if !enc.mounted {
+            eprintln!("\nRun `station unlock` to perform the boot ceremony before `station run`.");
+        }
+    }
+    Ok(())
+}
+
+/// Prints a set of holder shard QRs (shared by encrypt-in-place and vmk refresh).
+fn print_holder_shards(shards: &[rrn_station::recovery::HolderShard], threshold: u8) {
+    eprintln!(
+        "\nVMK armed: {}-of-{} holders. Show each holder their QR to scan into their wallet.\n",
+        threshold,
+        shards.len()
+    );
+    for (i, shard) in shards.iter().enumerate() {
+        eprintln!(
+            "── Holder {} of {} — {}",
+            i + 1,
+            shards.len(),
+            shard.address
+        );
+        println!("{}", rrn_station::recovery::render_qr(&shard.qr_payload));
+        eprintln!("(or paste this if scanning fails: {})\n", shard.qr_payload);
+    }
+}
+
+/// `station encrypt-in-place` — migrate to the encrypted profile.
+fn cmd_encrypt_in_place(
+    data_dir: &std::path::Path,
+    holders: &[String],
+    threshold: u8,
+) -> Result<()> {
+    eprintln!(
+        "This migrates {} to the encrypted at-rest profile. It is one-way: after it \n\
+         succeeds, the station only starts after a `station unlock` boot ceremony.\n\
+         Make a backup FIRST (`station backup`), and plan to physically destroy the old\n\
+         media — secure erase is unreliable on flash/SD.\n",
+        data_dir.display()
+    );
+    let passphrase = read_run_passphrase()?;
+    let shards =
+        rrn_station::storage::admin::encrypt_in_place(data_dir, &passphrase, holders, threshold)?;
+    print_holder_shards(&shards, threshold);
+    eprintln!(
+        "Migration complete and the volume is mounted. Start the daemon with `station run`.\n\
+         On the next reboot the volume is a locked brick until `station unlock`."
+    );
+    Ok(())
+}
+
+/// Reads holder `rrnrecover-resp:` response lines from stdin until a blank line.
+fn read_ceremony_responses() -> Result<Vec<String>> {
+    use std::io::BufRead;
+    eprintln!(
+        "Paste each holder's response line below as it comes in. Press Enter on an empty line \
+         when you have enough:"
+    );
+    let mut responses = Vec::new();
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.context("read response")?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with(rrn_station::recovery::RESPONSE_PREFIX) {
+            responses.push(trimmed.to_string());
+            eprintln!("  collected {} response(s)", responses.len());
+        } else {
+            eprintln!(
+                "  (ignored — not an {} line)",
+                rrn_station::recovery::RESPONSE_PREFIX
+            );
+        }
+    }
+    if responses.is_empty() {
+        anyhow::bail!("no responses collected");
+    }
+    Ok(responses)
+}
+
+/// `station unlock` — boot ceremony + mount.
+fn cmd_unlock(data_dir: &std::path::Path) -> Result<()> {
+    let (session, request_qr, fingerprint, descriptor) =
+        rrn_station::storage::admin::begin_unlock(data_dir)?;
+    eprintln!(
+        "Unlocking the encrypted state volume for VMK {}",
+        descriptor.vmk_address
+    );
+    eprintln!("\nConsole fingerprint (read this aloud so holders confirm it before responding):");
+    eprintln!("    {fingerprint}\n");
+    eprintln!(
+        "Have each of {} holders scan this request in their wallet's \"help recover\" flow:\n",
+        descriptor.threshold
+    );
+    println!("{}", rrn_station::recovery::render_qr(&request_qr));
+    eprintln!("(or send them this line: {request_qr})\n");
+
+    let responses = read_ceremony_responses()?;
+    rrn_station::storage::admin::finish_unlock_and_mount(data_dir, &session, &responses)?;
+    eprintln!("Unlocked. The state volume is mounted; start the daemon with `station run`.");
+    Ok(())
+}
+
+/// `station vmk status` — descriptor + (when mounted) holder set.
+fn cmd_vmk_status(data_dir: &std::path::Path) -> Result<()> {
+    let report = rrn_station::storage::admin::status(data_dir)?;
+    match report.encrypted {
+        None => anyhow::bail!("this station is not running the encrypted profile"),
+        Some(enc) => {
+            match (enc.vmk_address, enc.threshold, enc.total) {
+                (Some(addr), Some(k), Some(n)) => {
+                    println!("VMK {addr}: {k}-of-{n} custody");
+                }
+                _ => eprintln!("VMK is not armed (no descriptor on the boot dir)"),
+            }
+            if enc.mounted {
+                for h in rrn_station::storage::admin::vmk_holders(data_dir)? {
+                    println!("  holder {h}");
+                }
+            } else {
+                eprintln!("(volume locked — unlock to list the holder set)");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `station vmk refresh` — ceremony + re-split to a new holder set.
+fn cmd_vmk_refresh(data_dir: &std::path::Path, holders: &[String], threshold: u8) -> Result<()> {
+    let (session, request_qr, fingerprint, descriptor) =
+        rrn_station::storage::admin::begin_unlock(data_dir)?;
+    eprintln!(
+        "Re-splitting VMK {} to a new holder set",
+        descriptor.vmk_address
+    );
+    eprintln!(
+        "\nConsole fingerprint (holders confirm this before responding):\n    {fingerprint}\n"
+    );
+    eprintln!(
+        "Have {} current holders scan this request:\n",
+        descriptor.threshold
+    );
+    println!("{}", rrn_station::recovery::render_qr(&request_qr));
+    eprintln!("(or send them this line: {request_qr})\n");
+
+    let responses = read_ceremony_responses()?;
+    let shards = rrn_station::storage::admin::finish_refresh(
+        data_dir, &session, &responses, holders, threshold,
+    )?;
+    print_holder_shards(&shards, threshold);
+    eprintln!("Holder set refreshed. The old shards no longer unlock the volume.");
+    Ok(())
 }
 
 /// `station init` — prompt for a passphrase (twice) and bootstrap the dir.

@@ -32,6 +32,8 @@ use crate::clock::Clock;
 use crate::config::StationConfig;
 use crate::core::{Core, CoreHandle};
 use crate::dtn_loop::{DtnLoop, DtnOutbound};
+use crate::storage::layout::Layout;
+use crate::storage::volume;
 use crate::{gossip, mdns, mobile_server, paired, server};
 
 /// Bound on the outbound DTN wake channel. A wake signal is best-effort
@@ -110,15 +112,34 @@ impl Station {
     /// tasks on the current Tokio runtime.
     pub async fn open(params: StationParams) -> Result<Station> {
         let data_dir = params.data_dir;
+        // The `--data-dir` is the (unencrypted) boot dir; `config.toml` always lives
+        // here so a locked node can read it.
         let config =
             StationConfig::load_or_create(&data_dir.join(CONFIG_FILE)).context("load config")?;
 
-        let db = Database::open(&data_dir.join(DB_FILE)).context("open database")?;
+        // Resolve the two-root layout. Under the plaintext profile both roots are the
+        // flat data dir (today's behavior); under the encrypted profile the state dir
+        // is the container's mount point.
+        let layout = Layout::resolve(&data_dir, &config).context("resolve storage layout")?;
+
+        // Encrypted-profile **mount guard** (ADR-0024): refuse to touch any file
+        // unless the state dir is a *live* `dm-crypt` mount. Otherwise a mis-ordered
+        // restart (daemon up before the volume is unlocked) would create a fresh
+        // plaintext `station.db`, wallet, adapter identity, and index on the
+        // unencrypted root and serve them.
+        if layout.is_encrypted() && !volume::state_dir_is_live_mount(layout.state_dir())? {
+            anyhow::bail!(
+                "the encrypted state volume is not mounted at {} — run `station unlock` to \
+                 perform the boot ceremony first (ADR-0024)",
+                layout.state_dir().display()
+            );
+        }
+
+        let db = Database::open(&layout.db_path()).context("open database")?;
         migrations::run(&db).context("run migrations")?;
 
-        let wallet =
-            WalletContents::load_from_file(&data_dir.join(WALLET_FILE), &params.passphrase)
-                .context("open wallet (wrong passphrase, or run `station init` first)")?;
+        let wallet = WalletContents::load_from_file(&layout.wallet_path(), &params.passphrase)
+            .context("open wallet (wrong passphrase, or run `station init` first)")?;
         let address = wallet.address.to_string();
 
         // A `window_seconds` override collapses every tier to one window (the
@@ -130,13 +151,14 @@ impl Station {
                 tier2_window_seconds: config.settlement.tier2_window_seconds,
             },
         };
-        let paired = paired::PairedMobiles::load(&data_dir).context("load paired mobiles")?;
+        let paired =
+            paired::PairedMobiles::load(layout.state_dir()).context("load paired mobiles")?;
 
         // The marketplace index (T1.6.6). Failing to open it must not keep the
         // station down — it is a cache the core rebuilds from the log anyway — so
         // fall back to an in-memory index, which costs this run's browse nothing
         // and simply does not survive a restart.
-        let index_dir = data_dir.join(LISTING_INDEX_DIR);
+        let index_dir = layout.index_dir();
         let listings = match SearchIndex::open(&index_dir) {
             Ok(index) => index,
             Err(e) => {
@@ -251,8 +273,9 @@ impl Station {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
 
-        // CLI Unix-socket server.
-        let socket_path = data_dir.join(SOCKET_FILE);
+        // CLI Unix-socket server. The socket lives on the boot dir so the operator
+        // can reach the daemon (and a locked, pre-unlock one) without the container.
+        let socket_path = layout.socket_path();
         let unix = server::bind(&socket_path).context("bind unix socket")?;
         tracing::info!(socket = %socket_path.display(), "Listening on Unix socket");
         tasks.push(tokio::spawn(server::serve(
@@ -377,7 +400,7 @@ impl Station {
                 .config_dir
                 .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| data_dir.join("reticulum"));
+                .unwrap_or_else(|| layout.reticulum_dir());
             let sidecar_cfg = crate::sidecar::SidecarConfig {
                 rnsd_path: PathBuf::from(&config.sidecar.rnsd_path),
                 config_dir,
@@ -412,7 +435,7 @@ impl Station {
                     .config_dir
                     .clone()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| data_dir.join("reticulum"));
+                    .unwrap_or_else(|| layout.reticulum_dir());
                 let adapter_cfg = crate::reticulum::AdapterConfig {
                     python: PathBuf::from(&config.lora.adapter_python),
                     script: PathBuf::from(script),

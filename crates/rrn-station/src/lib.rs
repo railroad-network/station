@@ -60,6 +60,7 @@ pub mod server;
 pub mod sidecar;
 pub mod sms;
 pub mod station;
+pub mod storage;
 pub mod transaction_view;
 pub mod vouch_view;
 
