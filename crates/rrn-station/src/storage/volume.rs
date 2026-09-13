@@ -103,8 +103,13 @@ pub fn state_dir_is_crypt_mount(state_dir: &Path, mapping: &str) -> Result<bool>
 #[cfg(target_os = "linux")]
 fn linux_live_mount(state_dir: &Path, expect_mapping: Option<&str>) -> Result<bool> {
     let target = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
-    let info = match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(s) => s,
+    // Read as bytes, not `read_to_string`: an unrelated mount with a non-UTF-8 label
+    // (e.g. a Latin-1 USB stick auto-mounted elsewhere) would make the whole file
+    // invalid UTF-8 and, under `read_to_string`, abort the scan with `Ok(false)` —
+    // wrongly reporting *our* volume unmounted. Our own line is pure ASCII, so a lossy
+    // decode of the file leaves it intact.
+    let info = match std::fs::read("/proc/self/mountinfo") {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => return Ok(false),
     };
     for line in info.lines() {

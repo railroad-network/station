@@ -137,10 +137,16 @@ drill_encrypted() {
   [[ -n "$h1$h2$h3" ]] || fail "could not generate holder addresses"
 
   info "encrypt-in-place (provision keyslot-less LUKS2 container + arm VMK 2-of-3)"
-  "$STATION" --data-dir "$BOOT" encrypt-in-place \
-      --holder "$h1" --holder "$h2" --holder "$h3" --threshold 2 >/dev/null
+  # Run with a RELATIVE --data-dir from a different cwd, to exercise path resolution:
+  # the paths written into config.toml must be absolute, or `station run`/`unlock`
+  # would re-join a relative state_dir against the boot dir and never find the mount.
+  ( cd "$WORK" && "$STATION" --data-dir boot encrypt-in-place \
+      --holder "$h1" --holder "$h2" --holder "$h3" --threshold 2 ) >/dev/null
   [[ -f "$BOOT/state.img" ]] || fail "container was not provisioned"
   [[ -f "$BOOT/vmk.descriptor" ]] || fail "VMK descriptor not written"
+  grep -Eq '^\s*state_dir\s*=\s*"/' "$BOOT/config.toml" \
+    || fail "config.toml state_dir is not absolute (relative --data-dir path-resolution regression)"
+  pass "config.toml records an absolute state_dir despite a relative --data-dir"
   MAPPING="$(findmnt -no SOURCE "$BOOT/state" 2>/dev/null | sed 's#/dev/mapper/##')"
   pass "migrated; container mounted via mapping ${MAPPING:-?}"
 

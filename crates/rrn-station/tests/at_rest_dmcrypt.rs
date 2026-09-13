@@ -406,6 +406,47 @@ fn station_open_refuses_an_unmounted_state_dir_and_writes_nothing() {
 
 #[test]
 #[ignore = "needs dm-crypt + loop + passwordless sudo; run in the at-rest-dmcrypt CI lane"]
+fn station_open_refuses_plaintext_leftovers_on_the_boot_dir() {
+    require_dmcrypt();
+    // A migration interrupted after the config flip but before the erase leaves the
+    // plaintext originals on the boot dir beside a good, mounted container. Station
+    // must refuse to serve until they are shredded, rather than run with the ledger
+    // in the clear.
+    let vmk = Vmk::generate();
+    let vol = TestVolume::provision(&vmk); // mounted at vol.state_dir
+    let cfg = format!(
+        "[network]\nlisten = \"127.0.0.1:0\"\n[storage]\nat_rest = \"encrypted\"\n\
+         [storage.encrypted]\nstate_dir = \"{}\"\ncontainer_path = \"{}\"\n",
+        vol.state_dir.display(),
+        vol.container.display()
+    );
+    std::fs::write(vol.boot_dir.join("config.toml"), cfg).unwrap();
+    // Stray plaintext ledger left on the (unencrypted) boot dir.
+    std::fs::write(vol.boot_dir.join("station.db"), b"leftover ledger").unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let res = rt.block_on(async {
+        rrn_station::Station::open(rrn_station::StationParams {
+            data_dir: vol.boot_dir.clone(),
+            passphrase: "pw".into(),
+            clock: rrn_station::Clock::system(),
+        })
+        .await
+    });
+    drop(rt);
+    // `Station` is not `Debug`, so match rather than `expect_err`.
+    let err = match res {
+        Ok(_) => panic!("must refuse to run with plaintext leftovers on the boot dir"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("plaintext station files remain"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+#[ignore = "needs dm-crypt + loop + passwordless sudo; run in the at-rest-dmcrypt CI lane"]
 fn station_runs_on_the_encrypted_volume_and_leaves_no_plaintext_at_rest() {
     require_dmcrypt();
     // Invariant 1 as specified: run a station under the encrypted profile, stop it,

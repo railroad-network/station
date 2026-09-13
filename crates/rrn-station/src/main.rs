@@ -400,7 +400,10 @@ fn cmd_vmk_refresh(
     eprintln!(
         "Holder set refreshed. Old and new shards cannot be mixed, but a full quorum of the\n\
          OLD holders can still reconstruct this key — the volume key itself is unchanged. To\n\
-         lock out former holders entirely, rotate the key by re-migrating to a fresh container."
+         lock former holders out entirely you must rotate the key onto a NEW container:\n\
+         `station backup`, then `station restore` into a fresh plaintext data dir, then\n\
+         `station encrypt-in-place` there with the new holders, and destroy the old media\n\
+         (`encrypt-in-place` refuses to run on an already-encrypted station). See §4.4."
     );
     Ok(())
 }

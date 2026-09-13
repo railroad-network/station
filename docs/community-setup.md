@@ -569,9 +569,21 @@ A refresh gives every holder a brand-new shard and makes old and new shards
 **not** change the underlying volume key, though, so a *full quorum of the former
 holders*, acting together, could still reconstruct it. If you need to lock former
 holders out completely (not just re-key who cooperates going forward), rotate the
-key itself: take a backup, then re-migrate onto a fresh container
-(`station encrypt-in-place`) so the old shards protect a key that no longer opens
-anything.
+key onto a **new** container — `encrypt-in-place` refuses to run on a station that
+is already encrypted, so the rotation is a fresh migration:
+
+```sh
+station unlock && station backup --out rotate.rrnbak   # while still unlocked
+station restore rotate.rrnbak --data-dir /path/to/fresh # a fresh, plaintext dir
+station --data-dir /path/to/fresh encrypt-in-place \
+    --holder … --holder … --threshold 3               # new holders, new VMK
+cp <old-boot-dir>/config.toml /path/to/fresh/          # backups omit the boot config
+```
+
+Then move the fresh dir into place and **physically destroy the old media** — on the
+same SD card the restore step re-writes the plaintext ledger, and secure erase is
+unreliable on flash. Only after this do the former holders' shards protect a key that
+no longer opens anything.
 
 > **Backups under the encrypted profile** cover everything *inside* the container
 > (ledger, wallet, pairings), but not the boot-dir `config.toml` (peers, listen

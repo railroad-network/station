@@ -138,9 +138,10 @@ pub fn configured_vmk_threshold(data_dir: &Path) -> u8 {
 /// was flipped to `encrypted` but before the plaintext originals were erased — so the
 /// whole ledger and wallet are still in the clear on the boot dir, defeating the
 /// brick property. [`Station::open`](crate::station::Station::open) refuses to run
-/// while any remain. The state dir (which under this profile is a subdirectory of the
-/// boot dir and is never equal to it — `Layout::resolve` enforces that) is not
-/// scanned, so a legitimately-mounted volume never trips this.
+/// while any remain. Only the four fixed filenames directly in the boot dir are
+/// checked; the state dir is never descended into and can never equal the boot dir
+/// (`Layout::resolve` refuses that), so a legitimately-mounted volume — whose
+/// wallet/db live under the state dir — never trips this.
 pub fn boot_dir_plaintext_leftovers(boot_dir: &Path) -> Vec<std::path::PathBuf> {
     use crate::station::{DB_FILE, WALLET_FILE};
     [
@@ -350,11 +351,25 @@ mod linux {
             );
         }
         if container.exists() || state_dir.exists() {
+            let still_mounted = volume::state_dir_is_live_mount(&state_dir).unwrap_or(false);
+            let hint = if still_mounted {
+                format!(
+                    " — the volume still appears mounted (a previous migration was interrupted); \
+                     unmount and tear it down first: `sudo umount {sd}`, `sudo cryptsetup close {m}`, \
+                     `sudo losetup -d $(losetup -j {c} | cut -d: -f1)`, then remove {c} and {sd}",
+                    sd = state_dir.display(),
+                    m = enc.mapping_name(),
+                    c = container.display(),
+                )
+            } else {
+                String::new()
+            };
             bail!(
                 "an encrypted container ({}) or state dir ({}) already exists; refusing to \
-                 overwrite",
+                 overwrite{}",
                 container.display(),
-                state_dir.display()
+                state_dir.display(),
+                hint
             );
         }
 
@@ -478,7 +493,7 @@ mod linux {
         // the still-un-erased plaintext originals (the whole ledger and wallet) on the
         // boot dir — NOT harmless. `Station::open` detects that leftover on the next
         // boot and refuses to run until the operator shreds it (see
-        // `boot_dir_has_plaintext_leftovers`).
+        // `boot_dir_plaintext_leftovers`).
         write_encrypted_config(data_dir, config, enc, threshold)?;
 
         // Securely erase the plaintext originals. Note the caller must warn that
