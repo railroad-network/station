@@ -61,8 +61,10 @@ Decision Records) convention, using the structure in
 - [0021 — Escrowed offline spending certificates bound the debt floor under partition](0021-escrowed-offline-spending-certificates.md)
 - [0022 — The admission clock: the station's clock at admission is the only window-bearing clock](0022-admission-clock-time-trust.md)
 - [0023 — Emergency governance: deciding faster in a crisis without building a coup lever](0023-emergency-governance-modes.md)
+- [0024 — Station at-rest encryption: a member-keyed encrypted volume unlocked by a boot ceremony](0024-station-at-rest-encryption-key-ceremony.md)
 - [0025 — Equivocation cases are a distinct jury case kind with a Lapsed default and identity-anchored sortition](0025-equivocation-dispute-cases.md)
 - [0026 — The Reticulum sidecar is ratified: pinned `rnsd` 1.5, driven from the station, native Rust deferred](0026-reticulum-sidecar-ratified.md)
+- [0027 — Emergency declaration activation is a single first-crossing event, and a part-signed declaration expires](0027-emergency-declaration-activation-and-ttl.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.
