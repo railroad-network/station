@@ -139,24 +139,29 @@ fn linux_live_mount(state_dir: &Path, expect_mapping: Option<&str>) -> Result<bo
 /// verbatim.
 #[cfg(target_os = "linux")]
 fn unescape_mountinfo(s: &str) -> String {
+    // Accumulate raw bytes, not chars: the kernel escapes only space/tab/newline/
+    // backslash (all ASCII), and passes multi-byte UTF-8 through verbatim. Decoding
+    // byte-by-byte into `char` would map each UTF-8 continuation byte to a stray
+    // Latin-1 char and corrupt any non-ASCII path, so copy bytes through and rebuild
+    // the string at the end.
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 4 <= bytes.len() {
             let oct = &bytes[i + 1..i + 4];
             if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
                 if let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
-                    out.push(code as char);
+                    out.push(code);
                     i += 4;
                     continue;
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether the encrypted at-rest profile can run on this host. The profile is
@@ -780,6 +785,10 @@ mod tests {
         // A trailing lone backslash and a non-octal sequence pass through verbatim.
         assert_eq!(unescape_mountinfo("/a\\"), "/a\\");
         assert_eq!(unescape_mountinfo("/a\\09b"), "/a\\09b");
+        // Multi-byte UTF-8 is preserved (the kernel does not escape bytes ≥ 0x80),
+        // including alongside an escaped space.
+        assert_eq!(unescape_mountinfo("/home/señal"), "/home/señal");
+        assert_eq!(unescape_mountinfo("/mnt/se\\040ñal"), "/mnt/se ñal");
     }
 
     #[test]

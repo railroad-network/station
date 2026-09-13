@@ -62,6 +62,11 @@ fn encrypted_state_dir(data_dir: &Path, config: &StationConfig) -> std::path::Pa
         .as_ref()
         .and_then(|e| e.state_dir.clone())
         .map(std::path::PathBuf::from)
+        // A relative config path resolves against the boot dir, exactly as
+        // `Layout::resolve` does — otherwise `status`/`ops_dir`/`vmk refresh` would
+        // resolve it against the process cwd and disagree with `run`/`unlock` about
+        // where the volume is (e.g. under systemd `WorkingDirectory=/`).
+        .map(|p| if p.is_relative() { data_dir.join(p) } else { p })
         .unwrap_or_else(|| data_dir.join(STATE_DIR_NAME))
 }
 
@@ -124,6 +129,30 @@ pub fn configured_vmk_threshold(data_dir: &Path) -> u8 {
         .ok()
         .and_then(|c| c.storage.encrypted.map(|e| e.threshold))
         .unwrap_or_else(|| EncryptedSection::default().threshold)
+}
+
+/// Plaintext station files that must never sit on the (unencrypted) boot dir under
+/// the encrypted profile: the wallet, the ledger DB, and its WAL/SHM sidecars.
+///
+/// A non-empty result means an `encrypt-in-place` was interrupted after the config
+/// was flipped to `encrypted` but before the plaintext originals were erased — so the
+/// whole ledger and wallet are still in the clear on the boot dir, defeating the
+/// brick property. [`Station::open`](crate::station::Station::open) refuses to run
+/// while any remain. The state dir (which under this profile is a subdirectory of the
+/// boot dir and is never equal to it — `Layout::resolve` enforces that) is not
+/// scanned, so a legitimately-mounted volume never trips this.
+pub fn boot_dir_plaintext_leftovers(boot_dir: &Path) -> Vec<std::path::PathBuf> {
+    use crate::station::{DB_FILE, WALLET_FILE};
+    [
+        WALLET_FILE.to_string(),
+        DB_FILE.to_string(),
+        format!("{DB_FILE}-wal"),
+        format!("{DB_FILE}-shm"),
+    ]
+    .into_iter()
+    .map(|n| boot_dir.join(n))
+    .filter(|p| p.exists())
+    .collect()
 }
 
 /// Container size for a fresh migration: room for the ledger to grow well past its
@@ -227,14 +256,18 @@ pub fn finish_refresh(
         .save_to_file(&data_dir.join(crate::storage::layout::VMK_DESCRIPTOR_FILE))
         .context("write the updated VMK descriptor")?;
     // Keep `config.toml`'s recorded threshold in step with the new descriptor, so the
-    // config value never drifts from the K the ceremony now enforces.
-    if let Some(enc) = config.storage.encrypted.as_mut() {
-        if enc.threshold != new_threshold {
-            enc.threshold = new_threshold;
-            config
-                .save(&data_dir.join(CONFIG_FILE))
-                .context("update the recorded threshold in config.toml after refresh")?;
-        }
+    // config value never drifts from the K the ceremony now enforces. Insert the
+    // section if it is absent (a hand-written `at_rest = "encrypted"` with no
+    // `[storage.encrypted]` block), so the recorded threshold cannot stay stale.
+    let enc = config
+        .storage
+        .encrypted
+        .get_or_insert_with(EncryptedSection::default);
+    if enc.threshold != new_threshold {
+        enc.threshold = new_threshold;
+        config
+            .save(&data_dir.join(CONFIG_FILE))
+            .context("update the recorded threshold in config.toml after refresh")?;
     }
     Ok(shards)
 }
@@ -297,11 +330,17 @@ mod linux {
             );
         }
 
-        // Source (plaintext) and destination (encrypted) layouts.
+        // Source (plaintext) and destination (encrypted) layouts. Build the encrypted
+        // layout on the *canonical* (absolute) data dir so the `state_dir`/
+        // `container_path` written into config.toml are absolute: `Layout::resolve` at
+        // `station run` resolves a relative config path against the boot dir, so a
+        // relative path here (e.g. `--data-dir st`) would be re-joined to `st/st/state`
+        // and the mount guard would never find the volume.
         let plain = Layout::plaintext(data_dir);
-        let state_dir = data_dir.join(STATE_DIR_NAME);
-        let container = data_dir.join(crate::storage::layout::CONTAINER_FILE);
-        let enc = Layout::encrypted(data_dir, &state_dir, &container);
+        let boot = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        let state_dir = boot.join(STATE_DIR_NAME);
+        let container = boot.join(crate::storage::layout::CONTAINER_FILE);
+        let enc = Layout::encrypted(&boot, &state_dir, &container);
 
         // Validate the source is a plaintext station and the destination is clear.
         if !plain.wallet_path().exists() || !plain.db_path().exists() {
@@ -434,9 +473,12 @@ mod linux {
         }
 
         // Only now — the migrated copy is verified good — flip the config to the
-        // encrypted profile (holder set NOT persisted here). After this point a crash
-        // leaves a verified, mounted encrypted station with (harmless) plaintext
-        // leftovers the operator can shred manually; `station run` uses the container.
+        // encrypted profile (holder set NOT persisted here). A crash between here and
+        // the end of the erase below leaves a verified, mounted encrypted station but
+        // the still-un-erased plaintext originals (the whole ledger and wallet) on the
+        // boot dir — NOT harmless. `Station::open` detects that leftover on the next
+        // boot and refuses to run until the operator shreds it (see
+        // `boot_dir_has_plaintext_leftovers`).
         write_encrypted_config(data_dir, config, enc, threshold)?;
 
         // Securely erase the plaintext originals. Note the caller must warn that
@@ -457,9 +499,10 @@ mod linux {
         // The Reticulum directory holds the adapter's identity secret key; shred its
         // files rather than a plain remove.
         secure_erase_dir(&plain_reticulum);
-        // The marketplace index is non-secret (rebuilt inside the container on next
-        // run), so a plain remove is fine.
-        let _ = std::fs::remove_dir_all(data_dir.join(crate::station::LISTING_INDEX_DIR));
+        // The marketplace index carries listing/need text that would otherwise leak
+        // (ADR-0024 — the reason it lives inside the container); shred it too, even
+        // though it is rebuilt from the log inside the container on the next run.
+        secure_erase_dir(&data_dir.join(crate::station::LISTING_INDEX_DIR));
 
         Ok(shards)
     }
@@ -470,8 +513,17 @@ mod linux {
     fn cleanup_orphan_container(enc: &Layout) {
         let helper = SudoCryptsetupHelper;
         let _ = helper.close(&enc.mapping_name(), enc.container_path(), enc.state_dir());
-        let _ = std::fs::remove_file(enc.container_path());
-        let _ = std::fs::remove_dir_all(enc.state_dir());
+        // Roll back the boot-dir descriptor arming may have written, so a failed
+        // migration does not leave a stale VMK descriptor on a still-plaintext station.
+        let _ = std::fs::remove_file(enc.vmk_descriptor_path());
+        // Only remove the container and mount point if the volume actually unmounted;
+        // if `close` could not unmount (e.g. a shell is `cd`'d into it), removing the
+        // dir would delete into the live mount and the container is still in use, so
+        // leave them for the operator to clear by hand rather than corrupt them.
+        if !volume::state_dir_is_live_mount(enc.state_dir()).unwrap_or(true) {
+            let _ = std::fs::remove_file(enc.container_path());
+            let _ = std::fs::remove_dir_all(enc.state_dir());
+        }
     }
 
     /// Opens and mounts the already-provisioned container with a reconstructed VMK

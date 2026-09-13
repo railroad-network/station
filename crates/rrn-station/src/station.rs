@@ -156,6 +156,30 @@ impl Station {
             );
         }
 
+        // Refuse to serve if plaintext originals remain on the (unencrypted) boot dir:
+        // an `encrypt-in-place` that crashed after flipping the config but before the
+        // secure-erase would otherwise leave the whole ledger and wallet in the clear
+        // beside a mounted encrypted volume, silently voiding the brick property
+        // (ADR-0024). Fail closed until the operator shreds them.
+        if layout.is_encrypted() {
+            let leftovers = crate::storage::admin::boot_dir_plaintext_leftovers(layout.boot_dir());
+            if !leftovers.is_empty() {
+                let names = leftovers
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "plaintext station files remain on the unencrypted boot dir {} — an \
+                     `encrypt-in-place` was interrupted after the encrypted copy was verified but \
+                     before the originals were erased. The mounted volume is authoritative; \
+                     securely erase these leftovers (e.g. `shred -u`) before starting: {}",
+                    layout.boot_dir().display(),
+                    names
+                );
+            }
+        }
+
         let db = Database::open(&layout.db_path()).context("open database")?;
         migrations::run(&db).context("run migrations")?;
 

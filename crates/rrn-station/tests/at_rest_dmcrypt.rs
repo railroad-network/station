@@ -132,6 +132,14 @@ impl TestVolume {
                 break;
             }
             if attempt == 25 {
+                // The lazy umount is a safety net; if we ever reach it, a caller left
+                // the mount busy longer than 2.5 s (e.g. a Station::shutdown that did
+                // not release its DB handles). Make that visible rather than silent.
+                eprintln!(
+                    "WARNING: {} still busy after 2.5s; escalating to `umount -l` \
+                     (possible shutdown-ordering regression)",
+                    self.state_dir.display()
+                );
                 let _ = Command::new("sudo")
                     .args(["-n", "umount", "-l"])
                     .arg(&self.state_dir)

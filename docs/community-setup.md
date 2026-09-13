@@ -556,13 +556,27 @@ the machine from tricking your holders into unlocking it for them. If the
 fingerprint a holder sees does not match yours, **stop** — someone else is
 running the ceremony.
 
-**Rotating who holds keys.** When a relationship changes, re-split to a new set
-(the old shards stop working) — the volume must be unlocked first:
+**Rotating who holds keys.** When a relationship changes, re-split to a new set —
+the volume must be unlocked first:
 
 ```sh
 station vmk status                                   # current holders
 station vmk refresh --holder … --holder … --threshold 3
 ```
+
+A refresh gives every holder a brand-new shard and makes old and new shards
+**un-mixable** — a leftover old shard is useless next to the new ones. It does
+**not** change the underlying volume key, though, so a *full quorum of the former
+holders*, acting together, could still reconstruct it. If you need to lock former
+holders out completely (not just re-key who cooperates going forward), rotate the
+key itself: take a backup, then re-migrate onto a fresh container
+(`station encrypt-in-place`) so the old shards protect a key that no longer opens
+anything.
+
+> **Backups under the encrypted profile** cover everything *inside* the container
+> (ledger, wallet, pairings), but not the boot-dir `config.toml` (peers, listen
+> address, tuning). Keep a copy of `config.toml` with your backups, or expect to
+> re-enter that configuration when you restore onto fresh hardware.
 
 **If the station is seized anyway** — the recovery drill. Practice it before you
 need it:

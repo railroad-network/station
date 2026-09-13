@@ -121,8 +121,10 @@ enum VmkCmd {
     /// Show the VMK descriptor (address, K/N) and, when the volume is mounted, the
     /// current holder set.
     Status,
-    /// Re-split the VMK to a new holder set, revoking the old shards. Runs a boot
-    /// ceremony (the volume must already be unlocked) and prints the new shard QRs.
+    /// Re-split the VMK to a new holder set. Old and new shards cannot be combined,
+    /// but a full quorum of the *old* holders can still reconstruct the same key — to
+    /// truly revoke, rotate the VMK (re-migrate). Runs a boot ceremony (the volume
+    /// must already be unlocked) and prints the new shard QRs.
     Refresh {
         /// The new holder set: an `rrn1…` address, repeated once per holder.
         #[arg(long = "holder", required = true, value_name = "ADDRESS")]
@@ -395,7 +397,11 @@ fn cmd_vmk_refresh(
         data_dir, &session, &responses, holders, threshold,
     )?;
     print_holder_shards(&shards, threshold);
-    eprintln!("Holder set refreshed. The old shards no longer unlock the volume.");
+    eprintln!(
+        "Holder set refreshed. Old and new shards cannot be mixed, but a full quorum of the\n\
+         OLD holders can still reconstruct this key — the volume key itself is unchanged. To\n\
+         lock out former holders entirely, rotate the key by re-migrating to a fresh container."
+    );
     Ok(())
 }
 
