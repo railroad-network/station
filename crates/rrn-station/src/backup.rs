@@ -106,9 +106,20 @@ pub fn create_backup(data_dir: &Path, passphrase: &str, out_path: &Path) -> Resu
 
     let mut files = BTreeMap::new();
 
-    // Consistent live snapshot of the ledger into a throwaway temp dir, read
-    // into the bundle, then dropped.
-    let snap_dir = tempfile::tempdir().context("create temp dir for db snapshot")?;
+    // Consistent live snapshot of the ledger into a throwaway temp dir *inside
+    // `data_dir`*, read into the bundle, then dropped. This is deliberate, not a
+    // convenience: under the encrypted at-rest profile `data_dir` is the mounted
+    // container (callers route backup through the state dir), so the plaintext
+    // snapshot lands on the encrypted volume and never on a persistent plaintext
+    // partition (ADR-0024). A `/dev/shm` tmpfs would satisfy that too but caps the
+    // snapshot at available RAM and silently fell back to `/tmp` — on a Pi, the SD
+    // card — when `/dev/shm` was unavailable, defeating the invariant. Under the
+    // plaintext profile the database already lives here unencrypted, so a transient
+    // sibling snapshot leaks nothing new.
+    let snap_dir = tempfile::Builder::new()
+        .prefix(".rrn-snap-")
+        .tempdir_in(data_dir)
+        .with_context(|| format!("create temp dir for db snapshot in {}", data_dir.display()))?;
     let snap_path = snap_dir.path().join("snapshot.db");
     rrn_storage::db::snapshot_to(&db_path, &snap_path).context("snapshot database")?;
     let db_bytes = std::fs::read(&snap_path).context("read database snapshot")?;

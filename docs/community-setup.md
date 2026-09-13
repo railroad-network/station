@@ -464,6 +464,165 @@ The first three rows protect the *community*. The last two protect a
 *member* — which is why nudging everyone through in-app social recovery
 setup (Part 2.2) is steward work too.
 
+### 4.4 Seizure resistance — the encrypted profile (optional, Linux)
+
+By default a station stores its database in the clear: only the wallet's secret
+key is encrypted. A powered-off station that is seized or imaged hands over the
+whole community — every balance, memo, and who-vouched-for-whom. If your
+community faces that threat, the **encrypted at-rest profile** (ADR-0024) turns a
+powered-off node into an encrypted brick: the ledger, the wallet, and the radio
+identity all live inside a LUKS2 container whose key is **held by members, not
+stored on the machine**. No single person — and no seized machine — can open it.
+
+**The trade is real, and you choose it knowingly.** Every power loss (a blackout,
+an unplugged cable, a reboot) makes the station a locked brick until **K of your
+N key-holders gather to run an unlock ceremony**. Where holders share a building
+that is minutes; where they are dispersed it can be a scheduled meetup — days.
+So:
+
+- **A UPS is close to mandatory.** It turns brownouts and blips — the *common*
+  cause of downtime — into non-events, and shuts the station down cleanly on low
+  battery. Without one, ordinary power flicker means a ceremony.
+- **This profile is Linux-only** (it uses the kernel's `dm-crypt`). macOS and
+  other hosts run the plaintext profile.
+- **There is no operator-passphrase shortcut.** A passphrase one person knows is
+  exactly what coercion extracts — the member-held quorum exists to remove that
+  single seizable human. If you want single-operator unlock, you want the
+  plaintext profile; use it honestly.
+
+**Before you turn it on — hardening the host** (do these first; the encryption is
+only as good as the machine around it):
+
+```sh
+# Disable swap (or use encrypted swap) so VMK bytes / DB pages never page out:
+sudo swapoff -a          # and remove swap from /etc/fstab
+# Suppress core dumps so a crash can't spill plaintext to disk:
+echo 'kernel.core_pattern=|/bin/false' | sudo tee /etc/sysctl.d/50-no-cores.conf
+# Keep logs off any plaintext partition (journald to volatile storage is fine).
+```
+
+**Privileged helper commands.** `encrypt-in-place` and `unlock` drive the kernel's
+`cryptsetup`/`losetup`/`mount`/`mkfs.ext4`/`chown` via `sudo -n` (the daemon itself
+stays unprivileged). If you run the station as a dedicated non-root user, give that
+user a **scoped** sudoers rule for exactly those tools — do not grant blanket sudo:
+
+```
+# /etc/sudoers.d/rrn-station  (visudo -f), for user "rrn":
+rrn ALL=(root) NOPASSWD: /usr/sbin/cryptsetup, /usr/sbin/losetup, /bin/mount, \
+    /bin/umount, /sbin/mkfs.ext4, /bin/chown
+```
+
+Be honest about the residual: granting `mount`/`chown`/`cryptsetup` to a user is
+close to root-equivalent on that host. This is the trade for a code-driven,
+testable key ceremony; a community that wants a smaller privileged surface can run
+the ceremony as root interactively instead of via a service account.
+
+**Turn it on — one-way migration.** Take a backup first, then migrate. You need
+each key-holder's `rrn1…` address (they read it from their wallet app):
+
+```sh
+station backup --out ~/before-encrypt.rrnbak        # keep this somewhere safe
+station encrypt-in-place \
+    --holder rrn1<alice> --holder rrn1<bob> --holder rrn1<carol> \
+    --holder rrn1<dave>  --holder rrn1<erin> \
+    --threshold 3
+#   → provisions the container, moves the wallet + ledger inside, splits the
+#     Volume Master Key 3-of-5, and prints a QR per holder to scan into their
+#     wallet. The volume is left unlocked so you can `station run` right away.
+```
+
+Have each holder scan their QR **in person**. Their phone stores it as an
+ordinary recovery shard (it will read "a shard for `rrn1…`" — that is expected).
+
+**After migrating, destroy the old media.** `encrypt-in-place` securely erases the
+plaintext files it moved, but secure erase is **unreliable on SD cards and other
+wear-levelled flash** — the old blocks may survive remapping. For a real threat
+model, physically destroy the card the station ran on before the migration.
+
+**Every boot from now on — the unlock ceremony.** After any power loss the
+station will not start until K holders help:
+
+```sh
+station status          # shows "state volume: LOCKED (not mounted)"
+station unlock          # prints a request QR + a short console fingerprint
+#   Read the fingerprint aloud. Each holder confirms it matches on their end,
+#   THEN scans the request in their wallet's "help recover" flow and reads you
+#   back a response line. Paste K responses; the volume mounts.
+station run             # now the daemon starts normally
+```
+
+The console fingerprint is the safety check: it stops anyone who stole a copy of
+the machine from tricking your holders into unlocking it for them. If the
+fingerprint a holder sees does not match yours, **stop** — someone else is
+running the ceremony.
+
+**Rotating who holds keys.** When a relationship changes, re-split to a new set —
+the volume must be unlocked first:
+
+```sh
+station vmk status                                   # current holders
+station vmk refresh --holder … --holder … --threshold 3
+```
+
+A refresh gives every holder a brand-new shard and makes old and new shards
+**un-mixable** — a leftover old shard is useless next to the new ones. It does
+**not** change the underlying volume key, though, so a *full quorum of the former
+holders*, acting together, could still reconstruct it. If you need to lock former
+holders out completely (not just re-key who cooperates going forward), rotate the
+key onto a **new** container — `encrypt-in-place` refuses to run on a station that
+is already encrypted, so the rotation is a fresh migration:
+
+```sh
+station unlock && station backup --out rotate.rrnbak   # while still unlocked
+station restore rotate.rrnbak --data-dir /path/to/fresh # a fresh, plaintext dir
+station --data-dir /path/to/fresh encrypt-in-place \
+    --holder … --holder … --threshold 3               # new holders, new VMK
+cp <old-boot-dir>/config.toml /path/to/fresh/          # backups omit the boot config
+```
+
+Then move the fresh dir into place and **physically destroy the old media** — on the
+same SD card the restore step re-writes the plaintext ledger, and secure erase is
+unreliable on flash. Only after this do the former holders' shards protect a key that
+no longer opens anything.
+
+> **Backups under the encrypted profile** cover everything *inside* the container
+> (ledger, wallet, pairings), but not the boot-dir `config.toml` (peers, listen
+> address, tuning). Keep a copy of `config.toml` with your backups, or expect to
+> re-enter that configuration when you restore onto fresh hardware.
+
+**If the station is seized anyway** — the recovery drill. Practice it before you
+need it:
+
+```sh
+scripts/drill-seizure-recovery.sh --profile plaintext   # runs anywhere
+scripts/drill-seizure-recovery.sh --profile encrypted   # Linux, exercises the brick
+```
+
+What each profile actually checks:
+
+- `--profile plaintext` rehearses the **community-continues** path end to end:
+  stand up a station, back it up, delete the data dir ("seize"), `station restore`
+  onto fresh storage, and confirm the same identity with an openable ledger and
+  wallet.
+- `--profile encrypted` proves the **brick property**: with the volume closed, a
+  planted marker appears nowhere in the container bytes or on the boot dir (with a
+  positive control proving the sweep works), the holder set is absent from the boot
+  dir, and the LUKS header has zero keyslots.
+
+Recovering an **encrypted** station onto fresh hardware is a manual sequence, not
+something the drill runs for you: `station restore <archive>` (4.1) to get the
+ledger and wallet back, then `station encrypt-in-place` to provision a new
+keyslot-less container and re-arm the VMK to your (possibly changed) holder set,
+then the `station unlock` ceremony. The unlock ceremony and the ledger's
+durability across a remount are exercised by the `at-rest-dmcrypt` test lane.
+
+> **Heads-up for `systemd`:** under the encrypted profile `station run` exits until
+> the volume is unlocked, so a unit with `Restart=always` will crash-loop after a
+> reboot until someone runs `station unlock`. That is expected — unlock is a
+> deliberate human step. Use `Restart=on-failure` (as the sample unit in §3 does)
+> and start the service *after* the ceremony, or leave it enabled and simply expect
+> the restart backoff until K holders have gathered.
+
 ---
 
 ## Part 5 — Life with the network
@@ -640,6 +799,13 @@ station restore <archive> [--force]
 station recovery setup --threshold K --holder <addr> …   # arm; prints shard QRs
 station recovery status | show-shard <addr>
 station recovery restore [--from-backup <archive>]       # the ceremony
+
+# seizure resistance — encrypted at-rest profile (optional, Linux; §4.4)
+station status                                            # at-rest profile + unlock state
+station encrypt-in-place --threshold K --holder <addr> …  # migrate to the encrypted profile
+station unlock                                            # boot ceremony → mount the volume
+station vmk status | refresh --threshold K --holder <addr> …
+scripts/drill-seizure-recovery.sh --profile plaintext|encrypted
 
 # everyday admin / poking around
 rrn whoami | balance | history | transactions

@@ -120,6 +120,44 @@ jobs:
           RRN_SPIKE_PYTHON: /tmp/rns/bin/python
         run: cargo test -p rrn-station --test reticulum_spike -- --ignored --nocapture
 
+  at-rest-dmcrypt:
+    name: at-rest-dmcrypt
+    # The ADR-0024 encrypted-at-rest lane: exercises the REAL kernel dm-crypt path
+    # (keyslot-less LUKS2 container, brick property on raw bytes, boot ceremony,
+    # crash-safety, and the Station::open mount guard) plus the encrypted-profile
+    # seizure-recovery drill. Needs cryptsetup, loop devices, and passwordless sudo
+    # — all standard on GitHub-hosted ubuntu runners. This is the brick property's
+    # only real verification (the macOS dev host has no dm-crypt), so it gates
+    # push/PR rather than being manual. If it ever proves flaky for loop-device
+    # reasons, move it behind `workflow_dispatch` and say so in the PR — do not
+    # weaken the tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cryptsetup + load dm_crypt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cryptsetup-bin
+          sudo modprobe dm_crypt
+      - name: Preflight (fail loudly if the host cannot run dm-crypt)
+        run: |
+          set -euxo pipefail
+          sudo -n true
+          sudo losetup -f
+          cryptsetup --version
+      - name: Run the encrypted-at-rest integration tests
+        # `--ignored` is the opt-in; the tests themselves panic if a prerequisite is
+        # missing (no silent skip). Tee the output and assert a non-zero test count,
+        # so the lane cannot quietly become a no-op.
+        run: |
+          set -euo pipefail
+          cargo test -p rrn-station --test at_rest_dmcrypt -- --ignored --nocapture | tee /tmp/dmcrypt.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/dmcrypt.log
+      - name: Run the encrypted-profile seizure-recovery drill
+        run: ./scripts/drill-seizure-recovery.sh --profile encrypted
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

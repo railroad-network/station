@@ -3540,6 +3540,74 @@ background vouch path — so the opt-in background-signing credential
 ([Mobile–station transport](#mobilestation-transport), T1.3.6) does not sign
 vouches; its residual risk is unchanged by M1.4.
 
+### Encrypted at-rest storage and the boot ceremony (station, ADR-0024)
+
+The optional **encrypted at-rest profile** (`[storage] at_rest = "encrypted"`,
+Linux only) wraps the station's mutable and secret state in a member-keyed LUKS2
+container (`dm-crypt`) unlocked at boot by a Shamir quorum of member holders. Block
+encryption is the kernel's — `rrn-crypto` touches only the 32-byte Volume Master Key
+(VMK). Two new surfaces land here: the **root-privileged mount helper**
+(`rrn-station::storage::volume`) and the **wallet-free boot ceremony**
+(`rrn-station::storage::vmk`). This section is the encrypted profile's STRIDE; the
+plaintext profile (still the default) is unchanged and its residual — a seized
+powered-off node discloses everything — is the one this profile closes.
+
+**Assets:** the whole data directory at rest (ledger, memos, vouch graph, the
+station wallet, the Reticulum adapter identity, the search index — all now *inside*
+the container); the VMK, in memory during a ceremony and in the kernel while mapped;
+the boot-dir descriptor.
+
+- *Spoofing (forged ceremony):* the boot ceremony is unauthenticated by necessity —
+  no station keypair exists before unlock — and the `RecoveryRequest` is itself
+  unsigned. A seizer who imaged the boot dir could mint their own ephemeral key and
+  phish shares. *Mitigation:* the **console fingerprint** (blake3 over the ephemeral
+  key + VMK address, `ceremony_fingerprint`, pinned in `docs/spec/vmk-boot-ceremony.md`)
+  is the authenticator — holders confirm it out-of-band against the operator's console
+  before responding, and a forged ceremony shows a different fingerprint. As shipped,
+  the ceremony runs at the physical console only (the operator pastes holders'
+  responses); the ADR's optional pre-unlock LAN endpoint is a documented divergence,
+  not yet implemented, so there is no network listener before unlock. *Residual:*
+  relies on holders actually checking the fingerprint, and on a mobile client that
+  reproduces the pinned algorithm; a lazy holder is the weak link, stated plainly.
+- *Information disclosure (the whole point):* powered off, the container is a LUKS2
+  brick with **zero keyslots** — no wrapped copy of the key on the device (the VMK is
+  the volume key). Provisioning kills the throwaway `luksFormat` keyslot and
+  post-checks zero keyslots; `DmCryptVolume::open` refuses a container with any
+  keyslot. `< K` shards reveal nothing (ADR-0004), and the boot-dir descriptor
+  discloses only the VMK address and `K`/`N` — **never the holder set** (a coercion
+  map). The brick property is asserted on raw container bytes with a plaintext
+  positive control (`tests/at_rest_dmcrypt.rs`, `scripts/drill-seizure-recovery.sh`).
+- *Information disclosure (key handling):* the reconstructed VMK is never written to
+  disk, is held in a `ZeroizeOnDrop` type with a redacting `Debug`, is passed to the
+  mount helper **by file descriptor** (`/dev/stdin`, never argv/env/temp file), and is
+  zeroized the moment the volume is mapped — from then on the key lives only in kernel
+  crypto state.
+- *Elevation of privilege (mount helper):* the helper runs `cryptsetup`/`losetup`/
+  `mount` via `sudo -n`; the daemon itself stays unprivileged and the mount is
+  `chown`ed to it. The helper's transient VMK exposure is the fd above.
+- *Tampering / mis-ordered restart:* a daemon that started before the volume was
+  unlocked would otherwise create a fresh plaintext `station.db` on the unencrypted
+  root and serve it. *Mitigation:* `Station::open` verifies the state dir is a **live
+  `dm-crypt` mount** (an unprivileged `/proc/self/mountinfo` check) *before touching
+  any file*, and refuses otherwise (`tests/at_rest_dmcrypt.rs`,
+  `station_open_refuses_an_unmounted_state_dir_and_writes_nothing`).
+- *Denial of service:* every power loss unmaps the volume, so the node is a locked
+  brick until `K` holders converge — the availability cost, paid by design. A UPS is
+  the primary mitigation (runbook); the plaintext profile remains a supported choice.
+  With the console-only ceremony there is no pre-unlock network listener to flood; a
+  junk pasted response is simply rejected by `open_response`. Were the optional LAN
+  endpoint added later, it would be an unauthenticated ingest (junk-blob DoS) bounded
+  only by the fingerprint gating real progress — noted for that future work.
+- **Not covered — stated plainly:** a node seized **while running** has the volume
+  mapped and the key in kernel memory; cold-boot/RAM-remanence and live imaging can
+  recover it. The answer is physical (custody, tamper-evident enclosure) plus rapid
+  re-bootstrap on new hardware (ADR-0016), not this profile. Swap and core dumps can
+  page out VMK bytes or plaintext DB pages — the runbook requires disabling swap (or
+  encrypted swap) and suppressing core dumps. Backup/migration temporaries must be
+  written to tmpfs or inside the container, never the plaintext root (the migration
+  snapshots straight into the container via `VACUUM INTO`). Secure erase of the old
+  plaintext media is unreliable on wear-levelled flash/SD — destroy the card.
+
 ## Cross-cutting threats
 
 Some threats are not owned by a single crate — they emerge from how the layers
@@ -3679,15 +3747,22 @@ edges of that scope.
 - **No federation security.** Eclipse attacks, cross-replica ledger forks,
   rollback detection, and treaty abuse are out of scope (see
   [Log fork / rollback](#log-fork--rollback) and `rrn-protocol`).
-- **No at-rest encryption of the database.** Only the wallet secret key is
-  encrypted. Balances, the transaction graph, memos, and the social-vouch graph
-  are plaintext on disk — exposed to a local attacker or seized media. Whole-DB
-  encryption is future work (design §10.8).
+- **At-rest encryption is opt-in (ADR-0024), and Linux-only.** The default
+  **plaintext** profile still leaves balances, the transaction graph, memos, and
+  the social-vouch graph plaintext on disk — exposed to a local attacker or seized
+  media. The optional **encrypted** profile (`[storage] at_rest = "encrypted"`)
+  closes this for a *powered-off* node — the whole data directory (ledger, wallet,
+  adapter identity, index) becomes a member-keyed LUKS2 brick with no wrapped key on
+  the device — but it runs only on Linux (kernel `dm-crypt`), costs a boot ceremony
+  after every power loss, and does **not** defend a node seized *while running* (the
+  key is in kernel memory). See [Encrypted at-rest storage and the boot
+  ceremony](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024).
 - **No memory hardening beyond `zeroize`.** Keys are necessarily plaintext in
-  RAM while in use; no `mlock`, no swap guard, no core-dump suppression. A
-  same-user code-execution attacker or physical memory access defeats secrecy
-  (per the device-trust assumption). `RRN_PASSPHRASE`, if used, is visible in
-  the process environment.
+  RAM while in use; no `mlock`. Under the encrypted profile the runbook requires
+  disabling swap (or encrypted swap) and suppressing core dumps — but this is
+  operator hardening, not enforced by the daemon. A same-user code-execution attacker
+  or physical memory access defeats secrecy (per the device-trust assumption).
+  `RRN_PASSPHRASE`, if used, is visible in the process environment.
 - **Debt is bounded, not managed.** The debt floor (ADR-0018, default
   −20 Commons) caps how far a member can sign themselves into debt, but the
   contract-charge path is not floor-checked, the floor is operator config
@@ -3772,9 +3847,15 @@ above; this is the index. Anticipated mitigations from the design overview
 - **Tampering / forgery** → `verify_strict` over canonical CBOR via
   `SignedPayload`, re-verified at the log write; hash-chained log detected by
   `verify_chain`; state derived from the log, never written around it.
-- **Physical node seizure** → wallet key encrypted at rest (argon2id +
-  XChaCha20-Poly1305, `0o600`, atomic write). Whole-database encryption is **not
-  yet** done (see [Known limitations](#known-limitations)).
+- **Physical node seizure** → wallet key always encrypted at rest (argon2id +
+  XChaCha20-Poly1305, `0o600`, atomic write). The optional encrypted profile
+  (ADR-0024, Linux) additionally makes a *powered-off* node a member-keyed LUKS2
+  brick — ledger, wallet, and adapter identity all inside it, no wrapped key on the
+  device, unlocked by a `K`-of-`N` boot ceremony — while the default plaintext
+  profile leaves the database in the clear. A node seized *while running* is not
+  defended by either (see [Encrypted at-rest
+  storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) and
+  [Known limitations](#known-limitations)).
 - **Eclipse attack, ledger fork, Sybil federation** → deferred to Phase 1+
   (`rrn-protocol`), out of scope for the Phase 0 audit per [Scope](#scope).
 

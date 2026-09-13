@@ -73,6 +73,100 @@ pub struct StationConfig {
     /// texts receipts back.
     #[serde(default)]
     pub sms: SmsSection,
+    /// At-rest encryption profile (optional; defaults to the `plaintext` profile —
+    /// today's behavior). The `encrypted` profile wraps the station's mutable state
+    /// in a member-keyed LUKS container unlocked by a boot ceremony (ADR-0024).
+    #[serde(default)]
+    pub storage: StorageSection,
+}
+
+/// `[storage]` — the at-rest encryption profile (ADR-0024).
+///
+/// Two profiles, chosen at provisioning and not a runtime toggle:
+///
+/// - **`plaintext`** (default) — today's behavior: the data directory is a flat,
+///   unencrypted tree. Correct for communities that do not face a physical-seizure
+///   threat, and the only supported profile on non-Linux hosts.
+/// - **`encrypted`** — the seizure-resistance profile: the station's mutable and
+///   secret state lives inside a member-keyed LUKS2 container (`dm-crypt`), unlocked
+///   at boot by a Shamir quorum of member holders (the Volume Master Key is never
+///   written to disk). Powered off, the container is an encrypted brick. This
+///   profile is **Linux-only** — block encryption is the kernel's `dm-crypt`, driven
+///   by `cryptsetup`/`losetup`; a station started with `at_rest = "encrypted"` on a
+///   non-Linux host refuses rather than silently serving plaintext.
+///
+/// See ADR-0024 for the full design and the availability trade (every power loss
+/// costs a ceremony — a UPS is strongly recommended).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StorageSection {
+    /// Which at-rest profile this station runs. Defaults to
+    /// [`AtRestProfile::Plaintext`].
+    #[serde(default)]
+    pub at_rest: AtRestProfile,
+    /// The encrypted-profile parameters. Required (and validated) when
+    /// `at_rest = "encrypted"`; ignored under the plaintext profile.
+    #[serde(default)]
+    pub encrypted: Option<EncryptedSection>,
+}
+
+/// The at-rest storage profile (`[storage] at_rest`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AtRestProfile {
+    /// Flat, unencrypted data directory — today's behavior (default).
+    #[default]
+    Plaintext,
+    /// Member-keyed LUKS container unlocked by a boot ceremony (ADR-0024, Linux).
+    Encrypted,
+}
+
+/// `[storage.encrypted]` — the member-keyed encrypted-volume parameters (ADR-0024).
+///
+/// The `boot_dir` (the unencrypted `--data-dir`) holds only `config.toml`, the CLI
+/// socket, the LUKS container file, and a tiny VMK unlock descriptor; everything
+/// sensitive — the wallet, the ledger database, paired mobiles, the search index,
+/// the recovery package, and the Reticulum adapter identity — lives inside the
+/// container, mounted at [`state_dir`](EncryptedSection::state_dir). The VMK is
+/// Shamir-split at threshold [`threshold`](EncryptedSection::threshold) among the
+/// holders named on the `station encrypt-in-place` / `vmk refresh` command line,
+/// reusing ADR-0016's machinery.
+///
+/// **The holder set is deliberately not stored here.** Persisting holder addresses
+/// on the unencrypted boot dir would hand a seizer who imaged the card a
+/// coercion-target map (ADR-0024) — exactly what the boot-dir VMK descriptor is
+/// designed to avoid. The authoritative record of who holds a shard is the VMK
+/// package *inside* the encrypted container (readable only once unlocked, via
+/// `station vmk status`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedSection {
+    /// Path to the LUKS2 container file (`state.img`). When omitted, defaults to
+    /// `<boot_dir>/state.img` (resolved at [`Station::open`](crate::station::Station::open)
+    /// time, since the boot dir is not known here).
+    #[serde(default)]
+    pub container_path: Option<String>,
+    /// The mount point the decrypted container is mapped at — the `state_dir`. When
+    /// omitted, defaults to `<boot_dir>/state`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    /// `K` — how many holders must cooperate at the boot ceremony to reconstruct the
+    /// VMK. Defaults to 3; provisioning refuses `K < 2` (matching ADR-0016
+    /// `recovery::setup`), and `K` may not exceed the number of holders.
+    #[serde(default = "default_vmk_threshold")]
+    pub threshold: u8,
+}
+
+fn default_vmk_threshold() -> u8 {
+    3
+}
+
+impl Default for EncryptedSection {
+    fn default() -> Self {
+        Self {
+            container_path: None,
+            state_dir: None,
+            threshold: default_vmk_threshold(),
+        }
+    }
 }
 
 /// `[sms]` — SMS as a DTN carrier (T2.7.1, Overview §10.3 "No internet — SMS").
@@ -758,6 +852,7 @@ impl StationConfig {
             sidecar: SidecarSection::default(),
             lora: LoraSection::default(),
             sms: SmsSection::default(),
+            storage: StorageSection::default(),
         }
     }
 }
@@ -1078,6 +1173,79 @@ mod tests {
         assert_eq!(cfg.sms.max_inbound_per_hour, 120);
         // 153×6 = 918 chars − 22 header = 896 data chars → floor(896×3/4) = 672.
         assert_eq!(cfg.sms.relay_config().chunk_budget_bytes, 672);
+    }
+
+    #[test]
+    fn storage_defaults_to_plaintext_profile() {
+        // A config written before [storage] existed still parses, and the station
+        // runs the plaintext (today's) profile with no encrypted parameters.
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.storage.at_rest, AtRestProfile::Plaintext);
+        assert!(cfg.storage.encrypted.is_none());
+    }
+
+    #[test]
+    fn storage_encrypted_profile_parses() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [storage]
+            at_rest = "encrypted"
+
+            [storage.encrypted]
+            container_path = "/var/lib/rrn/state.img"
+            state_dir = "/run/rrn/state"
+            threshold = 3
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert_eq!(cfg.storage.at_rest, AtRestProfile::Encrypted);
+        let enc = cfg.storage.encrypted.expect("encrypted section present");
+        assert_eq!(
+            enc.container_path.as_deref(),
+            Some("/var/lib/rrn/state.img")
+        );
+        assert_eq!(enc.state_dir.as_deref(), Some("/run/rrn/state"));
+        assert_eq!(enc.threshold, 3);
+    }
+
+    #[test]
+    fn storage_encrypted_config_never_persists_holders() {
+        // The serialized encrypted config must not carry the holder set — persisting
+        // it on the unencrypted boot dir would leak a coercion-target map (ADR-0024).
+        let cfg = StationConfig::parse(
+            "[network]\nlisten = \"127.0.0.1:7411\"\n[storage]\nat_rest = \"encrypted\"\n\
+             [storage.encrypted]\nthreshold = 2\n",
+            &p(),
+        )
+        .unwrap();
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !serialized.contains("holders"),
+            "config must not serialize a holders field: {serialized}"
+        );
+    }
+
+    #[test]
+    fn storage_encrypted_threshold_defaults_to_three() {
+        // [storage.encrypted] with no explicit threshold takes the default of 3.
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+
+            [storage]
+            at_rest = "encrypted"
+
+            [storage.encrypted]
+            state_dir = "/run/rrn/state"
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        let enc = cfg.storage.encrypted.expect("encrypted section present");
+        assert_eq!(enc.threshold, 3);
     }
 
     #[test]
