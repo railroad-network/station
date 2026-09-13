@@ -541,7 +541,7 @@ impl MountHelper for SudoCryptsetupHelper {
     }
 
     fn is_live_mount(&self, state_dir: &Path) -> Result<bool> {
-        linux_live_mount(state_dir)
+        linux_live_mount(state_dir, None)
     }
 
     fn keyslot_count(&self, container_path: &Path) -> Result<usize> {
