@@ -117,10 +117,28 @@ impl TestVolume {
     }
 
     fn close(&self) {
-        let _ = Command::new("sudo")
-            .args(["-n", "umount"])
-            .arg(&self.state_dir)
-            .output();
+        // Retry the umount until the mount is actually gone. A station that has just
+        // shut down can briefly keep the mount busy while the tokio runtime's SQLite
+        // handles finish closing on worker threads; a single best-effort umount would
+        // then silently fail and leave the *decrypted* volume mounted, so a later
+        // at-rest sweep would read plaintext. Escalate to a lazy umount as a fallback,
+        // which detaches the mount from the namespace even if a handle lingers.
+        for attempt in 0..50 {
+            let _ = Command::new("sudo")
+                .args(["-n", "umount"])
+                .arg(&self.state_dir)
+                .output();
+            if !volume::state_dir_is_live_mount(&self.state_dir).unwrap_or(false) {
+                break;
+            }
+            if attempt == 25 {
+                let _ = Command::new("sudo")
+                    .args(["-n", "umount", "-l"])
+                    .arg(&self.state_dir)
+                    .output();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         let _ = Command::new("sudo")
             .args(["-n", "cryptsetup", "close", &self.mapping])
             .output();
@@ -433,6 +451,9 @@ fn station_runs_on_the_encrypted_volume_and_leaves_no_plaintext_at_rest() {
         );
         station.shutdown().await;
     });
+    // Drop the runtime before unmounting so its worker threads are joined and every
+    // SQLite handle is released — otherwise the umount in `close` could still be busy.
+    drop(rt);
 
     // Power off and sweep: the marker must be nowhere at rest.
     vol.close();
