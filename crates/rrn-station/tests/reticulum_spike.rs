@@ -140,6 +140,7 @@ fn boot_rnsd(config_dir: PathBuf) -> Node {
         restart_backoff: Duration::from_secs(1),
         tcp_listen: None, // config is pre-written; supervisor must not regenerate
         tcp_peers: vec![],
+        rnode: None,
         shutdown_grace: Duration::from_secs(5),
     };
     let state = Arc::new(ConnectivityState::new(vec![], "127.0.0.1:0".into(), false));

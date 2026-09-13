@@ -190,6 +190,58 @@ pub struct LoraSection {
     /// Defaults to 7 days.
     #[serde(default = "default_push_ttl_secs")]
     pub push_ttl_secs: i64,
+    /// The physical RNode radio interface (`[lora.rnode]`), templated into the
+    /// generated Reticulum config (ADR-0013). Absent → no radio interface is
+    /// templated: the generated config carries a commented example and a docs
+    /// pointer instead, so a station never transmits on a frequency or power that
+    /// nobody deliberately chose.
+    #[serde(default)]
+    pub rnode: Option<RNodeSection>,
+}
+
+/// `[lora.rnode]` — the physical RNode LoRa radio interface.
+///
+/// This templates an `RNodeInterface` stanza into the station's generated
+/// Reticulum config, so putting a station on radio is a *configuration* change,
+/// not a code one (ADR-0013: Reticulum is a carrier only). `frequency_hz` and
+/// `tx_power_dbm` have **no defaults**: a radio is enabled only by a deliberate,
+/// region-aware choice. Spectrum compliance (frequency, duty cycle, EIRP) is the
+/// operator's responsibility per geography — see the regional compliance table in
+/// `docs/lora-radio-bringup.md`. Every node on one LoRa network must share the
+/// same frequency, bandwidth, and spreading factor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RNodeSection {
+    /// Serial port of the radio, e.g. `/dev/ttyACM0` (nRF52 boards) or
+    /// `/dev/ttyUSB0` (many ESP32 boards). Run `ls /dev/tty*` before and after
+    /// plugging the radio in to find it.
+    pub port: String,
+    /// Centre frequency in Hz — **no default**. Must be legal for your region
+    /// (e.g. EU-868: 867200000; US-915: 915000000) and identical on every node.
+    pub frequency_hz: u64,
+    /// Transmit power in dBm — **no default**. Start low and stay within your
+    /// region's EIRP cap (antenna gain counts toward it).
+    pub tx_power_dbm: i32,
+    /// Channel bandwidth in Hz. Defaults to 125000 (125 kHz — the robust default).
+    #[serde(default = "default_lora_bandwidth_hz")]
+    pub bandwidth_hz: u64,
+    /// Spreading factor, 7..=12 (higher = more range, less throughput). Defaults
+    /// to 8.
+    #[serde(default = "default_lora_spreading_factor")]
+    pub spreading_factor: u8,
+    /// Coding-rate denominator (the `x` in 4/x); RNS accepts 5..=8. Defaults to 5
+    /// (a 4/5 coding rate).
+    #[serde(default = "default_lora_coding_rate")]
+    pub coding_rate: u8,
+}
+
+fn default_lora_bandwidth_hz() -> u64 {
+    125_000
+}
+fn default_lora_spreading_factor() -> u8 {
+    8
+}
+fn default_lora_coding_rate() -> u8 {
+    5
 }
 
 fn default_adapter_python() -> String {
@@ -227,6 +279,7 @@ impl Default for LoraSection {
             adapter_python: default_adapter_python(),
             push_rescan_secs: default_push_rescan_secs(),
             push_ttl_secs: default_push_ttl_secs(),
+            rnode: None,
         }
     }
 }
@@ -928,6 +981,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.lora.budget().sustained_bytes_per_sec, 30.0);
+    }
+
+    #[test]
+    fn rnode_absent_by_default() {
+        // A config with no [lora.rnode] leaves the radio interface unconfigured —
+        // the generated Reticulum config carries a commented example instead.
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        assert!(cfg.lora.rnode.is_none());
+    }
+
+    #[test]
+    fn rnode_parses_with_required_fields_and_radio_defaults() {
+        let text = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+            [lora.rnode]
+            port = "/dev/ttyUSB0"
+            frequency_hz = 915000000
+            tx_power_dbm = 5
+        "#;
+        let cfg = StationConfig::parse(text, &p()).unwrap();
+        let r = cfg.lora.rnode.expect("rnode configured");
+        assert_eq!(r.port, "/dev/ttyUSB0");
+        assert_eq!(r.frequency_hz, 915_000_000);
+        assert_eq!(r.tx_power_dbm, 5);
+        // Radio defaults fill in when omitted.
+        assert_eq!(r.bandwidth_hz, 125_000);
+        assert_eq!(r.spreading_factor, 8);
+        assert_eq!(r.coding_rate, 5);
+    }
+
+    #[test]
+    fn rnode_without_frequency_or_power_is_a_loud_error() {
+        // frequency_hz and tx_power_dbm have no defaults: a half-specified radio
+        // is a config error, never a silently-disabled or silently-defaulted one.
+        let missing_freq = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+            [lora.rnode]
+            port = "/dev/ttyUSB0"
+            tx_power_dbm = 5
+        "#;
+        assert!(StationConfig::parse(missing_freq, &p()).is_err());
+
+        let missing_power = r#"
+            [network]
+            listen = "127.0.0.1:7411"
+            [lora.rnode]
+            port = "/dev/ttyUSB0"
+            frequency_hz = 915000000
+        "#;
+        assert!(StationConfig::parse(missing_power, &p()).is_err());
     }
 
     #[test]
