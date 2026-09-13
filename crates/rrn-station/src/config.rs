@@ -127,8 +127,16 @@ pub enum AtRestProfile {
 /// sensitive — the wallet, the ledger database, paired mobiles, the search index,
 /// the recovery package, and the Reticulum adapter identity — lives inside the
 /// container, mounted at [`state_dir`](EncryptedSection::state_dir). The VMK is
-/// Shamir-split among [`holders`](EncryptedSection::holders) at threshold
-/// [`threshold`](EncryptedSection::threshold), reusing ADR-0016's machinery.
+/// Shamir-split at threshold [`threshold`](EncryptedSection::threshold) among the
+/// holders named on the `station encrypt-in-place` / `vmk refresh` command line,
+/// reusing ADR-0016's machinery.
+///
+/// **The holder set is deliberately not stored here.** Persisting holder addresses
+/// on the unencrypted boot dir would hand a seizer who imaged the card a
+/// coercion-target map (ADR-0024) — exactly what the boot-dir VMK descriptor is
+/// designed to avoid. The authoritative record of who holds a shard is the VMK
+/// package *inside* the encrypted container (readable only once unlocked, via
+/// `station vmk status`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedSection {
     /// Path to the LUKS2 container file (`state.img`). When omitted, defaults to
@@ -140,11 +148,6 @@ pub struct EncryptedSection {
     /// omitted, defaults to `<boot_dir>/state`.
     #[serde(default)]
     pub state_dir: Option<String>,
-    /// The VMK holder set: each a member's `rrn1…` address. A shard of the Volume
-    /// Master Key is sealed to each holder's identity key at provisioning. Must list
-    /// at least [`threshold`](EncryptedSection::threshold) holders (and ≥ 2).
-    #[serde(default)]
-    pub holders: Vec<String>,
     /// `K` — how many holders must cooperate at the boot ceremony to reconstruct the
     /// VMK. Defaults to 3; provisioning refuses `K < 2` (matching ADR-0016
     /// `recovery::setup`), and `K` may not exceed the number of holders.
@@ -161,7 +164,6 @@ impl Default for EncryptedSection {
         Self {
             container_path: None,
             state_dir: None,
-            holders: Vec::new(),
             threshold: default_vmk_threshold(),
         }
     }
@@ -1198,7 +1200,6 @@ mod tests {
             [storage.encrypted]
             container_path = "/var/lib/rrn/state.img"
             state_dir = "/run/rrn/state"
-            holders = ["rrn1aaa", "rrn1bbb", "rrn1ccc", "rrn1ddd", "rrn1eee"]
             threshold = 3
         "#;
         let cfg = StationConfig::parse(text, &p()).unwrap();
@@ -1209,8 +1210,24 @@ mod tests {
             Some("/var/lib/rrn/state.img")
         );
         assert_eq!(enc.state_dir.as_deref(), Some("/run/rrn/state"));
-        assert_eq!(enc.holders.len(), 5);
         assert_eq!(enc.threshold, 3);
+    }
+
+    #[test]
+    fn storage_encrypted_config_never_persists_holders() {
+        // The serialized encrypted config must not carry the holder set — persisting
+        // it on the unencrypted boot dir would leak a coercion-target map (ADR-0024).
+        let cfg = StationConfig::parse(
+            "[network]\nlisten = \"127.0.0.1:7411\"\n[storage]\nat_rest = \"encrypted\"\n\
+             [storage.encrypted]\nthreshold = 2\n",
+            &p(),
+        )
+        .unwrap();
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !serialized.contains("holders"),
+            "config must not serialize a holders field: {serialized}"
+        );
     }
 
     #[test]
@@ -1224,7 +1241,7 @@ mod tests {
             at_rest = "encrypted"
 
             [storage.encrypted]
-            holders = ["rrn1aaa", "rrn1bbb", "rrn1ccc"]
+            state_dir = "/run/rrn/state"
         "#;
         let cfg = StationConfig::parse(text, &p()).unwrap();
         let enc = cfg.storage.encrypted.expect("encrypted section present");

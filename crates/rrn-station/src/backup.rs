@@ -107,8 +107,14 @@ pub fn create_backup(data_dir: &Path, passphrase: &str, out_path: &Path) -> Resu
     let mut files = BTreeMap::new();
 
     // Consistent live snapshot of the ledger into a throwaway temp dir, read
-    // into the bundle, then dropped.
-    let snap_dir = tempfile::tempdir().context("create temp dir for db snapshot")?;
+    // into the bundle, then dropped. Prefer tmpfs (`/dev/shm`, RAM) so that under
+    // the encrypted at-rest profile the plaintext snapshot never touches a
+    // persistent partition (ADR-0024); fall back to the system temp dir elsewhere.
+    let snap_dir = tempfile::Builder::new()
+        .prefix("rrn-snap-")
+        .tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .context("create temp dir for db snapshot")?;
     let snap_path = snap_dir.path().join("snapshot.db");
     rrn_storage::db::snapshot_to(&db_path, &snap_path).context("snapshot database")?;
     let db_bytes = std::fs::read(&snap_path).context("read database snapshot")?;

@@ -442,6 +442,29 @@ fn cmd_peers_list(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The directory the backup/recovery commands should read and write.
+///
+/// Under the plaintext profile this is the data dir (today's behavior). Under the
+/// encrypted profile the wallet/ledger/recovery package live inside the container,
+/// so these commands must operate on the mounted `state_dir` — and are refused when
+/// the volume is locked, so a restore can never write a plaintext wallet or database
+/// onto the unencrypted boot dir (ADR-0024).
+fn ops_dir(data_dir: &std::path::Path) -> Result<PathBuf> {
+    let report = rrn_station::storage::admin::status(data_dir)?;
+    if report.profile == "encrypted" {
+        let enc = report.encrypted.expect("encrypted status present");
+        if !enc.mounted {
+            anyhow::bail!(
+                "the encrypted state volume is locked — run `station unlock` before this command \
+                 (the wallet and ledger live inside the container)"
+            );
+        }
+        Ok(PathBuf::from(enc.state_dir))
+    } else {
+        Ok(data_dir.to_path_buf())
+    }
+}
+
 /// Runs a single Unix-socket RPC against the live daemon and returns its result.
 ///
 /// These operator commands are separate processes from `station run`; they reach
@@ -520,7 +543,8 @@ fn cmd_unpair(data_dir: &std::path::Path, address: String) -> Result<()> {
 fn cmd_backup(data_dir: &std::path::Path, out: Option<PathBuf>) -> Result<()> {
     let out_path = out.unwrap_or_else(default_backup_path);
     let passphrase = read_run_passphrase()?;
-    let written = rrn_station::backup::create_backup(data_dir, &passphrase, &out_path)?;
+    let dir = ops_dir(data_dir)?;
+    let written = rrn_station::backup::create_backup(&dir, &passphrase, &out_path)?;
     println!("{}", written.display());
     eprintln!("Backed up station to {}", written.display());
     eprintln!("Keep this file safe: it holds the ledger and the (encrypted) wallet.");
@@ -530,9 +554,10 @@ fn cmd_backup(data_dir: &std::path::Path, out: Option<PathBuf>) -> Result<()> {
 /// `station restore <archive> [--force]` — restore a station into the data dir.
 fn cmd_restore(data_dir: &std::path::Path, archive: &std::path::Path, force: bool) -> Result<()> {
     let passphrase = read_run_passphrase()?;
-    let address = rrn_station::backup::restore_backup(archive, data_dir, &passphrase, force)?;
+    let dir = ops_dir(data_dir)?;
+    let address = rrn_station::backup::restore_backup(archive, &dir, &passphrase, force)?;
     println!("{address}");
-    eprintln!("Restored station {address} into {}", data_dir.display());
+    eprintln!("Restored station {address} into {}", dir.display());
     eprintln!("Start it with `station run` (the search index rebuilds on first run).");
     Ok(())
 }
@@ -540,7 +565,8 @@ fn cmd_restore(data_dir: &std::path::Path, archive: &std::path::Path, force: boo
 /// `station recovery setup` — split the key across holders and print shard QRs.
 fn cmd_recovery_setup(data_dir: &std::path::Path, holders: &[String], threshold: u8) -> Result<()> {
     let passphrase = read_run_passphrase()?;
-    let shards = rrn_station::recovery::setup(data_dir, &passphrase, holders, threshold)?;
+    let dir = ops_dir(data_dir)?;
+    let shards = rrn_station::recovery::setup(&dir, &passphrase, holders, threshold)?;
     eprintln!(
         "Recovery armed: {}-of-{} holders. Show each holder their QR to scan into their wallet.\n",
         threshold,
@@ -565,7 +591,7 @@ fn cmd_recovery_setup(data_dir: &std::path::Path, holders: &[String], threshold:
 
 /// `station recovery status` — print the current recovery configuration.
 fn cmd_recovery_status(data_dir: &std::path::Path) -> Result<()> {
-    let st = rrn_station::recovery::status(data_dir)?;
+    let st = rrn_station::recovery::status(&ops_dir(data_dir)?)?;
     println!("{}-of-{} recovery", st.threshold, st.total);
     eprintln!("Holders:");
     for h in &st.holders {
@@ -577,7 +603,7 @@ fn cmd_recovery_status(data_dir: &std::path::Path) -> Result<()> {
 
 /// `station recovery show-shard <address>` — re-print one holder's shard QR.
 fn cmd_recovery_show_shard(data_dir: &std::path::Path, address: &str) -> Result<()> {
-    let shard = rrn_station::recovery::shard_for(data_dir, address)?;
+    let shard = rrn_station::recovery::shard_for(&ops_dir(data_dir)?, address)?;
     eprintln!("Shard for {} — have them scan this:", shard.address);
     println!("{}", rrn_station::recovery::render_qr(&shard.qr_payload));
     eprintln!("(or paste: {})", shard.qr_payload);
@@ -593,7 +619,8 @@ fn cmd_recovery_restore(
 ) -> Result<()> {
     use std::io::BufRead;
 
-    let (session, request_qr) = rrn_station::recovery::begin_restore(data_dir, from_backup)?;
+    let dir = ops_dir(data_dir)?;
+    let (session, request_qr) = rrn_station::recovery::begin_restore(&dir, from_backup)?;
     eprintln!("Recovering station {}", session.target());
     eprintln!("\nHave each holder scan this request in their wallet's \"help recover\" flow:\n");
     println!("{}", rrn_station::recovery::render_qr(&request_qr));
@@ -626,13 +653,8 @@ fn cmd_recovery_restore(
     }
 
     let new_passphrase = read_new_passphrase()?;
-    let address = rrn_station::recovery::finish_restore(
-        &session,
-        &responses,
-        &new_passphrase,
-        data_dir,
-        force,
-    )?;
+    let address =
+        rrn_station::recovery::finish_restore(&session, &responses, &new_passphrase, &dir, force)?;
     println!("{address}");
     eprintln!("Recovered station {address}. Start it with `station run` using the new passphrase.");
     Ok(())

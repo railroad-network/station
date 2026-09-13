@@ -148,10 +148,18 @@ impl VmkDescriptor {
         })
     }
 
-    /// Writes the descriptor to `path` (plain — it is non-secret).
+    /// Writes the descriptor to `path` atomically (temp file + rename), so a power
+    /// loss mid-write cannot leave a truncated descriptor — losing it would lock the
+    /// operator out of `begin_unlock` even with a valid quorum, since the descriptor
+    /// carries the VMK address the ceremony reconstructs against. Plain, not
+    /// encrypted — it is non-secret.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.to_canonical_bytes())
-            .with_context(|| format!("write VMK descriptor to {}", path.display()))
+        let bytes = self.to_canonical_bytes();
+        let tmp = path.with_extension("descriptor.tmp");
+        std::fs::write(&tmp, &bytes)
+            .with_context(|| format!("write VMK descriptor temp {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename VMK descriptor into place at {}", path.display()))
     }
 
     /// Reads a descriptor back from `path`.
@@ -507,6 +515,23 @@ mod tests {
         );
         let recovered = finish_unlock(&session, &resp).unwrap();
         assert_eq!(&*recovered.key_bytes(), &*want);
+    }
+
+    #[test]
+    fn fingerprint_pinned_test_vector() {
+        // Pins the exact algorithm so a holder's app (mobile repo) can reproduce it
+        // from the scanned request and compare against the operator's console. See
+        // docs/spec/vmk-boot-ceremony.md. Inputs: ephemeral pubkey from seed [1;32],
+        // VMK address from seed [2;32].
+        use rrn_crypto::keypair::SecretKey;
+        let eph = Keypair::from_secret(SecretKey::from_bytes([1u8; 32]));
+        let vmk_addr = Address::from_public_key(
+            Keypair::from_secret(SecretKey::from_bytes([2u8; 32])).public_key(),
+        );
+        assert_eq!(
+            ceremony_fingerprint(&eph.public_key(), &vmk_addr),
+            "B523J-DY6LH"
+        );
     }
 
     #[test]

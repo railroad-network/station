@@ -92,6 +92,24 @@ impl Station {
             anyhow::bail!("a wallet already exists at {}", wallet_path.display());
         }
 
+        // `init` bootstraps a *plaintext* station. If a config here already selects
+        // the encrypted profile, writing a plaintext wallet + DB onto this
+        // (unencrypted boot) dir would be exactly the leak the profile prevents —
+        // refuse, and point at the real path (init plaintext elsewhere, then
+        // `encrypt-in-place`).
+        let config_path = data_dir.join(CONFIG_FILE);
+        if config_path.exists() {
+            let cfg = StationConfig::load_or_create(&config_path).context("load config")?;
+            if cfg.storage.at_rest == crate::config::AtRestProfile::Encrypted {
+                anyhow::bail!(
+                    "{} selects the encrypted at-rest profile; `station init` only bootstraps a \
+                     plaintext station. Initialise a plaintext station and run \
+                     `station encrypt-in-place` to migrate (ADR-0024).",
+                    config_path.display()
+                );
+            }
+        }
+
         let wallet = WalletContents::create_new();
         let address = wallet.address;
         wallet
@@ -127,11 +145,14 @@ impl Station {
         // restart (daemon up before the volume is unlocked) would create a fresh
         // plaintext `station.db`, wallet, adapter identity, and index on the
         // unencrypted root and serve them.
-        if layout.is_encrypted() && !volume::state_dir_is_live_mount(layout.state_dir())? {
+        if layout.is_encrypted()
+            && !volume::state_dir_is_crypt_mount(layout.state_dir(), &layout.mapping_name())?
+        {
             anyhow::bail!(
-                "the encrypted state volume is not mounted at {} — run `station unlock` to \
-                 perform the boot ceremony first (ADR-0024)",
-                layout.state_dir().display()
+                "the encrypted state volume is not mounted at {} (expected the dm-crypt mapping \
+                 {}) — run `station unlock` to perform the boot ceremony first (ADR-0024)",
+                layout.state_dir().display(),
+                layout.mapping_name()
             );
         }
 

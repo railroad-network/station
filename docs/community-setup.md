@@ -501,6 +501,22 @@ echo 'kernel.core_pattern=|/bin/false' | sudo tee /etc/sysctl.d/50-no-cores.conf
 # Keep logs off any plaintext partition (journald to volatile storage is fine).
 ```
 
+**Privileged helper commands.** `encrypt-in-place` and `unlock` drive the kernel's
+`cryptsetup`/`losetup`/`mount`/`mkfs.ext4`/`chown` via `sudo -n` (the daemon itself
+stays unprivileged). If you run the station as a dedicated non-root user, give that
+user a **scoped** sudoers rule for exactly those tools — do not grant blanket sudo:
+
+```
+# /etc/sudoers.d/rrn-station  (visudo -f), for user "rrn":
+rrn ALL=(root) NOPASSWD: /usr/sbin/cryptsetup, /usr/sbin/losetup, /bin/mount, \
+    /bin/umount, /sbin/mkfs.ext4, /bin/chown
+```
+
+Be honest about the residual: granting `mount`/`chown`/`cryptsetup` to a user is
+close to root-equivalent on that host. This is the trade for a code-driven,
+testable key ceremony; a community that wants a smaller privileged surface can run
+the ceremony as root interactively instead of via a service account.
+
 **Turn it on — one-way migration.** Take a backup first, then migrate. You need
 each key-holder's `rrn1…` address (they read it from their wallet app):
 

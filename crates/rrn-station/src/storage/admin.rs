@@ -18,6 +18,18 @@ use crate::storage::layout::{Layout, STATE_DIR_NAME};
 use crate::storage::vmk::{self, UnlockSession, VmkDescriptor};
 use crate::storage::volume;
 
+/// Reads `config.toml` from `data_dir` **without creating it** — so read-only
+/// operations like `status` never write a config into an empty directory. A missing
+/// file yields the default (plaintext) config.
+fn load_config(data_dir: &Path) -> Result<StationConfig> {
+    let path = data_dir.join(CONFIG_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(StationConfig::parse(&text, &path)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StationConfig::default_config()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("read {}", path.display()))),
+    }
+}
+
 /// A `station status` report (offline — reads on-disk config and the boot-dir
 /// descriptor; needs no running daemon and no unlock).
 pub struct StatusReport {
@@ -56,7 +68,7 @@ fn encrypted_state_dir(data_dir: &Path, config: &StationConfig) -> std::path::Pa
 /// Reports the at-rest profile and, under the encrypted profile, whether the volume
 /// is mounted and the VMK descriptor's parameters. Works on any platform.
 pub fn status(data_dir: &Path) -> Result<StatusReport> {
-    let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
+    let config = load_config(data_dir)?;
     match config.storage.at_rest {
         AtRestProfile::Plaintext => Ok(StatusReport {
             profile: "plaintext",
@@ -86,7 +98,7 @@ pub fn status(data_dir: &Path) -> Result<StatusReport> {
 /// The current VMK holder set, read from the package inside the (mounted) container.
 /// Errors if the volume is not mounted or the station is not encrypted.
 pub fn vmk_holders(data_dir: &Path) -> Result<Vec<String>> {
-    let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
+    let config = load_config(data_dir)?;
     if config.storage.at_rest != AtRestProfile::Encrypted {
         bail!("this station is not running the encrypted profile");
     }
@@ -185,7 +197,7 @@ pub fn finish_refresh(
     new_holders: &[String],
     new_threshold: u8,
 ) -> Result<Vec<HolderShard>> {
-    let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
+    let config = load_config(data_dir)?;
     if config.storage.at_rest != AtRestProfile::Encrypted {
         bail!("this station is not running the encrypted profile");
     }
@@ -214,15 +226,15 @@ fn write_encrypted_config(
     data_dir: &Path,
     mut config: StationConfig,
     layout: &Layout,
-    holders: &[String],
     threshold: u8,
 ) -> Result<()> {
+    // Note: the holder set is deliberately NOT written here — it lives only in the
+    // VMK package inside the container, never on the unencrypted boot dir (ADR-0024).
     config.storage = StorageSection {
         at_rest: AtRestProfile::Encrypted,
         encrypted: Some(EncryptedSection {
             container_path: Some(layout.container_path().display().to_string()),
             state_dir: Some(layout.state_dir().display().to_string()),
-            holders: holders.to_vec(),
             threshold,
         }),
     };
@@ -248,9 +260,21 @@ mod linux {
         holders: &[String],
         threshold: u8,
     ) -> Result<Vec<HolderShard>> {
-        let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
+        let config = load_config(data_dir)?;
         if config.storage.at_rest == AtRestProfile::Encrypted {
             bail!("this station is already running the encrypted profile");
+        }
+
+        // Refuse to migrate under a live daemon: it would keep appending to the
+        // plaintext DB after the snapshot, and those records would be lost (and the
+        // erase below would pull the file out from under it).
+        let sock = data_dir.join(crate::station::SOCKET_FILE);
+        if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            bail!(
+                "a station daemon appears to be running (its socket {} accepts connections) — \
+                 stop it before `encrypt-in-place`",
+                sock.display()
+            );
         }
 
         // Source (plaintext) and destination (encrypted) layouts.
@@ -332,8 +356,32 @@ mod linux {
             .save_to_file(&enc.vmk_descriptor_path())
             .context("write the VMK descriptor to the boot dir")?;
 
-        // Flip the config to the encrypted profile.
-        write_encrypted_config(data_dir, config, &enc, holders, threshold)?;
+        // Flip the config to the encrypted profile (holder set NOT persisted here).
+        write_encrypted_config(data_dir, config, &enc, threshold)?;
+
+        // VERIFY the migrated ledger against the source BEFORE erasing the only other
+        // copy: the container's hash chain must verify and hold exactly as many
+        // entries as the plaintext original (ADR-0024 "…VACUUM INTO across, verify,
+        // then securely erase").
+        {
+            let src = rrn_storage::db::Database::open(&plain.db_path())?;
+            let src_n = rrn_storage::log::AppendLog::new(&src)
+                .verify_chain()
+                .context("verify the source ledger before erase")?;
+            drop(src);
+            let dst = rrn_storage::db::Database::open(&enc.db_path())?;
+            let dst_n = rrn_storage::log::AppendLog::new(&dst)
+                .verify_chain()
+                .context("verify the migrated ledger before erase")?;
+            drop(dst);
+            if src_n != dst_n {
+                bail!(
+                    "migrated ledger has {dst_n} entries but the source has {src_n}; refusing to \
+                     erase the plaintext original (the container is mounted at {} — investigate)",
+                    state_dir.display()
+                );
+            }
+        }
 
         // Securely erase the plaintext originals. Note the caller must warn that
         // secure erase is unreliable on wear-levelled flash/SD.
@@ -358,7 +406,7 @@ mod linux {
     /// (the `station unlock` completion), enforcing the zero-keyslot precondition and
     /// the live-mount check via [`volume::DmCryptVolume`].
     pub fn open_and_mount(data_dir: &Path, vmk: &Vmk) -> Result<()> {
-        let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
+        let config = load_config(data_dir)?;
         let layout = Layout::resolve(data_dir, &config)?;
         if !layout.is_encrypted() {
             bail!("this station is not running the encrypted profile");

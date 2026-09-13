@@ -165,6 +165,16 @@ drill_encrypted() {
   fi
   pass "no plaintext marker in the container or boot dir"
 
+  info "HOLDER-SET SWEEP: the coercion-target map must not be on the boot dir"
+  # The holder addresses must live only inside the container, never in config.toml
+  # or any other boot-dir file (ADR-0024).
+  for h in "$h1" "$h2" "$h3"; do
+    if grep -raq "$h" "$BOOT" --exclude=state.img; then
+      fail "holder address $h LEAKED onto the unencrypted boot dir"
+    fi
+  done
+  pass "no holder addresses on the boot dir (custody map stays inside the brick)"
+
   info "POSITIVE CONTROL: the same sweep DOES find the marker in a plaintext station"
   local PLAIN="$WORK/control"
   "$STATION" --data-dir "$PLAIN" init >/dev/null

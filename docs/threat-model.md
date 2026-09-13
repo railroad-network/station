@@ -3557,14 +3557,18 @@ station wallet, the Reticulum adapter identity, the search index — all now *in
 the container); the VMK, in memory during a ceremony and in the kernel while mapped;
 the boot-dir descriptor.
 
-- *Spoofing (forged ceremony):* the pre-unlock LAN endpoint is unauthenticated by
-  necessity — no station keypair exists before unlock — and the `RecoveryRequest` is
-  itself unsigned. A seizer who imaged the boot dir could mint their own ephemeral
-  key and phish shares. *Mitigation:* the **console fingerprint** (blake3 over the
-  ephemeral key + VMK address, `ceremony_fingerprint`) is the authenticator — holders
-  confirm it out-of-band against the operator's console before responding, and a
-  forged ceremony shows a different fingerprint. *Residual:* relies on holders
-  actually checking the fingerprint; a lazy holder is the weak link, stated plainly.
+- *Spoofing (forged ceremony):* the boot ceremony is unauthenticated by necessity —
+  no station keypair exists before unlock — and the `RecoveryRequest` is itself
+  unsigned. A seizer who imaged the boot dir could mint their own ephemeral key and
+  phish shares. *Mitigation:* the **console fingerprint** (blake3 over the ephemeral
+  key + VMK address, `ceremony_fingerprint`, pinned in `docs/spec/vmk-boot-ceremony.md`)
+  is the authenticator — holders confirm it out-of-band against the operator's console
+  before responding, and a forged ceremony shows a different fingerprint. As shipped,
+  the ceremony runs at the physical console only (the operator pastes holders'
+  responses); the ADR's optional pre-unlock LAN endpoint is a documented divergence,
+  not yet implemented, so there is no network listener before unlock. *Residual:*
+  relies on holders actually checking the fingerprint, and on a mobile client that
+  reproduces the pinned algorithm; a lazy holder is the weak link, stated plainly.
 - *Information disclosure (the whole point):* powered off, the container is a LUKS2
   brick with **zero keyslots** — no wrapped copy of the key on the device (the VMK is
   the volume key). Provisioning kills the throwaway `luksFormat` keyslot and
@@ -3590,8 +3594,10 @@ the boot-dir descriptor.
 - *Denial of service:* every power loss unmaps the volume, so the node is a locked
   brick until `K` holders converge — the availability cost, paid by design. A UPS is
   the primary mitigation (runbook); the plaintext profile remains a supported choice.
-  The unauthenticated pre-unlock endpoint can be spammed with junk sealed blobs (DoS),
-  bounded only by the fingerprint check gating real progress.
+  With the console-only ceremony there is no pre-unlock network listener to flood; a
+  junk pasted response is simply rejected by `open_response`. Were the optional LAN
+  endpoint added later, it would be an unauthenticated ingest (junk-blob DoS) bounded
+  only by the fingerprint gating real progress — noted for that future work.
 - **Not covered — stated plainly:** a node seized **while running** has the volume
   mapped and the key in kernel memory; cold-boot/RAM-remanence and live imaging can
   recover it. The answer is physical (custody, tamper-evident enclosure) plus rapid

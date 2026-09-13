@@ -71,7 +71,7 @@ pub trait MountHelper: Send + Sync {
 pub fn state_dir_is_live_mount(state_dir: &Path) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        linux_live_mount(state_dir)
+        linux_live_mount(state_dir, None)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -80,11 +80,27 @@ pub fn state_dir_is_live_mount(state_dir: &Path) -> Result<bool> {
     }
 }
 
-/// The `/proc/self/mountinfo` scan behind [`state_dir_is_live_mount`]. A live
-/// `dm-crypt` mount shows a `/dev/mapper/…` (or `/dev/dm-…`) source at exactly this
-/// mount point.
+/// Whether `state_dir` is a live mount whose source is **exactly** the crypt mapping
+/// `/dev/mapper/{mapping}` — the strict guard `Station::open` uses, so a plaintext
+/// dm-linear (LVM) volume happening to be mounted at the state dir cannot pass for an
+/// encrypted one. On non-Linux returns `Ok(false)`.
+pub fn state_dir_is_crypt_mount(state_dir: &Path, mapping: &str) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_live_mount(state_dir, Some(mapping))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state_dir, mapping);
+        Ok(false)
+    }
+}
+
+/// The `/proc/self/mountinfo` scan behind the guards. With `expect_mapping = None`,
+/// a live mount at this point from any `/dev/mapper/…` (or `/dev/dm-…`) source
+/// counts; with `Some(m)`, only a source of exactly `/dev/mapper/{m}` counts.
 #[cfg(target_os = "linux")]
-fn linux_live_mount(state_dir: &Path) -> Result<bool> {
+fn linux_live_mount(state_dir: &Path, expect_mapping: Option<&str>) -> Result<bool> {
     let target = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
     let info = match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(s) => s,
@@ -102,11 +118,13 @@ fn linux_live_mount(state_dir: &Path) -> Result<bool> {
         }
         let mount_point = left[4];
         let source = right[1];
-        if Path::new(mount_point) == target
-            && (source.starts_with("/dev/mapper/") || source.starts_with("/dev/dm-"))
-        {
-            return Ok(true);
+        if Path::new(mount_point) != target {
+            continue;
         }
+        return Ok(match expect_mapping {
+            Some(m) => source == format!("/dev/mapper/{m}"),
+            None => source.starts_with("/dev/mapper/") || source.starts_with("/dev/dm-"),
+        });
     }
     Ok(false)
 }
@@ -313,38 +331,56 @@ impl SudoCryptsetupHelper {
         let pass_file_str = pass_file.to_string_lossy().to_string();
 
         // 4. Format with the VMK as the volume key (fed on stdin) plus a throwaway
-        //    keyslot from the tmpfs passphrase.
-        Self::cryptsetup_with_key(
-            &[
-                "cryptsetup",
-                "luksFormat",
-                "--type",
-                "luks2",
-                "--batch-mode",
-                "--volume-key-file",
-                "/dev/stdin",
-                "--key-file",
-                &pass_file_str,
-                &loop_dev,
-            ],
-            vmk,
-        )?;
-
-        // 5. Kill the throwaway keyslot, authenticating with the volume key — so the
-        //    header ends up with zero keyslots and no wrapped key survives.
-        Self::cryptsetup_with_key(
-            &[
-                "cryptsetup",
-                "luksKillSlot",
-                "--batch-mode",
-                "--volume-key-file",
-                "/dev/stdin",
-                &loop_dev,
-                "0",
-            ],
-            vmk,
-        )?;
+        //    keyslot from the tmpfs passphrase. The cipher is chosen for the host
+        //    (ADR-0024): AES-XTS where the CPU has AES acceleration, Adiantum on
+        //    AES-less ARM (the Pi 4). `--key-size 256` makes the volume key exactly
+        //    32 bytes so the VMK *is* the volume key (AES-XTS-256 splits into two
+        //    AES-128 keys; Adiantum takes a 256-bit key). The throwaway keyslot uses
+        //    a fast PBKDF (it is killed in step 5, so its cost buys nothing).
+        //    `--volume-key-file` needs cryptsetup ≥ 2.5 (Debian Bookworm's 2.6 is
+        //    fine; Bullseye's 2.3 is not — see the runbook).
+        let (cipher, sector_size) = choose_cipher();
+        let mut fmt_args: Vec<&str> = vec![
+            "cryptsetup",
+            "luksFormat",
+            "--type",
+            "luks2",
+            "--batch-mode",
+            "--cipher",
+            cipher,
+            "--key-size",
+            "256",
+            "--pbkdf",
+            "pbkdf2",
+            "--pbkdf-force-iterations",
+            "1000",
+        ];
+        if let Some(s) = sector_size {
+            fmt_args.push("--sector-size");
+            fmt_args.push(s);
+        }
+        fmt_args.extend_from_slice(&[
+            "--volume-key-file",
+            "/dev/stdin",
+            "--key-file",
+            &pass_file_str,
+            &loop_dev,
+        ]);
+        Self::cryptsetup_with_key(&fmt_args, vmk)?;
         drop(pass_dir);
+
+        // 5. Kill the throwaway keyslot — so the header ends up with zero keyslots
+        //    and no wrapped key survives. In `--batch-mode` this needs no passphrase
+        //    and no confirmation even for the last slot (`--volume-key-file` is not a
+        //    valid option for luksKillSlot).
+        let out =
+            Self::sudo(&["cryptsetup", "luksKillSlot", "--batch-mode", &loop_dev, "0"]).output()?;
+        if !out.status.success() {
+            bail!(
+                "cryptsetup luksKillSlot failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
 
         // 6. Post-check: the header must have zero keyslots, or it is not a brick.
         let slots = self.keyslot_count(container_path)?;
@@ -385,12 +421,23 @@ impl SudoCryptsetupHelper {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        // Hand the mount to the unprivileged user running the daemon.
-        if let Some(user) = std::env::var_os("USER") {
-            let user = user.to_string_lossy().to_string();
-            let _ = Self::sudo(&["chown", &format!("{user}:{user}")])
+        // Hand the mount to the unprivileged user running the daemon. Use numeric
+        // uid:gid (`id -u`/`id -g`) rather than $USER, which is unset under
+        // systemd/cron and does not imply a same-named group.
+        let uid = run_stdout("id", &["-u"]);
+        let gid = run_stdout("id", &["-g"]);
+        if let (Some(uid), Some(gid)) = (uid, gid) {
+            let out = Self::sudo(&["chown", &format!("{uid}:{gid}")])
                 .arg(state_dir)
-                .output();
+                .output()?;
+            if !out.status.success() {
+                bail!(
+                    "chown of the mounted state dir failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        } else {
+            bail!("could not determine uid/gid to own the mounted state dir");
         }
         Ok(())
     }
@@ -442,33 +489,37 @@ impl MountHelper for SudoCryptsetupHelper {
         };
 
         // Open the LUKS container keyslot-lessly: the VMK *is* the volume key, read
-        // from the child's stdin (fd) rather than any on-disk path.
-        let mut child = Self::sudo(&[
-            "cryptsetup",
-            "open",
-            "--type",
-            "luks2",
-            "--volume-key-file",
-            "/dev/stdin",
-            &loop_dev,
-            mapping,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(&key[..])?;
-        let status = child.wait()?;
-        if !status.success() {
-            bail!("cryptsetup open failed for {}", container_path.display());
+        // from the child's stdin (fd) rather than any on-disk path. If the mapping
+        // already exists (a prior run whose mount was dropped), skip straight to the
+        // mount so recovery is idempotent.
+        let mapper = format!("/dev/mapper/{mapping}");
+        if !Path::new(&mapper).exists() {
+            let mut child = Self::sudo(&[
+                "cryptsetup",
+                "open",
+                "--type",
+                "luks2",
+                "--volume-key-file",
+                "/dev/stdin",
+                &loop_dev,
+                mapping,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()?;
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(&key[..])?;
+            let status = child.wait()?;
+            if !status.success() {
+                bail!("cryptsetup open failed for {}", container_path.display());
+            }
         }
 
         // Mount the decrypted mapping.
         std::fs::create_dir_all(state_dir)?;
-        let mapper = format!("/dev/mapper/{mapping}");
         let out = Self::sudo(&["mount", &mapper]).arg(state_dir).output()?;
         if !out.status.success() {
             bail!(
@@ -481,11 +532,11 @@ impl MountHelper for SudoCryptsetupHelper {
 
     fn close(&self, mapping: &str, state_dir: &Path) -> Result<()> {
         // Best-effort teardown in reverse order; tolerate already-closed pieces.
+        // The mapping name does not by itself name a container, so loop-device
+        // detach is the caller's concern (it knows the container path); here we
+        // unmount and drop the crypt device.
         let _ = Self::sudo(&["umount"]).arg(state_dir).output();
         let _ = Self::sudo(&["cryptsetup", "close", mapping]).output();
-        // Detach the loop device if one is still attached to the mapping's backing
-        // container is left to `losetup -D` at the operator's discretion; the
-        // mapping close already dropped the crypt device.
         Ok(())
     }
 
@@ -509,12 +560,56 @@ impl MountHelper for SudoCryptsetupHelper {
         }
         let json: serde_json::Value = serde_json::from_slice(&out.stdout)
             .map_err(|e| anyhow::anyhow!("parse luksDump JSON: {e}"))?;
+        // Fail closed: an absent or non-object `keyslots` is an unrecognised dump,
+        // not proof of zero keyslots — never let the brick precondition pass by
+        // default on a shape we did not understand.
         let slots = json
             .get("keyslots")
             .and_then(|k| k.as_object())
             .map(|m| m.len())
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "luksDump JSON has no \"keyslots\" object; cannot confirm the zero-keyslot \
+                     brick property (unrecognised cryptsetup output)"
+                )
+            })?;
         Ok(slots)
+    }
+}
+
+/// Chooses the LUKS cipher for this host (ADR-0024): AES-XTS where the CPU has AES
+/// acceleration, Adiantum (`--sector-size 4096`) on AES-less ARM such as the Pi 4.
+/// Returns `(cipher, Some(sector_size))`. Both take a 256-bit (32-byte) volume key,
+/// so the VMK is the volume key directly.
+#[cfg(target_os = "linux")]
+fn choose_cipher() -> (&'static str, Option<&'static str>) {
+    let has_aes = std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| {
+            s.lines()
+                .any(|l| l.starts_with("Features") || l.starts_with("flags"))
+                && s.contains("aes")
+        })
+        .unwrap_or(false);
+    if has_aes {
+        ("aes-xts-plain64", None)
+    } else {
+        ("xchacha12,aes-adiantum-plain64", Some("4096"))
+    }
+}
+
+/// Runs a non-privileged command and returns its trimmed stdout, or `None` on
+/// failure. Used to read `id -u`/`id -g`.
+#[cfg(target_os = "linux")]
+fn run_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 

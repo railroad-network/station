@@ -24,6 +24,7 @@ use std::process::Command;
 use base64::Engine as _;
 use dcbor::prelude::*;
 
+use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::Keypair;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -78,12 +79,20 @@ struct TestVolume {
 
 impl TestVolume {
     /// Provisions a fresh keyslot-less container with `vmk`, mounted at `state_dir`.
+    ///
+    /// The dm-crypt mapping name is derived from the (unique per-test) boot dir with
+    /// the same formula `Layout::mapping_name` uses, so (a) concurrently-running tests
+    /// never collide on a mapping name, and (b) `Station::open`'s strict crypt-mount
+    /// guard, which recomputes the name from the boot dir, matches this mount.
     fn provision(vmk: &Vmk) -> Self {
         let work = tempfile::tempdir().unwrap();
         let boot_dir = work.path().to_path_buf();
         let container = boot_dir.join("state.img");
         let state_dir = boot_dir.join("state");
-        let mapping = format!("rrntest{}", std::process::id());
+        let mapping = format!(
+            "rrnstate-{}",
+            &Hash::of(boot_dir.to_string_lossy().as_bytes()).to_hex()[..12]
+        );
         let helper = SudoCryptsetupHelper;
         helper
             .provision(
@@ -355,6 +364,75 @@ fn station_open_refuses_an_unmounted_state_dir_and_writes_nothing() {
         "no plaintext station.db may be created on an unmounted state dir"
     );
     assert!(!state.join("wallet.rrnwallet").exists());
+}
+
+#[test]
+#[ignore = "needs dm-crypt + loop + passwordless sudo; run in the at-rest-dmcrypt CI lane"]
+fn station_runs_on_the_encrypted_volume_and_leaves_no_plaintext_at_rest() {
+    require_dmcrypt();
+    // Invariant 1 as specified: run a station under the encrypted profile, stop it,
+    // then sweep every byte at rest for a planted member memo — it must be absent.
+    let marker = format!("MEMBER-MEMO-RUN-{}", std::process::id());
+
+    let vmk = Vmk::generate();
+    let vol = TestVolume::provision(&vmk);
+
+    // Seed a real station INSIDE the mounted container: wallet, migrated DB with a
+    // log entry whose bytes carry the marker (via a memo-ish note is not enough, so
+    // also drop a paired-list file carrying the marker, which Station::open loads).
+    rrn_identity::wallet::WalletContents::create_new()
+        .save_to_file(&vol.state_dir.join("wallet.rrnwallet"), "pw")
+        .unwrap();
+    seed_log(&vol.state_dir, 5);
+    std::fs::write(
+        vol.state_dir.join("paired_mobiles.json"),
+        format!("{{\"mobiles\":[],\"note\":\"{marker}\"}}").as_bytes(),
+    )
+    .unwrap();
+
+    // Config on the (unencrypted) boot dir selects the encrypted profile at this
+    // container/state dir. A random loopback port avoids collisions on the CI host.
+    let cfg = format!(
+        "[network]\nlisten = \"127.0.0.1:0\"\n[mobile]\nlisten = \"127.0.0.1:0\"\nadvertise = false\n\
+         [storage]\nat_rest = \"encrypted\"\n[storage.encrypted]\nstate_dir = \"{}\"\ncontainer_path = \"{}\"\n",
+        vol.state_dir.display(),
+        vol.container.display()
+    );
+    std::fs::write(vol.boot_dir.join("config.toml"), cfg).unwrap();
+
+    // Station::open must succeed against the live mount, and its socket lands on the
+    // boot dir while the index is built inside the container.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let station = rrn_station::Station::open(rrn_station::StationParams {
+            data_dir: vol.boot_dir.clone(),
+            passphrase: "pw".into(),
+            clock: rrn_station::Clock::system(),
+        })
+        .await
+        .expect("station opens on the mounted encrypted volume");
+        assert!(
+            vol.boot_dir.join("station.sock").exists(),
+            "socket on boot dir"
+        );
+        assert!(
+            vol.state_dir.join("marketplace_index").exists(),
+            "index built inside the container"
+        );
+        station.shutdown().await;
+    });
+
+    // Power off and sweep: the marker must be nowhere at rest.
+    vol.close();
+    let container_bytes = std::fs::read(&vol.container).unwrap();
+    assert!(
+        !contains(&container_bytes, marker.as_bytes()),
+        "planted memo LEAKED into the container bytes"
+    );
+    assert!(
+        !dir_contains_marker(&vol.boot_dir, &marker, Some(&vol.container)),
+        "planted memo LEAKED onto the unencrypted boot dir (incl. any WAL/SHM leftovers)"
+    );
 }
 
 // ---------------------------------------------------------------------------
