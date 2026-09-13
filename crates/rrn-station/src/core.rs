@@ -65,14 +65,19 @@ use rrn_marketplace::lifecycle::{
 use rrn_marketplace::listing::{Listing, ListingId, Surface};
 use rrn_marketplace::search::{SearchIndex, SearchQuery};
 use rrn_storage::db::Database;
-use rrn_storage::dtn::{DtnStore, NoteOutcome};
+use rrn_storage::dtn::{DtnStore, NoteOutcome, PushStore};
 use rrn_storage::log::{AppendLog, StoredPayload};
 
+use rrn_protocol::airtime::Priority;
+use rrn_protocol::binding::{self, TransportBinding};
 use rrn_protocol::bundle::Bundle;
 use rrn_protocol::outbox;
 use rrn_protocol::receipt::{
     self, DeliveryReceipt, Disposition, Outcome, RefusalReason, SignedReceipt,
 };
+use rrn_protocol::transport::Endpoint;
+
+use crate::dtn_loop::{DtnOutbound, PushToSend};
 
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{PublicKey, Signature};
@@ -254,6 +259,39 @@ pub enum Command {
         /// The set of MSISDNs currently bound to an identity.
         reply: oneshot::Sender<std::collections::HashSet<crate::sms::Msisdn>>,
     },
+    /// The undelivered, un-abandoned outbound DTN pushes the loop should (re-)send.
+    /// Marks past-TTL rows abandoned first, then hands back the due rows,
+    /// recording that they were sent (bumps `attempts`, sets `last_sent_at`).
+    DtnPendingPushes {
+        /// Rows older than this (from `queued_at`) are abandoned, not returned.
+        ttl_secs: i64,
+        /// `None` returns every pending row (a loop start, when the syncer's cache
+        /// is empty); `Some(gap)` returns only rows last sent longer than `gap`
+        /// ago (a periodic re-scan).
+        resend_gap: Option<i64>,
+        /// The pushes to (re-)send.
+        reply: oneshot::Sender<Vec<PushToSend>>,
+    },
+    /// A signed delivery receipt arrived over the DTN transport: verify
+    /// it, correlate it to a tracked outbound push, and mark that push delivered.
+    DtnReceipt {
+        /// The signed-receipt envelope bytes.
+        receipt: Vec<u8>,
+        /// The carrier endpoint the receipt arrived from (must match the push's
+        /// peer).
+        source: Endpoint,
+        /// Whether a pending push was newly marked delivered by this receipt.
+        reply: oneshot::Sender<bool>,
+    },
+    /// Abandon a tracked outbound push that can never be delivered (e.g. a bundle
+    /// too large to frame for the carrier) — marked so `rrn dtn status` shows it,
+    /// never silently dropped.
+    DtnAbandonPush {
+        /// The push id to abandon.
+        push_id: [u8; 32],
+        /// Acknowledges the abandon completed (ordering with the loop).
+        reply: oneshot::Sender<()>,
+    },
     /// Stop the core loop (graceful shutdown).
     Shutdown,
 }
@@ -401,6 +439,65 @@ impl CoreHandle {
             return std::collections::HashSet::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    /// The undelivered, un-abandoned outbound DTN pushes the loop should (re-)send.
+    /// Marks past-TTL rows abandoned, then returns the due rows and
+    /// records that they were handed out. `resend_gap` is `None` on a loop start
+    /// (return everything pending) and `Some(gap)` on a periodic re-scan. Empty on
+    /// a stopped core.
+    pub async fn dtn_pending_pushes(
+        &self,
+        ttl_secs: i64,
+        resend_gap: Option<i64>,
+    ) -> Vec<PushToSend> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::DtnPendingPushes {
+                ttl_secs,
+                resend_gap,
+                reply,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Correlates a signed delivery receipt that arrived over the DTN transport to
+    /// a tracked outbound push and marks it delivered. Returns whether a
+    /// pending push was newly delivered by it (a forged, mismatched, or duplicate
+    /// receipt returns `false`, never an error). `false` on a stopped core.
+    pub async fn dtn_receipt(&self, receipt: Vec<u8>, source: Endpoint) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::DtnReceipt {
+                receipt,
+                source,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
+    /// Abandons a tracked outbound push that can never be delivered — e.g.
+    /// a bundle too large to frame for the carrier — so it fails legibly (shown by
+    /// `rrn dtn status`) instead of being retried until its TTL.
+    pub async fn dtn_abandon_push(&self, push_id: [u8; 32]) {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::DtnAbandonPush { push_id, reply })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
     }
 
     /// Returns `(our_address, log_tail_seq)`.
@@ -564,6 +661,17 @@ pub struct Core {
     /// no daemon around it — `status` then reports the configured surface with no
     /// live reachability. Purely derived degradation-legibility state.
     connectivity: Option<std::sync::Arc<crate::gossip::ConnectivityState>>,
+    /// The wake channel to the Reticulum DTN outbound loop. `Some` only
+    /// when a DTN transport is configured (`[lora] adapter_script` set); `None`
+    /// otherwise — the `dtn_push` RPC then refuses rather than queue a push
+    /// nothing will ever drain. The sender is a best-effort wake signal; the
+    /// durable record is the `dtn_pushes` table, which the loop re-scans.
+    dtn_outbound: Option<tokio::sync::mpsc::Sender<DtnOutbound>>,
+    /// Cached transport-binding directory (address → Reticulum destination),
+    /// derived from the log and re-derived only when the log tail advances — a
+    /// binding enters only via an append (the `sms_bound_senders`
+    /// pattern). `None` until first resolved.
+    binding_dir: Option<(u64, std::collections::HashMap<Address, String>)>,
 }
 
 /// Default DTN receipt retention (30 days), matching `[dtn]
@@ -602,7 +710,17 @@ impl Core {
             listings,
             dtn_receipt_retention_secs: DEFAULT_RECEIPT_RETENTION_SECS,
             connectivity: None,
+            dtn_outbound: None,
+            binding_dir: None,
         }
+    }
+
+    /// Attaches the wake channel to the Reticulum DTN outbound loop.
+    /// Builder-style; set only when a DTN transport is configured. Left unset, the
+    /// `dtn_push` RPC refuses (no transport to drain an outbound push).
+    pub fn with_dtn_outbound(mut self, tx: tokio::sync::mpsc::Sender<DtnOutbound>) -> Self {
+        self.dtn_outbound = Some(tx);
+        self
     }
 
     /// Sets the confirmed DTN receipt-retention window (seconds), from `[dtn]
@@ -693,6 +811,28 @@ impl Core {
                 }
                 Command::SmsBoundSenders { reply } => {
                     let _ = reply.send(sms_bound_senders(&AppendLog::new(&self.db)));
+                }
+                Command::DtnPendingPushes {
+                    ttl_secs,
+                    resend_gap,
+                    reply,
+                } => {
+                    let _ = reply.send(self.do_dtn_pending_pushes(ttl_secs, resend_gap));
+                }
+                Command::DtnReceipt {
+                    receipt,
+                    source,
+                    reply,
+                } => {
+                    let _ = reply.send(self.do_dtn_receipt(&receipt, &source));
+                }
+                Command::DtnAbandonPush { push_id, reply } => {
+                    if let Err(e) =
+                        PushStore::new(&self.db).mark_abandoned(&push_id, self.clock.now())
+                    {
+                        tracing::warn!(error = %e, "could not abandon a DTN push");
+                    }
+                    let _ = reply.send(());
                 }
                 Command::Handshake { reply } => {
                     let tail = self.tail_seq();
@@ -850,6 +990,14 @@ impl Core {
             "cert_request" => self.m_cert_request(req),
             "cert_list" => self.m_cert_list(req),
             "cert_export" => self.m_cert_export(req),
+            // Station-originated DTN push (ADR-0013, ADR-0020): the operator
+            // hands the station a bundle and a peer; the station queues it onto the
+            // Reticulum outbound path, tracks delivery, and correlates the returned
+            // receipt. `dtn_bind` publishes the station's own reachability binding;
+            // `dtn_pushes` lists the tracked pushes for `rrn dtn status`.
+            "dtn_push" => self.m_dtn_push(req),
+            "dtn_bind" => self.m_dtn_bind(req),
+            "dtn_pushes" => self.m_dtn_pushes(),
             other => Err(rpc::RpcError {
                 code: rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
@@ -1193,6 +1341,187 @@ impl Core {
         ok(&rpc::CertExportResult {
             envelope_hex: hex(&envelope),
         })
+    }
+
+    // --- station-originated DTN push (ADR-0013, ADR-0020) -----------------
+
+    /// `dtn_push` (operator / Unix socket): originate an outbound DTN bundle push
+    /// to a named peer over the Reticulum transport. The peer is `endpoint_hex` (a
+    /// bare Reticulum destination, the bench path) **or** `rrn_address` (resolved
+    /// through the log-derived binding directory, which pins the returned receipt's
+    /// signer to that identity). Returns an accepted/**queued** acknowledgement —
+    /// not a delivery confirmation; delivery is async and confirmed later by the
+    /// returned receipt (see `dtn_pushes` / `rrn dtn status`).
+    fn m_dtn_push(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DtnPushParams = parse_params(req)?;
+        let bundle_bytes =
+            unhex(&params.bundle_hex).ok_or_else(|| invalid_params("bundle_hex is not hex"))?;
+
+        // Decode + compute the presentation hash (the push id), the ordered record
+        // hashes, and the airtime class. A malformed bundle is INVALID_PARAMS,
+        // never queued. This mirrors the ingest side (the push id is the same
+        // presentation hash the receiver keys its receipt on).
+        let bundle = Bundle::decode(&bundle_bytes)
+            .map_err(|e| invalid_params(format!("bundle does not decode: {e}")))?;
+        let records = bundle.entries.len();
+        if records == 0 {
+            return Err(invalid_params("bundle carries no records; nothing to push"));
+        }
+        let mut record_hashes = Vec::with_capacity(records * 32);
+        for env in &bundle.entries {
+            let signed = env
+                .to_signed()
+                .map_err(|e| invalid_params(format!("bundle entry is malformed: {e}")))?;
+            record_hashes.extend_from_slice(&signed.payload.record_hash().to_bytes());
+        }
+        let push_id = Hash::of(&record_hashes).to_bytes();
+        let priority = rrn_protocol::airtime::bundle_priority(&bundle);
+
+        // Resolve the peer: exactly one of endpoint_hex / rrn_address. An
+        // operator-supplied destination is normalized to lowercase hex (the
+        // adapter reports `source_hash.hex()` lowercase, and the correlation keys
+        // on an exact peer match), so an uppercase paste still correlates.
+        let (endpoint, expected_station): (String, Option<[u8; 32]>) =
+            match (&params.endpoint_hex, &params.rrn_address) {
+                (Some(hex), None) => {
+                    let hex = normalize_destination_hex(hex)?;
+                    (hex, None)
+                }
+                (None, Some(addr)) => {
+                    let address = parse_addr(addr)?;
+                    let dest = self.resolve_binding(&address).ok_or_else(|| {
+                        invalid_params(format!("no known transport binding for {addr}"))
+                    })?;
+                    (dest, Some(address.public_key().to_bytes()))
+                }
+                _ => {
+                    return Err(invalid_params(
+                        "exactly one of endpoint_hex or rrn_address is required",
+                    ))
+                }
+            };
+
+        // Refuse if no DTN transport is configured: the caller must not be told
+        // "queued" for a push nothing will ever drain (the outbound loop is spawned
+        // only when the sidecar and the LXMF adapter script are both configured).
+        let Some(tx) = self.dtn_outbound.clone() else {
+            return Err(invalid_params(
+                "no DTN transport configured (the Reticulum sidecar / LXMF adapter is not set up); \
+                 cannot originate an outbound push",
+            ));
+        };
+
+        // A push id is the presented record set, so the same bundle re-pushed to a
+        // *different* peer (or with a different identity pin) would collide on the
+        // one row — refuse that rather than silently keep the first peer. A re-push
+        // to the *same* peer just returns the existing row's state (idempotent).
+        let now = self.clock.now();
+        if let Some(existing) = PushStore::new(&self.db).get(&push_id).map_err(internal)? {
+            if existing.peer != endpoint || existing.expected_station != expected_station {
+                return Err(invalid_params(
+                    "this bundle is already queued to a different peer or identity; \
+                     a push is keyed by its record set",
+                ));
+            }
+            let state = push_state_str(&existing);
+            // Re-signal only a still-pending row; a terminal row is reported as-is.
+            let signalled = existing.is_pending() && tx.try_send(DtnOutbound::Wake).is_ok();
+            return ok(&rpc::DtnPushResult {
+                push_id_hex: hex(&push_id),
+                queued: existing.is_pending(),
+                state: state.to_string(),
+                records,
+                signalled,
+            });
+        }
+
+        // Insert the durable row BEFORE signalling the loop, so a crash between the
+        // two loses nothing (the row is picked up on the next loop start / re-scan).
+        PushStore::new(&self.db)
+            .insert(
+                &push_id,
+                &endpoint,
+                expected_station.as_ref(),
+                &bundle_bytes,
+                &record_hashes,
+                priority_to_i64(priority),
+                now,
+            )
+            .map_err(internal)?;
+
+        // Best-effort wake. A full/closed channel is NOT an error to the caller —
+        // the row is durable and the next loop start / periodic re-scan drains it —
+        // but it is logged and reported.
+        let signalled = tx.try_send(DtnOutbound::Wake).is_ok();
+        if !signalled {
+            tracing::warn!(
+                push = %hex(&push_id),
+                "DTN outbound wake channel is full/closed; the push is durable and will be \
+                 re-sent on the next loop start / re-scan"
+            );
+        }
+
+        ok(&rpc::DtnPushResult {
+            push_id_hex: hex(&push_id),
+            queued: true,
+            state: "pending".to_string(),
+            records,
+            signalled,
+        })
+    }
+
+    /// `dtn_bind` (operator / Unix socket): sign a [`TransportBinding`] for **this
+    /// station's own** address at an operator-supplied Reticulum destination,
+    /// append it via the same log arm a carried binding uses (so this station's own
+    /// directory resolves it), and return the signed record's portable envelope
+    /// bytes (hex) for the operator to carry to peers out of band.
+    fn m_dtn_bind(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        let params: rpc::DtnBindParams = parse_params(req)?;
+        // Canonicalize to lowercase hex before it enters a signed record peers
+        // will resolve and match against a lowercase carrier-reported source.
+        let destination = normalize_destination_hex(&params.destination_hex)?;
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let signed = SignedPayload::sign(
+            TransportBinding::new(self.wallet.address, destination, now),
+            &station,
+        );
+        let body = to_canonical_bytes(signed.payload.clone());
+        self.admit_transport_binding(&body, signed.signer, signed.signature, now)
+            .map_err(|e| e.rpc_error())?;
+        ok(&rpc::DtnBindResult {
+            binding_hex: hex(&binding::encode_signed(&signed)),
+        })
+    }
+
+    /// `dtn_pushes` (operator / Unix socket): the tracked outbound pushes for
+    /// `rrn dtn status` — peer, record count, state (pending/delivered/abandoned),
+    /// attempts, and a one-line summary of the correlated receipt's outcomes.
+    fn m_dtn_pushes(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let rows = PushStore::new(&self.db).all().map_err(internal)?;
+        let pushes = rows
+            .into_iter()
+            .map(|row| {
+                let state = push_state_str(&row);
+                let receipt_summary = row
+                    .receipt
+                    .as_deref()
+                    .and_then(|bytes| receipt::decode_signed(bytes).ok())
+                    .map(|signed| summarize_outcomes(&signed.payload.outcomes));
+                rpc::DtnPushRow {
+                    push_id_hex: hex(&row.push_id),
+                    peer: row.peer,
+                    records: (row.record_hashes.len() / 32),
+                    state: state.to_string(),
+                    attempts: row.attempts,
+                    queued_at: row.queued_at,
+                    delivered_at: row.delivered_at,
+                    abandoned_at: row.abandoned_at,
+                    receipt_summary,
+                }
+            })
+            .collect();
+        ok(&rpc::DtnPushesResult { pushes })
     }
 
     fn m_vouch(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -4141,6 +4470,14 @@ impl Core {
             // inbound SMS sender registry from the log (T2.7.1). Handled off to the
             // side and returned early; it never touches the ledger engine below.
             Some(KIND_SMS_BINDING) => return self.admit_sms_binding(bytes, signer, signature, now),
+            // A Reticulum transport binding carries no engine semantics — a
+            // self-signed "you can reach me at this destination" appended verbatim
+            // so the station can derive its routing directory from the log.
+            // Handled off to the side and returned early, exactly like
+            // the SMS binding; it never touches the ledger engine below.
+            Some(KIND_TRANSPORT_BINDING) => {
+                return self.admit_transport_binding(bytes, signer, signature, now)
+            }
             // Governance records ride DTN like any member record (ADR-0020): a
             // proposal, co-signature, or ballot authored offline is admitted on
             // arrival through the same append guards the live RPC uses, so windows
@@ -4269,6 +4606,213 @@ impl Core {
                     "append_raw reported a duplicate binding absent from the log".into(),
                 )),
             },
+        }
+    }
+
+    /// Admits a self-signed `rrn.net.binding` record: a near-copy of
+    /// [`admit_sms_binding`](Self::admit_sms_binding) for the Reticulum transport
+    /// binding. Validate it is well-formed and self-signed by the bound address
+    /// ([`binding::validate`]), then append it to the log **verbatim**. It carries
+    /// no ledger semantics; the routing directory is derived from these records on
+    /// demand ([`binding_directory`]). A malformed or badly-signed one is a
+    /// per-record refusal, never a bundle abort; an already-present one is `Known`.
+    fn admit_transport_binding(
+        &self,
+        bytes: &[u8],
+        signer: PublicKey,
+        signature: Signature,
+        now: i64,
+    ) -> Result<Disposition, BundleIngestError> {
+        let Ok(payload) = from_canonical_bytes::<TransportBinding>(bytes) else {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        };
+        let signed = SignedPayload {
+            payload,
+            signer,
+            signature,
+        };
+        // Self-signed gate: a bad signature or a signer that is not the bound
+        // address is a refusal (the directory must map an identity to a
+        // destination *that identity itself* attested; ADR-0013).
+        if binding::validate(&signed).is_err() {
+            return Ok(refused_disposition(RefusalReason::Rejected));
+        }
+        let stored = StoredPayload {
+            bytes: bytes.to_vec(),
+            signer: signed.signer,
+            signature: signed.signature,
+        };
+        let mut log = AppendLog::new(&self.db);
+        match log
+            .append_raw(stored, now)
+            .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+        {
+            Some(entry) => Ok(Disposition::Admitted { seq: entry.seq }),
+            None => match log
+                .admission_of(&Hash::of(bytes))
+                .map_err(|e| BundleIngestError::Internal(e.to_string()))?
+            {
+                Some((seq, _)) => Ok(Disposition::Known { seq }),
+                None => Err(BundleIngestError::Internal(
+                    "append_raw reported a duplicate binding absent from the log".into(),
+                )),
+            },
+        }
+    }
+
+    /// Resolves an `rrn1…` address to its Reticulum destination via the
+    /// log-derived binding directory, caching it and re-deriving only
+    /// when the log tail advanced since (a binding enters only via an append).
+    fn resolve_binding(&mut self, address: &Address) -> Option<String> {
+        let tail = self.tail_seq();
+        let fresh = matches!(&self.binding_dir, Some((cached, _)) if *cached == tail);
+        if !fresh {
+            let dir = binding_directory(&AppendLog::new(&self.db));
+            self.binding_dir = Some((tail, dir));
+        }
+        self.binding_dir
+            .as_ref()
+            .and_then(|(_, dir)| dir.get(address).cloned())
+    }
+
+    /// The undelivered, un-abandoned outbound DTN pushes to (re-)send.
+    /// Marks any past-TTL row abandoned (never dropped — it stays visible to
+    /// `rrn dtn status`), then returns the due rows and records that they were
+    /// handed to the syncer. All clocks are the injected daemon clock (never a
+    /// peer-asserted time; ADR-0022).
+    fn do_dtn_pending_pushes(&self, ttl_secs: i64, resend_gap: Option<i64>) -> Vec<PushToSend> {
+        let now = self.clock.now();
+        let mut store = PushStore::new(&self.db);
+        let pending = match store.pending() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read pending DTN pushes");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for row in pending {
+            if now.saturating_sub(row.queued_at) > ttl_secs {
+                if let Err(e) = store.mark_abandoned(&row.push_id, now) {
+                    tracing::warn!(error = %e, "could not mark a DTN push abandoned");
+                } else {
+                    tracing::warn!(
+                        push = %hex(&row.push_id),
+                        peer = %row.peer,
+                        attempts = row.attempts,
+                        "DTN push abandoned after TTL with no receipt; economic payload \
+                         must fail legibly — the paper fallback is the next rung"
+                    );
+                }
+                continue;
+            }
+            let due = match resend_gap {
+                None => true,
+                Some(gap) => match row.last_sent_at {
+                    None => true,
+                    Some(sent) => now.saturating_sub(sent) >= gap,
+                },
+            };
+            if !due {
+                continue;
+            }
+            if let Err(e) = store.mark_sent(&row.push_id, now) {
+                tracing::warn!(error = %e, "could not record a DTN push send");
+                continue;
+            }
+            out.push(PushToSend {
+                push_id: row.push_id,
+                to: Endpoint(row.peer),
+                bundle: row.bundle,
+                priority: priority_from_i64(row.priority),
+            });
+        }
+        out
+    }
+
+    /// Correlates an inbound signed delivery receipt to a tracked outbound push
+    /// and marks it delivered. Never trusts the carrier: the receipt must
+    /// verify, be signed by the station it names, list the exact presented record
+    /// set (its presentation hash is the push id), arrive from the peer we pushed
+    /// to, and — when the push was addressed by identity — be signed by the
+    /// expected station. Any mismatch is logged and ignored (dumb carrier,
+    /// ADR-0013). Idempotent: a re-sent receipt after a lost ack is a no-op.
+    fn do_dtn_receipt(&self, receipt_bytes: &[u8], source: &Endpoint) -> bool {
+        let now = self.clock.now();
+        let signed = match receipt::decode_signed(receipt_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "DTN receipt did not decode; ignored");
+                return false;
+            }
+        };
+        if signed.verify().is_err() {
+            tracing::warn!("DTN receipt failed signature verification; dropped");
+            return false;
+        }
+        // A receipt must be signed by the very station it names.
+        if signed.signer != *signed.payload.station.public_key() {
+            tracing::warn!("DTN receipt signer is not the station it names; dropped");
+            return false;
+        }
+        // The presentation hash — a pure function of the ordered record hashes —
+        // is the push id. Receipts key on `record_hash`, never a bundle id
+        // (dtn-bundles.md §2), so this correlates for any bundling.
+        let mut pres = Vec::with_capacity(signed.payload.outcomes.len() * 32);
+        for outcome in &signed.payload.outcomes {
+            pres.extend_from_slice(&outcome.record_hash.to_bytes());
+        }
+        let push_id = Hash::of(&pres).to_bytes();
+
+        let mut store = PushStore::new(&self.db);
+        let row = match store.get(&push_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::debug!(
+                    push = %hex(&push_id),
+                    "DTN receipt for an unknown presentation; ignored"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not look up a DTN push for a receipt");
+                return false;
+            }
+        };
+        if row.peer != source.0 {
+            tracing::warn!(
+                push = %hex(&push_id),
+                expected_peer = %row.peer,
+                from = %source.0,
+                "DTN receipt arrived from a peer we did not push to; ignored"
+            );
+            return false;
+        }
+        if let Some(expected) = row.expected_station {
+            if expected != signed.payload.station.public_key().to_bytes() {
+                tracing::warn!(
+                    push = %hex(&push_id),
+                    "DTN receipt signed by a different station than the one addressed; ignored"
+                );
+                return false;
+            }
+        }
+        match store.mark_delivered(&push_id, receipt_bytes, now) {
+            Ok(true) => {
+                tracing::info!(
+                    push = %hex(&push_id),
+                    peer = %source.0,
+                    "DTN push delivered; receipt correlated and marked"
+                );
+                true
+            }
+            // Already delivered (a duplicate genuine receipt) or abandoned: a
+            // no-op, not an error.
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not mark a DTN push delivered");
+                false
+            }
         }
     }
 
@@ -5936,6 +6480,11 @@ const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
 /// the log (a cache, never authoritative). Admitted via the normal DTN path so a
 /// member can register a number over any carrier.
 const KIND_SMS_BINDING: &str = rrn_protocol::binding::SMS_BINDING_KIND;
+/// A Reticulum transport-reachability binding (`rrn.net.binding`, ADR-0013),
+/// self-signed by the bound identity; the station derives its routing directory
+/// from these. Admitted via the normal DTN path so a member or peer
+/// station can register a destination over any carrier.
+const KIND_TRANSPORT_BINDING: &str = rrn_protocol::binding::BINDING_KIND;
 // Governance record kinds carried over DTN (T2.1.3); the strings mirror the
 // `pub(crate)` discriminators in `rrn-governance` (a proposal, its co-signature,
 // and a ballot).
@@ -6516,6 +7065,44 @@ fn sms_bound_senders(log: &AppendLog) -> std::collections::HashSet<crate::sms::M
         .collect()
 }
 
+/// The transport-binding routing directory (address → Reticulum destination),
+/// derived from the log. Mirrors [`sms_bound_senders`]: keep only
+/// self-signed `rrn.net.binding` records (the log signer must be the bound
+/// address's key), and per address keep the binding with the **highest
+/// `issued_at`, log order breaking ties**. That is a member's choice among their
+/// *own* reachability handles — never a window, deadline, or eligibility input —
+/// so it stays inside ADR-0022's trust model while still surviving out-of-order
+/// courier delivery of a stale binding after a fresh one.
+fn binding_directory(log: &AppendLog) -> std::collections::HashMap<Address, String> {
+    // (issued_at, log_seq, destination) per address; higher issued_at wins, then
+    // higher log_seq (later admission) as the tiebreak.
+    let mut latest: std::collections::HashMap<Address, (i64, u64, String)> =
+        std::collections::HashMap::new();
+    for entry in log.iter_from(1) {
+        let Ok(entry) = entry else { continue };
+        if dtn_record_kind(&entry.payload.bytes).as_deref() != Some(KIND_TRANSPORT_BINDING) {
+            continue;
+        }
+        let Ok(binding) = from_canonical_bytes::<TransportBinding>(&entry.payload.bytes) else {
+            continue;
+        };
+        // Self-signed: the log entry's signer must be the bound identity's key.
+        if entry.payload.signer != *binding.address.public_key() {
+            continue;
+        }
+        let slot = latest
+            .entry(binding.address)
+            .or_insert((i64::MIN, 0, String::new()));
+        if (binding.issued_at, entry.seq) >= (slot.0, slot.1) {
+            *slot = (binding.issued_at, entry.seq, binding.destination);
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(addr, (_, _, dest))| (addr, dest))
+        .collect()
+}
+
 /// The proposal a transaction carries, whatever state it has reached. Every
 /// lifecycle state carries the proposal, so this is always `Some`.
 fn proposal_of(state: &TransactionState) -> Option<&TransactionProposal> {
@@ -6535,6 +7122,76 @@ fn linked_listing(state: &TransactionState) -> Option<ListingId> {
     proposal_of(state)?
         .listing_id
         .map(|ListingRef(bytes)| ListingId(Hash::from_bytes(bytes)))
+}
+
+/// The `pending` / `delivered` / `abandoned` label for a tracked push.
+fn push_state_str(row: &rrn_storage::dtn::PushRow) -> &'static str {
+    if row.delivered_at.is_some() {
+        "delivered"
+    } else if row.abandoned_at.is_some() {
+        "abandoned"
+    } else {
+        "pending"
+    }
+}
+
+/// Canonicalizes an operator-supplied carrier destination to lowercase (trimmed),
+/// or a typed error if empty. The field is hex by contract, and the adapter
+/// reports its source as lowercase `source_hash.hex()`, while receipt correlation
+/// keys on an exact peer match — so an uppercase paste must be folded to lowercase
+/// here or a delivered push would never correlate. The value stays otherwise
+/// opaque to the transport (ADR-0013): no length or charset is imposed, so any
+/// `FrameTransport` endpoint (including the mock carriers) is accepted.
+fn normalize_destination_hex(s: &str) -> Result<String, rpc::RpcError> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Err(invalid_params("destination hex must not be empty"));
+    }
+    Ok(s)
+}
+
+/// A one-line summary of a delivery receipt's per-record outcomes, for
+/// `rrn dtn status`, e.g. `"2 admitted, 1 refused"`.
+fn summarize_outcomes(outcomes: &[Outcome]) -> String {
+    let (mut admitted, mut known, mut refused) = (0u32, 0u32, 0u32);
+    for o in outcomes {
+        match o.disposition {
+            Disposition::Admitted { .. } => admitted += 1,
+            Disposition::Known { .. } => known += 1,
+            Disposition::Refused { .. } => refused += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if admitted > 0 {
+        parts.push(format!("{admitted} admitted"));
+    }
+    if known > 0 {
+        parts.push(format!("{known} known"));
+    }
+    if refused > 0 {
+        parts.push(format!("{refused} refused"));
+    }
+    if parts.is_empty() {
+        "no records".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// The stored `dtn_pushes.priority` discriminant for an airtime [`Priority`].
+fn priority_to_i64(p: Priority) -> i64 {
+    p as i64
+}
+
+/// Reads a stored `dtn_pushes.priority` discriminant back into a [`Priority`].
+/// An unknown value is [`Priority::Bulk`] — the safe default, since
+/// misclassifying *down* only ever delays a frame, never a settlement.
+fn priority_from_i64(i: i64) -> Priority {
+    match i {
+        0 => Priority::Economic,
+        1 => Priority::Governance,
+        _ => Priority::Bulk,
+    }
 }
 
 /// Lowercase hex of a byte slice.
@@ -10099,5 +10756,458 @@ mod tests {
         assert_eq!(detail["tally"]["quorum_met"], true);
         assert_eq!(detail["tally"]["approval_met"], true);
         assert_eq!(detail["body"], "No power tools after 9pm.");
+    }
+
+    // --- station-originated DTN push (ADR-0013, ADR-0020) -----------------
+
+    /// The presentation hash (push id) of a bundle of entries — the same value the
+    /// receiver keys its receipt on, computed here on the sender side.
+    fn push_id_of(entries: &[SignedOutboxEntry]) -> [u8; 32] {
+        let mut pres = Vec::with_capacity(entries.len() * 32);
+        for e in entries {
+            pres.extend_from_slice(&e.payload.record_hash().to_bytes());
+        }
+        Hash::of(&pres).to_bytes()
+    }
+
+    fn concat_record_hashes(entries: &[SignedOutboxEntry]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(entries.len() * 32);
+        for e in entries {
+            v.extend_from_slice(&e.payload.record_hash().to_bytes());
+        }
+        v
+    }
+
+    /// A single-record proposal bundle from `alice` to `bob`, for push tests.
+    fn one_record_bundle(alice: &Keypair, bob: &Keypair) -> Vec<SignedOutboxEntry> {
+        let proposal = member_proposal(alice, bob, 300, 0, 900, 900 + 1_000_000);
+        vec![outbox_entry(alice, 0, zero(), &proposal, 900)]
+    }
+
+    #[test]
+    fn dtn_push_refuses_a_malformed_bundle() {
+        let mut core = test_core();
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": "zzzz", "endpoint_hex": "deadbeef" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        // A well-formed-hex but non-bundle payload is also INVALID_PARAMS.
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": "00010203", "endpoint_hex": "deadbeef" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dtn_push_refuses_when_no_transport_configured() {
+        let mut core = test_core(); // no dtn_outbound set
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let entries = one_record_bundle(&alice, &bob);
+        let bundle_hex = encode_bundle(&entries, 1000);
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex, "endpoint_hex": "deadbeef" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        assert!(err.message.contains("no DTN transport configured"));
+    }
+
+    #[test]
+    fn dtn_push_requires_exactly_one_peer_identifier() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut core = test_core().with_dtn_outbound(tx);
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let entries = one_record_bundle(&alice, &bob);
+        let bundle_hex = encode_bundle(&entries, 1000);
+        // Neither.
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex.clone() }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        // Both.
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({
+                "bundle_hex": bundle_hex,
+                "endpoint_hex": "deadbeef",
+                "rrn_address": "rrn1xyz"
+            }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dtn_push_queues_and_signals_and_status_reflects_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut core = test_core().with_dtn_outbound(tx);
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let entries = one_record_bundle(&alice, &bob);
+        let expect_id = hex(&push_id_of(&entries));
+        let bundle_hex = encode_bundle(&entries, 1000);
+
+        let result = call(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex, "endpoint_hex": "deadbeef" }),
+        );
+        assert_eq!(result["queued"], true);
+        assert_eq!(result["state"], "pending");
+        assert_eq!(result["records"], 1);
+        assert_eq!(result["signalled"], true);
+        assert_eq!(result["push_id_hex"], expect_id);
+
+        // The loop was woken (a payload-free wake signal).
+        assert!(
+            matches!(rx.try_recv(), Ok(DtnOutbound::Wake)),
+            "the outbound loop must be woken"
+        );
+
+        // `dtn_pushes` (rrn dtn status) shows it pending.
+        let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
+        let pushes = status["pushes"].as_array().unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0]["state"], "pending");
+        assert_eq!(pushes[0]["peer"], "deadbeef");
+        assert_eq!(pushes[0]["records"], 1);
+
+        // A re-push of the identical presentation to the SAME peer is idempotent
+        // (still one row) and returns the existing row's state.
+        let bundle_hex = encode_bundle(&entries, 1000);
+        let again = call(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex.clone(), "endpoint_hex": "deadbeef" }),
+        );
+        assert_eq!(again["state"], "pending");
+        let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
+        assert_eq!(status["pushes"].as_array().unwrap().len(), 1);
+
+        // The same bundle to a DIFFERENT peer collides on the presentation-hash
+        // row and is refused (a push is keyed by its record set), not silently
+        // kept on the first peer.
+        let conflict = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex, "endpoint_hex": "beefdead" }),
+        );
+        assert_eq!(conflict.code, rpc::INVALID_PARAMS);
+        assert!(conflict.message.contains("different peer"));
+    }
+
+    #[test]
+    fn dtn_push_normalizes_uppercase_endpoint_hex() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut core = test_core().with_dtn_outbound(tx);
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let bundle_hex = encode_bundle(&one_record_bundle(&alice, &bob), 1000);
+        let _ = call(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex, "endpoint_hex": "DEADBEEF" }),
+        );
+        // Stored lowercase, so a lowercase carrier-reported source correlates.
+        let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
+        assert_eq!(status["pushes"][0]["peer"], "deadbeef");
+    }
+
+    #[test]
+    fn dtn_push_refuses_an_empty_bundle() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut core = test_core().with_dtn_outbound(tx);
+        let empty = hex(&Bundle::new(vec![], 1000).encode());
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": empty, "endpoint_hex": "deadbeef" }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dtn_bind_appends_a_binding_the_directory_resolves() {
+        let mut core = test_core();
+        let station = core.wallet.address;
+        let result = call(
+            &mut core,
+            "dtn_bind",
+            serde_json::json!({ "destination_hex": "a1b2c3d4" }),
+        );
+        // The returned envelope decodes and validates as a self-signed binding.
+        let binding_hex = result["binding_hex"].as_str().unwrap();
+        let signed = binding::decode_signed(&unhex(binding_hex).unwrap()).unwrap();
+        binding::validate(&signed).unwrap();
+        assert_eq!(signed.payload.address, station);
+        assert_eq!(signed.payload.destination, "a1b2c3d4");
+
+        // The directory resolves the station's own address to it.
+        let dir = binding_directory(&AppendLog::new(&core.db));
+        assert_eq!(dir.get(&station).map(String::as_str), Some("a1b2c3d4"));
+        // And `resolve_binding` (the cached path) agrees.
+        assert_eq!(core.resolve_binding(&station).as_deref(), Some("a1b2c3d4"));
+    }
+
+    #[test]
+    fn dtn_push_by_address_resolves_binding_or_misses_typed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut core = test_core().with_dtn_outbound(tx);
+        let station = core.wallet.address.to_string();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let bundle_hex = encode_bundle(&one_record_bundle(&alice, &bob), 1000);
+
+        // Unbound address → typed miss.
+        let unknown = Address::from_public_key(Keypair::generate().public_key()).to_string();
+        let err = call_err(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex.clone(), "rrn_address": unknown }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        assert!(err.message.contains("no known transport binding"));
+
+        // Bind the station's own address, then push to it by address: resolves.
+        let _ = call(
+            &mut core,
+            "dtn_bind",
+            serde_json::json!({ "destination_hex": "cafebabe" }),
+        );
+        let result = call(
+            &mut core,
+            "dtn_push",
+            serde_json::json!({ "bundle_hex": bundle_hex, "rrn_address": station }),
+        );
+        assert_eq!(result["queued"], true);
+        // The push row pins the expected station and points at the resolved dest.
+        let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
+        assert_eq!(status["pushes"][0]["peer"], "cafebabe");
+    }
+
+    /// Seeds the log with two self-signed bindings for one address where the
+    /// **later-issued** one is *admitted first* (an earlier log seq), plus one
+    /// signed by the wrong key. The wrong-key one is refused; the directory keeps
+    /// the higher-`issued_at` destination even though it was admitted first —
+    /// proof it keys on `issued_at`, not admission/log order — and the cache
+    /// re-derives after a later append.
+    #[test]
+    fn binding_directory_prefers_highest_issued_at_and_refuses_wrong_key() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let alice_addr = Address::from_public_key(alice.public_key());
+        let mallory = Keypair::generate();
+
+        // alice's chain (same-author entries must be carried in position order):
+        // pos0 = newer (issued 200, "newdest"), admitted first; pos1 = older
+        // (issued 100, "olddest"), admitted later. "Newest admitted wins" would
+        // pick olddest; "highest issued_at wins" must pick newdest.
+        let newer = SignedPayload::sign(TransportBinding::new(alice_addr, "newdest", 200), &alice);
+        let e0 = outbox_entry(&alice, 0, zero(), &newer, 200);
+        let older = SignedPayload::sign(TransportBinding::new(alice_addr, "olddest", 100), &alice);
+        let e1 = outbox_entry(&alice, 1, e0.payload.entry_hash(), &older, 100);
+        // Wrong key: alice's address, but signed by mallory (mallory's own chain).
+        let forged =
+            SignedPayload::sign(TransportBinding::new(alice_addr, "evildest", 999), &mallory);
+        let e_bad = outbox_entry(&mallory, 0, zero(), &forged, 999);
+
+        // Carry order: pos0 (newer), pos1 (older), forged — position order.
+        let entries = [e0.clone(), e1.clone(), e_bad.clone()];
+        let receipt = submit_bundle(&mut core, &entries, 1000);
+        // The two alice bindings admitted; the wrong-key one refused Rejected.
+        assert!(matches!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+        assert!(matches!(
+            receipt.payload.outcomes[1].disposition,
+            Disposition::Admitted { .. }
+        ));
+        assert!(matches!(
+            receipt.payload.outcomes[2].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::Rejected
+            }
+        ));
+
+        // Directory: highest issued_at wins (newdest), evildest never entered.
+        let dir = binding_directory(&AppendLog::new(&core.db));
+        assert_eq!(dir.get(&alice_addr).map(String::as_str), Some("newdest"));
+        assert_eq!(
+            dir.len(),
+            1,
+            "the wrong-key binding is not in the directory"
+        );
+
+        // An unbound address is a miss.
+        let other = Address::from_public_key(Keypair::generate().public_key());
+        assert!(core.resolve_binding(&other).is_none());
+
+        // A later binding (issued 300) supersedes it; the cache re-derives on the
+        // tail advance.
+        assert_eq!(
+            core.resolve_binding(&alice_addr).as_deref(),
+            Some("newdest")
+        );
+        let newest =
+            SignedPayload::sign(TransportBinding::new(alice_addr, "newestdest", 300), &alice);
+        let e2 = outbox_entry(&alice, 2, e1.payload.entry_hash(), &newest, 300);
+        submit_bundle(&mut core, &[e2], 1100);
+        assert_eq!(
+            core.resolve_binding(&alice_addr).as_deref(),
+            Some("newestdest"),
+            "cache re-derived after the append"
+        );
+    }
+
+    /// A genuine receipt from a receiver station correlates to a tracked push and
+    /// marks it delivered; forged/mismatched/duplicate receipts do not.
+    #[test]
+    fn dtn_receipt_correlation_and_negatives() {
+        // Receiver B ingests a bundle and produces a genuine signed receipt.
+        let mut recv = test_core();
+        let station_b = recv.wallet.address;
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let entries = one_record_bundle(&alice, &bob);
+        let signed_receipt = submit_bundle(&mut recv, &entries, 1000);
+        let receipt_bytes = receipt::encode_signed(&signed_receipt);
+        let push_id = push_id_of(&entries);
+        let record_hashes = concat_record_hashes(&entries);
+        let bundle_hex = encode_bundle(&entries, 1000);
+        let bundle_bytes = unhex(&bundle_hex).unwrap();
+
+        // Sender A tracks the push (addressed to B by identity), then correlates.
+        let sender = test_core();
+        let insert = |peer: &str, expected: Option<[u8; 32]>| {
+            PushStore::new(&sender.db)
+                .insert(
+                    &push_id,
+                    peer,
+                    expected.as_ref(),
+                    &bundle_bytes,
+                    &record_hashes,
+                    0,
+                    500,
+                )
+                .unwrap()
+        };
+        insert("b", Some(station_b.public_key().to_bytes()));
+        assert!(
+            sender.do_dtn_receipt(&receipt_bytes, &Endpoint::new("b")),
+            "a genuine receipt from the right peer/station marks delivered"
+        );
+        assert!(PushStore::new(&sender.db)
+            .get(&push_id)
+            .unwrap()
+            .unwrap()
+            .delivered_at
+            .is_some());
+        // Duplicate genuine receipt: a no-op.
+        assert!(!sender.do_dtn_receipt(&receipt_bytes, &Endpoint::new("b")));
+
+        // Wrong peer: a receipt from a peer we did not push to is ignored.
+        let sender2 = test_core();
+        PushStore::new(&sender2.db)
+            .insert(&push_id, "b", None, &bundle_bytes, &record_hashes, 0, 500)
+            .unwrap();
+        assert!(!sender2.do_dtn_receipt(&receipt_bytes, &Endpoint::new("someone-else")));
+        assert!(PushStore::new(&sender2.db)
+            .get(&push_id)
+            .unwrap()
+            .unwrap()
+            .delivered_at
+            .is_none());
+
+        // Expected-station mismatch: addressed by identity to a *different* station.
+        let sender3 = test_core();
+        let other_station = Address::from_public_key(Keypair::generate().public_key());
+        let other_key = other_station.public_key().to_bytes();
+        PushStore::new(&sender3.db)
+            .insert(
+                &push_id,
+                "b",
+                Some(&other_key),
+                &bundle_bytes,
+                &record_hashes,
+                0,
+                500,
+            )
+            .unwrap();
+        assert!(!sender3.do_dtn_receipt(&receipt_bytes, &Endpoint::new("b")));
+
+        // Forged signature: re-sign the same receipt body with a different key.
+        let sender4 = test_core();
+        PushStore::new(&sender4.db)
+            .insert(&push_id, "b", None, &bundle_bytes, &record_hashes, 0, 500)
+            .unwrap();
+        let forged = SignedReceipt::sign(signed_receipt.payload.clone(), &Keypair::generate());
+        let forged_bytes = receipt::encode_signed(&forged);
+        assert!(
+            !sender4.do_dtn_receipt(&forged_bytes, &Endpoint::new("b")),
+            "a receipt whose signer is not the station it names is dropped"
+        );
+
+        // Different record set: a receipt for an unknown presentation is ignored.
+        let sender5 = test_core();
+        PushStore::new(&sender5.db)
+            .insert(&push_id, "b", None, &bundle_bytes, &record_hashes, 0, 500)
+            .unwrap();
+        let other_entries = one_record_bundle(&Keypair::generate(), &Keypair::generate());
+        let other_receipt = submit_bundle(&mut test_core(), &other_entries, 1000);
+        assert!(
+            !sender5.do_dtn_receipt(&receipt::encode_signed(&other_receipt), &Endpoint::new("b"))
+        );
+    }
+
+    #[test]
+    fn dtn_pending_pushes_hands_out_due_and_abandons_expired() {
+        let core = test_core(); // clock = 1000
+        let store_insert = |id: &[u8; 32], queued_at: i64| {
+            PushStore::new(&core.db)
+                .insert(id, "peer", None, b"bundle", &[0u8; 32], 0, queued_at)
+                .unwrap();
+        };
+        let fresh = [1u8; 32];
+        let old = [2u8; 32];
+        store_insert(&fresh, 1000);
+        store_insert(&old, 0); // queued long ago
+
+        // TTL 500: `old` (age 1000) is past it → abandoned and not returned; `fresh`
+        // is returned (a loop-start pull, resend_gap None).
+        let due = core.do_dtn_pending_pushes(500, None);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].push_id, fresh);
+        let old_row = PushStore::new(&core.db).get(&old).unwrap().unwrap();
+        assert!(old_row.abandoned_at.is_some(), "expired push abandoned");
+        let fresh_row = PushStore::new(&core.db).get(&fresh).unwrap().unwrap();
+        assert_eq!(fresh_row.attempts, 1, "handed out once");
+        assert_eq!(fresh_row.last_sent_at, Some(1000));
+
+        // A re-scan with a gap larger than the time since last_sent returns nothing.
+        assert!(core.do_dtn_pending_pushes(500, Some(3600)).is_empty());
+    }
+
+    #[test]
+    fn dtn_push_abandoned_is_surfaced_by_status_not_dropped() {
+        let core = test_core(); // clock = 1000
+        let id = [7u8; 32];
+        PushStore::new(&core.db)
+            .insert(&id, "peer", None, b"bundle", &[0u8; 32], 0, 0)
+            .unwrap();
+        // Age 1000 > TTL 100 → abandoned.
+        assert!(core.do_dtn_pending_pushes(100, None).is_empty());
+        let mut core = core;
+        let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
+        assert_eq!(status["pushes"][0]["state"], "abandoned");
     }
 }

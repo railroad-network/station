@@ -24,10 +24,20 @@ use rrn_marketplace::search::SearchIndex;
 use rrn_storage::db::Database;
 use rrn_storage::migrations;
 
+use rrn_protocol::airtime::AirtimeBudget;
+use rrn_protocol::transport::FrameTransport;
+use tokio::sync::mpsc;
+
 use crate::clock::Clock;
 use crate::config::StationConfig;
 use crate::core::{Core, CoreHandle};
+use crate::dtn_loop::{DtnLoop, DtnOutbound};
 use crate::{gossip, mdns, mobile_server, paired, server};
+
+/// Bound on the outbound DTN wake channel. A wake signal is best-effort
+/// — the durable record is the `dtn_pushes` table — so a full channel is dropped,
+/// not blocked on: the periodic re-scan re-sends anything a dropped signal missed.
+const DTN_OUTBOUND_QUEUE: usize = 256;
 
 /// Wallet file name within the data dir.
 pub const WALLET_FILE: &str = "wallet.rrnwallet";
@@ -214,7 +224,15 @@ impl Station {
             config.mobile.advertise,
         ));
 
-        let core = Core::new(
+        // Outbound DTN wake channel: created only when a DTN transport
+        // will actually run (`[sidecar]` on *and* `[lora] adapter_script` set), so
+        // the `dtn_push` RPC refuses rather than queue a push nothing will drain.
+        // The `Sender` goes into the core; the `Receiver` into the DTN loop below.
+        let dtn_enabled = config.sidecar.enabled && config.lora.adapter_script.is_some();
+        let (dtn_tx, dtn_rx) = mpsc::channel::<DtnOutbound>(DTN_OUTBOUND_QUEUE);
+        let mut dtn_rx = if dtn_enabled { Some(dtn_rx) } else { None };
+
+        let mut core_builder = Core::new(
             db,
             wallet,
             settlement,
@@ -224,8 +242,11 @@ impl Station {
             listings,
         )
         .with_receipt_retention_secs(config.dtn.receipt_retention_secs as i64)
-        .with_connectivity(connectivity.clone())
-        .spawn();
+        .with_connectivity(connectivity.clone());
+        if dtn_enabled {
+            core_builder = core_builder.with_dtn_outbound(dtn_tx);
+        }
+        let core = core_builder.spawn();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -405,12 +426,21 @@ impl Station {
                 // the adapter (which attaches to `rnsd`'s shared instance and would
                 // fail before `rnsd` is up), and re-spawns it with backoff on exit
                 // — so an `rnsd` restart, or a wedged adapter, self-heals.
+                // The outbound receiver (Some iff `dtn_enabled`, which is exactly
+                // this branch) rides into the loop, held stable across adapter
+                // re-spawns so a push queued while an adapter is down is not lost.
+                let outbound = dtn_rx
+                    .take()
+                    .expect("dtn_rx present when adapter configured");
                 tasks.push(tokio::spawn(reticulum_dtn_loop(
                     adapter_cfg,
                     config.lora.budget(),
+                    config.lora.push_ttl_secs,
+                    config.lora.push_rescan_secs,
                     core.clone(),
                     connectivity.clone(),
                     params.clock.clone(),
+                    outbound,
                     shutdown_rx.clone(),
                 )));
             }
@@ -682,12 +712,16 @@ pub async fn sms_gateway_loop<G: crate::sms::SmsGateway + 'static>(
 /// the core's front door and sending its signed receipt back. If the adapter dies
 /// (an `rnsd` restart, a wedge), it is re-spawned with backoff; on shutdown the
 /// adapter is torn down cleanly. Never fatal to the daemon.
+#[allow(clippy::too_many_arguments)]
 async fn reticulum_dtn_loop(
     adapter: crate::reticulum::AdapterConfig,
     budget: rrn_protocol::airtime::AirtimeBudget,
+    push_ttl_secs: i64,
+    push_rescan_secs: i64,
     core: CoreHandle,
     connectivity: Arc<gossip::ConnectivityState>,
     clock: Clock,
+    mut outbound: mpsc::Receiver<DtnOutbound>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut backoff = 2u64;
@@ -723,7 +757,19 @@ async fn reticulum_dtn_loop(
             }
         };
 
-        let stopped = run_dtn_syncer(transport, budget, &core, &clock, &mut shutdown).await;
+        let stopped = run_dtn_syncer(
+            transport,
+            |t: &crate::reticulum::ReticulumTransport| t.is_alive(),
+            |t: crate::reticulum::ReticulumTransport| t.shutdown(),
+            budget,
+            &core,
+            &clock,
+            &mut outbound,
+            push_ttl_secs,
+            push_rescan_secs,
+            &mut shutdown,
+        )
+        .await;
         if stopped {
             break; // clean shutdown; the syncer already tore the adapter down
         }
@@ -738,53 +784,53 @@ async fn reticulum_dtn_loop(
     tracing::info!("Reticulum DTN transport stopped");
 }
 
-/// Runs one adapter's `DtnSyncer` until shutdown (returns `true`) or the adapter
-/// dies (returns `false`). On either exit the transport is shut down.
-async fn run_dtn_syncer(
-    transport: crate::reticulum::ReticulumTransport,
-    budget: rrn_protocol::airtime::AirtimeBudget,
+/// Runs one carrier's [`DtnLoop`] until shutdown (returns `true`) or the carrier
+/// dies (returns `false`, `is_alive` gone). On either exit `shutdown_transport`
+/// tears the carrier down. Generic over the carrier: the daemon instantiates it
+/// with the [`ReticulumTransport`](crate::reticulum::ReticulumTransport)
+/// (`is_alive` is its inherent liveness probe, not a trait method — hence the
+/// injected closures), the hermetic tests with the mock carriers.
+#[allow(clippy::too_many_arguments)]
+async fn run_dtn_syncer<T, A, S>(
+    transport: T,
+    is_alive: A,
+    shutdown_transport: S,
+    budget: AirtimeBudget,
     core: &CoreHandle,
     clock: &Clock,
+    outbound: &mut mpsc::Receiver<DtnOutbound>,
+    push_ttl_secs: i64,
+    push_rescan_secs: i64,
     shutdown: &mut watch::Receiver<bool>,
-) -> bool {
-    use crate::dtn_sync::{DtnSyncer, PayloadKind, SyncConfig};
-    use rrn_protocol::airtime::Priority;
-
-    let mut syncer = DtnSyncer::new(transport, budget, SyncConfig::default(), clock.now());
+) -> bool
+where
+    T: FrameTransport,
+    A: Fn(&T) -> bool,
+    S: FnOnce(T),
+{
+    let mut dtn_loop = DtnLoop::new(
+        transport,
+        budget,
+        push_ttl_secs,
+        push_rescan_secs,
+        clock.now(),
+    );
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let clean = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if !syncer.transport().is_alive() {
+                if !is_alive(dtn_loop.transport()) {
                     break false; // adapter gone → caller re-spawns
                 }
-                let now = clock.now();
-                match syncer.tick(now) {
-                    Ok(completed) => {
-                        for c in completed {
-                            match c.kind {
-                                PayloadKind::Bundle => {
-                                    if let Some(receipt) = core.ingest_bundle_bytes(c.bytes).await {
-                                        syncer.send(&c.source, PayloadKind::Receipt, &receipt, Priority::Economic, now);
-                                    }
-                                }
-                                PayloadKind::Receipt => tracing::debug!(
-                                    source = %c.source.0,
-                                    "DTN delivery receipt received over Reticulum"
-                                ),
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "Reticulum DTN transport error"),
-                }
+                dtn_loop.step(clock.now(), core, outbound).await;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break true; }
             }
         }
     };
-    syncer.into_transport().shutdown();
+    shutdown_transport(dtn_loop.into_transport());
     clean
 }
 

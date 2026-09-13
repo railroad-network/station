@@ -561,6 +561,213 @@ impl<'a> DtnStore<'a> {
     }
 }
 
+/// A station-originated outbound DTN push row (`dtn_pushes`, migration 0008).
+/// Local delivery metadata the outbound loop tracks until a matching receipt is
+/// correlated — never signed, never replayed (ADR-0020 §1). The bytes here are
+/// opaque to this layer, exactly as elsewhere in the module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushRow {
+    /// The bundle's presentation hash (Blake3 over the ordered record hashes) —
+    /// the primary key and the receipt-correlation id.
+    pub push_id: [u8; 32],
+    /// The carrier destination the push was sent to (opaque Endpoint hex).
+    pub peer: String,
+    /// The 32-byte address key the push was addressed to, when resolved from a
+    /// transport binding; `None` for a bare-endpoint push.
+    pub expected_station: Option<[u8; 32]>,
+    /// The encoded bundle bytes, re-sent verbatim on retransmit.
+    pub bundle: Vec<u8>,
+    /// The presented record hashes concatenated (32·n, in presented order).
+    pub record_hashes: Vec<u8>,
+    /// The airtime class the bundle is paced at (Economic=0/Governance=1/Bulk=2).
+    pub priority: i64,
+    /// Admission-clock reading when first queued (testimony).
+    pub queued_at: i64,
+    /// Admission-clock reading when the loop last (re-)sent it, or `None`.
+    pub last_sent_at: Option<i64>,
+    /// How many times the loop has (re-)sent this push.
+    pub attempts: i64,
+    /// Admission-clock reading when a matching receipt was correlated, or `None`.
+    pub delivered_at: Option<i64>,
+    /// The correlated signed-receipt envelope bytes, or `None` while pending.
+    pub receipt: Option<Vec<u8>>,
+    /// Admission-clock reading when the row was abandoned past its TTL, or `None`.
+    pub abandoned_at: Option<i64>,
+}
+
+impl PushRow {
+    /// Whether this push is still awaiting a receipt (neither delivered nor
+    /// abandoned) — the rows the outbound loop re-sends.
+    pub fn is_pending(&self) -> bool {
+        self.delivered_at.is_none() && self.abandoned_at.is_none()
+    }
+}
+
+/// Persistence for station-originated outbound DTN pushes (`dtn_pushes`,
+/// migration 0008). Sibling of [`DtnStore`] over the same database;
+/// pure local delivery metadata (see [`PushRow`]). Policy — when to re-send,
+/// when to abandon — lives in the station layer, which has the clock and the
+/// config; this store is thin CRUD.
+pub struct PushStore<'a> {
+    db: &'a Database,
+}
+
+impl<'a> PushStore<'a> {
+    /// Opens the store over a database handle.
+    pub fn new(db: &'a Database) -> Self {
+        Self { db }
+    }
+
+    /// Inserts a new push row, or leaves an existing row with this `push_id`
+    /// untouched (idempotent — a re-push of an identical presentation to the same
+    /// peer is one row, keeping its delivery progress). Returns whether a new row
+    /// was inserted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert(
+        &mut self,
+        push_id: &[u8; 32],
+        peer: &str,
+        expected_station: Option<&[u8; 32]>,
+        bundle: &[u8],
+        record_hashes: &[u8],
+        priority: i64,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = self.db.conn().execute(
+            "INSERT INTO dtn_pushes \
+             (push_id, peer, expected_station, bundle, record_hashes, priority, queued_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(push_id) DO NOTHING",
+            rusqlite::params![
+                push_id.as_slice(),
+                peer,
+                expected_station.map(|s| s.as_slice()),
+                bundle,
+                record_hashes,
+                priority,
+                now
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The push row for `push_id`, if any.
+    pub fn get(&self, push_id: &[u8; 32]) -> Result<Option<PushRow>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT push_id, peer, expected_station, bundle, record_hashes, priority, \
+                 queued_at, last_sent_at, attempts, delivered_at, receipt, abandoned_at \
+                 FROM dtn_pushes WHERE push_id = ?1",
+                [push_id.as_slice()],
+                row_to_push,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// All pending pushes (neither delivered nor abandoned), highest-priority
+    /// then oldest first — the rows the outbound loop re-sends.
+    pub fn pending(&self) -> Result<Vec<PushRow>> {
+        self.query_rows(
+            "SELECT push_id, peer, expected_station, bundle, record_hashes, priority, \
+             queued_at, last_sent_at, attempts, delivered_at, receipt, abandoned_at \
+             FROM dtn_pushes WHERE delivered_at IS NULL AND abandoned_at IS NULL \
+             ORDER BY priority ASC, queued_at ASC",
+        )
+    }
+
+    /// Every push row, newest first — the `rrn dtn status` view.
+    pub fn all(&self) -> Result<Vec<PushRow>> {
+        self.query_rows(
+            "SELECT push_id, peer, expected_station, bundle, record_hashes, priority, \
+             queued_at, last_sent_at, attempts, delivered_at, receipt, abandoned_at \
+             FROM dtn_pushes ORDER BY queued_at DESC, push_id ASC",
+        )
+    }
+
+    /// Records that the loop just (re-)sent this push: sets `last_sent_at` and
+    /// bumps `attempts`. A no-op for an already-delivered/abandoned row.
+    pub fn mark_sent(&mut self, push_id: &[u8; 32], now: i64) -> Result<()> {
+        self.db.conn().execute(
+            "UPDATE dtn_pushes SET last_sent_at = ?2, attempts = attempts + 1 \
+             WHERE push_id = ?1 AND delivered_at IS NULL AND abandoned_at IS NULL",
+            rusqlite::params![push_id.as_slice(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Marks the push delivered and stores the correlated receipt. Idempotent:
+    /// only a still-pending row is changed. Returns whether it was newly
+    /// delivered (so a re-sent receipt after a lost ack is a no-op, not an error).
+    pub fn mark_delivered(&mut self, push_id: &[u8; 32], receipt: &[u8], now: i64) -> Result<bool> {
+        let changed = self.db.conn().execute(
+            "UPDATE dtn_pushes SET delivered_at = ?2, receipt = ?3 \
+             WHERE push_id = ?1 AND delivered_at IS NULL AND abandoned_at IS NULL",
+            rusqlite::params![push_id.as_slice(), now, receipt],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Marks a still-pending push abandoned (past its TTL with no receipt). The
+    /// row is kept and surfaced by `rrn dtn status`, never dropped.
+    pub fn mark_abandoned(&mut self, push_id: &[u8; 32], now: i64) -> Result<()> {
+        self.db.conn().execute(
+            "UPDATE dtn_pushes SET abandoned_at = ?2 \
+             WHERE push_id = ?1 AND delivered_at IS NULL AND abandoned_at IS NULL",
+            rusqlite::params![push_id.as_slice(), now],
+        )?;
+        Ok(())
+    }
+
+    fn query_rows(&self, sql: &str) -> Result<Vec<PushRow>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], row_to_push)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+}
+
+/// Maps a `dtn_pushes` result row to a [`PushRow`] (or a corruption error on a
+/// mis-sized hash BLOB). The outer `rusqlite::Result` wraps the inner
+/// [`Result`] so a decode error surfaces without a panic.
+fn row_to_push(row: &rusqlite::Row) -> rusqlite::Result<Result<PushRow>> {
+    let push_id: Vec<u8> = row.get(0)?;
+    let peer: String = row.get(1)?;
+    let expected_station: Option<Vec<u8>> = row.get(2)?;
+    let bundle: Vec<u8> = row.get(3)?;
+    let record_hashes: Vec<u8> = row.get(4)?;
+    let priority: i64 = row.get(5)?;
+    let queued_at: i64 = row.get(6)?;
+    let last_sent_at: Option<i64> = row.get(7)?;
+    let attempts: i64 = row.get(8)?;
+    let delivered_at: Option<i64> = row.get(9)?;
+    let receipt: Option<Vec<u8>> = row.get(10)?;
+    let abandoned_at: Option<i64> = row.get(11)?;
+    Ok((|| {
+        Ok(PushRow {
+            push_id: to_hash("dtn_pushes.push_id", push_id)?,
+            peer,
+            expected_station: expected_station
+                .map(|s| to_hash("dtn_pushes.expected_station", s))
+                .transpose()?,
+            bundle,
+            record_hashes,
+            priority,
+            queued_at,
+            last_sent_at,
+            attempts,
+            delivered_at,
+            receipt,
+            abandoned_at,
+        })
+    })())
+}
+
 /// Converts a stored BLOB into a 32-byte hash, or [`Error::Corrupt`].
 fn to_hash(col: &str, bytes: Vec<u8>) -> Result<[u8; 32]> {
     let len = bytes.len();
@@ -837,5 +1044,98 @@ mod tests {
             s.delivery_of(&h(20)).unwrap().is_none(),
             "unconfirmed pruned"
         );
+    }
+
+    // --- PushStore (outbound push tracking) ---------------------------------
+
+    #[test]
+    fn push_insert_is_idempotent_and_preserves_progress() {
+        let db = store_db();
+        let mut s = PushStore::new(&db);
+        let id = h(1);
+        assert!(s
+            .insert(&id, "peerhex", Some(&h(9)), b"bundle", &[0u8; 32], 0, 100)
+            .unwrap());
+        // Re-inserting the same push_id does nothing and reports "not new".
+        assert!(!s
+            .insert(&id, "peerhex", Some(&h(9)), b"bundle", &[0u8; 32], 0, 200)
+            .unwrap());
+        let row = s.get(&id).unwrap().unwrap();
+        assert_eq!(row.queued_at, 100, "first queued_at kept");
+        assert_eq!(row.peer, "peerhex");
+        assert_eq!(row.expected_station, Some(h(9)));
+        assert!(row.is_pending());
+        assert_eq!(row.attempts, 0);
+        assert!(row.last_sent_at.is_none());
+    }
+
+    #[test]
+    fn push_mark_sent_bumps_attempts() {
+        let db = store_db();
+        let mut s = PushStore::new(&db);
+        let id = h(2);
+        s.insert(&id, "p", None, b"b", &[0u8; 32], 0, 10).unwrap();
+        s.mark_sent(&id, 20).unwrap();
+        s.mark_sent(&id, 30).unwrap();
+        let row = s.get(&id).unwrap().unwrap();
+        assert_eq!(row.attempts, 2);
+        assert_eq!(row.last_sent_at, Some(30));
+        assert_eq!(row.expected_station, None);
+    }
+
+    #[test]
+    fn push_mark_delivered_is_idempotent() {
+        let db = store_db();
+        let mut s = PushStore::new(&db);
+        let id = h(3);
+        s.insert(&id, "p", None, b"b", &[0u8; 32], 0, 10).unwrap();
+        assert!(s.mark_delivered(&id, b"receipt", 50).unwrap(), "first wins");
+        // A second (re-sent) receipt is a no-op, not an error, and does not
+        // overwrite the stored receipt/timestamp.
+        assert!(!s.mark_delivered(&id, b"other", 60).unwrap());
+        let row = s.get(&id).unwrap().unwrap();
+        assert_eq!(row.delivered_at, Some(50));
+        assert_eq!(row.receipt.as_deref(), Some(&b"receipt"[..]));
+        assert!(!row.is_pending());
+    }
+
+    #[test]
+    fn push_pending_excludes_delivered_and_abandoned_and_orders_by_priority() {
+        let db = store_db();
+        let mut s = PushStore::new(&db);
+        // Bulk (2) queued first, economic (0) second: economic must come first.
+        s.insert(&h(1), "p", None, b"b", &[0u8; 32], 2, 10).unwrap();
+        s.insert(&h(2), "p", None, b"b", &[0u8; 32], 0, 20).unwrap();
+        let delivered = h(3);
+        s.insert(&delivered, "p", None, b"b", &[0u8; 32], 0, 5)
+            .unwrap();
+        s.mark_delivered(&delivered, b"r", 6).unwrap();
+        let abandoned = h(4);
+        s.insert(&abandoned, "p", None, b"b", &[0u8; 32], 0, 5)
+            .unwrap();
+        s.mark_abandoned(&abandoned, 6).unwrap();
+
+        let pending = s.pending().unwrap();
+        assert_eq!(pending.len(), 2, "delivered and abandoned excluded");
+        assert_eq!(pending[0].push_id, h(2), "economic first");
+        assert_eq!(pending[1].push_id, h(1), "bulk last");
+        // `all` still shows every row.
+        assert_eq!(s.all().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn push_abandoned_row_cannot_be_delivered() {
+        let db = store_db();
+        let mut s = PushStore::new(&db);
+        let id = h(5);
+        s.insert(&id, "p", None, b"b", &[0u8; 32], 0, 10).unwrap();
+        s.mark_abandoned(&id, 40).unwrap();
+        assert!(
+            !s.mark_delivered(&id, b"r", 50).unwrap(),
+            "an abandoned push is terminal"
+        );
+        let row = s.get(&id).unwrap().unwrap();
+        assert_eq!(row.abandoned_at, Some(40));
+        assert!(row.delivered_at.is_none());
     }
 }

@@ -1,5 +1,6 @@
 CREATE TABLE attestations ( id BLOB PRIMARY KEY, kind TEXT NOT NULL, payload BLOB NOT NULL, signature BLOB NOT NULL, signer BLOB NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY (signer) REFERENCES identities (pubkey) ) STRICT
 CREATE TABLE balances ( identity BLOB PRIMARY KEY, positive_increments BLOB NOT NULL, negative_increments BLOB NOT NULL ) STRICT
+CREATE TABLE dtn_pushes ( push_id BLOB NOT NULL PRIMARY KEY, peer TEXT NOT NULL, expected_station BLOB, bundle BLOB NOT NULL, record_hashes BLOB NOT NULL, priority INTEGER NOT NULL, queued_at INTEGER NOT NULL, last_sent_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, delivered_at INTEGER, receipt BLOB, abandoned_at INTEGER ) STRICT
 CREATE TABLE identities ( pubkey BLOB PRIMARY KEY, created_at INTEGER NOT NULL, metadata BLOB ) STRICT
 CREATE TABLE issued_receipts ( presentation_hash BLOB NOT NULL PRIMARY KEY, receipt_envelope BLOB NOT NULL, issued_at INTEGER NOT NULL ) STRICT
 CREATE TABLE kv ( key TEXT PRIMARY KEY, value BLOB ) STRICT
@@ -12,6 +13,7 @@ CREATE TABLE reputation_snapshots ( address BLOB PRIMARY KEY, last_computed_at I
 CREATE TABLE seen_outbox_entries ( author BLOB NOT NULL, position INTEGER NOT NULL, entry_hash BLOB NOT NULL, envelope BLOB NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY (author, position) ) STRICT
 CREATE TABLE seen_outbox_heads ( author BLOB NOT NULL PRIMARY KEY, position INTEGER NOT NULL, entry_hash BLOB NOT NULL, updated_at INTEGER NOT NULL ) STRICT
 CREATE TABLE transactions ( id BLOB PRIMARY KEY, sender BLOB NOT NULL, receiver BLOB NOT NULL, amount_centicommons INTEGER NOT NULL, state TEXT NOT NULL, nonce INTEGER NOT NULL, proposed_at INTEGER NOT NULL, settled_at INTEGER ) STRICT
+CREATE INDEX dtn_pushes_pending ON dtn_pushes (delivered_at, abandoned_at)
 CREATE INDEX idx_attestations_signer ON attestations (signer)
 CREATE INDEX idx_log_entries_content_hash ON log_entries (content_hash)
 CREATE INDEX idx_outbox_pending ON outbox_entries (author, position) WHERE acked_outcome IS NULL

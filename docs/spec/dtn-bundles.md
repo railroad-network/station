@@ -298,8 +298,14 @@ identity, never merged with it (ADR-0013 "bind, do not collapse"). Fields:
 `address`, `destination` (hex), `issued_at`. Fixture:
 `tests/fixtures/cross_platform_binding.json`.
 
-The record type and its self-signed `validate()` land in T2.6.2
-(`rrn_protocol::binding`); **appending a binding to the log and reading peers'
-bindings back to route outbound traffic is the follow-up** that goes with the
-station-originated outbound path (T2.6.2 wires the inbound receive → ingest →
-receipt path; the outbound directory is next).
+The record type and its self-signed `validate()` landed in T2.6.2
+(`rrn_protocol::binding`). **Appending a binding to the log and reading peers'
+bindings back into a routing directory landed in T2.6.4**, alongside the
+station-originated outbound path (T2.6.2 wired the inbound receive → ingest →
+receipt path; T2.6.4 closes the loop with originate → ingest → receipt →
+delivered). A binding is admitted through the same DTN front door as any record
+(self-signed, else a per-record `Rejected` refusal); the directory is derived by
+log replay, keeping per address the binding with the highest `issued_at` (log
+order breaking ties). A station publishes its own binding with `rrn dtn bind
+--destination <hex>` and pushes to a peer by `rrn1…` address (resolved through the
+directory) or by a bare destination hex.

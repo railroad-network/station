@@ -26,10 +26,10 @@ use rrn_station::rpc::{
     AnnounceNeedResult, BackupExportResult, BalanceResult, CertListResult, CertRequestResult,
     CloseListingResult, ConfirmResult, ContractStateResult, CreateListingResult,
     DisputeEscalateResult, DisputeEscalationVoteResult, DisputeRaiseResult, DisputeResolveResult,
-    DisputeRuleResult, EditListingResult, GovCharterResult, GovCosignResult,
-    GovEmergencyActionResult, GovProposeResult, HistoryResult, InquireResult, InquiryStateResult,
-    ProposeResult, RecoverImportResult, StatusResult, TransactionRow, TransactionsResult,
-    VouchResult, WhoamiResult,
+    DisputeRuleResult, DtnBindResult, DtnPushResult, DtnPushesResult, EditListingResult,
+    GovCharterResult, GovCosignResult, GovEmergencyActionResult, GovProposeResult, HistoryResult,
+    InquireResult, InquiryStateResult, ProposeResult, RecoverImportResult, StatusResult,
+    TransactionRow, TransactionsResult, VouchResult, WhoamiResult,
 };
 use rrn_station::rpc_client::UnixClient;
 
@@ -402,6 +402,41 @@ enum Command {
     Paper {
         #[command(subcommand)]
         cmd: paper::PaperCmd,
+    },
+    /// Delay-tolerant networking: originate an outbound bundle push to a peer over
+    /// the Reticulum transport, inspect tracked pushes, and publish this station's
+    /// own reachability binding (M2.6, ADR-0013/0020).
+    Dtn {
+        #[command(subcommand)]
+        cmd: DtnCmd,
+    },
+}
+
+/// The `rrn dtn …` subcommands.
+#[derive(Subcommand)]
+enum DtnCmd {
+    /// Push a bundle file to a peer over the DTN transport. Returns a queued
+    /// acknowledgement — delivery is confirmed later by the peer's receipt (watch
+    /// `rrn dtn status`).
+    Push {
+        /// The peer: an `rrn1…` address (resolved via the binding directory) or a
+        /// bare Reticulum destination hex.
+        #[arg(long)]
+        peer: String,
+        /// Path to a bundle file (encoded bytes), e.g. one produced by the paper
+        /// tooling.
+        #[arg(long)]
+        bundle: PathBuf,
+    },
+    /// List tracked outbound pushes: peer, records, state, attempts, and the
+    /// correlated receipt's outcome summary.
+    Status,
+    /// Publish this station's own transport binding at a Reticulum destination hex,
+    /// and print the signed binding envelope to carry to peers.
+    Bind {
+        /// The Reticulum destination hex this station is reachable at.
+        #[arg(long)]
+        destination: String,
     },
 }
 
@@ -1135,7 +1170,100 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Dispute { cmd } => cmd_dispute(&client, fmt, color, cmd).await,
         Command::Cert { cmd } => cmd_cert(&client, fmt, cmd).await,
         Command::Paper { cmd } => paper::cmd_paper(&client, fmt, cmd).await,
+        Command::Dtn { cmd } => cmd_dtn(&client, fmt, cmd).await,
     }
+}
+
+/// The `rrn dtn …` command family (ADR-0013, ADR-0020).
+async fn cmd_dtn(client: &UnixClient, fmt: Format, cmd: DtnCmd) -> Result<()> {
+    match cmd {
+        DtnCmd::Push { peer, bundle } => {
+            let bytes = std::fs::read(&bundle)
+                .with_context(|| format!("read bundle file {}", bundle.display()))?;
+            let bundle_hex = hex_encode(&bytes);
+            // An `rrn1…` peer resolves through the binding directory; anything else
+            // is a bare Reticulum destination hex.
+            let params = if peer.starts_with("rrn1") {
+                json!({ "bundle_hex": bundle_hex, "rrn_address": peer })
+            } else {
+                json!({ "bundle_hex": bundle_hex, "endpoint_hex": peer })
+            };
+            let v = client.call("dtn_push", params).await?;
+            emit(fmt, &v, || {
+                let r: DtnPushResult = parse(&v)?;
+                let verb = if r.queued {
+                    "queued push"
+                } else {
+                    "push already"
+                };
+                let note = if !r.queued {
+                    format!("({})", r.state)
+                } else if r.signalled {
+                    "sent to the outbound loop".to_string()
+                } else {
+                    "durable; will be re-scanned".to_string()
+                };
+                Ok(format!(
+                    "{} {}  ({} record{})  {}",
+                    verb,
+                    r.push_id_hex,
+                    r.records,
+                    if r.records == 1 { "" } else { "s" },
+                    note
+                ))
+            })
+        }
+        DtnCmd::Status => {
+            let v = client.call("dtn_pushes", json!({})).await?;
+            emit(fmt, &v, || {
+                let r: DtnPushesResult = parse(&v)?;
+                if r.pushes.is_empty() {
+                    return Ok("no tracked DTN pushes".to_string());
+                }
+                let mut lines = Vec::with_capacity(r.pushes.len());
+                for p in &r.pushes {
+                    let summary = p
+                        .receipt_summary
+                        .as_deref()
+                        .map(|s| format!("  [{s}]"))
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "{}  {}  {} record{}  {} attempt{}  → {}{}",
+                        &p.push_id_hex[..p.push_id_hex.len().min(12)],
+                        p.state,
+                        p.records,
+                        if p.records == 1 { "" } else { "s" },
+                        p.attempts,
+                        if p.attempts == 1 { "" } else { "s" },
+                        p.peer,
+                        summary
+                    ));
+                }
+                Ok(lines.join("\n"))
+            })
+        }
+        DtnCmd::Bind { destination } => {
+            let v = client
+                .call("dtn_bind", json!({ "destination_hex": destination }))
+                .await?;
+            emit(fmt, &v, || {
+                let r: DtnBindResult = parse(&v)?;
+                Ok(format!(
+                    "binding published; carry to peers:\n{}",
+                    r.binding_hex
+                ))
+            })
+        }
+    }
+}
+
+/// Lowercase hex of a byte slice (the RPC byte-param convention).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// The `rrn cert …` command family (T2.3.1, ADR-0021).
