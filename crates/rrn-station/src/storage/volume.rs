@@ -48,8 +48,9 @@ pub trait MountHelper: Send + Sync {
     ) -> Result<()>;
 
     /// Unmounts `state_dir`, closes the `dm-crypt` mapping, and detaches the loop
-    /// device. Idempotent-ish: tolerates an already-closed volume.
-    fn close(&self, mapping: &str, state_dir: &Path) -> Result<()>;
+    /// device backing `container_path`. Idempotent-ish: tolerates an already-closed
+    /// volume.
+    fn close(&self, mapping: &str, container_path: &Path, state_dir: &Path) -> Result<()>;
 
     /// Whether `state_dir` is right now a **live `dm-crypt` mount** — not a plain
     /// directory. The daemon calls this before touching any file, so a mis-ordered
@@ -116,9 +117,13 @@ fn linux_live_mount(state_dir: &Path, expect_mapping: Option<&str>) -> Result<bo
         if left.len() < 5 || right.len() < 2 {
             continue;
         }
-        let mount_point = left[4];
+        // The mount point is octal-escaped in mountinfo (space→\040, tab→\011,
+        // newline→\012, backslash→\134); unescape before comparing, or a state dir
+        // whose path contains a space could never match and the encrypted profile
+        // would be permanently unusable there with a misleading "not mounted" error.
+        let mount_point = unescape_mountinfo(left[4]);
         let source = right[1];
-        if Path::new(mount_point) != target {
+        if Path::new(&mount_point) != target {
             continue;
         }
         return Ok(match expect_mapping {
@@ -127,6 +132,31 @@ fn linux_live_mount(state_dir: &Path, expect_mapping: Option<&str>) -> Result<bo
         });
     }
     Ok(false)
+}
+
+/// Decodes the octal escapes the kernel writes into the `/proc/self/mountinfo`
+/// path fields (`\NNN`). Unrecognised backslash sequences are passed through
+/// verbatim.
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            let oct = &bytes[i + 1..i + 4];
+            if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                if let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                    out.push(code as char);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Whether the encrypted at-rest profile can run on this host. The profile is
@@ -164,7 +194,7 @@ impl DmCryptVolume {
     #[cfg(target_os = "linux")]
     pub fn new(container_path: PathBuf, mapping: String, state_dir: PathBuf) -> Self {
         Self::with_helper(
-            Box::new(SudoCryptsetupHelper::default()),
+            Box::new(SudoCryptsetupHelper),
             container_path,
             mapping,
             state_dir,
@@ -232,7 +262,8 @@ impl DmCryptVolume {
 
     /// Closes and unmounts the volume.
     pub fn close(&self) -> Result<()> {
-        self.helper.close(&self.mapping, &self.state_dir)
+        self.helper
+            .close(&self.mapping, &self.container_path, &self.state_dir)
     }
 }
 
@@ -245,7 +276,6 @@ impl DmCryptVolume {
 /// (`tests/at_rest_dmcrypt.rs`), which needs a real kernel, loop devices, and
 /// passwordless sudo — none of which exist on the macOS dev host.
 #[cfg(target_os = "linux")]
-#[derive(Default)]
 pub struct SudoCryptsetupHelper;
 
 #[cfg(target_os = "linux")]
@@ -392,12 +422,18 @@ impl SudoCryptsetupHelper {
         }
 
         // 7. Open keyslot-lessly with the VMK, make a filesystem, mount, chown.
+        //    A zero-keyslot LUKS2 header carries no key-size metadata, so cryptsetup
+        //    refuses to open it unless `--key-size` is given explicitly (it cannot
+        //    infer the volume-key length from a slot that no longer exists). Our VMK
+        //    is 256-bit, matching the `luksFormat --key-size 256` above.
         Self::cryptsetup_with_key(
             &[
                 "cryptsetup",
                 "open",
                 "--type",
                 "luks2",
+                "--key-size",
+                "256",
                 "--volume-key-file",
                 "/dev/stdin",
                 &loop_dev,
@@ -414,7 +450,11 @@ impl SudoCryptsetupHelper {
             );
         }
         std::fs::create_dir_all(state_dir)?;
-        let out = Self::sudo(&["mount", &mapper]).arg(state_dir).output()?;
+        // The filesystem holds only the daemon's data; it should never carry device
+        // nodes, setuid binaries, or executables, so harden the mount against them.
+        let out = Self::sudo(&["mount", "-o", "nodev,nosuid,noexec", &mapper])
+            .arg(state_dir)
+            .output()?;
         if !out.status.success() {
             bail!(
                 "mount failed: {}",
@@ -492,6 +532,9 @@ impl MountHelper for SudoCryptsetupHelper {
         // from the child's stdin (fd) rather than any on-disk path. If the mapping
         // already exists (a prior run whose mount was dropped), skip straight to the
         // mount so recovery is idempotent.
+        // `--key-size 256` is required: a keyslot-less LUKS2 header has no key-size
+        // metadata, so cryptsetup cannot infer the volume-key length and refuses to
+        // open without it. Our VMK is 256-bit (matches provisioning).
         let mapper = format!("/dev/mapper/{mapping}");
         if !Path::new(&mapper).exists() {
             let mut child = Self::sudo(&[
@@ -499,6 +542,8 @@ impl MountHelper for SudoCryptsetupHelper {
                 "open",
                 "--type",
                 "luks2",
+                "--key-size",
+                "256",
                 "--volume-key-file",
                 "/dev/stdin",
                 &loop_dev,
@@ -518,9 +563,12 @@ impl MountHelper for SudoCryptsetupHelper {
             }
         }
 
-        // Mount the decrypted mapping.
+        // Mount the decrypted mapping. Harden it: data-only filesystem, so no device
+        // nodes, setuid binaries, or executables (matches provisioning).
         std::fs::create_dir_all(state_dir)?;
-        let out = Self::sudo(&["mount", &mapper]).arg(state_dir).output()?;
+        let out = Self::sudo(&["mount", "-o", "nodev,nosuid,noexec", &mapper])
+            .arg(state_dir)
+            .output()?;
         if !out.status.success() {
             bail!(
                 "mount failed: {}",
@@ -530,13 +578,18 @@ impl MountHelper for SudoCryptsetupHelper {
         Ok(())
     }
 
-    fn close(&self, mapping: &str, state_dir: &Path) -> Result<()> {
+    fn close(&self, mapping: &str, container_path: &Path, state_dir: &Path) -> Result<()> {
         // Best-effort teardown in reverse order; tolerate already-closed pieces.
-        // The mapping name does not by itself name a container, so loop-device
-        // detach is the caller's concern (it knows the container path); here we
-        // unmount and drop the crypt device.
+        // Resolve the backing loop device *before* closing the crypt mapping (once
+        // detached, losetup -j can no longer find it), then unmount, drop the crypt
+        // device, and detach the loop — otherwise every open/close cycle leaks a
+        // loop device until reboot.
+        let loop_dev = Self::loop_for(container_path).ok().flatten();
         let _ = Self::sudo(&["umount"]).arg(state_dir).output();
         let _ = Self::sudo(&["cryptsetup", "close", mapping]).output();
+        if let Some(dev) = loop_dev {
+            let _ = Self::sudo(&["losetup", "-d", &dev]).output();
+        }
         Ok(())
     }
 
@@ -643,7 +696,7 @@ mod tests {
             *self.mounted.lock().unwrap() = true;
             Ok(())
         }
-        fn close(&self, mapping: &str, _state_dir: &Path) -> Result<()> {
+        fn close(&self, mapping: &str, _container: &Path, _state_dir: &Path) -> Result<()> {
             self.calls.lock().unwrap().push(format!("close:{mapping}"));
             *self.mounted.lock().unwrap() = false;
             Ok(())
@@ -716,6 +769,17 @@ mod tests {
         );
         let calls = helper.calls.lock().unwrap().clone();
         assert_eq!(calls, vec!["keyslot_count", "open:rrnstate"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unescape_mountinfo_decodes_octal() {
+        assert_eq!(unescape_mountinfo("/var/lib/rrn"), "/var/lib/rrn");
+        assert_eq!(unescape_mountinfo("/mnt/my\\040data"), "/mnt/my data");
+        assert_eq!(unescape_mountinfo("/a\\011b"), "/a\tb");
+        // A trailing lone backslash and a non-octal sequence pass through verbatim.
+        assert_eq!(unescape_mountinfo("/a\\"), "/a\\");
+        assert_eq!(unescape_mountinfo("/a\\09b"), "/a\\09b");
     }
 
     #[test]

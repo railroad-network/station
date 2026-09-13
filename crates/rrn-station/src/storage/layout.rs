@@ -97,13 +97,26 @@ impl Layout {
             AtRestProfile::Encrypted => {
                 crate::storage::volume::ensure_platform_supported()?;
                 let enc = config.storage.encrypted.as_ref();
+                // A relative path in config resolves against the boot dir, not the
+                // process cwd — otherwise `station unlock` from a shell and `station
+                // run` under systemd (`WorkingDirectory=/`) would disagree on where
+                // the state dir / container is.
+                let resolve_rel = |p: PathBuf| {
+                    if p.is_relative() {
+                        boot_dir.join(p)
+                    } else {
+                        p
+                    }
+                };
                 let state_dir = enc
                     .and_then(|e| e.state_dir.clone())
                     .map(PathBuf::from)
+                    .map(resolve_rel)
                     .unwrap_or_else(|| boot_dir.join(STATE_DIR_NAME));
                 let container_path = enc
                     .and_then(|e| e.container_path.clone())
                     .map(PathBuf::from)
+                    .map(resolve_rel)
                     .unwrap_or_else(|| boot_dir.join(CONTAINER_FILE));
                 if state_dir == boot_dir {
                     bail!(
@@ -134,8 +147,16 @@ impl Layout {
 
     /// A stable device-mapper name for this station's `dm-crypt` mapping, derived
     /// from the boot dir so two stations on one host do not collide.
+    ///
+    /// The boot dir is canonicalized first (it always exists at runtime), so the same
+    /// physical directory named differently on two invocations — a trailing slash, a
+    /// relative path, a symlink — yields the *same* mapping. Otherwise `station
+    /// unlock` could mount under one name while `station run`'s strict mount guard
+    /// demanded another, dead-locking the operator into a fresh ceremony.
     pub fn mapping_name(&self) -> String {
-        let digest = rrn_crypto::hash::Hash::of(self.boot_dir.to_string_lossy().as_bytes());
+        let canonical =
+            std::fs::canonicalize(&self.boot_dir).unwrap_or_else(|_| self.boot_dir.clone());
+        let digest = rrn_crypto::hash::Hash::of(canonical.to_string_lossy().as_bytes());
         format!("rrnstate-{}", &digest.to_hex()[..12])
     }
 
@@ -285,7 +306,7 @@ mod tests {
     fn resolve_encrypted_is_linux_only() {
         let cfg = StationConfig::parse(
             "[network]\nlisten = \"127.0.0.1:7411\"\n[storage]\nat_rest = \"encrypted\"\n\
-             [storage.encrypted]\nholders = [\"a\",\"b\",\"c\"]\n",
+             [storage.encrypted]\nthreshold = 3\n",
             Path::new("config.toml"),
         )
         .unwrap();

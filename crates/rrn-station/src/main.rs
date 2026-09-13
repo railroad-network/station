@@ -101,8 +101,9 @@ enum Command {
         #[arg(long = "holder", required = true, value_name = "ADDRESS")]
         holders: Vec<String>,
         /// K — how many holders must cooperate at each boot ceremony (2 ≤ K ≤ N).
+        /// Defaults to the configured `[storage.encrypted] threshold` (3 if unset).
         #[arg(long)]
-        threshold: u8,
+        threshold: Option<u8>,
     },
     /// Run the boot ceremony and unlock (mount) the encrypted state volume, so the
     /// daemon can then be started (ADR-0024). Linux only. Prints a request QR and a
@@ -126,9 +127,10 @@ enum VmkCmd {
         /// The new holder set: an `rrn1…` address, repeated once per holder.
         #[arg(long = "holder", required = true, value_name = "ADDRESS")]
         holders: Vec<String>,
-        /// The new threshold K (2 ≤ K ≤ N).
+        /// The new threshold K (2 ≤ K ≤ N). Defaults to the current configured
+        /// threshold when omitted.
         #[arg(long)]
-        threshold: u8,
+        threshold: Option<u8>,
     },
 }
 
@@ -264,8 +266,10 @@ fn print_holder_shards(shards: &[rrn_station::recovery::HolderShard], threshold:
 fn cmd_encrypt_in_place(
     data_dir: &std::path::Path,
     holders: &[String],
-    threshold: u8,
+    threshold: Option<u8>,
 ) -> Result<()> {
+    let threshold = threshold
+        .unwrap_or_else(|| rrn_station::storage::admin::configured_vmk_threshold(data_dir));
     eprintln!(
         "This migrates {} to the encrypted at-rest profile. It is one-way: after it \n\
          succeeds, the station only starts after a `station unlock` boot ceremony.\n\
@@ -363,7 +367,13 @@ fn cmd_vmk_status(data_dir: &std::path::Path) -> Result<()> {
 }
 
 /// `station vmk refresh` — ceremony + re-split to a new holder set.
-fn cmd_vmk_refresh(data_dir: &std::path::Path, holders: &[String], threshold: u8) -> Result<()> {
+fn cmd_vmk_refresh(
+    data_dir: &std::path::Path,
+    holders: &[String],
+    threshold: Option<u8>,
+) -> Result<()> {
+    let threshold = threshold
+        .unwrap_or_else(|| rrn_station::storage::admin::configured_vmk_threshold(data_dir));
     let (session, request_qr, fingerprint, descriptor) =
         rrn_station::storage::admin::begin_unlock(data_dir)?;
     eprintln!(

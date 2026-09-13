@@ -2,8 +2,8 @@
 //!
 //! These exercise the real kernel block-encryption path: provisioning a
 //! keyslot-less LUKS2 container, the brick property on raw bytes, the boot ceremony
-//! reconstructing the volume key, crash-safety across an unclean remount, and the
-//! `Station::open` mount guard. None of this can run on the macOS dev host, so the
+//! reconstructing the volume key, ledger durability across an unmount/remount cycle,
+//! and the `Station::open` mount guard. None of this can run on the macOS dev host, so the
 //! whole file is `#![cfg(target_os = "linux")]` and every test is `#[ignore]`d:
 //! `--ignored` is the opt-in. There is no "skip if unavailable" fallback —
 //! [`require_dmcrypt`] **panics** with a clear message if the prerequisites
@@ -89,9 +89,13 @@ impl TestVolume {
         let boot_dir = work.path().to_path_buf();
         let container = boot_dir.join("state.img");
         let state_dir = boot_dir.join("state");
+        // Canonicalize the boot dir before hashing, exactly as `Layout::mapping_name`
+        // does, so this mount's mapping equals the one `Station::open`'s strict guard
+        // recomputes even when TMPDIR resolves through a symlink.
+        let canonical = std::fs::canonicalize(&boot_dir).unwrap_or_else(|_| boot_dir.clone());
         let mapping = format!(
             "rrnstate-{}",
-            &Hash::of(boot_dir.to_string_lossy().as_bytes()).to_hex()[..12]
+            &Hash::of(canonical.to_string_lossy().as_bytes()).to_hex()[..12]
         );
         let helper = SudoCryptsetupHelper;
         helper
@@ -294,10 +298,18 @@ fn boot_ceremony_reconstructs_the_key_and_opens_the_volume() {
 
 #[test]
 #[ignore = "needs dm-crypt + loop + passwordless sudo; run in the at-rest-dmcrypt CI lane"]
-fn crash_safety_remount_preserves_and_verifies_the_chain() {
+fn remount_cycle_preserves_and_verifies_the_chain() {
     require_dmcrypt();
-    // Loop a few seeds: write a log, drop it without a graceful DB close, unmount
-    // hard, remount, and confirm the hash chain still verifies with all entries.
+    // Loop a few seeds: write a hash-chained log inside the container, unmount and
+    // close the dm-crypt mapping, then re-open with the same VMK and confirm the
+    // chain still verifies with every entry. This proves the ledger survives the
+    // full close/re-attach cycle (a daemon restart while the host stays up) with no
+    // corruption or lost entries. It is a *clean* unmount, not a kill-9 during
+    // writes: SQLite checkpoints its WAL when `seed_log` drops the connection, so
+    // there is no open WAL at unmount. True power-loss-mid-write consistency rests on
+    // ext4 ordered journaling under dm-crypt plus SQLite WAL recovery, exercised by
+    // the manual field procedure in the runbook rather than in-process (an open DB
+    // handle would make the `umount` fail with "target is busy").
     for seed in 0..3u64 {
         let vmk = Vmk::generate();
         let vol = TestVolume::provision(&vmk);
@@ -306,20 +318,20 @@ fn crash_safety_remount_preserves_and_verifies_the_chain() {
         assert_eq!(
             verify_log(&vol.state_dir),
             n,
-            "seed {seed}: chain before crash"
+            "seed {seed}: chain before unmount"
         );
 
-        // Simulate power loss: unmount + close without a graceful daemon shutdown.
+        // Unmount + close the mapping (a daemon stop / host-up restart).
         vol.close();
 
-        // Re-open the same container with the same VMK (host-up re-attach) and
-        // verify the chain survived intact — no corruption, no lost entries.
+        // Re-open the same container with the same VMK and verify the chain survived
+        // intact — no corruption, no lost entries.
         let dmv = DmCryptVolume::new(
             vol.container.clone(),
             vol.mapping.clone(),
             vol.state_dir.clone(),
         );
-        dmv.open(&vmk.key_bytes()).expect("re-open after crash");
+        dmv.open(&vmk.key_bytes()).expect("re-open after remount");
         assert_eq!(
             verify_log(&vol.state_dir),
             n,
@@ -341,7 +353,7 @@ fn station_open_refuses_an_unmounted_state_dir_and_writes_nothing() {
     std::fs::create_dir_all(&state).unwrap(); // a plain directory, not a mount
     let cfg = format!(
         "[network]\nlisten = \"127.0.0.1:7411\"\n[storage]\nat_rest = \"encrypted\"\n\
-         [storage.encrypted]\nstate_dir = \"{}\"\nholders = [\"a\",\"b\",\"c\"]\n",
+         [storage.encrypted]\nstate_dir = \"{}\"\nthreshold = 3\n",
         state.display()
     );
     std::fs::write(boot.join("config.toml"), cfg).unwrap();
@@ -432,6 +444,32 @@ fn station_runs_on_the_encrypted_volume_and_leaves_no_plaintext_at_rest() {
     assert!(
         !dir_contains_marker(&vol.boot_dir, &marker, Some(&vol.container)),
         "planted memo LEAKED onto the unencrypted boot dir (incl. any WAL/SHM leftovers)"
+    );
+}
+
+#[test]
+#[ignore = "needs dm-crypt + loop + passwordless sudo; run in the at-rest-dmcrypt CI lane"]
+fn strict_guard_matches_only_this_containers_mapping() {
+    require_dmcrypt();
+    // A live dm-crypt mount is present at the state dir. The loose guard accepts it,
+    // and the strict guard accepts it *only* under this container's own mapping name —
+    // a different mapping (e.g. another station's, or a plaintext dm-linear volume
+    // that happened to mount here) must be rejected, or `Station::open` could serve
+    // the wrong volume.
+    let vmk = Vmk::generate();
+    let vol = TestVolume::provision(&vmk);
+
+    assert!(
+        volume::state_dir_is_live_mount(&vol.state_dir).unwrap(),
+        "loose guard sees the live mount"
+    );
+    assert!(
+        volume::state_dir_is_crypt_mount(&vol.state_dir, &vol.mapping).unwrap(),
+        "strict guard accepts this container's own mapping"
+    );
+    assert!(
+        !volume::state_dir_is_crypt_mount(&vol.state_dir, "rrnstate-000000000000").unwrap(),
+        "strict guard rejects a different mapping name at the same mount point"
     );
 }
 

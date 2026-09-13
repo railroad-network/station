@@ -116,6 +116,16 @@ pub fn vmk_holders(data_dir: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The configured VMK threshold `K` for `data_dir`: the `[storage.encrypted]
+/// threshold` when set, else the default (3). Used as the default when the operator
+/// omits `--threshold`, so the config value is authoritative rather than write-only.
+pub fn configured_vmk_threshold(data_dir: &Path) -> u8 {
+    load_config(data_dir)
+        .ok()
+        .and_then(|c| c.storage.encrypted.map(|e| e.threshold))
+        .unwrap_or_else(|| EncryptedSection::default().threshold)
+}
+
 /// Container size for a fresh migration: room for the ledger to grow well past its
 /// current size, floored at 512 MiB. A sparse file, so the nominal size is a ceiling
 /// on growth, not disk actually consumed up front.
@@ -197,7 +207,7 @@ pub fn finish_refresh(
     new_holders: &[String],
     new_threshold: u8,
 ) -> Result<Vec<HolderShard>> {
-    let config = load_config(data_dir)?;
+    let mut config = load_config(data_dir)?;
     if config.storage.at_rest != AtRestProfile::Encrypted {
         bail!("this station is not running the encrypted profile");
     }
@@ -216,6 +226,16 @@ pub fn finish_refresh(
     descriptor
         .save_to_file(&data_dir.join(crate::storage::layout::VMK_DESCRIPTOR_FILE))
         .context("write the updated VMK descriptor")?;
+    // Keep `config.toml`'s recorded threshold in step with the new descriptor, so the
+    // config value never drifts from the K the ceremony now enforces.
+    if let Some(enc) = config.storage.encrypted.as_mut() {
+        if enc.threshold != new_threshold {
+            enc.threshold = new_threshold;
+            config
+                .save(&data_dir.join(CONFIG_FILE))
+                .context("update the recorded threshold in config.toml after refresh")?;
+        }
+    }
     Ok(shards)
 }
 
@@ -250,7 +270,7 @@ mod linux {
     use crate::station::DB_FILE;
     use crate::storage::layout::RETICULUM_DIR;
     use crate::storage::vmk::Vmk;
-    use crate::storage::volume::SudoCryptsetupHelper;
+    use crate::storage::volume::{MountHelper, SudoCryptsetupHelper};
     use zeroize::Zeroizing;
 
     /// The migration proper (see [`super::encrypt_in_place`]).
@@ -304,6 +324,12 @@ mod linux {
         rrn_identity::wallet::WalletContents::load_from_file(&plain.wallet_path(), passphrase)
             .context("open wallet (wrong passphrase, or not a station data dir)")?;
 
+        // Validate the holder set/threshold BEFORE any block operation: a bad
+        // `--holder`/`--threshold` must fail here, not after `provision` has mounted a
+        // container under a VMK that then leaves memory forever (an unrecoverable
+        // orphan). This is the same check `vmk::arm` runs below.
+        vmk::validate_holders(holders, threshold)?;
+
         // Provision the keyslot-less container with a fresh VMK, then mount it.
         let vmk = Vmk::generate();
         let helper = SudoCryptsetupHelper;
@@ -324,6 +350,31 @@ mod linux {
             // key (Zeroizing) drops here.
         }
 
+        // Everything past `provision` has mounted a container and attached a loop
+        // device; a failure here would otherwise leave that orphan behind and the
+        // "already exists" guard would refuse the retry. Run the rest under a guard
+        // that tears the orphan down on error.
+        let outcome =
+            migrate_after_provision(data_dir, &plain, &enc, config, holders, threshold, &vmk);
+        if outcome.is_err() {
+            cleanup_orphan_container(&enc);
+        }
+        outcome
+    }
+
+    /// The migration steps that run *after* the container is provisioned and mounted:
+    /// move state inside, arm the VMK, verify the migrated ledger, flip the config,
+    /// then securely erase the plaintext originals. Split out so [`encrypt_in_place`]
+    /// can tear down the mounted orphan if any of it fails.
+    fn migrate_after_provision(
+        data_dir: &Path,
+        plain: &Layout,
+        enc: &Layout,
+        config: StationConfig,
+        holders: &[String],
+        threshold: u8,
+        vmk: &Vmk,
+    ) -> Result<Vec<HolderShard>> {
         // Move state INSIDE the container — never onto the plaintext root.
         // 1. A consistent DB snapshot straight into the container (VACUUM INTO).
         rrn_storage::db::snapshot_to(&plain.db_path(), &enc.db_path())
@@ -348,7 +399,7 @@ mod linux {
 
         // Arm the VMK split; the full package lives inside the container, the
         // descriptor on the boot dir.
-        let (package, descriptor, shards) = vmk::arm(&vmk, holders, threshold)?;
+        let (package, descriptor, shards) = vmk::arm(vmk, holders, threshold)?;
         package
             .save_to_file(&enc.vmk_package_path())
             .context("persist the VMK package inside the container")?;
@@ -356,13 +407,12 @@ mod linux {
             .save_to_file(&enc.vmk_descriptor_path())
             .context("write the VMK descriptor to the boot dir")?;
 
-        // Flip the config to the encrypted profile (holder set NOT persisted here).
-        write_encrypted_config(data_dir, config, &enc, threshold)?;
-
-        // VERIFY the migrated ledger against the source BEFORE erasing the only other
-        // copy: the container's hash chain must verify and hold exactly as many
-        // entries as the plaintext original (ADR-0024 "…VACUUM INTO across, verify,
-        // then securely erase").
+        // VERIFY the migrated ledger against the source BEFORE flipping the config or
+        // erasing the only other copy: the container's hash chain must verify and hold
+        // exactly as many entries as the plaintext original (ADR-0024 "…VACUUM INTO
+        // across, verify, then securely erase"). If this fails the config is still
+        // plaintext and the originals are intact, so the guard's teardown leaves a
+        // clean plaintext station.
         {
             let src = rrn_storage::db::Database::open(&plain.db_path())?;
             let src_n = rrn_storage::log::AppendLog::new(&src)
@@ -378,10 +428,16 @@ mod linux {
                 bail!(
                     "migrated ledger has {dst_n} entries but the source has {src_n}; refusing to \
                      erase the plaintext original (the container is mounted at {} — investigate)",
-                    state_dir.display()
+                    enc.state_dir().display()
                 );
             }
         }
+
+        // Only now — the migrated copy is verified good — flip the config to the
+        // encrypted profile (holder set NOT persisted here). After this point a crash
+        // leaves a verified, mounted encrypted station with (harmless) plaintext
+        // leftovers the operator can shred manually; `station run` uses the container.
+        write_encrypted_config(data_dir, config, enc, threshold)?;
 
         // Securely erase the plaintext originals. Note the caller must warn that
         // secure erase is unreliable on wear-levelled flash/SD.
@@ -392,14 +448,30 @@ mod linux {
         if plain.paired_path().exists() {
             secure_erase(&plain.paired_path());
         }
-        // The marketplace index and reticulum dir on the plaintext root are removed
-        // (the index is rebuilt inside the container on next run).
-        let _ = std::fs::remove_dir_all(data_dir.join(crate::station::LISTING_INDEX_DIR));
-        if plain_reticulum.exists() {
-            let _ = std::fs::remove_dir_all(&plain_reticulum);
+        // The station recovery package names every station-key trustee — the same
+        // "coercion-target map" ADR-0024 keeps off the boot dir — so shred it, not
+        // just unlink it, once its copy is safe inside the container.
+        if plain.recovery_path().exists() {
+            secure_erase(&plain.recovery_path());
         }
+        // The Reticulum directory holds the adapter's identity secret key; shred its
+        // files rather than a plain remove.
+        secure_erase_dir(&plain_reticulum);
+        // The marketplace index is non-secret (rebuilt inside the container on next
+        // run), so a plain remove is fine.
+        let _ = std::fs::remove_dir_all(data_dir.join(crate::station::LISTING_INDEX_DIR));
 
         Ok(shards)
+    }
+
+    /// Best-effort teardown of a half-migrated container: unmount, close the crypt
+    /// mapping, detach the loop device, and remove the container file and state dir so
+    /// a re-run of `encrypt-in-place` is not refused by the "already exists" guard.
+    fn cleanup_orphan_container(enc: &Layout) {
+        let helper = SudoCryptsetupHelper;
+        let _ = helper.close(&enc.mapping_name(), enc.container_path(), enc.state_dir());
+        let _ = std::fs::remove_file(enc.container_path());
+        let _ = std::fs::remove_dir_all(enc.state_dir());
     }
 
     /// Opens and mounts the already-provisioned container with a reconstructed VMK
@@ -435,6 +507,25 @@ mod linux {
             .arg(path)
             .output();
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Best-effort secure erase of a directory tree: [`secure_erase`] every file
+    /// (depth-first) before removing the directories, so secret files (e.g. the
+    /// Reticulum adapter identity key) are shredded rather than merely unlinked.
+    fn secure_erase_dir(dir: &Path) {
+        if !dir.exists() {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(ty) if ty.is_dir() => secure_erase_dir(&path),
+                    _ => secure_erase(&path),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A minimal recursive directory copy (used to move the Reticulum dir inside).
@@ -474,7 +565,7 @@ mod tests {
     fn status_reports_encrypted_and_unmounted_when_configured() {
         let dir = tempfile::tempdir().unwrap();
         let text = "[network]\nlisten = \"127.0.0.1:7411\"\n[storage]\nat_rest = \"encrypted\"\n\
-                    [storage.encrypted]\nholders = [\"a\",\"b\",\"c\"]\n";
+                    [storage.encrypted]\nthreshold = 3\n";
         std::fs::write(dir.path().join(CONFIG_FILE), text).unwrap();
         let report = status(dir.path()).unwrap();
         assert_eq!(report.profile, "encrypted");

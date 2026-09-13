@@ -565,16 +565,37 @@ station vmk refresh --holder … --holder … --threshold 3
 ```
 
 **If the station is seized anyway** — the recovery drill. Practice it before you
-need it; the same script is your rehearsal:
+need it:
 
 ```sh
 scripts/drill-seizure-recovery.sh --profile plaintext   # runs anywhere
 scripts/drill-seizure-recovery.sh --profile encrypted   # Linux, exercises the brick
 ```
 
-Recovering onto fresh hardware is `station restore <archive>` (4.1) plus
-re-provisioning the encrypted container and re-arming the VMK to your (possibly
-changed) holder set — the drill script walks the path.
+What each profile actually checks:
+
+- `--profile plaintext` rehearses the **community-continues** path end to end:
+  stand up a station, back it up, delete the data dir ("seize"), `station restore`
+  onto fresh storage, and confirm the same identity with an openable ledger and
+  wallet.
+- `--profile encrypted` proves the **brick property**: with the volume closed, a
+  planted marker appears nowhere in the container bytes or on the boot dir (with a
+  positive control proving the sweep works), the holder set is absent from the boot
+  dir, and the LUKS header has zero keyslots.
+
+Recovering an **encrypted** station onto fresh hardware is a manual sequence, not
+something the drill runs for you: `station restore <archive>` (4.1) to get the
+ledger and wallet back, then `station encrypt-in-place` to provision a new
+keyslot-less container and re-arm the VMK to your (possibly changed) holder set,
+then the `station unlock` ceremony. The unlock ceremony and the ledger's
+durability across a remount are exercised by the `at-rest-dmcrypt` test lane.
+
+> **Heads-up for `systemd`:** under the encrypted profile `station run` exits until
+> the volume is unlocked, so a unit with `Restart=always` will crash-loop after a
+> reboot until someone runs `station unlock`. That is expected — unlock is a
+> deliberate human step. Use `Restart=on-failure` (as the sample unit in §3 does)
+> and start the service *after* the ceremony, or leave it enabled and simply expect
+> the restart backoff until K holders have gathered.
 
 ---
 

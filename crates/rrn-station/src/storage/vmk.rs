@@ -154,12 +154,30 @@ impl VmkDescriptor {
     /// carries the VMK address the ceremony reconstructs against. Plain, not
     /// encrypted — it is non-secret.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
         let bytes = self.to_canonical_bytes();
         let tmp = path.with_extension("descriptor.tmp");
-        std::fs::write(&tmp, &bytes)
-            .with_context(|| format!("write VMK descriptor temp {}", tmp.display()))?;
+        // fsync the temp file's contents *before* the rename, or on a non-ext4
+        // filesystem (or ext4 without auto_da_alloc) a power loss between rename and
+        // writeback can leave a zero-length descriptor in place — the exact lockout
+        // this atomic-write dance exists to prevent.
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .with_context(|| format!("create VMK descriptor temp {}", tmp.display()))?;
+            f.write_all(&bytes)
+                .with_context(|| format!("write VMK descriptor temp {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("fsync VMK descriptor temp {}", tmp.display()))?;
+        }
         std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename VMK descriptor into place at {}", path.display()))
+            .with_context(|| format!("rename VMK descriptor into place at {}", path.display()))?;
+        // fsync the directory so the rename itself is durable.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 
     /// Reads a descriptor back from `path`.
@@ -196,6 +214,15 @@ fn parse_holders(holders: &[String], threshold: u8) -> Result<Vec<PublicKey>> {
         pubkeys.push(*parsed.public_key());
     }
     Ok(pubkeys)
+}
+
+/// Validates a holder set and threshold without doing any block work — the cheap
+/// check `encrypt-in-place` runs *before* provisioning a container, so a bad
+/// `--holder`/`--threshold` argument fails before anything is created on disk rather
+/// than after (which would leave a mounted orphan under a VMK that just left memory).
+pub fn validate_holders(holders: &[String], threshold: u8) -> Result<()> {
+    parse_holders(holders, threshold)?;
+    Ok(())
 }
 
 /// Encodes a raw shard payload as the `rrnrecovery:<base64>` string a holder's
