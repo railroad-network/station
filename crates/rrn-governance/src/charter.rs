@@ -279,6 +279,22 @@ pub enum CharterError {
         /// Size of the declared founding set.
         founders: usize,
     },
+    /// A higher-version founder-authorized charter cannot be admitted while an
+    /// emergency holds — the effective charter is frozen on *every* door, not only
+    /// the amendment path (ADR-0023 §3b). Names the active declaration and its
+    /// scheduled expiry so the operator knows when the freeze lifts.
+    #[error("the charter is frozen while emergency {declaration} holds (until {expiry})")]
+    FrozenByEmergency {
+        /// The declaration hash of the emergency in force.
+        declaration: Hash,
+        /// The station-attested scheduled expiry of that emergency (Unix seconds).
+        expiry: i64,
+    },
+    /// An error re-deriving the active-emergency state for the freeze check. Boxed
+    /// because [`crate::emergency::EmergencyError`] carries a [`CharterError`] of
+    /// its own.
+    #[error("emergency: {0}")]
+    Emergency(Box<crate::emergency::EmergencyError>),
     /// A storage/log error while publishing or reading the Charter.
     #[error("storage: {0}")]
     Storage(#[from] rrn_storage::Error),
@@ -417,28 +433,92 @@ impl SignedCharter {
     }
 }
 
+/// ADR-0023 §3b — the constitution freeze, shared by both founder-charter write
+/// doors ([`store_charter`] and [`store_pending_charter`]).
+///
+/// While an emergency holds, **no founder charter may be admitted onto an existing
+/// root**: any charter appended once a root exists would either re-root the
+/// community — [`founder_charter`] selects the highest `version`, ties broken by
+/// the *later* seq, so even an equal-version charter supersedes — or, if lower, is
+/// inert anyway, so refusing it costs nothing. Left open, a replacement root could
+/// also re-tune the emergency's own legitimacy bars mid-crisis
+/// ([`crate::emergency::emergency_params`] reads them from that root).
+///
+/// **Genesis is never frozen**: with no root yet there can be no emergency (a
+/// declaration requires a charter), and the guard must not be able to deadlock
+/// founding — so it does not consult the emergency predicate at all until a root
+/// exists. The freeze is judged at the monotone-clamped admission instant the
+/// entry will carry (mirroring `statute::record_implementation`), so a station
+/// clock that regresses below the activation instant cannot slip a charter past
+/// it; replay simply trusts the log (ADR-0022 §2) and never re-gates.
+///
+/// `station` must be the community's sole-writer station key (ADR-0020) — the key
+/// the emergency attestations are signed with — or the freeze is judged against an
+/// empty timeline and never fires.
+fn check_charter_freeze(
+    log: &AppendLog,
+    db: &Database,
+    station: &PublicKey,
+    now: i64,
+) -> Result<(), CharterError> {
+    if founder_charter(db)?.is_some() {
+        let admitted_at = match log.tail()? {
+            Some(tail) => now.max(tail.created_at),
+            None => now,
+        };
+        if let Some(active) =
+            crate::emergency::active_emergency_at(db, admitted_at, u64::MAX, station)
+                .map_err(|e| CharterError::Emergency(Box::new(e)))?
+        {
+            return Err(CharterError::FrozenByEmergency {
+                declaration: active.declaration_hash,
+                expiry: active.scheduled_expiry,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Publishes a founder-authorized Charter to the log, wrapped in a
 /// single-signer envelope signed by `publisher` (attribution; the inner multisig
-/// is the authority). Rejects a Charter that does not clear the founder threshold
-/// before writing anything.
+/// is the authority). `publisher` must be the community's station key — the sole
+/// writer (ADR-0020) — since the §3b freeze below is judged against that key's
+/// emergency timeline.
+///
+/// Rejects a Charter that does not clear the founder threshold, and — while an
+/// emergency holds — any founder charter that would land on an existing root
+/// (ADR-0023 §3b; see [`check_charter_freeze`]). Nothing is written on either
+/// refusal.
 pub fn store_charter(
     log: &mut AppendLog,
+    db: &Database,
     publisher: &Keypair,
     charter: SignedCharter,
     now: i64,
 ) -> Result<LogEntry, CharterError> {
     charter.verify_founders()?;
+    check_charter_freeze(log, db, &publisher.public_key(), now)?;
     Ok(log.append(SignedPayload::sign(charter, publisher), now)?)
 }
 
-/// The community's genesis root Charter: the highest-`version`, founder-authorized
+/// The community's root founder Charter: the highest-`version`, founder-authorized
 /// Charter on the log, or `None` if none has been published yet. Ties on version
-/// break toward the later log entry.
+/// break toward the later log entry — so an equal-version charter admitted later
+/// supersedes too.
 ///
 /// This is the *founder* charter only — it does not fold in amendments enacted
 /// through the vote lifecycle (those carry no founder authority). The effective,
 /// possibly-amended Charter is [`crate::tally::effective_charter`], which builds
 /// on this root.
+///
+/// The selection rule is deliberately *not* emergency-aware: the freeze on a
+/// replacement root is enforced at admission by the writer ([`store_charter`] /
+/// [`store_pending_charter`] via [`check_charter_freeze`], ADR-0022 §2 pattern),
+/// so any founder charter that re-roots the community is — by construction — one
+/// admitted outside any emergency, and replay just trusts it. The one exception is
+/// a record injected straight onto the log via the ungated gossip front door
+/// (ADR-0020 §7); closing that is a separate conformance follow-up, not this
+/// selection's concern.
 ///
 /// Deviation from the task sketch's non-optional return: a community may legally
 /// have no Charter yet (it is bootstrapping), which is an absence, not an error.
@@ -477,12 +557,20 @@ pub fn founder_charter_hash(db: &Database) -> Result<Option<Hash>, CharterError>
 /// not clear the threshold, so a pending Charter is not treated as the community's
 /// genesis root until enough founders have signed. The final, threshold-clearing
 /// append is what publishes it.
+///
+/// This is the ceremony's *actual* publishing door — the threshold-clearing append
+/// lands here, not in [`store_charter`] — so it carries the same ADR-0023 §3b
+/// freeze ([`check_charter_freeze`]): once a root exists, no ceremony may publish a
+/// replacement root while an emergency holds. `publisher` must be the station key
+/// (see [`store_charter`]). Genesis is unaffected (no root yet).
 pub fn store_pending_charter(
     log: &mut AppendLog,
+    db: &Database,
     publisher: &Keypair,
     charter: SignedCharter,
     now: i64,
 ) -> Result<LogEntry, CharterError> {
+    check_charter_freeze(log, db, &publisher.public_key(), now)?;
     Ok(log.append(SignedPayload::sign(charter, publisher), now)?)
 }
 
@@ -958,7 +1046,7 @@ mod tests {
         // Begin: the coordinator's signature only, appended as a pending charter.
         let mut signed = create_charter(params_for(&founders), &founders[..1]).unwrap();
         let mut log = AppendLog::new(&db);
-        store_pending_charter(&mut log, coordinator, signed.clone(), NOW).unwrap();
+        store_pending_charter(&mut log, &db, coordinator, signed.clone(), NOW).unwrap();
         // Latest sees the pending one; founder_charter (threshold-gated) does not.
         assert!(latest_charter(&db).unwrap().is_some());
         assert!(latest_charter(&db)
@@ -974,7 +1062,7 @@ mod tests {
             signed.add_remote_signature(f.public_key(), sig).unwrap();
         }
         let mut log = AppendLog::new(&db);
-        store_charter(&mut log, coordinator, signed, NOW).unwrap();
+        store_charter(&mut log, &db, coordinator, signed, NOW).unwrap();
         // Now it is the community's genesis root.
         assert!(founder_charter(&db).unwrap().is_some());
     }
@@ -1047,7 +1135,7 @@ mod tests {
         let want_hash = signed.charter_hash();
         {
             let mut log = AppendLog::new(&db);
-            store_charter(&mut log, &founders[0], signed, NOW).unwrap();
+            store_charter(&mut log, &db, &founders[0], signed, NOW).unwrap();
         }
         let current = founder_charter(&db)
             .unwrap()
@@ -1069,8 +1157,8 @@ mod tests {
         let v2_hash = v2.charter_hash();
 
         let mut log = AppendLog::new(&db);
-        store_charter(&mut log, &founders[0], v1, NOW).unwrap();
-        store_charter(&mut log, &founders[1], v2, NOW).unwrap();
+        store_charter(&mut log, &db, &founders[0], v1, NOW).unwrap();
+        store_charter(&mut log, &db, &founders[1], v2, NOW).unwrap();
 
         let current = founder_charter(&db).unwrap().unwrap();
         assert_eq!(current.charter().version, 2);
@@ -1084,7 +1172,7 @@ mod tests {
         let under = create_charter(params_for(&founders), &founders[..2]).unwrap();
         let mut log = AppendLog::new(&db);
         assert!(matches!(
-            store_charter(&mut log, &founders[0], under, NOW),
+            store_charter(&mut log, &db, &founders[0], under, NOW),
             Err(CharterError::BelowThreshold { .. })
         ));
         // Nothing was written.

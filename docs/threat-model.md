@@ -2383,19 +2383,22 @@ then lapses* — and withhold every adjacent one.
   back-dated earlier (legal under ADR-0022 §3) cannot enter the pinned set — closing
   the "declare, then manufacture members, then vote" path.
 - *Tampering — restructuring under cover of crisis.* The charter is frozen on
-  the **amendment** path while an emergency holds: a `CharterAmendment` is
-  refused at admission (`CharterFrozenByEmergency`) and its enactment deferred
-  until lapse (`record_implementation` / `enact_due`), so the rules of the game
-  cannot be rewritten through governance during the compressed window.
-  *Residual (found in the 2026-09-13 consolidation):* ADR-0023 §3(b) also
-  requires freezing the **founder-charter** door — `effective_charter` roots on
-  the highest-version founder-authorized charter (`charter::founder_charter`),
-  and neither `store_charter` nor that selection checks for an active
-  emergency. The door is latent: the RPC pins the founder charter at version 1
-  and the Charter kind is `UnroutableKind` on DTN, so the only way a v+1
-  founder charter reaches the log today is the gossip `append_raw` path
-  (`[peers] list = []` in the pilot). It is a conformance gap against the ADR,
-  tracked for a follow-up, not a live lever in a single-writer deployment.
+  **both** doors while an emergency holds: a `CharterAmendment` is refused at
+  admission (`CharterFrozenByEmergency`) and its enactment deferred until lapse
+  (`record_implementation` / `enact_due`), and a replacement founder-authorized
+  charter is refused at admission on **both** founder-charter write doors
+  (`CharterError::FrozenByEmergency` via `check_charter_freeze`, called by
+  `charter::store_charter` and the ceremony's `store_pending_charter`, judged at
+  the monotone-clamped admission instant). `founder_charter` selects the highest
+  version, ties broken by the later seq, so the guard keys on "a root already
+  exists" rather than a version test — an equal-version re-root is caught too.
+  Neither the rules of the game nor the emergency's own legitimacy bars (which
+  `emergency_params` reads from that root) can be rewritten during the compressed
+  window. All are write-path guards on the sole writer; replay trusts the log
+  (ADR-0022 §2). The one surviving vector is a founder charter injected straight
+  onto the log through the ungated gossip front door (`append_raw`); closing that
+  is the separate gossip-gate follow-up (`[peers] list = []` in the pilot until
+  then).
 - *Replica divergence.* The activation instant and scheduled expiry are frozen into
   the **station-signed** `emergency_activated` attestation (never recomputed from a
   replica's re-stamped admission clock), and the compressed window is frozen into
@@ -4020,10 +4023,10 @@ entry citing its ADR or the section that owns it.
   50 % duty cycle and file an ordinary power measure under a crisis label
   (`scope` is testimony); a ≤ 2-member grace electorate declares at two
   signatures; the 7-day declaration TTL does not bound a colluding faction that
-  holds a fully-signed bundle off-log; the **founder-charter door is not
-  frozen** during an emergency (a conformance gap against ADR-0023 §3(b),
-  latent because that door is reachable only via gossip today — see the
-  emergency section). A renewal re-pins the electorate at its own activation.
+  holds a fully-signed bundle off-log. A renewal re-pins the electorate at its
+  own activation. (Both charter doors — amendment *and* replacement founder
+  charter — are now frozen at admission during an emergency; ADR-0023 §3(b) is
+  met, save for the ungated gossip front door tracked separately.)
 - **Station-signed ledger records are replay-trusted with no signer pin**
   (`SettlementRecord`, `ContractCharge`, `HeadroomCertificate`); the
   equivocation `Overturn` gate pins to the record's author, not the community

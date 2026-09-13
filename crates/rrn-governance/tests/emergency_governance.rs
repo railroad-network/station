@@ -14,7 +14,8 @@ use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
 
 use rrn_governance::charter::{
-    create_charter, store_charter, AmendmentRules, Charter, CharterParams, GovernanceStructure,
+    create_charter, founder_charter, store_charter, AmendmentRules, Charter, CharterError,
+    CharterParams, GovernanceStructure, SignedCharter,
 };
 use rrn_governance::emergency::{
     self, EmergencyActivated, EmergencyCosign, EmergencyDeclaration, EmergencyError,
@@ -62,7 +63,7 @@ fn publish_charter_with(db: &Database, founders: &[Keypair], gov: GovernanceStru
     };
     let signed = create_charter(params, founders).unwrap();
     let mut log = AppendLog::new(db);
-    store_charter(&mut log, &founders[0], signed, 0).unwrap();
+    store_charter(&mut log, db, &founders[0], signed, 0).unwrap();
 }
 
 fn publish_charter(db: &Database, founders: &[Keypair]) {
@@ -453,6 +454,268 @@ fn charter_amendments_are_frozen_during_an_emergency_and_admit_after_lapse() {
         t0 + 30,
     )
     .expect("amendments admit once the emergency has lapsed");
+}
+
+// --- M2.11 conformance: the *founder-charter replacement* door is frozen too,
+// not just the amendment path (ADR-0023 §3b, second door). -------------------
+
+/// A version-2 founder charter chained on the community's genesis root, signed by
+/// all founders (so it clears the founder threshold). The caller publishes it with
+/// [`store_charter`]; the outer publisher must be the community's station key `st`
+/// so the write-path guard resolves the emergency under the right key.
+fn founder_charter_v2(
+    db: &Database,
+    founders: &[Keypair],
+    gov: GovernanceStructure,
+) -> SignedCharter {
+    let genesis = founder_charter(db)
+        .unwrap()
+        .expect("a genesis charter is published");
+    let params = CharterParams {
+        version: 2,
+        community_id: "commons".into(),
+        founding_principles: vec![],
+        rights_floor: vec![],
+        governance_structure: gov,
+        amendment_rules: AmendmentRules::default(),
+        founders: founders.iter().map(addr).collect(),
+        created_at: 0,
+        previous_hash: Some(genesis.charter_hash()),
+    };
+    create_charter(params, founders).unwrap()
+}
+
+#[test]
+fn a_higher_version_founder_charter_is_frozen_during_an_emergency_and_admits_after_lapse() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    let h = activate(&db, &st, &founders, t0);
+
+    // A replacement founder charter (version 2) is refused on the writer's own
+    // publish door while the emergency holds — the effective charter is frozen on
+    // *every* door, not just the amendment-proposal path (ADR-0023 §3b).
+    let v2 = founder_charter_v2(&db, &founders, GovernanceStructure::default());
+    let v2_hash = v2.charter_hash();
+    {
+        let mut log = AppendLog::new(&db);
+        let err = store_charter(&mut log, &db, &st, v2.clone(), t0 + 10).unwrap_err();
+        assert!(
+            matches!(err, CharterError::FrozenByEmergency { .. }),
+            "expected FrozenByEmergency, got {err:?}"
+        );
+    }
+    // The root is untouched — still the genesis version 1.
+    assert_eq!(founder_charter(&db).unwrap().unwrap().charter().version, 1);
+
+    // Lapse the emergency early (author + one co-sign of the lapse); the same
+    // charter now admits and re-roots the community.
+    let lapse = em_lapse(&db, &founders[0], h, t0 + 20);
+    em_cosign(&db, &st, &founders[1], lapse, t0 + 20);
+    {
+        let mut log = AppendLog::new(&db);
+        store_charter(&mut log, &db, &st, v2, t0 + 30)
+            .expect("a replacement founder charter admits once the emergency has lapsed");
+    }
+    let root = founder_charter(&db).unwrap().unwrap();
+    assert_eq!(root.charter().version, 2);
+    assert_eq!(root.charter_hash(), v2_hash);
+    let eff = rrn_governance::tally::effective_charter(&db, &st.public_key())
+        .unwrap()
+        .unwrap();
+    assert_eq!(eff.version, 2);
+}
+
+#[test]
+fn the_founder_charter_freeze_lifts_at_scheduled_expiry() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0); // 72 h default
+                                       // Read the scheduled expiry off the derived emergency rather than re-deriving it
+                                       // from the helper's duration.
+    let expiry = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &st.public_key())
+        .unwrap()
+        .unwrap()
+        .scheduled_expiry;
+    let v2 = founder_charter_v2(&db, &founders, GovernanceStructure::default());
+
+    // Still frozen at the scheduled-expiry instant (the active span is inclusive of
+    // its bound, matching `an_emergency_expires_exactly_at_its_scheduled_bound`).
+    {
+        let mut log = AppendLog::new(&db);
+        let err = store_charter(&mut log, &db, &st, v2.clone(), expiry).unwrap_err();
+        assert!(
+            matches!(err, CharterError::FrozenByEmergency { .. }),
+            "expected FrozenByEmergency at the scheduled bound, got {err:?}"
+        );
+    }
+    // One second past the scheduled expiry: the freeze has lifted without any lapse.
+    {
+        let mut log = AppendLog::new(&db);
+        store_charter(&mut log, &db, &st, v2, expiry + 1)
+            .expect("the freeze lifts once the emergency has expired");
+    }
+    assert_eq!(founder_charter(&db).unwrap().unwrap().charter().version, 2);
+}
+
+#[test]
+fn emergency_params_cannot_be_re_tuned_mid_emergency() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let timeline_before = emergency::emergency_timeline(&db, &st.public_key()).unwrap();
+
+    // A v2 founder charter that tries to raise the declaration bar and tighten the
+    // renewal cap — i.e. re-tune the emergency's own legitimacy parameters, which
+    // `emergency_params` reads from the founder root — is refused while active.
+    let retune = GovernanceStructure {
+        emergency_declaration_pct: 100,
+        max_consecutive_renewals: 0,
+        ..GovernanceStructure::default()
+    };
+    let v2 = founder_charter_v2(&db, &founders, retune);
+    {
+        let mut log = AppendLog::new(&db);
+        let err = store_charter(&mut log, &db, &st, v2, t0 + 10).unwrap_err();
+        assert!(
+            matches!(err, CharterError::FrozenByEmergency { .. }),
+            "expected FrozenByEmergency, got {err:?}"
+        );
+    }
+    let timeline_after = emergency::emergency_timeline(&db, &st.public_key()).unwrap();
+    assert_eq!(
+        timeline_before, timeline_after,
+        "a refused re-tune leaves the running emergency's derived timeline unchanged"
+    );
+}
+
+#[test]
+fn a_regressed_station_clock_cannot_slip_a_founder_charter_past_the_freeze() {
+    let (db, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let activation = emergency::active_emergency_at(&db, t0 + 1, u64::MAX, &st.public_key())
+        .unwrap()
+        .unwrap()
+        .activation_instant;
+
+    // Grow the log past the activation instant: an Emergency measure admitted at
+    // t0+100 makes the tail's `created_at` strictly greater than the activation.
+    let charter = rrn_governance::tally::effective_charter(&db, &st.public_key())
+        .unwrap()
+        .unwrap();
+    propose_emergency(&db, &st, &charter, &founders[0], t0 + 100 + 3600, t0 + 100);
+
+    // Step the station clock *below* the activation instant. The guard consults the
+    // monotone-clamped admission instant `now.max(tail.created_at)` = t0+100, not the
+    // regressed `now`, so the freeze still holds (mirror of the enactment freeze).
+    let regressed = activation - 500_000;
+    let v2 = founder_charter_v2(&db, &founders, GovernanceStructure::default());
+    let mut log = AppendLog::new(&db);
+    let err = store_charter(&mut log, &db, &st, v2, regressed).unwrap_err();
+    assert!(
+        matches!(err, CharterError::FrozenByEmergency { .. }),
+        "a regressed clock must not lift the freeze, got {err:?}"
+    );
+}
+
+#[test]
+fn a_genesis_charter_is_never_frozen() {
+    // On an empty log there can be no emergency, and the guard must not consult a
+    // predicate in a way that errors — a version-1 charter always admits.
+    let db = fresh_db();
+    let founders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+    let params = CharterParams {
+        version: 1,
+        community_id: "commons".into(),
+        founding_principles: vec![],
+        rights_floor: vec![],
+        governance_structure: GovernanceStructure::default(),
+        amendment_rules: AmendmentRules::default(),
+        founders: founders.iter().map(addr).collect(),
+        created_at: 0,
+        previous_hash: None,
+    };
+    let signed = create_charter(params, &founders).unwrap();
+    let mut log = AppendLog::new(&db);
+    store_charter(&mut log, &db, &station(), signed, 0).expect("a genesis charter is never frozen");
+    assert!(founder_charter(&db).unwrap().is_some());
+}
+
+#[test]
+fn a_refused_then_admitted_founder_charter_replays_identically() {
+    let (db1, founders, st) = three_founder_community();
+    let t0 = 1_000_000;
+    let h = activate(&db1, &st, &founders, t0);
+    let v2 = founder_charter_v2(&db1, &founders, GovernanceStructure::default());
+    // Refused while the emergency holds — nothing is appended.
+    {
+        let mut log = AppendLog::new(&db1);
+        assert!(store_charter(&mut log, &db1, &st, v2.clone(), t0 + 10).is_err());
+    }
+    // Then admitted after an early lapse.
+    let lapse = em_lapse(&db1, &founders[0], h, t0 + 20);
+    em_cosign(&db1, &st, &founders[1], lapse, t0 + 20);
+    {
+        let mut log = AppendLog::new(&db1);
+        store_charter(&mut log, &db1, &st, v2, t0 + 30).unwrap();
+    }
+    let root1 = founder_charter(&db1).unwrap().unwrap();
+    let eff1 = rrn_governance::tally::effective_charter(&db1, &st.public_key())
+        .unwrap()
+        .unwrap();
+
+    // Replay every signed payload onto a fresh replica with a late admission clock:
+    // the derived root and effective charter are identical, because the refusal left
+    // no trace on the log (the writer gated; replay just trusts what is there).
+    let late = t0 + 500 * DAY;
+    let db2 = fresh_db();
+    {
+        let src = AppendLog::new(&db1);
+        let mut dst = AppendLog::new(&db2);
+        for entry in src.iter_from(1) {
+            dst.append_raw(entry.unwrap().payload, late).unwrap();
+        }
+    }
+    let root2 = founder_charter(&db2).unwrap().unwrap();
+    let eff2 = rrn_governance::tally::effective_charter(&db2, &st.public_key())
+        .unwrap()
+        .unwrap();
+    assert_eq!(root1.charter_hash(), root2.charter_hash());
+    assert_eq!(eff1, eff2);
+}
+
+#[test]
+fn a_same_version_founder_charter_cannot_re_root_during_an_emergency() {
+    // `founder_charter` selects the highest version, breaking ties toward the later
+    // seq — so a *second* version-1 founder charter would re-root a v1 community.
+    // The freeze is on the asset (any charter that lands on an existing root), not a
+    // version-number test, so this must be refused too (ADR-0023 §3b). This is the
+    // realistic shape of the vector, since every construction path is version-1.
+    let (db, founders, st) = three_founder_community(); // genesis v1 is the root
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+
+    // A fresh self-declared founding set co-signs a competing version-1 charter
+    // (trust-on-first-use: it clears its *own* founder threshold).
+    let usurpers: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+    let params = CharterParams {
+        version: 1,
+        community_id: "commons".into(),
+        founding_principles: vec![],
+        rights_floor: vec![],
+        governance_structure: GovernanceStructure::default(),
+        amendment_rules: AmendmentRules::default(),
+        founders: usurpers.iter().map(addr).collect(),
+        created_at: 0,
+        previous_hash: None,
+    };
+    let competing = create_charter(params, &usurpers).unwrap();
+    let mut log = AppendLog::new(&db);
+    let err = store_charter(&mut log, &db, &st, competing, t0 + 10).unwrap_err();
+    assert!(
+        matches!(err, CharterError::FrozenByEmergency { .. }),
+        "an equal-version re-root must be frozen too, got {err:?}"
+    );
 }
 
 // --- Invariant 2: automatic expiry, caps, cooldown (ADR-0023 §4) ------------

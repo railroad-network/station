@@ -2872,7 +2872,7 @@ impl Core {
         let version = signed.charter().version;
 
         let mut log = AppendLog::new(&self.db);
-        store_charter(&mut log, &station, signed, now)
+        store_charter(&mut log, &self.db, &station, signed, now)
             .map_err(|e| invalid_params(e.to_string()))?;
         ok(&rpc::GovCharterResult {
             charter_hash,
@@ -2929,7 +2929,7 @@ impl Core {
             .map_err(|e| invalid_params(e.to_string()))?;
 
         let mut log = AppendLog::new(&self.db);
-        store_pending_charter(&mut log, &station, signed.clone(), now)
+        store_pending_charter(&mut log, &self.db, &station, signed.clone(), now)
             .map_err(|e| invalid_params(e.to_string()))?;
         ok(&self.pending_charter_view(&signed))
     }
@@ -3025,7 +3025,7 @@ impl Core {
         let mut log = AppendLog::new(&self.db);
         // Threshold-clearing appends publish (verify_founders holds); short of it,
         // the Charter stays pending — both are the same append, gated on reads.
-        store_pending_charter(&mut log, &station, signed.clone(), now)
+        store_pending_charter(&mut log, &self.db, &station, signed.clone(), now)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(signed)
     }
@@ -10660,6 +10660,27 @@ mod tests {
             &mut core,
             "governance_charter_begin",
             serde_json::json!({ "community_id": "pilot", "founders": founders }),
+        );
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn governance_init_charter_pins_version_1_and_refuses_a_second() {
+        // A higher-version founder charter is not constructible through the RPC:
+        // `init_charter` hard-codes version 1 and refuses a second charter. The
+        // `store_charter` §3b emergency freeze is therefore defence in depth for a
+        // future write path, not a live RPC-reachable hole (ADR-0023 §3b).
+        let mut core = test_core();
+        let r = call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({ "community_id": "commons" }),
+        );
+        assert_eq!(r["version"], 1);
+        let err = call_err(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({ "community_id": "commons" }),
         );
         assert_eq!(err.code, rpc::INVALID_PARAMS);
     }

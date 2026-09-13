@@ -930,10 +930,11 @@ the sharpest capture lever in the system, so know exactly what it does:
 - **What it compresses:** the deliberation/voting window for `Emergency`-kind
   proposals admitted while the declaration is active — down to 24 hours (the
   floor; a charter cannot go lower). Everything else runs its normal window.
-- **What it freezes and pins:** no charter amendment can be admitted or enacted
-  while the emergency holds, and the electorate (who counts, who may vote) is
-  pinned at the moment of activation, so nobody can be minted into it
-  mid-crisis.
+- **What it freezes and pins:** no charter amendment *or replacement founder
+  charter* can be admitted (or enacted) while the emergency holds — the whole
+  constitution is frozen, not just one door — and the electorate (who counts,
+  who may vote) is pinned at the moment of activation, so nobody can be minted
+  into it mid-crisis.
 - **What it never touches:** settlement and dispute windows, the debt floor,
   certificates, reputation. A flood does not authorize economic restructuring.
 - **How it ends:** by itself. Default 72 hours, at most 7 days per declaration,
