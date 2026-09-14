@@ -65,6 +65,7 @@ Decision Records) convention, using the structure in
 - [0025 — Equivocation cases are a distinct jury case kind with a Lapsed default and identity-anchored sortition](0025-equivocation-dispute-cases.md)
 - [0026 — The Reticulum sidecar is ratified: pinned `rnsd` 1.5, driven from the station, native Rust deferred](0026-reticulum-sidecar-ratified.md)
 - [0027 — Emergency declaration activation is a single first-crossing event, and a part-signed declaration expires](0027-emergency-declaration-activation-and-ttl.md)
+- [0028 — A self-custody CLI member wallet: the non-mobile member device, a sealed-channel client with an offline outbox](0028-non-mobile-member-wallet.md)
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here.
