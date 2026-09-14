@@ -1,5 +1,5 @@
-//! The T2.4.1 offline exit tests, in two parts (split by ADR-0020 §7 / T2.11.4:
-//! a writer never pulls, so a writer no longer carries a peer):
+//! The offline exit tests, in two parts (split under the single-writer model,
+//! ADR-0020 §7: a writer never pulls, so a writer no longer carries a peer):
 //!
 //! 1. [`offline_full_lifecycle_on_a_peerless_writer`] — a single **writer**
 //!    `station` daemon, bound to loopback only, with **no peers at all** (fully
@@ -7,12 +7,13 @@
 //!    cert-backed *offline* spend delivered by DTN — and shuts down cleanly.
 //! 2. [`a_replica_against_an_unreachable_writer_reports_it_and_shuts_down`] — a
 //!    **replica** pointed at an unreachable **black-hole** writer proves the
-//!    T2.4.1 timeout fix: a real pull round completes under `PEER_DIAL_TIMEOUT`
-//!    (`last_attempt_at` set, `reachable` false), the replica admits nothing, and
-//!    the daemon stops promptly rather than parking on the OS SYN timeout. This
-//!    is where the bounded-dial evidence lives now, because only a replica dials.
+//!    bounded-dial timeout fix: a real pull round completes under
+//!    `PEER_DIAL_TIMEOUT` (`last_attempt_at` set, `reachable` false), the replica
+//!    admits nothing, and the daemon stops promptly rather than parking on the OS
+//!    SYN timeout. This is where the bounded-dial evidence lives now, because only
+//!    a replica dials.
 //!
-//! Member model (see the T2.4.1 PR): the writer **operator** is member A and the
+//! Member model: the writer **operator** is member A and the
 //! sole certificate holder (issuance is a live operator round-trip — a DTN cert
 //! request is refused `UnroutableKind`). A second test keypair is member **B**,
 //! whose confirmations reach the station **only** through `bundle_submit` — the
@@ -55,7 +56,7 @@ const WINDOW: u64 = 5;
 const BLACK_HOLE: &str = "10.255.255.1:7411";
 
 /// Writes a **writer** config with no peers (a writer never pulls, ADR-0020 §1),
-/// mDNS advertising ON (per the T2.4.1 ticket), loopback-only binds on ephemeral
+/// mDNS advertising ON (per the offline-hardening design), loopback-only binds on ephemeral
 /// ports, and fast windows/timers.
 fn write_config(dir: &Path) {
     let text = format!(
@@ -415,7 +416,7 @@ async fn run() {
 }
 
 /// A read-replica pointed at an unreachable (black-hole) writer: the bounded-dial
-/// evidence T2.4.1 introduced now lives here, because only a replica pulls
+/// reachability evidence now lives here, because only a replica pulls
 /// (ADR-0020 §7). The replica attempts the writer, is bounded by
 /// `PEER_DIAL_TIMEOUT` (never the OS SYN timeout), reports the peer as attempted
 /// but never reachable, admits nothing, and shuts down promptly.
@@ -450,8 +451,8 @@ async fn replica_run() {
     assert_eq!(st.connectivity.peers[0].address, BLACK_HOLE);
 
     // A real pull round against the black hole completes under the dial bound and
-    // is recorded: `last_attempt_at` set, `reachable` false — the T2.4.1 timeout
-    // fix, proven on the path that actually dials.
+    // is recorded: `last_attempt_at` set, `reachable` false — the bounded-dial
+    // timeout fix, proven on the path that actually dials.
     poll_until(Duration::from_secs(15), || async {
         let st: StatusResult =
             serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
@@ -485,11 +486,78 @@ async fn replica_run() {
         "a replica with an unreachable writer admits nothing"
     );
 
+    // The transport half of "a replica never admits": a DTN bundle handed to the
+    // core directly (the code path both the Reticulum and SMS inbound loops use)
+    // is dropped — no receipt, nothing appended. Even a well-formed bundle whose
+    // records would pass a writer's front door is refused before ingest.
+    let sender = Keypair::generate();
+    let receiver = Keypair::generate();
+    let proposal = SignedProposal::sign(
+        TransactionProposal::new(
+            addr(&sender),
+            addr(&receiver),
+            100,
+            None,
+            0,
+            START,
+            START + 100_000,
+        ),
+        &sender,
+    );
+    let entry = outbox_entry(&sender, 0, Hash::from_bytes([0u8; 32]), &proposal, START);
+    let bundle = Bundle::new(vec![EntryEnvelope::from_signed(&entry)], START).encode();
+    let receipt = station.core().ingest_bundle_bytes(bundle).await;
+    assert!(
+        receipt.is_none(),
+        "a replica returns no receipt for a DTN bundle"
+    );
+    assert_eq!(
+        verify_chain(&dir.path().join(DB_FILE)),
+        0,
+        "a replica ingests nothing over a DTN transport"
+    );
+
     // And it stops cleanly and promptly (bounded by PEER_DIAL_TIMEOUT).
     let socket = station.socket_path().to_path_buf();
     station.shutdown().await;
     assert!(
         !socket.exists(),
         "the socket must be removed on clean shutdown"
+    );
+}
+
+/// A writer refuses to start with a peer list (ADR-0020 §1): the single-writer
+/// discipline holds at startup, not only in the config validator's unit test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_with_peers_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    Station::init(dir.path(), PASSPHRASE).unwrap();
+    // Default role is writer; give it a peer — a misconfiguration.
+    let text = format!(
+        "[peers]\n\
+         list = [\"{BLACK_HOLE}\"]\n\n\
+         [network]\n\
+         listen = \"127.0.0.1:0\"\n\n\
+         [mobile]\n\
+         advertise = false\n\
+         listen = \"127.0.0.1:0\"\n"
+    );
+    std::fs::write(dir.path().join("config.toml"), text).unwrap();
+
+    let result = Station::open(StationParams {
+        data_dir: dir.path().to_path_buf(),
+        passphrase: PASSPHRASE.into(),
+        clock: Clock::manual(START),
+    })
+    .await;
+    // `Station` is not `Debug`, so match rather than `expect_err`.
+    let err = match result {
+        Ok(_) => panic!("a writer with a peer list must refuse to start"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("writer never pulls"),
+        "unexpected error: {msg}"
     );
 }

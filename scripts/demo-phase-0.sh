@@ -6,7 +6,7 @@
 # A community has exactly one *writer* station — it owns the log and admits
 # records at its front door — and any number of *replicas*, read-only copies that
 # pull the writer's chain and re-derive state but admit nothing (ADR-0020 §1/§7,
-# and its T2.11.4 Clarification: the writer never pulls; a replica never admits).
+# and its §7 Clarification: the writer never pulls; a replica never admits).
 #
 # This demo brings up:
 #   - a WRITER station (the community's station), with no peers, and

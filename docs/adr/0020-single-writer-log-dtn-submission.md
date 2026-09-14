@@ -176,11 +176,12 @@ default `writer`):
 
 A replica re-derives station-signed state (balances from settlement, governance
 tallies, emergencies) by replaying records the *writer* signed, but the ledger
-and governance readers pin those records to *this* station's signer (ADR-0022 §5
-/ the T2.1.4 and T2.11.3 signer-pinning work, decision (a)). A replica's own key
-is not the writer's, so those readers correctly decline the writer-signed
-records: a replica faithfully copies the *chain*, and its derived station-signed
-views read as "genesis and nothing else" rather than mirroring the writer's.
+and governance readers pin those records to *this* station's signer (the
+station-signer-pinning work, decision (a); see the threat model's `rrn-governance`
+residual list). A replica's own key is not the writer's, so those readers
+correctly decline the writer-signed records: a replica faithfully copies the
+*chain*, and its derived station-signed views read as "genesis and nothing else"
+rather than mirroring the writer's.
 Making a replica's derived views match the writer's would require a
 replica-supplied expected-writer key at the pinning boundary; that is left as a
 follow-up, not part of this clarification.

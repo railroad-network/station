@@ -1,6 +1,5 @@
 //! The two-station exit test, reshaped for the single-writer model (ADR-0020 §1,
-//! and its §7 Clarification / T2.11.4: the writer never pulls, a replica never
-//! admits).
+//! and its §7 Clarification: the writer never pulls, a replica never admits).
 //!
 //! A community has exactly one **writer** — the station that owns the chain and
 //! admits records at its front door — and any number of **replicas**, read-only
@@ -14,8 +13,9 @@
 //! *offline* and his confirmation reaches the writer through the real courier
 //! path (`bundle_submit`, ADR-0020 §3), exactly as a phone's would. The writer
 //! settles. The replica then converges to a byte-identical copy of the writer's
-//! chain and derives the same balances — and refuses any write with the typed
-//! read-replica error.
+//! chain — and refuses any write with the typed read-replica error. (Its own
+//! balance view reads zero: it pins station-signed records to its own key, not
+//! the writer's — the documented signer-pinning residual, asserted below.)
 //!
 //! Both stations run in-process as Tokio tasks sharing one manual [`Clock`] so the
 //! test fast-forwards across the settlement window atomically.
@@ -322,19 +322,37 @@ async fn writer_admits_and_settles_while_a_replica_copies_the_chain() {
     // The replica saw the records by replication, not by admitting them.
     assert!(has_kind(&client_r, "settlement").await || has_kind(&client_r, "confirmation").await);
 
+    // A replica's admitting sweep timers are gated off; even if the operator
+    // drives a sweep by hand it is a no-op and appends nothing, so the replica
+    // cannot fork its copy by settling under its own key.
+    let before = log_content_set(&db_r);
+    assert_eq!(
+        replica.sweep().await,
+        0,
+        "a replica sweep must admit nothing"
+    );
+    assert_eq!(replica.charge_contracts().await, 0);
+    assert_eq!(replica.enact_governance().await, 0);
+    assert_eq!(replica.resolve_disputes().await, 0);
+    assert_eq!(
+        log_content_set(&db_r),
+        before,
+        "a replica's sweep hooks must not append to its chain"
+    );
+
     // The replica re-derives from the chain but pins station-signed records to
-    // *its own* station key (T2.11.3 / T2.1.4 decision (a)), which differs from
-    // the writer's — so the writer-signed **settlement** records are not counted
-    // in the replica's balance view: it reads 0, not -300/+300. This is the
-    // documented signer-pinning residual (a read-replica pins to the wrong key),
-    // explicitly out of scope for T2.11.4; the *chain* is what a replica copies
-    // faithfully. Asserted here so the residual is legible and a regression in
-    // the pinning boundary would be caught.
+    // *its own* station key (the station signer-pinning residual, decision (a)),
+    // which differs from the writer's — so the writer-signed **settlement**
+    // records are not counted in the replica's balance view: it reads 0, not
+    // -300/+300. This is the documented signer-pinning residual (a read-replica
+    // pins to the wrong key), out of scope for this change; the *chain* is what a
+    // replica copies faithfully. Asserted here so the residual is legible and a
+    // regression in the pinning boundary would be caught.
     assert_eq!(
         balance(&client_r, &alice).await,
         0,
         "a replica cannot re-derive the writer-signed settlement under its own key \
-         (documented T2.1.4/T2.11.3 residual)"
+         (documented signer-pinning residual)"
     );
     assert_eq!(balance(&client_r, &bob).await, 0);
 
