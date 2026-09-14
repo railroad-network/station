@@ -23,6 +23,7 @@
 //! human should look at. The station logs violations for operator review
 //! ([`crate::snapshot`]) and scoring proceeds unchanged.
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
@@ -161,8 +162,13 @@ fn allowance(from_time: i64, to_time: i64) -> f32 {
 
 /// Whether `address` has been vouched for by a member established enough to
 /// anchor it.
-pub fn is_anchored(db: &Database, address: &Address, at_time: i64) -> Result<bool> {
-    is_anchored_bounded(db, address, at_time, u64::MAX)
+pub fn is_anchored(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    station: &PublicKey,
+) -> Result<bool> {
+    is_anchored_bounded(db, address, at_time, u64::MAX, station)
 }
 
 /// Like [`is_anchored`], but only vouches (and voucher evidence) admitted within
@@ -174,8 +180,9 @@ pub fn is_anchored_bounded(
     address: &Address,
     at_time: i64,
     max_seq: u64,
+    station: &PublicKey,
 ) -> Result<bool> {
-    Ok(anchoring_voucher_bounded(db, address, at_time, max_seq)?.is_some())
+    Ok(anchoring_voucher_bounded(db, address, at_time, max_seq, station)?.is_some())
 }
 
 /// The member whose vouch anchors `address`, if any: the first, in log order, to
@@ -204,8 +211,9 @@ pub fn anchoring_voucher(
     db: &Database,
     address: &Address,
     at_time: i64,
+    station: &PublicKey,
 ) -> Result<Option<Address>> {
-    anchoring_voucher_bounded(db, address, at_time, u64::MAX)
+    anchoring_voucher_bounded(db, address, at_time, u64::MAX, station)
 }
 
 /// Like [`anchoring_voucher`], but only vouches admitted within the log prefix
@@ -216,9 +224,10 @@ pub fn anchoring_voucher_bounded(
     address: &Address,
     at_time: i64,
     max_seq: u64,
+    station: &PublicKey,
 ) -> Result<Option<Address>> {
     let log = AppendLog::new(db);
-    let scorer = ReputationScorer::new(db);
+    let scorer = ReputationScorer::new(db, station);
 
     for entry in log.iter_from(1) {
         let entry = entry?;
@@ -483,9 +492,9 @@ mod tests {
         maxed_out_member(&db, &patron, &station, t);
         append_vouch(&db, &patron, &addr(&newcomer), t);
 
-        assert!(is_anchored(&db, &addr(&newcomer), t).unwrap());
+        assert!(is_anchored(&db, &addr(&newcomer), t, &station.public_key()).unwrap());
         assert_eq!(
-            anchoring_voucher(&db, &addr(&newcomer), t).unwrap(),
+            anchoring_voucher(&db, &addr(&newcomer), t, &station.public_key()).unwrap(),
             Some(addr(&patron))
         );
     }
@@ -500,7 +509,7 @@ mod tests {
         // The ceiling with three of five dimensions structurally zero is
         // 0.55·5.0 = 2.75. The band-relative threshold sits under it, which the
         // original 3.0 did not — the whole reason ADR-0009 was amended.
-        let composite = ReputationScorer::new(&db)
+        let composite = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&patron), t)
             .unwrap()
             .composite();
@@ -515,31 +524,34 @@ mod tests {
     fn vouching_for_yourself_anchors_nothing() {
         let db = fresh_db();
         let alice = Keypair::generate();
+        let station = Keypair::generate();
         let t = 6 * MONTH;
 
         append_vouch(&db, &alice, &addr(&alice), t);
-        assert!(!is_anchored(&db, &addr(&alice), t).unwrap());
+        assert!(!is_anchored(&db, &addr(&alice), t, &station.public_key()).unwrap());
     }
 
     #[test]
     fn a_vouch_from_a_nobody_does_not_anchor() {
         let db = fresh_db();
         let (stranger, newcomer) = (Keypair::generate(), Keypair::generate());
+        let station = Keypair::generate();
         let t = 6 * MONTH;
 
         // A fresh identity with no history vouches: the cheapest Sybil move.
         append_vouch(&db, &stranger, &addr(&newcomer), t);
-        assert!(!is_anchored(&db, &addr(&newcomer), t).unwrap());
+        assert!(!is_anchored(&db, &addr(&newcomer), t, &station.public_key()).unwrap());
     }
 
     #[test]
     fn a_vouch_issued_later_does_not_anchor_yet() {
         let db = fresh_db();
         let (patron, newcomer) = (Keypair::generate(), Keypair::generate());
+        let station = Keypair::generate();
         let t = 6 * MONTH;
 
         append_vouch(&db, &patron, &addr(&newcomer), t);
         // Asked about a moment before the vouch existed.
-        assert!(!is_anchored(&db, &addr(&newcomer), t - 1).unwrap());
+        assert!(!is_anchored(&db, &addr(&newcomer), t - 1, &station.public_key()).unwrap());
     }
 }

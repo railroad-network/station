@@ -35,6 +35,7 @@
 //! function of everyone's replayable score), so it is not tied to this station's
 //! snapshot cache.
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
 use rrn_storage::db::Database;
 
@@ -63,8 +64,13 @@ pub fn composite_to_centi(composite: f32) -> u64 {
 /// The reputation `address` would stake on a Tier-2 confirmation made at
 /// `at_time`: their raw composite in centi-points. Replayable, so a later dispute
 /// can recompute the exact stake that was at risk.
-pub fn tier2_stake_centi(db: &Database, address: &Address, at_time: i64) -> Result<u64> {
-    let raw = ReputationScorer::new(db)
+pub fn tier2_stake_centi(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    station: &PublicKey,
+) -> Result<u64> {
+    let raw = ReputationScorer::new(db, station)
         .score_raw_at(address, at_time)?
         .composite();
     Ok(composite_to_centi(raw))
@@ -81,10 +87,14 @@ pub fn tier2_stake_centi(db: &Database, address: &Address, at_time: i64) -> Resu
 /// identical on every replica, but the returned **order is not** deterministic (it
 /// follows a hash-set iteration): a caller that needs a stable order — a dispute
 /// draw, say — must sort the result itself.
-pub fn established_members(db: &Database, at_time: i64) -> Result<Vec<Address>> {
-    let scorer = ReputationScorer::new(db);
+pub fn established_members(
+    db: &Database,
+    at_time: i64,
+    station: &PublicKey,
+) -> Result<Vec<Address>> {
+    let scorer = ReputationScorer::new(db, station);
     let mut members = Vec::new();
-    for address in known_addresses(db)? {
+    for address in known_addresses(db, station)? {
         if scorer.score(&address, at_time)?.composite() >= BAND_MEMBER_MIN {
             members.push(address);
         }
@@ -94,8 +104,8 @@ pub fn established_members(db: &Database, at_time: i64) -> Result<Vec<Address>> 
 
 /// How many known members hold an **effective** (anchored) composite at or above
 /// the Member band as of `at_time` — the count the bootstrap grace turns on.
-pub fn established_member_count(db: &Database, at_time: i64) -> Result<usize> {
-    Ok(established_members(db, at_time)?.len())
+pub fn established_member_count(db: &Database, at_time: i64, station: &PublicKey) -> Result<usize> {
+    Ok(established_members(db, at_time, station)?.len())
 }
 
 /// Whether the community is still in **bootstrap grace** as of `at_time`: fewer
@@ -106,8 +116,8 @@ pub fn established_member_count(db: &Database, at_time: i64) -> Result<usize> {
 /// (ADR-0012), and disputes (ADR-0014) all key their bootstrap relaxations off,
 /// so a community is either bootstrapping or it is not — uniformly across all
 /// three. Like [`established_member_count`] it is a pure function of the log.
-pub fn in_grace(db: &Database, at_time: i64) -> Result<bool> {
-    Ok(established_member_count(db, at_time)? < BOOTSTRAP_GRACE_THRESHOLD)
+pub fn in_grace(db: &Database, at_time: i64, station: &PublicKey) -> Result<bool> {
+    Ok(established_member_count(db, at_time, station)? < BOOTSTRAP_GRACE_THRESHOLD)
 }
 
 /// The community's governing electorate as of `at_time` (ADR-0015): the body that
@@ -127,10 +137,15 @@ pub fn in_grace(db: &Database, at_time: i64) -> Result<bool> {
 /// this crate deliberately does not depend on. As with [`established_members`] the
 /// returned order is **not** deterministic; a caller needing a stable order (a
 /// dispute draw, say) must sort it.
-pub fn grace_electorate(db: &Database, founders: &[Address], at_time: i64) -> Result<Vec<Address>> {
+pub fn grace_electorate(
+    db: &Database,
+    founders: &[Address],
+    at_time: i64,
+    station: &PublicKey,
+) -> Result<Vec<Address>> {
     // `established_members().len()` is the grace predicate, so reuse the set we
     // just computed rather than scoring the community a second time.
-    let mut electorate = established_members(db, at_time)?;
+    let mut electorate = established_members(db, at_time, station)?;
     if electorate.len() < BOOTSTRAP_GRACE_THRESHOLD {
         for founder in founders {
             if !electorate.contains(founder) {
@@ -147,10 +162,15 @@ pub fn grace_electorate(db: &Database, founders: &[Address], at_time: i64) -> Re
 /// the position-bounded form governance uses to pin an electorate at a window's
 /// log position (ADR-0022 §5), closing the back-dated-evidence packing vector.
 /// `max_seq == u64::MAX` is exactly [`established_members`].
-pub fn established_members_asof(db: &Database, at_time: i64, max_seq: u64) -> Result<Vec<Address>> {
-    let scorer = ReputationScorer::new(db);
+pub fn established_members_asof(
+    db: &Database,
+    at_time: i64,
+    max_seq: u64,
+    station: &PublicKey,
+) -> Result<Vec<Address>> {
+    let scorer = ReputationScorer::new(db, station);
     let mut members = Vec::new();
-    for address in known_addresses(db)? {
+    for address in known_addresses(db, station)? {
         if scorer
             .score_at_position(&address, at_time, max_seq)?
             .composite()
@@ -164,14 +184,24 @@ pub fn established_members_asof(db: &Database, at_time: i64, max_seq: u64) -> Re
 
 /// Position-bounded [`established_member_count`] (T2.1.3): the count as of the log
 /// prefix `[1, max_seq]`.
-pub fn established_member_count_asof(db: &Database, at_time: i64, max_seq: u64) -> Result<usize> {
-    Ok(established_members_asof(db, at_time, max_seq)?.len())
+pub fn established_member_count_asof(
+    db: &Database,
+    at_time: i64,
+    max_seq: u64,
+    station: &PublicKey,
+) -> Result<usize> {
+    Ok(established_members_asof(db, at_time, max_seq, station)?.len())
 }
 
 /// Position-bounded [`in_grace`] (T2.1.3): whether the community was in bootstrap
 /// grace as of the log prefix `[1, max_seq]`.
-pub fn in_grace_asof(db: &Database, at_time: i64, max_seq: u64) -> Result<bool> {
-    Ok(established_member_count_asof(db, at_time, max_seq)? < BOOTSTRAP_GRACE_THRESHOLD)
+pub fn in_grace_asof(
+    db: &Database,
+    at_time: i64,
+    max_seq: u64,
+    station: &PublicKey,
+) -> Result<bool> {
+    Ok(established_member_count_asof(db, at_time, max_seq, station)? < BOOTSTRAP_GRACE_THRESHOLD)
 }
 
 /// Position-bounded [`grace_electorate`] (T2.1.3): the governing electorate as of
@@ -183,8 +213,9 @@ pub fn grace_electorate_asof(
     founders: &[Address],
     at_time: i64,
     max_seq: u64,
+    station: &PublicKey,
 ) -> Result<Vec<Address>> {
-    let mut electorate = established_members_asof(db, at_time, max_seq)?;
+    let mut electorate = established_members_asof(db, at_time, max_seq, station)?;
     if electorate.len() < BOOTSTRAP_GRACE_THRESHOLD {
         for founder in founders {
             if !electorate.contains(founder) {
@@ -255,8 +286,9 @@ pub fn evaluate_tier2_confirmation(
     db: &Database,
     confirmer: &Address,
     at_time: i64,
+    station: &PublicKey,
 ) -> Result<Tier2Eligibility> {
-    let scorer = ReputationScorer::new(db);
+    let scorer = ReputationScorer::new(db, station);
     let effective = scorer.score(confirmer, at_time)?.composite();
     let stake_centi = composite_to_centi(scorer.score_raw_at(confirmer, at_time)?.composite());
 
@@ -269,7 +301,7 @@ pub fn evaluate_tier2_confirmation(
         });
     }
     // Below the floor: the count decides grace vs. refusal.
-    let established = established_member_count(db, at_time)?;
+    let established = established_member_count(db, at_time, station)?;
     Ok(decide(effective, stake_centi, established))
 }
 
@@ -387,12 +419,26 @@ mod tests {
 
         // Unbounded: the subject is anchored. Bounded before the vouch's admission:
         // it is not, however old the vouch claims to be.
-        assert!(crate::sybil::is_anchored(&db, &addr(&subject), t).unwrap());
-        assert!(!crate::sybil::is_anchored_bounded(&db, &addr(&subject), t, bound_before).unwrap());
+        assert!(crate::sybil::is_anchored(&db, &addr(&subject), t, &station.public_key()).unwrap());
+        assert!(!crate::sybil::is_anchored_bounded(
+            &db,
+            &addr(&subject),
+            t,
+            bound_before,
+            &station.public_key()
+        )
+        .unwrap());
         // Parity: the unbounded form is exactly the u64::MAX-bounded form.
         assert_eq!(
-            crate::sybil::is_anchored(&db, &addr(&subject), t).unwrap(),
-            crate::sybil::is_anchored_bounded(&db, &addr(&subject), t, u64::MAX).unwrap()
+            crate::sybil::is_anchored(&db, &addr(&subject), t, &station.public_key()).unwrap(),
+            crate::sybil::is_anchored_bounded(
+                &db,
+                &addr(&subject),
+                t,
+                u64::MAX,
+                &station.public_key()
+            )
+            .unwrap()
         );
     }
 
@@ -457,9 +503,13 @@ mod tests {
         append_settled(&db, &buyer, &newcomer, &station, 1, t);
 
         // No member is established, so the bootstrap grace is open.
-        assert_eq!(established_member_count(&db, t).unwrap(), 0);
+        assert_eq!(
+            established_member_count(&db, t, &station.public_key()).unwrap(),
+            0
+        );
 
-        let decision = evaluate_tier2_confirmation(&db, &addr(&newcomer), t).unwrap();
+        let decision =
+            evaluate_tier2_confirmation(&db, &addr(&newcomer), t, &station.public_key()).unwrap();
         match decision {
             Tier2Eligibility::Allowed {
                 stake_centi,
@@ -473,7 +523,7 @@ mod tests {
                 assert!(stake_centi > 0);
                 assert_eq!(
                     stake_centi,
-                    tier2_stake_centi(&db, &addr(&newcomer), t).unwrap()
+                    tier2_stake_centi(&db, &addr(&newcomer), t, &station.public_key()).unwrap()
                 );
             }
             other => panic!("expected grace allowance, got {other:?}"),
@@ -495,14 +545,20 @@ mod tests {
         earn_raw_standing(&db, &patron_a, &station, t);
         earn_raw_standing(&db, &patron_b, &station, t);
         // Before anchoring, neither is *effectively* established (both capped).
-        assert_eq!(established_member_count(&db, t).unwrap(), 0);
+        assert_eq!(
+            established_member_count(&db, t, &station.public_key()).unwrap(),
+            0
+        );
 
         append_vouch(&db, &patron_a, &addr(&patron_b), t);
         append_vouch(&db, &patron_b, &addr(&patron_a), t);
 
         // Now both clear the Member band on their effective (anchored) composite;
         // the many trade counterparties and vouch subjects stay well below it.
-        assert_eq!(established_member_count(&db, t).unwrap(), 2);
+        assert_eq!(
+            established_member_count(&db, t, &station.public_key()).unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -520,7 +576,8 @@ mod tests {
         append_vouch(&db, &patron_b, &addr(&patron_a), t);
 
         // patron_a is established, so confirming is allowed on their own standing.
-        match evaluate_tier2_confirmation(&db, &addr(&patron_a), t).unwrap() {
+        match evaluate_tier2_confirmation(&db, &addr(&patron_a), t, &station.public_key()).unwrap()
+        {
             Tier2Eligibility::Allowed {
                 stake_centi,
                 via_grace,
@@ -558,30 +615,37 @@ mod tests {
 
         // A fresh log has no established members — squarely in grace.
         let db0 = fresh_db();
-        assert!(in_grace(&db0, t).unwrap());
+        assert!(in_grace(&db0, t, &station.public_key()).unwrap());
 
         // Two established is still short of the threshold of three.
         let db2 = fresh_db();
         establish_members(&db2, &station, 2, t);
-        assert_eq!(established_member_count(&db2, t).unwrap(), 2);
-        assert!(in_grace(&db2, t).unwrap());
+        assert_eq!(
+            established_member_count(&db2, t, &station.public_key()).unwrap(),
+            2
+        );
+        assert!(in_grace(&db2, t, &station.public_key()).unwrap());
 
         // Three established tips the community out of grace.
         let db3 = fresh_db();
         establish_members(&db3, &station, 3, t);
-        assert_eq!(established_member_count(&db3, t).unwrap(), 3);
-        assert!(!in_grace(&db3, t).unwrap());
+        assert_eq!(
+            established_member_count(&db3, t, &station.public_key()).unwrap(),
+            3
+        );
+        assert!(!in_grace(&db3, t, &station.public_key()).unwrap());
     }
 
     #[test]
     fn grace_electorate_unions_founders_while_bootstrapping() {
         let db = fresh_db();
+        let station = Keypair::generate();
         let t = 10 * MONTH;
         let (f1, f2) = (Keypair::generate(), Keypair::generate());
         let founders = [addr(&f1), addr(&f2)];
 
         // No established members yet: the electorate is exactly the founders.
-        let electorate = grace_electorate(&db, &founders, t).unwrap();
+        let electorate = grace_electorate(&db, &founders, t, &station.public_key()).unwrap();
         assert_eq!(electorate.len(), 2);
         assert!(electorate.contains(&addr(&f1)));
         assert!(electorate.contains(&addr(&f2)));
@@ -596,7 +660,8 @@ mod tests {
 
         // Two members establish (still in grace); neither is the founder.
         let established = establish_members(&db, &station, 2, t);
-        let electorate = grace_electorate(&db, &[addr(&founder)], t).unwrap();
+        let electorate =
+            grace_electorate(&db, &[addr(&founder)], t, &station.public_key()).unwrap();
 
         // The union is the two established members plus the founder.
         assert_eq!(electorate.len(), 3);
@@ -615,7 +680,7 @@ mod tests {
         // Two members establish, and one of them is also named a founder.
         let established = establish_members(&db, &station, 2, t);
         let founder_addr = addr(&established[0]);
-        let electorate = grace_electorate(&db, &[founder_addr], t).unwrap();
+        let electorate = grace_electorate(&db, &[founder_addr], t, &station.public_key()).unwrap();
 
         // The overlapping founder is not added twice.
         assert_eq!(electorate.len(), 2);
@@ -629,12 +694,13 @@ mod tests {
 
         // Three members establish → grace is over.
         establish_members(&db, &station, 3, t);
-        assert!(!in_grace(&db, t).unwrap());
+        assert!(!in_grace(&db, t, &station.public_key()).unwrap());
 
         // A founder who never established is now excluded: the electorate is the
         // established set alone.
         let outsider = Keypair::generate();
-        let electorate = grace_electorate(&db, &[addr(&outsider)], t).unwrap();
+        let electorate =
+            grace_electorate(&db, &[addr(&outsider)], t, &station.public_key()).unwrap();
         assert_eq!(electorate.len(), 3);
         assert!(!electorate.contains(&addr(&outsider)));
     }

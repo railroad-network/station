@@ -135,7 +135,9 @@ pub fn votes(
         return Ok(HashMap::new());
     }
     let (open_seq, open_time) = (records.open_seq, records.open_time);
-    if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
+    if !records.is_published(effective_cosign_threshold(
+        db, open_time, open_seq, station,
+    )?) {
         return Ok(HashMap::new());
     }
     // Ballot eligibility is pinned at the *emergency activation* position for a
@@ -183,7 +185,7 @@ pub fn votes(
         // Voter eligibility is pinned at the governing electorate position (the
         // proposal's open, or the emergency's activation for a compressed proposal —
         // §3c), not at the ballot's own admission.
-        if !is_eligible_asof(db, &founders, &vote.voter, pin_time, pin_seq)? {
+        if !is_eligible_asof(db, &founders, &vote.voter, pin_time, pin_seq, station)? {
             continue;
         }
         // First ballot wins; a later one from the same voter is ignored.
@@ -219,7 +221,9 @@ pub fn append_vote(
         return Err(VoteError::UnknownProposal(vote.proposal_id));
     };
     let (open_seq, open_time) = (records.open_seq, records.open_time);
-    if !records.is_published(effective_cosign_threshold(db, open_time, open_seq)?) {
+    if !records.is_published(effective_cosign_threshold(
+        db, open_time, open_seq, station,
+    )?) {
         return Err(VoteError::ProposalNotPublished(vote.proposal_id));
     }
     // The ballot will be admitted at the monotone-clamped `now`; the window is on
@@ -247,10 +251,17 @@ pub fn append_vote(
         station,
     )
     .map_err(|e| ProposalError::Emergency(Box::new(e)))?;
-    if !is_eligible_asof(db, &founder_set(db)?, &vote.voter, pin_time, pin_seq)? {
+    if !is_eligible_asof(
+        db,
+        &founder_set(db)?,
+        &vote.voter,
+        pin_time,
+        pin_seq,
+        station,
+    )? {
         return Err(VoteError::VoterNotEstablished {
             voter: vote.voter,
-            composite: composite_at_position(db, &vote.voter, pin_time, pin_seq)?,
+            composite: composite_at_position(db, &vote.voter, pin_time, pin_seq, station)?,
         });
     }
 
@@ -475,7 +486,7 @@ mod tests {
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
         for nonce in 0..10 {
-            append_settled(db, who, station, station, nonce, at);
+            append_settled(db, who, station, &test_station(), nonce, at);
         }
         for _ in 0..10 {
             append_vouch(db, who, &addr(&Keypair::generate()), at);

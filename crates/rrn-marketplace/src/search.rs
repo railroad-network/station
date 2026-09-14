@@ -201,9 +201,11 @@ impl SearchIndex {
         writer.delete_all_documents()?;
 
         let states = compute_all(log, station, now)?;
+        // `station` is threaded on to per-listing writes so the provider's
+        // reputation-at-creation is scored under the community-pinned scorer.
         for state in states.values() {
             if let Some(listing) = state.listing() {
-                self.write_listing(db, &mut writer, listing, state)?;
+                self.write_listing(db, &mut writer, listing, state, station)?;
             }
         }
         writer.commit()?;
@@ -214,9 +216,15 @@ impl SearchIndex {
     ///
     /// The incremental path, for a station applying newly-appended records
     /// rather than replaying everything.
-    pub fn upsert(&self, db: &Database, listing: &Listing, state: &ListingState) -> Result<()> {
+    pub fn upsert(
+        &self,
+        db: &Database,
+        listing: &Listing,
+        state: &ListingState,
+        station: &PublicKey,
+    ) -> Result<()> {
         let mut writer: IndexWriter = self.index.writer(INDEX_WRITER_HEAP_BYTES)?;
-        self.write_listing(db, &mut writer, listing, state)?;
+        self.write_listing(db, &mut writer, listing, state, station)?;
         writer.commit()?;
         Ok(())
     }
@@ -237,6 +245,7 @@ impl SearchIndex {
         writer: &mut IndexWriter,
         listing: &Listing,
         state: &ListingState,
+        station: &PublicKey,
     ) -> Result<()> {
         let status = match state {
             // An expired listing is not closed on the log yet, so the row keeps
@@ -257,7 +266,12 @@ impl SearchIndex {
                 category: listing.category.clone(),
                 status: status.to_string(),
                 price_centi: listing.pricing.amount_centi,
-                reputation_at_creation: reputation_at(db, &listing.provider, listing.created_at),
+                reputation_at_creation: reputation_at(
+                    db,
+                    &listing.provider,
+                    listing.created_at,
+                    station,
+                ),
                 created_at: listing.created_at,
                 expires_at: listing.expires_at,
                 listing_cbor: to_canonical_bytes(listing.clone()),
@@ -489,8 +503,8 @@ fn reputation_now(db: &Database, provider: &Address) -> f32 {
 /// on indexing, never on search, and a failure records `0.0` rather than failing
 /// the index write: the value is for audit and tie-stability, and no read path
 /// gates on it.
-fn reputation_at(db: &Database, provider: &Address, at_time: i64) -> f32 {
-    match rrn_reputation::scoring::ReputationScorer::new(db).score_at(provider, at_time) {
+fn reputation_at(db: &Database, provider: &Address, at_time: i64, station: &PublicKey) -> f32 {
+    match rrn_reputation::scoring::ReputationScorer::new(db, station).score_at(provider, at_time) {
         Ok(profile) => profile.composite(),
         Err(e) => {
             tracing::warn!(
@@ -580,7 +594,7 @@ mod tests {
         let state = compute_state(log, &listing.id, station, NOW)
             .unwrap()
             .unwrap();
-        index.upsert(db, listing, &state).unwrap();
+        index.upsert(db, listing, &state, station).unwrap();
     }
 
     /// Stores a reputation snapshot with the given composite. `composite` is
@@ -924,7 +938,7 @@ mod tests {
         let state = compute_state(&log, &withdrawn.id, &station, NOW)
             .unwrap()
             .unwrap();
-        index.upsert(&db, &withdrawn, &state).unwrap();
+        index.upsert(&db, &withdrawn, &state, &station).unwrap();
 
         assert_eq!(
             titles(&index.search(&db, &SearchQuery::default(), NOW).unwrap()),
@@ -1004,7 +1018,7 @@ mod tests {
         let state = compute_state(&log, &listings[3].id, &station, NOW)
             .unwrap()
             .unwrap();
-        index.upsert(&db, &listings[3], &state).unwrap();
+        index.upsert(&db, &listings[3], &state, &station).unwrap();
 
         let queries = [
             SearchQuery::default(),
@@ -1123,7 +1137,7 @@ mod tests {
             .unwrap();
         let revised = state.listing().unwrap().clone();
         assert_eq!(revised.id, original.id);
-        index.upsert(&db, &revised, &state).unwrap();
+        index.upsert(&db, &revised, &state, &station).unwrap();
 
         let hits = index
             .search(

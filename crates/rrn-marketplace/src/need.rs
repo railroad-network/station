@@ -397,7 +397,7 @@ mod tests {
         let state = compute_state(log, &listing.id, station, NOW)
             .unwrap()
             .unwrap();
-        index.upsert(db, listing, &state).unwrap();
+        index.upsert(db, listing, &state, station).unwrap();
     }
 
     fn give_reputation(db: &Database, provider: &Keypair, composite: f32) {
@@ -678,7 +678,7 @@ mod tests {
         let state = compute_state(&log, &squash.id, &station, NOW)
             .unwrap()
             .unwrap();
-        index.upsert(&db, &squash, &state).unwrap();
+        index.upsert(&db, &squash, &state, &station).unwrap();
 
         assert!(find_matches(&index, &db, &need, NOW).unwrap().is_empty());
     }

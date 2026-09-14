@@ -35,19 +35,26 @@ fn addr(kp: &Keypair) -> Address {
     Address::from_public_key(kp.public_key())
 }
 
-fn snapshot(db: &Database) -> LedgerSnapshot {
-    LedgerSnapshot::derive(&AppendLog::new(db)).unwrap()
+fn snapshot(db: &Database, station: &Keypair) -> LedgerSnapshot {
+    LedgerSnapshot::derive(&AppendLog::new(db), &station.public_key()).unwrap()
 }
 
-fn next_nonce(db: &Database, kp: &Keypair) -> u64 {
-    snapshot(db).next_nonce(&kp.public_key().to_bytes())
+fn next_nonce(db: &Database, station: &Keypair, kp: &Keypair) -> u64 {
+    snapshot(db, station).next_nonce(&kp.public_key().to_bytes())
 }
 
 /// Issues a certificate through the engine front door, returning its content id.
 /// Takes the db explicitly for the shared-nonce lookup (the engine does not
 /// expose its borrowed handle).
-fn issue(engine: &mut Engine, db: &Database, member: &Keypair, cap_centi: i64, now: i64) -> CertId {
-    let nonce = next_nonce(db, member);
+fn issue(
+    engine: &mut Engine,
+    db: &Database,
+    station: &Keypair,
+    member: &Keypair,
+    cap_centi: i64,
+    now: i64,
+) -> CertId {
+    let nonce = next_nonce(db, station, member);
     let req = CertificateRequest::new(addr(member), cap_centi, nonce, now);
     engine
         .submit_certificate_request(SignedPayload::sign(req, member), now)
@@ -59,13 +66,14 @@ fn issue(engine: &mut Engine, db: &Database, member: &Keypair, cap_centi: i64, n
 /// A cert-backed proposal from `sender`, drawing `amount_centi` against `cert`.
 fn cert_proposal(
     db: &Database,
+    station: &Keypair,
     sender: &Keypair,
     receiver: &Keypair,
     amount_centi: i64,
     cert: CertId,
     now: i64,
 ) -> SignedProposal {
-    let nonce = next_nonce(db, sender);
+    let nonce = next_nonce(db, station, sender);
     let p = TransactionProposal::new(
         addr(sender),
         addr(receiver),
@@ -82,12 +90,13 @@ fn cert_proposal(
 /// A plain (uncertificated) proposal from `sender`.
 fn plain_proposal(
     db: &Database,
+    station: &Keypair,
     sender: &Keypair,
     receiver: &Keypair,
     amount_centi: i64,
     now: i64,
 ) -> SignedProposal {
-    let nonce = next_nonce(db, sender);
+    let nonce = next_nonce(db, station, sender);
     let p = TransactionProposal::new(
         addr(sender),
         addr(receiver),
@@ -127,19 +136,19 @@ fn a_cert_backed_spend_admits_with_no_floor_headroom_remaining() {
     let now = 1_000;
 
     // Reserve a 500 certificate (committed rises to 500; headroom left 1500).
-    let cert = issue(&mut engine, &db, &alice, 500, now);
+    let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
     // Add ordinary pending debits taking alice's committed position to the floor:
     // 500 (cert) + 1500 (plain) = 2000 = |floor|, so projected = −2000.
-    let fill = plain_proposal(&db, &alice, &bob, 1_500, now);
+    let fill = plain_proposal(&db, &station, &alice, &bob, 1_500, now);
     engine.submit_proposal(fill, now).unwrap();
     assert_eq!(
-        committed_debits_centi(&snapshot(&db), &addr(&alice), now, &cfg),
+        committed_debits_centi(&snapshot(&db, &station), &addr(&alice), now, &cfg),
         2_000
     );
 
     // A plain 1-centi spend now breaches the floor.
-    let over = plain_proposal(&db, &alice, &bob, 1, now);
+    let over = plain_proposal(&db, &station, &alice, &bob, 1, now);
     assert!(matches!(
         engine.submit_proposal(over, now),
         Err(Error::DebtFloorExceeded { .. })
@@ -147,12 +156,12 @@ fn a_cert_backed_spend_admits_with_no_floor_headroom_remaining() {
 
     // The cert-backed 300 spend admits regardless — the headroom was paid for at
     // issuance (nonce reused, since the refused plain spend wrote nothing).
-    let spend = cert_proposal(&db, &alice, &bob, 300, cert, now);
+    let spend = cert_proposal(&db, &station, &alice, &bob, 300, cert, now);
     let spend_id = spend.payload.id;
     engine.submit_proposal(spend, now).unwrap();
 
     // Consumption is recorded against the certificate.
-    let snap = snapshot(&db);
+    let snap = snapshot(&db, &station);
     assert_eq!(snap.certificate(&cert).unwrap().consumed_centi, 300);
 
     // Confirm, run the window, settle; balances move by the spend.
@@ -174,15 +183,18 @@ fn overspend_is_refused_with_the_three_amounts() {
         Keypair::generate(),
         Keypair::generate(),
     );
-    let mut engine = Engine::new(&db, station).with_credit_config(CreditConfig::default());
+    let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
     let now = 1_000;
-    let cert = issue(&mut engine, &db, &alice, 500, now);
+    let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
     engine
-        .submit_proposal(cert_proposal(&db, &alice, &bob, 300, cert, now), now)
+        .submit_proposal(
+            cert_proposal(&db, &station, &alice, &bob, 300, cert, now),
+            now,
+        )
         .unwrap();
     // 300 already consumed; a 201 spend would reach 501 > 500.
-    let over = cert_proposal(&db, &alice, &bob, 201, cert, now);
+    let over = cert_proposal(&db, &station, &alice, &bob, 201, cert, now);
     assert!(matches!(
         engine.submit_proposal(over, now),
         Err(Error::CertificateOverspent {
@@ -201,24 +213,33 @@ fn spending_to_exactly_the_cap_admits() {
         Keypair::generate(),
         Keypair::generate(),
     );
-    let mut engine = Engine::new(&db, station).with_credit_config(CreditConfig::default());
+    let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
     let now = 1_000;
-    let cert = issue(&mut engine, &db, &alice, 500, now);
+    let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
     engine
-        .submit_proposal(cert_proposal(&db, &alice, &bob, 300, cert, now), now)
+        .submit_proposal(
+            cert_proposal(&db, &station, &alice, &bob, 300, cert, now),
+            now,
+        )
         .unwrap();
     // consumed 300 + attempted 200 == cap 500: admits.
     engine
-        .submit_proposal(cert_proposal(&db, &alice, &bob, 200, cert, now), now)
+        .submit_proposal(
+            cert_proposal(&db, &station, &alice, &bob, 200, cert, now),
+            now,
+        )
         .unwrap();
     assert_eq!(
-        snapshot(&db).certificate(&cert).unwrap().consumed_centi,
+        snapshot(&db, &station)
+            .certificate(&cert)
+            .unwrap()
+            .consumed_centi,
         500
     );
 
     // One more centicommon is now an overspend.
-    let over = cert_proposal(&db, &alice, &bob, 1, cert, now);
+    let over = cert_proposal(&db, &station, &alice, &bob, 1, cert, now);
     assert!(matches!(
         engine.submit_proposal(over, now),
         Err(Error::CertificateOverspent {
@@ -238,11 +259,11 @@ fn expiry_boundary_is_the_shared_escrow_instant() {
         Keypair::generate(),
     );
     let cfg = CreditConfig::default();
-    let mut engine = Engine::new(&db, station).with_credit_config(cfg);
+    let mut engine = Engine::new(&db, station.clone()).with_credit_config(cfg);
     let issued_at = 1_000;
-    let cert = issue(&mut engine, &db, &alice, 500, issued_at);
+    let cert = issue(&mut engine, &db, &station, &alice, 500, issued_at);
 
-    let cert_payload = snapshot(&db)
+    let cert_payload = snapshot(&db, &station)
         .certificate(&cert)
         .unwrap()
         .certificate
@@ -251,7 +272,7 @@ fn expiry_boundary_is_the_shared_escrow_instant() {
     let bound = spend_admissible_until(&cert_payload, &cfg);
 
     // One second past the boundary: refused as expired (nothing written).
-    let too_late = cert_proposal(&db, &alice, &bob, 300, cert, bound + 1);
+    let too_late = cert_proposal(&db, &station, &alice, &bob, 300, cert, bound + 1);
     assert!(matches!(
         engine.submit_proposal(too_late, bound + 1),
         Err(Error::CertificateExpired)
@@ -259,10 +280,13 @@ fn expiry_boundary_is_the_shared_escrow_instant() {
 
     // At exactly the boundary: admitted — the same instant T2.3.1's reservation
     // release is coupled to.
-    let at_bound = cert_proposal(&db, &alice, &bob, 300, cert, bound);
+    let at_bound = cert_proposal(&db, &station, &alice, &bob, 300, cert, bound);
     engine.submit_proposal(at_bound, bound).unwrap();
     assert_eq!(
-        snapshot(&db).certificate(&cert).unwrap().consumed_centi,
+        snapshot(&db, &station)
+            .certificate(&cert)
+            .unwrap()
+            .consumed_centi,
         300
     );
 }
@@ -276,20 +300,20 @@ fn wrong_member_returned_negative_and_unknown_are_each_refused() {
         Keypair::generate(),
         Keypair::generate(),
     );
-    let mut engine = Engine::new(&db, station).with_credit_config(CreditConfig::default());
+    let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
     let now = 1_000;
-    let cert = issue(&mut engine, &db, &alice, 500, now);
+    let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
     // Unknown certificate.
     let ghost = CertId(rrn_crypto::hash::Hash::of(b"ghost"));
-    let unknown = cert_proposal(&db, &alice, &bob, 100, ghost, now);
+    let unknown = cert_proposal(&db, &station, &alice, &bob, 100, ghost, now);
     assert!(matches!(
         engine.submit_proposal(unknown, now),
         Err(Error::UnknownCertificate)
     ));
 
     // Wrong member: mallory signs a spend against alice's certificate.
-    let wrong = cert_proposal(&db, &mallory, &bob, 100, cert, now);
+    let wrong = cert_proposal(&db, &station, &mallory, &bob, 100, cert, now);
     assert!(matches!(
         engine.submit_proposal(wrong, now),
         Err(Error::CertificateWrongMember)
@@ -298,7 +322,7 @@ fn wrong_member_returned_negative_and_unknown_are_each_refused() {
     // Neither a negative amount (a payment request) nor a zero amount is a spend
     // that can ride an escrow — the holder must be the debtor.
     for bad_amount in [-100, 0] {
-        let misuse = cert_proposal(&db, &alice, &bob, bad_amount, cert, now);
+        let misuse = cert_proposal(&db, &station, &alice, &bob, bad_amount, cert, now);
         assert!(matches!(
             engine.submit_proposal(misuse, now),
             Err(Error::CertificateMisuse)
@@ -314,7 +338,7 @@ fn wrong_member_returned_negative_and_unknown_are_each_refused() {
     engine
         .submit_certificate_return(SignedPayload::sign(ret, &alice), now)
         .unwrap();
-    let after_return = cert_proposal(&db, &alice, &bob, 100, cert, now);
+    let after_return = cert_proposal(&db, &station, &alice, &bob, 100, cert, now);
     assert!(matches!(
         engine.submit_proposal(after_return, now),
         Err(Error::CertificateNotOutstanding)
@@ -334,17 +358,17 @@ fn consumption_is_monotone_across_cancellation() {
         Keypair::generate(),
     );
     let cfg = CreditConfig::default();
-    let mut engine = Engine::new(&db, station).with_credit_config(cfg);
+    let mut engine = Engine::new(&db, station.clone()).with_credit_config(cfg);
     let now = 1_000;
-    let cert = issue(&mut engine, &db, &alice, 500, now);
+    let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
-    let first = cert_proposal(&db, &alice, &bob, 300, cert, now);
+    let first = cert_proposal(&db, &station, &alice, &bob, 300, cert, now);
     let first_id = first.payload.id;
     engine.submit_proposal(first, now).unwrap();
 
     // Committed = pending 300 (the spend) + remaining cap 200 = 500.
     assert_eq!(
-        committed_debits_centi(&snapshot(&db), &addr(&alice), now, &cfg),
+        committed_debits_centi(&snapshot(&db, &station), &addr(&alice), now, &cfg),
         500
     );
 
@@ -352,13 +376,13 @@ fn consumption_is_monotone_across_cancellation() {
     engine
         .cancel_proposal(&first_id, CancelReason::RejectedByReceiver, now)
         .unwrap();
-    let snap = snapshot(&db);
+    let snap = snapshot(&db, &station);
     assert_eq!(snap.certificate(&cert).unwrap().consumed_centi, 300);
     // Committed dropped by 300 → just the remaining cap 200.
     assert_eq!(committed_debits_centi(&snap, &addr(&alice), now, &cfg), 200);
 
     // Another 300 would reach 600 > cap 500: overspent.
-    let again = cert_proposal(&db, &alice, &bob, 300, cert, now);
+    let again = cert_proposal(&db, &station, &alice, &bob, 300, cert, now);
     assert!(matches!(
         engine.submit_proposal(again, now),
         Err(Error::CertificateOverspent {
@@ -370,10 +394,16 @@ fn consumption_is_monotone_across_cancellation() {
 
     // But 200 (to exactly the cap) admits.
     engine
-        .submit_proposal(cert_proposal(&db, &alice, &bob, 200, cert, now), now)
+        .submit_proposal(
+            cert_proposal(&db, &station, &alice, &bob, 200, cert, now),
+            now,
+        )
         .unwrap();
     assert_eq!(
-        snapshot(&db).certificate(&cert).unwrap().consumed_centi,
+        snapshot(&db, &station)
+            .certificate(&cert)
+            .unwrap()
+            .consumed_centi,
         500
     );
 }
@@ -388,7 +418,7 @@ fn nonces_interleave_across_request_cert_backed_and_plain() {
         Keypair::generate(),
         Keypair::generate(),
     );
-    let mut engine = Engine::new(&db, station).with_credit_config(CreditConfig::default());
+    let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
     let now = 1_000;
 
     let req = CertificateRequest::new(addr(&alice), 500, 0, now);
@@ -409,7 +439,7 @@ fn nonces_interleave_across_request_cert_backed_and_plain() {
         .submit_proposal(SignedProposal::sign(plain, &alice), now)
         .unwrap();
 
-    assert_eq!(next_nonce(&db, &alice), 3);
+    assert_eq!(next_nonce(&db, &station, &alice), 3);
 }
 
 // --- The ADR-0021 §6 floor invariant proptest --------------------------------
@@ -486,7 +516,7 @@ proptest! {
 
         let members = [addr(&alice), addr(&bob)];
         let assert_floor = |db: &Database, now: i64| {
-            let snap = snapshot(db);
+            let snap = snapshot(db, &station);
             let balances = BalanceView::new(db);
             for m in &members {
                 let settled = balances.balance_of(m).unwrap();
@@ -506,7 +536,7 @@ proptest! {
 
         // The open alice→bob proposals available to confirm / cancel.
         let open_proposals = |db: &Database| -> Vec<TransactionId> {
-            let snap = snapshot(db);
+            let snap = snapshot(db, &station);
             snap.iter()
                 .filter_map(|(id, st)| {
                     matches!(st, rrn_ledger::state::TransactionState::Proposed { .. }).then_some(*id)
@@ -517,7 +547,7 @@ proptest! {
         for op in ops {
             match op {
                 Op::IssueCert(cap) => {
-                    let nonce = next_nonce(&db, &alice);
+                    let nonce = next_nonce(&db, &station, &alice);
                     let req = CertificateRequest::new(addr(&alice), cap, nonce, now);
                     if let Ok(signed) =
                         engine.submit_certificate_request(SignedPayload::sign(req, &alice), now)
@@ -526,13 +556,13 @@ proptest! {
                     }
                 }
                 Op::PlainSpend(amount) => {
-                    let p = plain_proposal(&db, &alice, &bob, amount, now);
+                    let p = plain_proposal(&db, &station, &alice, &bob, amount, now);
                     let _ = engine.submit_proposal(p, now);
                 }
                 Op::CertSpend(idx, amount) => {
                     if !certs.is_empty() {
                         let cert = certs[idx % certs.len()];
-                        let p = cert_proposal(&db, &alice, &bob, amount, cert, now);
+                        let p = cert_proposal(&db, &station, &alice, &bob, amount, cert, now);
                         let _ = engine.submit_proposal(p, now);
                     }
                 }
@@ -576,7 +606,7 @@ proptest! {
         // on the fully-swept ledger (a stronger statement than any mid-run step,
         // since more debt has moved from pending to settled).
         now = now.saturating_add(10_000);
-        let mut settler = Settler::new(&db, station, settle_cfg);
+        let mut settler = Settler::new(&db, station.clone(), settle_cfg);
         settler.sweep(now).unwrap();
         assert_floor(&db, now)?;
     }

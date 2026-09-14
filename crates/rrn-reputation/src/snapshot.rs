@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
@@ -61,8 +62,13 @@ pub fn get_cached_profile(
 /// ([`crate::sybil::check_velocity`]). A violation is logged for operator review
 /// and nothing else: the snapshot is still written and the score still stands, by
 /// design — humans decide what an implausible gain means.
-pub fn refresh_snapshot(db: &Database, address: &Address, now: i64) -> Result<ReputationProfile> {
-    let profile = ReputationScorer::new(db).score(address, now)?;
+pub fn refresh_snapshot(
+    db: &Database,
+    address: &Address,
+    now: i64,
+    station: &PublicKey,
+) -> Result<ReputationProfile> {
+    let profile = ReputationScorer::new(db, station).score(address, now)?;
 
     if let Some(previous) = stored_profile(db, address)? {
         if let Err(violation) = check_velocity(&previous, &profile) {
@@ -96,11 +102,11 @@ fn stored_profile(db: &Database, address: &Address) -> Result<Option<ReputationP
 /// Recomputes and writes a snapshot for every identity that appears in the log.
 /// Returns how many identities were refreshed. This is the body of the station's
 /// hourly background refresh.
-pub fn refresh_all_snapshots(db: &Database, now: i64) -> Result<usize> {
-    let addresses = known_addresses(db)?;
+pub fn refresh_all_snapshots(db: &Database, now: i64, station: &PublicKey) -> Result<usize> {
+    let addresses = known_addresses(db, station)?;
     let count = addresses.len();
     for address in addresses {
-        refresh_snapshot(db, &address, now)?;
+        refresh_snapshot(db, &address, now, station)?;
     }
     Ok(count)
 }
@@ -109,11 +115,11 @@ pub fn refresh_all_snapshots(db: &Database, now: i64) -> Result<usize> {
 /// party or on either side of a vouch. These are exactly the identities that can
 /// have a non-empty profile, and the set is derived from the canonical log so it
 /// is identical on every replica.
-pub(crate) fn known_addresses(db: &Database) -> Result<Vec<Address>> {
+pub(crate) fn known_addresses(db: &Database, station: &PublicKey) -> Result<Vec<Address>> {
     let log = AppendLog::new(db);
     let mut addresses: HashSet<Address> = HashSet::new();
 
-    let ledger = LedgerSnapshot::derive(&log)?;
+    let ledger = LedgerSnapshot::derive(&log, station)?;
     for (_, state) in ledger.iter() {
         if let Some(proposal) = proposal_of(state) {
             addresses.insert(proposal.sender);
@@ -233,7 +239,7 @@ mod tests {
         let t = 8 * MONTH;
         append_settled(&db, &alice, &bob, &station, 0, t);
 
-        let written = refresh_snapshot(&db, &addr(&alice), t).unwrap();
+        let written = refresh_snapshot(&db, &addr(&alice), t, &station.public_key()).unwrap();
         // A generous max age so freshness never rejects it here.
         let read = get_cached_profile(&db, &addr(&alice), i64::MAX).unwrap();
         assert_eq!(read, Some(written));
@@ -256,7 +262,7 @@ mod tests {
             None
         );
         // Refresh writes it; now it hits.
-        let refreshed = refresh_snapshot(&db, &addr(&alice), t).unwrap();
+        let refreshed = refresh_snapshot(&db, &addr(&alice), t, &station.public_key()).unwrap();
         assert_eq!(
             get_cached_profile(&db, &addr(&alice), i64::MAX).unwrap(),
             Some(refreshed)
@@ -273,7 +279,7 @@ mod tests {
         );
         append_settled(&db, &alice, &bob, &station, 0, 8 * MONTH);
         // Computed "long ago" relative to the wall clock, so any small max age misses.
-        refresh_snapshot(&db, &addr(&alice), 1).unwrap();
+        refresh_snapshot(&db, &addr(&alice), 1, &station.public_key()).unwrap();
         assert_eq!(get_cached_profile(&db, &addr(&alice), 60).unwrap(), None);
     }
 
@@ -291,7 +297,10 @@ mod tests {
         append_settled(&db, &bob, &carol, &station, 0, t);
 
         // alice, bob, carol all appear as transaction parties.
-        assert_eq!(refresh_all_snapshots(&db, t).unwrap(), 3);
+        assert_eq!(
+            refresh_all_snapshots(&db, t, &station.public_key()).unwrap(),
+            3
+        );
         for who in [&alice, &bob, &carol] {
             assert!(get_cached_profile(&db, &addr(who), i64::MAX)
                 .unwrap()
@@ -311,8 +320,9 @@ mod tests {
         append_settled(&db, &alice, &bob, &station, 0, t);
 
         // Write a newer snapshot, then attempt an older recompute.
-        let newer = refresh_snapshot(&db, &addr(&alice), t + 5 * MONTH).unwrap();
-        let _older = refresh_snapshot(&db, &addr(&alice), t).unwrap();
+        let newer =
+            refresh_snapshot(&db, &addr(&alice), t + 5 * MONTH, &station.public_key()).unwrap();
+        let _older = refresh_snapshot(&db, &addr(&alice), t, &station.public_key()).unwrap();
         // The stored row is still the newer one (LWW guard held).
         let stored = get_cached_profile(&db, &addr(&alice), i64::MAX).unwrap();
         assert_eq!(stored, Some(newer));
@@ -334,8 +344,8 @@ mod tests {
         build(&db_b);
 
         let now = t + 2 * MONTH;
-        refresh_snapshot(&db_a, &addr(&alice), now).unwrap();
-        refresh_snapshot(&db_b, &addr(&alice), now).unwrap();
+        refresh_snapshot(&db_a, &addr(&alice), now, &station.public_key()).unwrap();
+        refresh_snapshot(&db_b, &addr(&alice), now, &station.public_key()).unwrap();
         // Compare the stored bytes directly: identical logs → identical snapshots.
         let a = store::get(&db_a, &addr(&alice).public_key().to_bytes()).unwrap();
         let b = store::get(&db_b, &addr(&alice).public_key().to_bytes()).unwrap();

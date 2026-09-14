@@ -24,6 +24,7 @@
 
 use std::collections::BTreeSet;
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_ledger::contract::{ContractCharge, ContractRef};
@@ -34,16 +35,28 @@ use rrn_storage::log::AppendLog;
 
 /// The balance of `who`, in centicommons, derived from the log's balance records
 /// — settlements and contract charges. Positive = net credit; negative = net debt.
-pub fn balance_of(db: &Database, who: &Address) -> rrn_storage::Result<i64> {
+///
+/// Both balance records are station-signed (ADR-0005, T1.7.7). Only a record whose
+/// envelope signer is the community `station` moves a balance: a forged
+/// settlement or contract charge injected via gossip `append_raw` is skipped, so it
+/// can never debit or credit an account here. This is the highest-value pin — this
+/// function is what a wallet balance is read from.
+pub fn balance_of(db: &Database, who: &Address, station: &PublicKey) -> rrn_storage::Result<i64> {
     let log = AppendLog::new(db);
     let mut settled: BTreeSet<TransactionId> = BTreeSet::new();
     let mut charged: BTreeSet<(ContractRef, u32)> = BTreeSet::new();
     let mut total: i64 = 0;
 
     for entry in log.iter_from(1) {
-        let bytes = &entry?.payload.bytes;
+        let entry = entry?;
+        // A balance record only counts when the community station signed it.
+        let signed_by_station = entry.payload.signer == *station;
+        let bytes = &entry.payload.bytes;
 
         if let Ok(rec) = from_canonical_bytes::<SettlementRecord>(bytes) {
+            if !signed_by_station {
+                continue;
+            }
             // Each transaction settles once; ignore redundant records for it.
             if !settled.insert(rec.proposal_id) {
                 continue;
@@ -58,6 +71,9 @@ pub fn balance_of(db: &Database, who: &Address) -> rrn_storage::Result<i64> {
         }
 
         if let Ok(charge) = from_canonical_bytes::<ContractCharge>(bytes) {
+            if !signed_by_station {
+                continue;
+            }
             // Each contract period charges once; a re-swept, replayed, or gossiped
             // duplicate for the same `(contract, period)` is ignored. The buyer is
             // debited and the provider credited (a contract only ever charges in
@@ -127,8 +143,8 @@ mod tests {
         );
         let (a, b) = (addr(&alice), addr(&bob));
         settle(&db, &station, &a, &b, 300, 100);
-        assert_eq!(balance_of(&db, &a).unwrap(), -300);
-        assert_eq!(balance_of(&db, &b).unwrap(), 300);
+        assert_eq!(balance_of(&db, &a, &station.public_key()).unwrap(), -300);
+        assert_eq!(balance_of(&db, &b, &station.public_key()).unwrap(), 300);
     }
 
     #[test]
@@ -156,14 +172,18 @@ mod tests {
                 .append(SignedPayload::sign(rec, &station), 0)
                 .unwrap();
         }
-        assert_eq!(balance_of(&db, &b).unwrap(), 300); // not 600
+        assert_eq!(balance_of(&db, &b, &station.public_key()).unwrap(), 300); // not 600
     }
 
     #[test]
     fn unsettled_log_has_zero_balance() {
         let db = fresh_db();
         let alice = Keypair::generate();
-        assert_eq!(balance_of(&db, &addr(&alice)).unwrap(), 0);
+        let station = Keypair::generate();
+        assert_eq!(
+            balance_of(&db, &addr(&alice), &station.public_key()).unwrap(),
+            0
+        );
     }
 
     /// Appends a station-signed contract charge to the log.
@@ -204,8 +224,8 @@ mod tests {
         for period in 0..3 {
             charge(&db, &station, &b, &p, 500, contract, period);
         }
-        assert_eq!(balance_of(&db, &b).unwrap(), -1_500);
-        assert_eq!(balance_of(&db, &p).unwrap(), 1_500);
+        assert_eq!(balance_of(&db, &b, &station.public_key()).unwrap(), -1_500);
+        assert_eq!(balance_of(&db, &p, &station.public_key()).unwrap(), 1_500);
     }
 
     #[test]
@@ -236,7 +256,7 @@ mod tests {
                 .append(SignedPayload::sign(r, &station), 0)
                 .unwrap();
         }
-        assert_eq!(balance_of(&db, &p).unwrap(), 500); // not 1000
+        assert_eq!(balance_of(&db, &p, &station.public_key()).unwrap(), 500); // not 1000
     }
 
     #[test]
@@ -257,7 +277,97 @@ mod tests {
         charge(&db, &station, &a, &b, 200, ContractRef([5u8; 32]), 0);
         charge(&db, &station, &a, &b, 200, ContractRef([5u8; 32]), 1);
 
-        assert_eq!(balance_of(&db, &a).unwrap(), 300 - 400);
-        assert_eq!(balance_of(&db, &b).unwrap(), -300 + 400);
+        assert_eq!(
+            balance_of(&db, &a, &station.public_key()).unwrap(),
+            300 - 400
+        );
+        assert_eq!(
+            balance_of(&db, &b, &station.public_key()).unwrap(),
+            -300 + 400
+        );
+    }
+
+    #[test]
+    fn a_forged_settlement_or_contract_charge_moves_no_balance() {
+        // Both balance records are pinned to the community station key. A
+        // settlement or contract charge signed by any other key (a gossip forgery)
+        // is skipped, so it can neither debit nor credit an account.
+        let db = fresh_db();
+        let (alice, bob, station, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let (a, b) = (addr(&alice), addr(&bob));
+
+        // A forged settlement (mallory-signed) crediting bob 300.
+        let forged = SettlementRecord {
+            proposal_id: TransactionProposal::new(a, b, 300, None, 0, 0, 1).id,
+            sender: a,
+            receiver: b,
+            amount_centi: 300,
+            settled_at: 100,
+        };
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(forged, &mallory), 0)
+            .unwrap();
+        // A forged contract charge (mallory-signed) debiting alice 500.
+        let forged_charge = ContractCharge {
+            contract_ref: ContractRef([9u8; 32]),
+            buyer: a,
+            provider: b,
+            amount_centi: 500,
+            period_index: 0,
+            charged_at: 200,
+        };
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(forged_charge, &mallory), 0)
+            .unwrap();
+
+        // Under the station key, both forgeries are invisible: everyone is at zero.
+        assert_eq!(balance_of(&db, &a, &station.public_key()).unwrap(), 0);
+        assert_eq!(balance_of(&db, &b, &station.public_key()).unwrap(), 0);
+
+        // The genuine station-signed settlement then moves the balance.
+        settle(&db, &station, &a, &b, 300, 300);
+        assert_eq!(balance_of(&db, &a, &station.public_key()).unwrap(), -300);
+        assert_eq!(balance_of(&db, &b, &station.public_key()).unwrap(), 300);
+    }
+
+    #[test]
+    fn a_forged_charge_does_not_dedup_out_the_genuine_one_for_the_same_period() {
+        // The signer pin is checked *before* the once-only `(contract, period)`
+        // dedup, so a forged charge for a period cannot burn that period's slot and
+        // suppress the genuine charge the station later signs for it.
+        let db = fresh_db();
+        let (alice, bob, station, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let (a, b) = (addr(&alice), addr(&bob));
+        let contract = ContractRef([7u8; 32]);
+
+        // A forged charge for (contract, period 0) debiting alice 500 lands first.
+        let forged = ContractCharge {
+            contract_ref: contract,
+            buyer: a,
+            provider: b,
+            amount_centi: 500,
+            period_index: 0,
+            charged_at: 100,
+        };
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(forged, &mallory), 0)
+            .unwrap();
+        // The genuine station charge for the same period debits alice 200.
+        charge(&db, &station, &a, &b, 200, contract, 0);
+
+        // Only the genuine 200 counts — the forged 500 neither applied nor
+        // consumed the period's slot.
+        assert_eq!(balance_of(&db, &a, &station.public_key()).unwrap(), -200);
+        assert_eq!(balance_of(&db, &b, &station.public_key()).unwrap(), 200);
     }
 }

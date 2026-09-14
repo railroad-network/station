@@ -1237,7 +1237,17 @@ fn assert_no_forks(db_path: &Path) {
 /// Assertion 4: replaying the final log, at EVERY prefix, every member's projected
 /// position (settled balance minus committed debits) is ≥ the floor — exactly the
 /// invariant the engine enforced at each admission (ADR-0018). O(n²), fine here.
+/// The community station key, loaded from the wallet on disk — the key the
+/// running station signed every settlement, cancellation, certificate and
+/// equivocation with, and the one the station-signer pin verifies against at replay.
+fn station_pk(db_path: &Path) -> rrn_crypto::keypair::PublicKey {
+    let wallet =
+        WalletContents::load_from_file(&db_path.with_file_name(WALLET_FILE), PASSPHRASE).unwrap();
+    *wallet.address.public_key()
+}
+
 fn assert_floor_invariant_every_prefix(db_path: &Path) {
+    let station = station_pk(db_path);
     let src = Database::open(db_path).unwrap();
     let entries: Vec<_> = AppendLog::new(&src)
         .iter_from(1)
@@ -1253,7 +1263,7 @@ fn assert_floor_invariant_every_prefix(db_path: &Path) {
             .append_raw(entry.payload.clone(), entry.created_at)
             .unwrap();
         let log = AppendLog::new(&prefix);
-        let snapshot = LedgerSnapshot::derive(&log).unwrap();
+        let snapshot = LedgerSnapshot::derive(&log, &station).unwrap();
         let now = entry.created_at;
 
         // Check EVERY participant (any sender or receiver seen so far), not just
@@ -1264,7 +1274,7 @@ fn assert_floor_invariant_every_prefix(db_path: &Path) {
             // never from the balances cache — the prefix DB holds only log entries,
             // and the cache would read as zero. This is the same fold the daemon's
             // `ledger_view::balance_of` performs.
-            let settled = rrn_station::ledger_view::balance_of(&prefix, &addr).unwrap();
+            let settled = rrn_station::ledger_view::balance_of(&prefix, &addr, &station).unwrap();
             let committed = committed_debits_centi(&snapshot, &addr, now, &cfg);
             let projected = settled - committed;
             assert!(
@@ -1293,7 +1303,7 @@ fn participants(snapshot: &LedgerSnapshot) -> HashSet<Address> {
 /// admitted (escrow honored — a cert-backed spend rides its reserved headroom).
 fn assert_escrow_honored(db_path: &Path) {
     let db = Database::open(db_path).unwrap();
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station_pk(db_path)).unwrap();
     // The operator address (derivable from the wallet on disk).
     let wallet =
         WalletContents::load_from_file(&db_path.with_file_name(WALLET_FILE), PASSPHRASE).unwrap();
@@ -1322,7 +1332,7 @@ fn assert_escrow_honored(db_path: &Path) {
 /// attributed to the forker — and nothing else.
 fn assert_exactly_the_planted_equivocations(db_path: &Path, operator: Address, forker: Address) {
     let db = Database::open(db_path).unwrap();
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station_pk(db_path)).unwrap();
     let mut cert_overspend = 0;
     let mut outbox_fork = 0;
     for rec in snapshot.equivocations() {
@@ -1358,7 +1368,7 @@ fn assert_exactly_the_planted_equivocations(db_path: &Path, operator: Address, f
 fn assert_windows_respected(db_path: &Path) {
     let db = Database::open(db_path).unwrap();
     let log = AppendLog::new(&db);
-    let snapshot = LedgerSnapshot::derive(&log).unwrap();
+    let snapshot = LedgerSnapshot::derive(&log, &station_pk(db_path)).unwrap();
 
     let mut settlements = 0;
     for entry in log.iter_from(1) {

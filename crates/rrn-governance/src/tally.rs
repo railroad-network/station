@@ -231,7 +231,8 @@ fn count_against(
     // log position (T2.1.3), so it is replica-deterministic and cannot be packed
     // by standing manufactured — even with a back-dated timestamp — after the
     // proposal opens. A concluded quorum stays stable on replay.
-    let eligible = grace_electorate_asof(db, &governing.founders, pin_time, pin_seq)?.len() as u32;
+    let eligible =
+        grace_electorate_asof(db, &governing.founders, pin_time, pin_seq, station)?.len() as u32;
     let participation = yes + no + abstain;
     let decisive = yes + no;
 
@@ -414,7 +415,7 @@ mod tests {
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
         for nonce in 0..10 {
-            append_settled(db, who, station, station, nonce, at);
+            append_settled(db, who, station, &test_station(), nonce, at);
         }
         for _ in 0..10 {
             append_vouch(db, who, &addr(&Keypair::generate()), at);
@@ -648,7 +649,12 @@ mod tests {
 
         // Time-based, the community now has a fifth established member...
         assert_eq!(
-            rrn_reputation::staking::established_member_count(&db, close + 1).unwrap(),
+            rrn_reputation::staking::established_member_count(
+                &db,
+                close + 1,
+                &test_station().public_key()
+            )
+            .unwrap(),
             5
         );
         // ...but the proposal's electorate, pinned at its OPEN log position, is
@@ -970,9 +976,11 @@ mod tests {
         // Four founders, none with any earned standing — a brand-new community
         // squarely in bootstrap grace.
         let founders: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
+        let station = Keypair::generate();
         publish_charter(&db, &founders);
         assert_eq!(
-            rrn_reputation::staking::established_member_count(&db, NOW).unwrap(),
+            rrn_reputation::staking::established_member_count(&db, NOW, &station.public_key())
+                .unwrap(),
             0
         );
 

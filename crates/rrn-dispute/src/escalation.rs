@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dcbor::prelude::*;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -236,9 +237,10 @@ pub fn escalation_electorate(
     founders: &[Address],
     info: &DisputedInfo,
     at: i64,
+    station: &PublicKey,
 ) -> Result<HashSet<Address>> {
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
-    Ok(grace_electorate(db, founders, at)?
+    Ok(grace_electorate(db, founders, at, station)?
         .into_iter()
         .filter(|a| !parties.contains(a))
         .collect())

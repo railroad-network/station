@@ -178,7 +178,8 @@ impl<'db> Settler<'db> {
     /// Transaction ids that are confirmed and whose settlement window has now
     /// elapsed (`admitted_at(confirmation) + window_seconds <= now`).
     pub fn find_eligible(&self, now: i64) -> Result<Vec<TransactionId>> {
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         let mut eligible = Vec::new();
         for (id, state) in snapshot.iter() {
             if let TransactionState::Confirmed { proposal, .. } = state {
@@ -214,7 +215,8 @@ impl<'db> Settler<'db> {
     /// Settles a single transaction. Idempotent: an already-settled transaction
     /// is a no-op; a non-existent one is an error.
     pub fn settle(&mut self, tx_id: &TransactionId, now: i64) -> Result<()> {
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         let state = snapshot.get(tx_id).ok_or(Error::UnknownTransaction)?;
 
         // The derived state already passed log-time signature verification, but
@@ -591,7 +593,7 @@ mod tests {
         let balances = BalanceView::new(&db);
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 0);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 0);
-        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert!(matches!(
             snap.get(&id),
             Some(TransactionState::Disputed { .. })
@@ -615,7 +617,7 @@ mod tests {
         let balances = BalanceView::new(&db);
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
-        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert!(matches!(
             snap.get(&id),
             Some(TransactionState::Settled { .. })

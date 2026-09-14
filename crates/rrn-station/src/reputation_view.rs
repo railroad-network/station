@@ -27,6 +27,7 @@
 
 use serde::Serialize;
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
 use rrn_reputation::model::{
     max_composite_now, ReputationBand, ReputationProfile, DIMENSION_MAX, DORMANT_DIMENSIONS,
@@ -134,9 +135,10 @@ pub fn member_reputation(
     db: &Database,
     member: &Address,
     now: i64,
+    station: &PublicKey,
 ) -> rrn_reputation::Result<ReputationView> {
-    let profile = cached_or_fresh(db, member, now, OWN_PROFILE_MAX_AGE_SECS)?;
-    let voucher = anchoring_voucher(db, member, now)?;
+    let profile = cached_or_fresh(db, member, now, OWN_PROFILE_MAX_AGE_SECS, station)?;
+    let voucher = anchoring_voucher(db, member, now, station)?;
     Ok(view_of(&profile, voucher))
 }
 
@@ -151,8 +153,9 @@ pub fn address_band(
     db: &Database,
     address: &Address,
     now: i64,
+    station: &PublicKey,
 ) -> rrn_reputation::Result<BandView> {
-    let profile = cached_or_fresh(db, address, now, BAND_MAX_AGE_SECS)?;
+    let profile = cached_or_fresh(db, address, now, BAND_MAX_AGE_SECS, station)?;
     Ok(BandView {
         address: profile.address.to_string(),
         composite: profile.composite(),
@@ -169,10 +172,11 @@ fn cached_or_fresh(
     address: &Address,
     now: i64,
     max_age: i64,
+    station: &PublicKey,
 ) -> rrn_reputation::Result<ReputationProfile> {
     match get_cached_profile(db, address, max_age)? {
         Some(profile) => Ok(profile),
-        None => refresh_snapshot(db, address, now),
+        None => refresh_snapshot(db, address, now, station),
     }
 }
 
@@ -369,7 +373,13 @@ mod tests {
         let stranger = addr(&Keypair::generate());
 
         // A listing card for someone with no history still has to render.
-        let view = address_band(&db, &stranger, wall_now()).unwrap();
+        let view = address_band(
+            &db,
+            &stranger,
+            wall_now(),
+            &Keypair::generate().public_key(),
+        )
+        .unwrap();
         assert_eq!(view.band, "New");
         assert_eq!(view.composite, 0.0);
         assert_eq!(view.address, stranger.to_string());
@@ -380,7 +390,8 @@ mod tests {
         let db = fresh_db();
         let member = addr(&Keypair::generate());
 
-        let view = member_reputation(&db, &member, wall_now()).unwrap();
+        let view =
+            member_reputation(&db, &member, wall_now(), &Keypair::generate().public_key()).unwrap();
 
         assert_eq!(view.dimensions.len(), 5, "all five, dormant ones included");
         assert!(dimension(&view, "trade_reliability").live);
@@ -421,7 +432,7 @@ mod tests {
         let now = wall_now();
         let member = member_who_can_anchor(&db, &station, now);
 
-        let view = member_reputation(&db, &addr(&member), now).unwrap();
+        let view = member_reputation(&db, &addr(&member), now, &station.public_key()).unwrap();
 
         assert!(!view.anchored, "nobody has vouched for them");
         assert_eq!(view.anchoring_voucher_address, None);
@@ -455,7 +466,8 @@ mod tests {
         // did not, which is the sort of flake that only shows up on a loaded CI
         // runner.
         let read_at = wall_now();
-        let view = member_reputation(&db, &addr(&newcomer), read_at).unwrap();
+        let view =
+            member_reputation(&db, &addr(&newcomer), read_at, &station.public_key()).unwrap();
 
         assert!(view.anchored);
         assert_eq!(
@@ -476,10 +488,16 @@ mod tests {
         let now = wall_now();
         let member = addr(&member_who_can_anchor(&db, &station, now));
 
-        let first = member_reputation(&db, &member, now).unwrap();
+        let first = member_reputation(&db, &member, now, &station.public_key()).unwrap();
         // A later read inside the tolerance must not rescore — reads are on the
         // O(V·N) replay path and the whole point of the cache is to stay off it.
-        let second = member_reputation(&db, &member, now + OWN_PROFILE_MAX_AGE_SECS / 2).unwrap();
+        let second = member_reputation(
+            &db,
+            &member,
+            now + OWN_PROFILE_MAX_AGE_SECS / 2,
+            &station.public_key(),
+        )
+        .unwrap();
 
         assert_eq!(
             second.computed_at, first.computed_at,

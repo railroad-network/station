@@ -104,8 +104,16 @@ fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
     log.append(vouch.sign(voucher), 0).unwrap();
 }
 
+/// The one community station key every test in this file shares: standing-earning
+/// settlements, the resolution settlement, and every derivation pin against the
+/// same key, so station-signed records count under the station-signer pin exactly as
+/// before (invariant 2 — the genuine path is unchanged).
+fn test_station() -> Keypair {
+    Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([7u8; 32]))
+}
+
 fn earn_raw_standing(db: &Database, who: &Keypair, at: i64) {
-    let station = Keypair::generate();
+    let station = test_station();
     for nonce in 0..10 {
         append_settled(db, who, &station, nonce, at);
     }
@@ -206,8 +214,9 @@ fn params() -> DisputeParams {
 
 /// The deterministic seating order for a dispute.
 fn sequence(db: &Database, tx_id: &TransactionId, p: &DisputeParams) -> Vec<Address> {
-    let info = disputed_info(db, tx_id).unwrap();
-    let pool = eligible_pool(db, &[], &info, info.opened_at, p).unwrap();
+    let station = test_station().public_key();
+    let info = disputed_info(db, tx_id, &station).unwrap();
+    let pool = eligible_pool(db, &[], &info, info.opened_at, p, &station).unwrap();
     draw_sequence(&pool, sortition_seed(tx_id, ANCHOR))
 }
 
@@ -342,7 +351,7 @@ fn party_opened_at_is_ignored_for_the_draw_and_window() {
         let tx_liar = append_disputed_admitted(&liar, &alice, &bob, 300, T, lie);
         assert_eq!(tx_honest, tx_liar, "same parties/amount/nonce ⇒ same tx id");
 
-        let info = disputed_info(&liar, &tx_liar).unwrap();
+        let info = disputed_info(&liar, &tx_liar, &test_station().public_key()).unwrap();
         assert_eq!(
             info.opened_at, T,
             "opened_at must be the admitted time, not the party's signed lie ({lie})"
@@ -368,8 +377,16 @@ fn parties_and_their_vouchers_are_recused() {
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
 
-    let info = disputed_info(&db, &tx).unwrap();
-    let pool = eligible_pool(&db, &[], &info, info.opened_at, &p).unwrap();
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    let pool = eligible_pool(
+        &db,
+        &[],
+        &info,
+        info.opened_at,
+        &p,
+        &test_station().public_key(),
+    )
+    .unwrap();
     let pool_addrs: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
 
     // The party (members[0]) and its voucher (members[1]) are both excluded;
@@ -394,8 +411,16 @@ fn voucher_recusal_relaxes_before_the_panel_goes_unseated() {
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
 
-    let info = disputed_info(&db, &tx).unwrap();
-    let pool = eligible_pool(&db, &[], &info, info.opened_at, &p).unwrap();
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    let pool = eligible_pool(
+        &db,
+        &[],
+        &info,
+        info.opened_at,
+        &p,
+        &test_station().public_key(),
+    )
+    .unwrap();
     let pool_addrs: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
     // Relaxed pool = established minus the party only: the three vouchers return.
     assert_eq!(pool_addrs.len(), 3);
@@ -410,7 +435,7 @@ fn two_uphold_verdicts_void_the_transfer() {
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
     let seq = sequence(&db, &tx, &p);
-    let station = Keypair::generate();
+    let station = test_station();
 
     // The first two seated jurors uphold.
     append_verdict(
@@ -420,6 +445,7 @@ fn two_uphold_verdicts_void_the_transfer() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
     append_verdict(
@@ -429,13 +455,15 @@ fn two_uphold_verdicts_void_the_transfer() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
 
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 20).unwrap();
     assert_eq!(outcome, Resolution::Upheld);
 
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Cancelled {
@@ -453,7 +481,7 @@ fn two_reject_verdicts_settle_the_transaction() {
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
     let seq = sequence(&db, &tx, &p);
-    let station = Keypair::generate();
+    let station = test_station();
 
     append_verdict(
         &db,
@@ -462,6 +490,7 @@ fn two_reject_verdicts_settle_the_transaction() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[0]), false, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
     append_verdict(
@@ -471,13 +500,15 @@ fn two_reject_verdicts_settle_the_transaction() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[1]), false, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
 
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 20).unwrap();
     assert_eq!(outcome, Resolution::Rejected);
 
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Settled { .. })
@@ -514,6 +545,7 @@ fn a_silent_juror_is_redrawn_around() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 5),
         T + 5,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -539,9 +571,10 @@ fn a_silent_juror_is_redrawn_around() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[3]), true, T + 12),
         T + 12,
+        &test_station().public_key(),
     )
     .unwrap();
-    let station = Keypair::generate();
+    let station = test_station();
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 15).unwrap();
     assert_eq!(outcome, Resolution::Upheld);
 }
@@ -553,7 +586,7 @@ fn an_unresolved_dispute_lapses_and_settles() {
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
-    let station = Keypair::generate();
+    let station = test_station();
 
     // No verdicts. Before the window closes: still pending.
     assert_eq!(
@@ -563,7 +596,8 @@ fn an_unresolved_dispute_lapses_and_settles() {
     // At the window's close: it lapses to the confirmed status quo.
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 1000).unwrap();
     assert_eq!(outcome, Resolution::Lapsed);
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Settled { .. })
@@ -588,6 +622,7 @@ fn a_non_juror_verdict_is_refused() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[3]), true, T + 1),
         T + 1,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotSeated)));
 
@@ -599,6 +634,7 @@ fn a_non_juror_verdict_is_refused() {
         ANCHOR,
         signed_verdict(&tx, &alice, true, T + 1),
         T + 1,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotSeated)));
 }
@@ -620,6 +656,7 @@ fn a_second_verdict_from_a_juror_is_refused() {
         ANCHOR,
         signed_verdict(&tx, j0, true, T + 5),
         T + 5,
+        &test_station().public_key(),
     )
     .unwrap();
     let err = append_verdict(
@@ -629,6 +666,7 @@ fn a_second_verdict_from_a_juror_is_refused() {
         ANCHOR,
         signed_verdict(&tx, j0, false, T + 6),
         T + 6,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::AlreadyVoted)));
 }
@@ -640,7 +678,7 @@ fn cannot_seat_escalation_upheld_by_the_electorate_voids_the_transfer() {
     let db = fresh_db();
     let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
     let p = esc_params();
-    let station = Keypair::generate();
+    let station = test_station();
 
     // A party escalates because the jury cannot seat a panel, then the lone
     // eligible member (the whole electorate here) upholds.
@@ -651,6 +689,7 @@ fn cannot_seat_escalation_upheld_by_the_electorate_voids_the_transfer() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
         T + 5,
+        &test_station().public_key(),
     )
     .unwrap();
     append_escalation_ballot(
@@ -659,6 +698,7 @@ fn cannot_seat_escalation_upheld_by_the_electorate_voids_the_transfer() {
         &p,
         signed_ballot(&tx, &lone, true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -670,7 +710,8 @@ fn cannot_seat_escalation_upheld_by_the_electorate_voids_the_transfer() {
     // Once the window closes, the electorate's ruling enacts.
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 6000).unwrap();
     assert_eq!(outcome, Resolution::EscalationUpheld);
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Cancelled {
@@ -694,7 +735,7 @@ fn escalation_opened_at_is_ignored_for_the_window_and_electorate() {
     let db = fresh_db();
     let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
     let p = esc_params();
-    let station = Keypair::generate();
+    let station = test_station();
 
     open_escalation(
         &db,
@@ -703,6 +744,7 @@ fn escalation_opened_at_is_ignored_for_the_window_and_electorate() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T - 4000),
         T + 5, // admission time
+        &test_station().public_key(),
     )
     .unwrap();
     append_escalation_ballot(
@@ -711,6 +753,7 @@ fn escalation_opened_at_is_ignored_for_the_window_and_electorate() {
         &p,
         signed_ballot(&tx, &lone, true, T + 2000),
         T + 2000,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -720,7 +763,8 @@ fn escalation_opened_at_is_ignored_for_the_window_and_electorate() {
         Resolution::EscalationUpheld,
         "the ballot must be counted against the admission-anchored window, not the signed opened_at"
     );
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Cancelled {
@@ -735,7 +779,7 @@ fn cannot_seat_escalation_rejected_by_the_electorate_settles() {
     let db = fresh_db();
     let (alice, bob, lone, tx) = cannot_seat_setup(&db);
     let p = esc_params();
-    let station = Keypair::generate();
+    let station = test_station();
 
     open_escalation(
         &db,
@@ -744,6 +788,7 @@ fn cannot_seat_escalation_rejected_by_the_electorate_settles() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
         T + 5,
+        &test_station().public_key(),
     )
     .unwrap();
     append_escalation_ballot(
@@ -752,12 +797,14 @@ fn cannot_seat_escalation_rejected_by_the_electorate_settles() {
         &p,
         signed_ballot(&tx, &lone, false, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
 
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 6000).unwrap();
     assert_eq!(outcome, Resolution::EscalationRejected);
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Settled { .. })
@@ -772,7 +819,7 @@ fn an_escalation_without_quorum_lapses_open_and_settles() {
     let db = fresh_db();
     let (alice, _bob, _lone, tx) = cannot_seat_setup(&db);
     let p = esc_params();
-    let station = Keypair::generate();
+    let station = test_station();
 
     // Escalated, but nobody votes.
     open_escalation(
@@ -782,12 +829,14 @@ fn an_escalation_without_quorum_lapses_open_and_settles() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
         T + 5,
+        &test_station().public_key(),
     )
     .unwrap();
 
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 6000).unwrap();
     assert_eq!(outcome, Resolution::EscalationLapsed);
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Settled { .. })
@@ -802,7 +851,7 @@ fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = esc_params();
     let seq = sequence(&db, &tx, &p);
-    let station = Keypair::generate();
+    let station = test_station();
 
     // The jury upholds the dispute (2 of 3).
     append_verdict(
@@ -812,6 +861,7 @@ fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
     append_verdict(
@@ -821,6 +871,7 @@ fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -839,16 +890,25 @@ fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::Appeal, T + 20),
         T + 20,
+        &test_station().public_key(),
     )
     .unwrap();
     for m in &members[0..3] {
-        append_escalation_ballot(&db, &[], &p, signed_ballot(&tx, m, false, T + 30), T + 30)
-            .unwrap();
+        append_escalation_ballot(
+            &db,
+            &[],
+            &p,
+            signed_ballot(&tx, m, false, T + 30),
+            T + 30,
+            &test_station().public_key(),
+        )
+        .unwrap();
     }
 
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 6000).unwrap();
     assert_eq!(outcome, Resolution::EscalationRejected);
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(
         matches!(snapshot.get(&tx), Some(TransactionState::Settled { .. })),
         "the electorate overturned the jury's uphold, so the transfer settles"
@@ -863,7 +923,7 @@ fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = esc_params();
     let seq = sequence(&db, &tx, &p);
-    let station = Keypair::generate();
+    let station = test_station();
 
     append_verdict(
         &db,
@@ -872,6 +932,7 @@ fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
     append_verdict(
@@ -881,6 +942,7 @@ fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
         ANCHOR,
         signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -891,7 +953,8 @@ fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
     );
     let outcome = resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 2000).unwrap();
     assert_eq!(outcome, Resolution::Upheld);
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+    let snapshot =
+        LedgerSnapshot::derive(&AppendLog::new(&db), &test_station().public_key()).unwrap();
     assert!(matches!(
         snapshot.get(&tx),
         Some(TransactionState::Cancelled {
@@ -918,6 +981,7 @@ fn escalation_and_ballot_gates_refuse_the_illegitimate() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
         T + 5,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotEscalatable)));
 
@@ -929,6 +993,7 @@ fn escalation_and_ballot_gates_refuse_the_illegitimate() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::Appeal, T + 5),
         T + 5,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotEscalatable)));
 
@@ -941,6 +1006,7 @@ fn escalation_and_ballot_gates_refuse_the_illegitimate() {
         ANCHOR,
         signed_escalation(&tx, &stranger, EscalationReason::CannotSeat, T + 5),
         T + 5,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::BadEscalation)));
 }
@@ -958,6 +1024,7 @@ fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
         T + 5,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -969,12 +1036,19 @@ fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
         &p,
         signed_ballot(&tx, &stranger, true, T + 10),
         T + 10,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
 
     // A ballot before the escalation opened is out of window.
-    let err =
-        append_escalation_ballot(&db, &[], &p, signed_ballot(&tx, &lone, true, T + 1), T + 10);
+    let err = append_escalation_ballot(
+        &db,
+        &[],
+        &p,
+        signed_ballot(&tx, &lone, true, T + 1),
+        T + 10,
+        &test_station().public_key(),
+    );
     assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
 
     // The lone member votes once, then a second ballot is refused.
@@ -984,6 +1058,7 @@ fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
         &p,
         signed_ballot(&tx, &lone, true, T + 10),
         T + 10,
+        &test_station().public_key(),
     )
     .unwrap();
     let err = append_escalation_ballot(
@@ -992,6 +1067,7 @@ fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
         &p,
         signed_ballot(&tx, &lone, false, T + 11),
         T + 11,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::AlreadyVoted)));
 
@@ -1003,6 +1079,7 @@ fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 12),
         T + 12,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::AlreadyEscalated)));
 }
@@ -1025,6 +1102,7 @@ fn the_escalation_window_is_clamped_to_the_main_window() {
         ANCHOR,
         signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 50),
         T + 50,
+        &test_station().public_key(),
     )
     .unwrap();
 
@@ -1035,6 +1113,7 @@ fn the_escalation_window_is_clamped_to_the_main_window() {
         &p,
         signed_ballot(&tx, &lone, true, T + 90),
         T + 90,
+        &test_station().public_key(),
     )
     .unwrap();
     // ...but one at T+150 — inside the raw 5000s window, past the clamped close — is not.
@@ -1044,6 +1123,7 @@ fn the_escalation_window_is_clamped_to_the_main_window() {
         &p,
         signed_ballot(&tx, &lone, true, T + 150),
         T + 150,
+        &test_station().public_key(),
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
 }
@@ -1054,7 +1134,10 @@ fn find_disputed_lists_the_frozen_transaction() {
     let _members = established_members(&db, 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
-    assert_eq!(find_disputed(&db).unwrap(), vec![tx]);
+    assert_eq!(
+        find_disputed(&db, &test_station().public_key()).unwrap(),
+        vec![tx]
+    );
 
     // No verdicts cast yet.
     let empty: HashMap<Address, (bool, i64)> = HashMap::new();
@@ -1082,7 +1165,15 @@ fn grace_seats_founders_in_the_jury_pool() {
 
     // With founders supplied, the pool is exactly the four founders (none is a
     // party), enough to seat a panel of three.
-    let pool = eligible_pool(&db, &founder_addrs, &info, T, &p).unwrap();
+    let pool = eligible_pool(
+        &db,
+        &founder_addrs,
+        &info,
+        T,
+        &p,
+        &test_station().public_key(),
+    )
+    .unwrap();
     let members: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
     assert_eq!(members.len(), 4);
     for f in &founder_addrs {
@@ -1091,7 +1182,7 @@ fn grace_seats_founders_in_the_jury_pool() {
     assert!(pool.len() >= p.panel_size);
 
     // Without founders (the steady-state call), the fresh community seats no one.
-    let empty = eligible_pool(&db, &[], &info, T, &p).unwrap();
+    let empty = eligible_pool(&db, &[], &info, T, &p, &test_station().public_key()).unwrap();
     assert!(empty.is_empty());
 }
 
@@ -1111,7 +1202,15 @@ fn grace_still_recuses_a_party_who_is_a_founder() {
     };
     let p = params();
 
-    let pool = eligible_pool(&db, &founder_addrs, &info, T, &p).unwrap();
+    let pool = eligible_pool(
+        &db,
+        &founder_addrs,
+        &info,
+        T,
+        &p,
+        &test_station().public_key(),
+    )
+    .unwrap();
     let members: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
     assert_eq!(members.len(), 3);
     assert!(!members.contains(&addr(&founders[0])));

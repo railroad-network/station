@@ -1323,7 +1323,8 @@ mod reputation {
         earn_raw_standing(&db, &newcomer, &st, AT + 10);
         append_vouch(&db, &members[0], &addr(&newcomer), AT + 10);
         assert_eq!(
-            rrn_reputation::staking::established_member_count(&db, AT + 20).unwrap(),
+            rrn_reputation::staking::established_member_count(&db, AT + 20, &st.public_key())
+                .unwrap(),
             5,
             "the community now has five established members by wall clock"
         );

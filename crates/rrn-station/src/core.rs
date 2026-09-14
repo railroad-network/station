@@ -1014,9 +1014,12 @@ impl Core {
         // `in_grace` predicate; the count is derived from the log, so it always
         // reflects current standing and the phone can render its grace banner
         // without recomputing it.
-        let established =
-            rrn_reputation::staking::established_member_count(&self.db, self.clock.now())
-                .map_err(internal)?;
+        let established = rrn_reputation::staking::established_member_count(
+            &self.db,
+            self.clock.now(),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         let threshold = rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD;
         ok(&rpc::WhoamiResult {
             address: self.wallet.address.to_string(),
@@ -1036,8 +1039,12 @@ impl Core {
     fn m_status(&self) -> Result<serde_json::Value, rpc::RpcError> {
         use std::sync::atomic::Ordering;
         let now = self.clock.now();
-        let established =
-            rrn_reputation::staking::established_member_count(&self.db, now).map_err(internal)?;
+        let established = rrn_reputation::staking::established_member_count(
+            &self.db,
+            now,
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         let threshold = rrn_reputation::staking::BOOTSTRAP_GRACE_THRESHOLD;
 
         // Peer/mobile state comes from the shared connectivity snapshot the daemon
@@ -1113,7 +1120,8 @@ impl Core {
             Some(s) => parse_addr(&s)?,
             None => self.wallet.address,
         };
-        let balance_centi = ledger_view::balance_of(&self.db, &who).map_err(internal)?;
+        let balance_centi =
+            ledger_view::balance_of(&self.db, &who, &self.station_pubkey()).map_err(internal)?;
         ok(&rpc::BalanceResult { balance_centi })
     }
 
@@ -1124,8 +1132,11 @@ impl Core {
         let station = self.station_keypair();
 
         // The next nonce for *this* identity, derived from the log.
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         let nonce = snapshot.next_nonce(&self.wallet.address.public_key().to_bytes());
 
         let mut proposal = TransactionProposal::new(
@@ -1197,7 +1208,13 @@ impl Core {
 
     fn m_history(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::HistoryParams = parse_params(req)?;
-        let entries = history::history(&self.db, params.limit, params.offset).map_err(internal)?;
+        let entries = history::history(
+            &self.db,
+            params.limit,
+            params.offset,
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         ok(&rpc::HistoryResult { entries })
     }
 
@@ -1208,7 +1225,8 @@ impl Core {
         let params: rpc::TransactionsParams = parse_params(req)?;
         let member = parse_addr(&params.address)?;
         let log = AppendLog::new(&self.db);
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&log).map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&log, &self.station_pubkey())
+            .map_err(internal)?;
         let station_pk = self.station_keypair().public_key();
         let transactions = transaction_view::member_transactions(
             &snapshot,
@@ -1230,8 +1248,11 @@ impl Core {
             Some(s) => parse_addr(&s)?,
             None => self.wallet.address,
         };
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         let nonce = snapshot.next_nonce(&who.public_key().to_bytes());
         ok(&rpc::NextNonceResult { nonce })
     }
@@ -1247,8 +1268,11 @@ impl Core {
 
         // The next nonce for this identity — certificate requests share the
         // member's proposal nonce sequence (ADR-0021 §1).
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         let nonce = snapshot.next_nonce(&self.wallet.address.public_key().to_bytes());
 
         let request = rrn_ledger::escrow::CertificateRequest::new(
@@ -1283,8 +1307,11 @@ impl Core {
             None => self.wallet.address,
         };
         let now = self.clock.now();
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         // Only *live* certificates — an expired one reserves nothing, so listing
         // it with a full remaining allowance would mislead (matches the reservation
         // and the issuance count).
@@ -1321,8 +1348,11 @@ impl Core {
         let params: rpc::CertExportParams = parse_params(req)?;
         let id = rrn_ledger::escrow::CertId(Hash::from_bytes(parse_record_hash(&params.cert_id)?));
         let now = self.clock.now();
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
         let state = snapshot
             .certificate(&id)
             .ok_or_else(|| invalid_params(format!("unknown certificate {}", params.cert_id)))?;
@@ -2088,8 +2118,11 @@ impl Core {
             &hex(&inquiry_id.to_bytes())[..8]
         );
 
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(internal)?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(internal)?;
 
         // Idempotency: if a payment for this agreement is already on the log, return
         // it instead of signing a second one — the station-side of the guard the
@@ -2273,7 +2306,7 @@ impl Core {
             )
             .map_err(internal)?
             .ok_or_else(|| internal("contract vanished after termination"))?;
-            let charged = charged_periods_by_contract(&log);
+            let charged = charged_periods_by_contract(&log, &self.station_pubkey());
             let periods_charged =
                 periods_charged_of(&charged, &contract_id, records.total_periods());
             records.state(now, periods_charged).tag()
@@ -2332,13 +2365,14 @@ impl Core {
         // changes it. A direct pay carries no link and settles as it always has.
         let due: Vec<(TransactionId, Option<ListingId>)> = {
             let log = AppendLog::new(&self.db);
-            let snapshot = match rrn_ledger::state::LedgerSnapshot::derive(&log) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "settlement sweep could not read the log");
-                    return 0;
-                }
-            };
+            let snapshot =
+                match rrn_ledger::state::LedgerSnapshot::derive(&log, &self.station_pubkey()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "settlement sweep could not read the log");
+                        return 0;
+                    }
+                };
             let settler = Settler::new(&self.db, self.station_keypair(), self.settlement);
             match settler.find_eligible(now) {
                 Ok(ids) => ids
@@ -2405,7 +2439,8 @@ impl Core {
 
     fn do_refresh_reputation(&mut self) -> usize {
         let now = self.clock.now();
-        match rrn_reputation::snapshot::refresh_all_snapshots(&self.db, now) {
+        match rrn_reputation::snapshot::refresh_all_snapshots(&self.db, now, &self.station_pubkey())
+        {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "reputation snapshot refresh failed");
@@ -2472,7 +2507,8 @@ impl Core {
 
         let result = match (&state, state.listing()) {
             (ListingState::Active(_), Some(listing)) => {
-                self.listings.upsert(&self.db, listing, &state)
+                self.listings
+                    .upsert(&self.db, listing, &state, &self.station_pubkey())
             }
             _ => self.listings.remove(&self.db, listing_id),
         };
@@ -2629,7 +2665,10 @@ impl Core {
                     return 0;
                 }
             };
-            (contracts, charged_periods_by_contract(&log))
+            (
+                contracts,
+                charged_periods_by_contract(&log, &self.station_pubkey()),
+            )
         };
 
         let mut appended = 0;
@@ -3440,6 +3479,7 @@ impl Core {
             &self.dispute_params(),
             &self.dispute_anchor(),
             self.clock.now(),
+            &self.station_pubkey(),
         )
         .map_err(dispute_err)?;
         Ok(serde_json::json!({ "disputes": disputes }))
@@ -3455,6 +3495,7 @@ impl Core {
             &self.dispute_params(),
             &self.dispute_anchor(),
             self.clock.now(),
+            &self.station_pubkey(),
         )
         .map_err(dispute_err)?
         {
@@ -3539,6 +3580,7 @@ impl Core {
             &self.dispute_anchor(),
             signed,
             now,
+            &self.station_pubkey(),
         )
         .map_err(dispute_err)?;
         ok(&rpc::DisputeRuleResult {
@@ -3563,7 +3605,7 @@ impl Core {
         let targeted = params.tx_id.is_some();
         let ids = match &params.tx_id {
             Some(hex) => vec![parse_tx_id(hex)?],
-            None => find_disputed(&self.db).map_err(dispute_err)?,
+            None => find_disputed(&self.db, &self.station_pubkey()).map_err(dispute_err)?,
         };
         let now = self.clock.now();
         let station = self.station_keypair();
@@ -3620,6 +3662,7 @@ impl Core {
             &self.dispute_anchor(),
             signed,
             now,
+            &self.station_pubkey(),
         )
         .map_err(dispute_err)?;
         ok(&rpc::DisputeEscalateResult {
@@ -3652,6 +3695,7 @@ impl Core {
             &self.dispute_params(),
             signed,
             now,
+            &self.station_pubkey(),
         )
         .map_err(dispute_err)?;
         ok(&rpc::DisputeEscalationVoteResult {
@@ -3853,6 +3897,7 @@ impl Core {
             &self.dispute_anchor(),
             signed,
             now,
+            &self.station_pubkey(),
         )
         .map_err(dispute_err_pair)?;
         Ok(serde_json::json!({ "tx_id": tx_id, "uphold": uphold }))
@@ -3888,6 +3933,7 @@ impl Core {
             &self.dispute_anchor(),
             signed,
             now,
+            &self.station_pubkey(),
         )
         .map_err(dispute_err_pair)?;
         Ok(serde_json::json!({ "tx_id": tx_id, "reason": reason }))
@@ -3925,6 +3971,7 @@ impl Core {
             &self.dispute_params(),
             signed,
             now,
+            &self.station_pubkey(),
         )
         .map_err(dispute_err_pair)?;
         Ok(serde_json::json!({ "tx_id": tx_id, "uphold": uphold }))
@@ -3965,7 +4012,7 @@ impl Core {
                 Vec::new()
             }
         };
-        let ids = match find_disputed(&self.db) {
+        let ids = match find_disputed(&self.db, &self.station_pubkey()) {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::warn!(error = %e, "dispute resolution sweep: listing disputes failed");
@@ -3987,12 +4034,13 @@ impl Core {
         // founders/anchor, and enact neutralize-only: a terminal `Overturn` appends
         // the station verdict that lifts the reputation penalty, a `Confirm` records
         // finality, and a lapse (re-seatable) or a still-open round enacts nothing.
-        match equivocation_cases(&self.db) {
+        match equivocation_cases(&self.db, &self.station_pubkey()) {
             Ok(cases) => {
                 // One snapshot for the whole sweep: skip cases that already carry a
                 // terminal station ruling so a settled case is neither re-derived nor
                 // re-counted on every tick.
-                let snapshot = LedgerSnapshot::derive(&AppendLog::new(&self.db));
+                let snapshot =
+                    LedgerSnapshot::derive(&AppendLog::new(&self.db), &self.station_pubkey());
                 for case in cases {
                     if let Ok(snap) = &snapshot {
                         if case
@@ -5047,8 +5095,11 @@ impl Core {
             return Ok(());
         };
         let member = refused.payload.sender;
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
         // One record per certificate: a repeated overspend attempt is refused
         // without appending a second record.
         if snapshot.has_cert_equivocation(&cert_id) {
@@ -5128,8 +5179,11 @@ impl Core {
     ) -> Result<(), BundleIngestError> {
         let member = incoming.payload.author;
         let position = incoming.payload.position;
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))
-            .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )
+        .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
         if snapshot.has_fork_equivocation(&member, position) {
             return Ok(());
         }
@@ -5178,7 +5232,10 @@ impl Core {
         confirmer: &Address,
         now: i64,
     ) -> anyhow::Result<Option<(f32, usize)>> {
-        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&self.db))?;
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_pubkey(),
+        )?;
         let tier = snapshot
             .get(proposal_id)
             .and_then(proposal_of)
@@ -5190,7 +5247,12 @@ impl Core {
             return Ok(None);
         }
         use rrn_reputation::staking::Tier2Eligibility;
-        match rrn_reputation::staking::evaluate_tier2_confirmation(&self.db, confirmer, now)? {
+        match rrn_reputation::staking::evaluate_tier2_confirmation(
+            &self.db,
+            confirmer,
+            now,
+            &self.station_pubkey(),
+        )? {
             Tier2Eligibility::Allowed {
                 stake_centi,
                 via_grace,
@@ -5212,6 +5274,15 @@ impl Core {
 
     fn station_keypair(&self) -> Keypair {
         Keypair::from_secret(self.wallet.secret_key.clone())
+    }
+
+    /// This station's public key — the community station key that pins every
+    /// station-signed ledger and governance record on replay (ADR-0020).
+    /// On the sole writer this is the community key; a gossip read-replica would
+    /// pin against its own (different) key and see no settlements/certificates —
+    /// the documented, tested read-replica residual.
+    fn station_pubkey(&self) -> PublicKey {
+        self.station_keypair().public_key()
     }
 
     // --- pairing (T1.3.3) ---------------------------------------------------
@@ -5340,7 +5411,8 @@ impl Core {
         let member_pk = envelope.signer;
         let nonce = envelope.nonce;
         let tail = self.tail_seq();
-        let events = events::events_since(&self.db, &member, last_seen, tail);
+        let events =
+            events::events_since(&self.db, &member, last_seen, tail, &self.station_pubkey());
         if events.is_empty() {
             Ok(SubscribeOutcome::Waiting {
                 member,
@@ -5369,7 +5441,8 @@ impl Core {
         force: bool,
     ) -> Option<Vec<u8>> {
         let tail = self.tail_seq();
-        let events = events::events_since(&self.db, &member, last_seen, tail);
+        let events =
+            events::events_since(&self.db, &member, last_seen, tail, &self.station_pubkey());
         if events.is_empty() && !force {
             return None;
         }
@@ -6110,8 +6183,9 @@ impl Core {
     ) -> Result<serde_json::Value, (i32, String)> {
         let member = Address::from_public_key(envelope.signer);
         let now = self.clock.now();
-        let view = reputation_view::member_reputation(&self.db, &member, now)
-            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        let view =
+            reputation_view::member_reputation(&self.db, &member, now, &self.station_pubkey())
+                .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
     }
 
@@ -6132,7 +6206,7 @@ impl Core {
             .map_err(|e| (rpc::INVALID_PARAMS, format!("params not valid JSON: {e}")))?;
         let address = parse_addr(&params.address).map_err(|e| (e.code, e.message))?;
         let now = self.clock.now();
-        let view = reputation_view::address_band(&self.db, &address, now)
+        let view = reputation_view::address_band(&self.db, &address, now, &self.station_pubkey())
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
     }
@@ -6342,7 +6416,7 @@ impl Core {
             .map_err(internal)?
         {
             Some(records) if records.buyer() == viewer || records.provider() == viewer => {
-                let charged = charged_periods_by_contract(&log);
+                let charged = charged_periods_by_contract(&log, &self.station_pubkey());
                 let periods_charged =
                     periods_charged_of(&charged, &contract_id, records.total_periods());
                 ok(&contract_view::detail(&records, periods_charged, now))
@@ -6361,7 +6435,7 @@ impl Core {
         let log = AppendLog::new(&self.db);
         let all = rrn_marketplace::contract::all_contract_records(&log, station_pk, &admits)
             .map_err(internal)?;
-        let charged = charged_periods_by_contract(&log);
+        let charged = charged_periods_by_contract(&log, &self.station_pubkey());
         let paired = all.into_iter().map(|(id, records)| {
             let periods_charged = periods_charged_of(&charged, &id, records.total_periods());
             (records, periods_charged)
@@ -7001,10 +7075,23 @@ const PENALTY_PERIOD_INDEX: u32 = u32::MAX;
 /// This is where the station reads back `periods_charged` — the count the
 /// contract crate takes as an input rather than deriving — so the charge sweep
 /// and every state read agree on what the ledger has actually billed.
-fn charged_periods_by_contract(log: &AppendLog) -> BTreeMap<ContractRef, BTreeSet<u32>> {
+///
+/// A contract charge is station-signed (ADR-0005); only a charge whose envelope
+/// signer is the community `station` counts. A forged charge injected via gossip
+/// `append_raw` must not be read as billed — otherwise it would suppress the
+/// genuine charge the sweep owes (the station would see the period already charged
+/// and never debit the buyer), the inverse of the inert behavior the pin exists to
+/// give. Mirrors the pin in `ledger_view::balance_of`, which reads the same record.
+fn charged_periods_by_contract(
+    log: &AppendLog,
+    station: &PublicKey,
+) -> BTreeMap<ContractRef, BTreeSet<u32>> {
     let mut map: BTreeMap<ContractRef, BTreeSet<u32>> = BTreeMap::new();
     for entry in log.iter_from(1) {
         let Ok(entry) = entry else { continue };
+        if entry.payload.signer != *station {
+            continue;
+        }
         if let Ok(charge) = from_canonical_bytes::<ContractCharge>(&entry.payload.bytes) {
             map.entry(charge.contract_ref)
                 .or_default()
@@ -7951,7 +8038,7 @@ mod tests {
     }
 
     fn tx_state(core: &Core, id: &TransactionId) -> Option<TransactionState> {
-        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db), &core.station_pubkey())
             .unwrap()
             .get(id)
             .cloned()
@@ -8016,10 +8103,13 @@ mod tests {
         let alice_addr = Address::from_public_key(alice.public_key());
         let bob_addr = Address::from_public_key(bob.public_key());
         assert_eq!(
-            ledger_view::balance_of(&core.db, &alice_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &alice_addr, &core.station_pubkey()).unwrap(),
             -300
         );
-        assert_eq!(ledger_view::balance_of(&core.db, &bob_addr).unwrap(), 300);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &bob_addr, &core.station_pubkey()).unwrap(),
+            300
+        );
     }
 
     /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle (acceptance 3,
@@ -8317,9 +8407,12 @@ mod tests {
         cap_centi: i64,
         now: i64,
     ) -> rrn_ledger::escrow::CertId {
-        let nonce = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
-            .unwrap()
-            .next_nonce(&member.public_key().to_bytes());
+        let nonce = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&core.db),
+            &core.station_pubkey(),
+        )
+        .unwrap()
+        .next_nonce(&member.public_key().to_bytes());
         let req = rrn_ledger::escrow::CertificateRequest::new(
             Address::from_public_key(member.public_key()),
             cap_centi,
@@ -8359,7 +8452,7 @@ mod tests {
     }
 
     fn consumed_of(core: &Core, cert: &rrn_ledger::escrow::CertId) -> i64 {
-        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db), &core.station_pubkey())
             .unwrap()
             .certificate(cert)
             .unwrap()
@@ -8470,12 +8563,13 @@ mod tests {
         assert!(matches!(d[2], Disposition::Admitted { .. }), "return");
 
         // The return took effect: the certificate is no longer outstanding.
-        assert!(
-            rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
-                .unwrap()
-                .outstanding_certs_of(&Address::from_public_key(alice.public_key()))
-                .is_empty()
-        );
+        assert!(rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&core.db),
+            &core.station_pubkey()
+        )
+        .unwrap()
+        .outstanding_certs_of(&Address::from_public_key(alice.public_key()))
+        .is_empty());
 
         // A certificate *request* cannot ride a store-and-forward bundle.
         let req = SignedPayload::sign(
@@ -8498,7 +8592,7 @@ mod tests {
 
     /// Every equivocation record on the log, in content order.
     fn equivocations(core: &Core) -> Vec<rrn_ledger::escrow::SignedEquivocationRecord> {
-        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
+        rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db), &core.station_pubkey())
             .unwrap()
             .equivocations()
             .cloned()
@@ -8539,7 +8633,11 @@ mod tests {
 
         // Exactly one equivocation record; basis cert-overspend; it names alice;
         // its evidence verifies against the certificate's cap.
-        let snap = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+        let snap = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&core.db),
+            &core.station_pubkey(),
+        )
+        .unwrap();
         let recs: Vec<_> = snap.equivocations().collect();
         assert_eq!(recs.len(), 1, "one record for the overspend");
         let rec = &recs[0].payload;
@@ -8820,8 +8918,11 @@ mod tests {
         // window is still open (`expires_at` beyond `late`), so the refusal is
         // `CertExpired`, not the ordinary window `Expired`.
         let boundary = {
-            let snap =
-                rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+            let snap = rrn_ledger::state::LedgerSnapshot::derive(
+                &AppendLog::new(&core.db),
+                &core.station_pubkey(),
+            )
+            .unwrap();
             let c = snap.certificate(&cert).unwrap().certificate.payload.clone();
             rrn_ledger::escrow::spend_admissible_until(&c, &core.credit)
         };
@@ -9298,7 +9399,7 @@ mod tests {
         let mut core = established_core(); // clock = TEN_MONTHS
         let now = core.clock.now();
         // End bootstrap grace: three established members exist.
-        gov_established_members(&core.db, 3, now);
+        gov_established_members(&core.db, 3, now, &core.station_keypair());
 
         let sender = Keypair::generate();
         let alice = Keypair::generate(); // fresh — below the Member band; the confirmer
@@ -10126,8 +10227,11 @@ mod tests {
 
         // The proposal stands on the log: from the station, to the provider, at the
         // granted price, and linked to the listing so settlement can attest the sale.
-        let snapshot =
-            rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db)).unwrap();
+        let snapshot = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&core.db),
+            &core.station_pubkey(),
+        )
+        .unwrap();
         let state = snapshot.get(&parse_tx_id(&tx_id).unwrap()).unwrap();
         let proposal = proposal_of(state).unwrap();
         assert_eq!(proposal.sender, core.wallet.address);
@@ -10152,10 +10256,13 @@ mod tests {
         assert_eq!(first["tx_id"], second["tx_id"]);
 
         // Only one proposal was ever appended — the second call found the first.
-        let count = rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db))
-            .unwrap()
-            .iter()
-            .count();
+        let count = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&core.db),
+            &core.station_pubkey(),
+        )
+        .unwrap()
+        .iter()
+        .count();
         assert_eq!(count, 1);
     }
 
@@ -10191,11 +10298,11 @@ mod tests {
         // At NOW only period 0 is due: one charge, buyer debited, provider paid.
         assert_eq!(core.do_charge_contracts(), 1);
         assert_eq!(
-            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -500
         );
         assert_eq!(
-            ledger_view::balance_of(&core.db, &provider_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
             500
         );
 
@@ -10203,7 +10310,7 @@ mod tests {
         // per-period idempotency key in the balance fold is the backstop.
         assert_eq!(core.do_charge_contracts(), 0);
         assert_eq!(
-            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -500
         );
 
@@ -10214,12 +10321,62 @@ mod tests {
         assert_eq!(core.do_charge_contracts(), 3);
         assert_eq!(core.do_charge_contracts(), 0);
         assert_eq!(
-            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -2000
         );
         assert_eq!(
-            ledger_view::balance_of(&core.db, &provider_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
             2000
+        );
+    }
+
+    #[test]
+    fn a_forged_contract_charge_does_not_suppress_genuine_billing() {
+        // A forged (non-station) `ContractCharge` for a due period must not be read
+        // as "already billed" — otherwise it would suppress the genuine charge the
+        // station owes, leaving the buyer billed nothing. The charge-sweep reader
+        // pins the signer to the community station key, so the forgery is ignored.
+        let mut core = test_core();
+        let (provider, buyer, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let contract_id = seed_contract(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+
+        // A hostile peer injects a forged charge for period 0 of this contract.
+        let forged = ContractCharge {
+            contract_ref: ContractRef(contract_id.to_bytes()),
+            buyer: buyer_addr,
+            provider: provider_addr,
+            amount_centi: 500,
+            period_index: 0,
+            charged_at: NOW,
+        };
+        AppendLog::new(&core.db)
+            .append(
+                rrn_crypto::signed::SignedPayload::sign(forged, &mallory),
+                NOW,
+            )
+            .unwrap();
+
+        // The forged charge moved no balance and did not consume period 0's slot:
+        // the genuine sweep still bills it.
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            0,
+            "the forged charge must not debit the buyer"
+        );
+        assert_eq!(core.do_charge_contracts(), 1, "period 0 is still due");
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -500
+        );
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
+            500
         );
     }
 
@@ -10261,11 +10418,11 @@ mod tests {
         core.clock.set(NOW + WEEK_SECS);
         assert_eq!(core.do_charge_contracts(), 2); // period 1 + the penalty
         assert_eq!(
-            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -(2 * CONTRACT_PRICE) - CONTRACT_PENALTY
         );
         assert_eq!(
-            ledger_view::balance_of(&core.db, &provider_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
             2 * CONTRACT_PRICE + CONTRACT_PENALTY
         );
 
@@ -10274,7 +10431,7 @@ mod tests {
         core.clock.set(NOW + 10 * WEEK_SECS);
         assert_eq!(core.do_charge_contracts(), 0);
         assert_eq!(
-            ledger_view::balance_of(&core.db, &buyer_addr).unwrap(),
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -(2 * CONTRACT_PRICE) - CONTRACT_PENALTY
         );
     }
@@ -10509,12 +10666,18 @@ mod tests {
 
     /// Builds `n` established members anchored in a ring — the electorate the
     /// governance guards require.
-    fn gov_established_members(db: &Database, n: usize, at: i64) -> Vec<Keypair> {
-        let settler = Keypair::generate();
+    fn gov_established_members(
+        db: &Database,
+        n: usize,
+        at: i64,
+        station: &Keypair,
+    ) -> Vec<Keypair> {
+        // Settlements must be signed by the community station the Core derives
+        // reputation under, or the signer pin skips them and no one establishes.
         let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
         for m in &members {
             for nonce in 0..10 {
-                gov_settled(db, m, &Keypair::generate(), &settler, nonce, at);
+                gov_settled(db, m, &Keypair::generate(), station, nonce, at);
             }
             for _ in 0..10 {
                 gov_vouch(db, m, &gaddr(&Keypair::generate()), at);
@@ -10699,7 +10862,7 @@ mod tests {
     #[test]
     fn governance_channel_lifecycle_publishes_and_counts_votes() {
         let mut core = established_core();
-        let members = gov_established_members(&core.db, 4, TEN_MONTHS);
+        let members = gov_established_members(&core.db, 4, TEN_MONTHS, &core.station_keypair());
 
         // The station publishes the genesis charter (sole founder).
         call(

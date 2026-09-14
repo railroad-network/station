@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -331,9 +331,9 @@ fn payees_of(evidence_bytes: &[Vec<u8>]) -> HashSet<Address> {
 ///
 /// Records that did not verify at replay are already absent from
 /// [`LedgerSnapshot::equivocations`], so every case here rests on proven evidence.
-pub fn equivocation_cases(db: &Database) -> Result<Vec<EquivCase>> {
+pub fn equivocation_cases(db: &Database, station: &PublicKey) -> Result<Vec<EquivCase>> {
     let log = AppendLog::new(db);
-    let snapshot = LedgerSnapshot::derive(&log)?;
+    let snapshot = LedgerSnapshot::derive(&log, station)?;
 
     // Gather each verified record with its admission position, grouped by identity.
     struct Attached {
@@ -401,8 +401,12 @@ pub fn equivocation_cases(db: &Database) -> Result<Vec<EquivCase>> {
 
 /// The equivocation case a ballot or re-seat's `equivocation_id` belongs to, if
 /// any — resolves any attached record id to its case identity (ADR-0025 §1).
-pub fn case_for_record(db: &Database, id: &EquivocationId) -> Result<Option<EquivCase>> {
-    Ok(equivocation_cases(db)?
+pub fn case_for_record(
+    db: &Database,
+    id: &EquivocationId,
+    station: &PublicKey,
+) -> Result<Option<EquivCase>> {
+    Ok(equivocation_cases(db, station)?
         .into_iter()
         .find(|c| c.attached.contains(id)))
 }
@@ -427,6 +431,7 @@ fn rounds(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<Vec<Round>> {
     let mut rounds = vec![Round {
         index: 0,
@@ -462,11 +467,29 @@ fn rounds(
         if entry.created_at < closed {
             continue;
         }
-        if round_decision(db, founders, case, &cur, params, anchor, entry.created_at)?.is_some() {
+        if round_decision(
+            db,
+            founders,
+            case,
+            &cur,
+            params,
+            anchor,
+            entry.created_at,
+            station,
+        )?
+        .is_some()
+        {
             continue;
         }
         // The requester must be an established, non-subject member at admission.
-        if !reseat_eligible(db, founders, case, &reseat.requester, entry.created_at)? {
+        if !reseat_eligible(
+            db,
+            founders,
+            case,
+            &reseat.requester,
+            entry.created_at,
+            station,
+        )? {
             continue;
         }
         rounds.push(Round {
@@ -486,15 +509,17 @@ fn reseat_eligible(
     case: &EquivCase,
     requester: &Address,
     at_time: i64,
+    station: &PublicKey,
 ) -> Result<bool> {
     if *requester == case.subject {
         return Ok(false);
     }
-    Ok(grace_electorate(db, founders, at_time)?.contains(requester))
+    Ok(grace_electorate(db, founders, at_time, station)?.contains(requester))
 }
 
 /// The seated panel for one round of a case as of `now` — the shared derivation
 /// [`round_decision`] and the ballot append-gate both key off.
+#[allow(clippy::too_many_arguments)]
 fn round_panel(
     db: &Database,
     founders: &[Address],
@@ -503,10 +528,12 @@ fn round_panel(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<Panel> {
     let hard = case.hard_excluded();
     let soft = vouchers_of_until(db, &case.subject, round.anchor_seq)?;
-    let pool = eligible_pool_excluding(db, founders, round.opened_at, params, &hard, &soft)?;
+    let pool =
+        eligible_pool_excluding(db, founders, round.opened_at, params, &hard, &soft, station)?;
     let sequence = draw_sequence(&pool, case.seed(round.anchor_seq, anchor));
     let ballots = round_ballots(db, case, round.index)?;
     Ok(resolve_panel(
@@ -522,6 +549,7 @@ fn round_panel(
 /// mapping the shared [`tally`] onto the equivocation verdict space
 /// (`Upheld` ⇒ `Overturn`, `Rejected` ⇒ `Confirm`). `None` while the jury is short
 /// of a majority.
+#[allow(clippy::too_many_arguments)]
 fn round_decision(
     db: &Database,
     founders: &[Address],
@@ -530,8 +558,9 @@ fn round_decision(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<Option<VerdictDecision>> {
-    let panel = round_panel(db, founders, case, round, params, anchor, now)?;
+    let panel = round_panel(db, founders, case, round, params, anchor, now, station)?;
     Ok(tally(&panel, params).map(|o| match o {
         DisputeOutcome::Upheld => VerdictDecision::Overturn,
         DisputeOutcome::Rejected => VerdictDecision::Confirm,
@@ -582,8 +611,9 @@ pub fn preview_equivocation(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<EquivResolution> {
-    decide_equivocation(db, founders, case, params, anchor, now)
+    decide_equivocation(db, founders, case, params, anchor, now, station)
 }
 
 /// The pure decision for a case as of `now`. A station-signed terminal ruling, if
@@ -596,8 +626,9 @@ fn decide_equivocation(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<EquivResolution> {
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db), station)?;
     if let Some(decision) = terminal_of(&snapshot, case) {
         return Ok(match decision {
             VerdictDecision::Overturn => EquivResolution::Overturned,
@@ -605,9 +636,9 @@ fn decide_equivocation(
         });
     }
 
-    let rounds = rounds(db, founders, case, params, anchor, now)?;
+    let rounds = rounds(db, founders, case, params, anchor, now, station)?;
     let cur = *rounds.last().expect("round 0 is always present");
-    match round_decision(db, founders, case, &cur, params, anchor, now)? {
+    match round_decision(db, founders, case, &cur, params, anchor, now, station)? {
         Some(VerdictDecision::Overturn) => Ok(EquivResolution::Overturned),
         Some(VerdictDecision::Confirm) => Ok(EquivResolution::Confirmed),
         None if now >= cur.opened_at.saturating_add(params.window_seconds) => {
@@ -641,14 +672,15 @@ pub fn resolve_equivocation(
     anchor: &[u8],
     now: i64,
 ) -> Result<EquivResolution> {
-    let outcome = decide_equivocation(db, founders, case, params, anchor, now)?;
+    let station_pub = station.public_key();
+    let outcome = decide_equivocation(db, founders, case, params, anchor, now, &station_pub)?;
     let decision = match outcome {
         EquivResolution::Overturned => VerdictDecision::Overturn,
         EquivResolution::Confirmed => VerdictDecision::Confirm,
         EquivResolution::Pending | EquivResolution::Lapsed => return Ok(outcome),
     };
 
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db), &station_pub)?;
     for id in &case.attached {
         // Idempotent: never append a second terminal for a record already ruled on.
         if snapshot.equivocation_terminal(id).is_some() {
@@ -682,6 +714,7 @@ pub fn append_equivocation_ballot(
     anchor: &[u8],
     ballot: SignedEquivocationBallot,
     now: i64,
+    station: &PublicKey,
 ) -> Result<()> {
     ballot.verify().map_err(|_| Error::BadEquivocationBallot)?;
     let (equivocation_id, juror, round) = (
@@ -693,8 +726,8 @@ pub fn append_equivocation_ballot(
         return Err(Error::BadEquivocationBallot);
     }
 
-    let case = case_for_record(db, &equivocation_id)?.ok_or(Error::NoEquivocationCase)?;
-    let rounds = rounds(db, founders, &case, params, anchor, now)?;
+    let case = case_for_record(db, &equivocation_id, station)?.ok_or(Error::NoEquivocationCase)?;
+    let rounds = rounds(db, founders, &case, params, anchor, now, station)?;
     let round_anchor = rounds
         .iter()
         .find(|r| r.index == round)
@@ -711,7 +744,16 @@ pub fn append_equivocation_ballot(
     // window already closed has had their seat redrawn, so this fails — a late
     // ballot cannot be backdated in. `cast_at` is retained on the record as
     // testimony only and enters no arithmetic.
-    let panel = round_panel(db, founders, &case, round_anchor, params, anchor, now)?;
+    let panel = round_panel(
+        db,
+        founders,
+        &case,
+        round_anchor,
+        params,
+        anchor,
+        now,
+        station,
+    )?;
     match panel.seat_of(&juror) {
         Some(seat) if seat.verdict.is_none() => {}
         _ => return Err(Error::NotSeated),
@@ -737,6 +779,7 @@ pub fn append_equivocation_reseat(
     anchor: &[u8],
     reseat: SignedEquivocationReseat,
     now: i64,
+    station: &PublicKey,
 ) -> Result<()> {
     reseat.verify().map_err(|_| Error::BadReseat)?;
     let (equivocation_id, requester, round) = (
@@ -748,20 +791,22 @@ pub fn append_equivocation_reseat(
         return Err(Error::BadReseat);
     }
 
-    let case = case_for_record(db, &equivocation_id)?.ok_or(Error::NoEquivocationCase)?;
+    let case = case_for_record(db, &equivocation_id, station)?.ok_or(Error::NoEquivocationCase)?;
 
     // The case must currently be lapsed, and this request must open the very next
     // round. A terminal (confirmed/overturned) or still-pending case is not
     // re-seatable, and a round that does not follow the current one is refused.
-    if decide_equivocation(db, founders, &case, params, anchor, now)? != EquivResolution::Lapsed {
+    if decide_equivocation(db, founders, &case, params, anchor, now, station)?
+        != EquivResolution::Lapsed
+    {
         return Err(Error::NotReseatable);
     }
-    let rounds = rounds(db, founders, &case, params, anchor, now)?;
+    let rounds = rounds(db, founders, &case, params, anchor, now, station)?;
     let cur = rounds.last().expect("round 0 is always present");
     if round != cur.index + 1 {
         return Err(Error::NotReseatable);
     }
-    if !reseat_eligible(db, founders, &case, &requester, now)? {
+    if !reseat_eligible(db, founders, &case, &requester, now, station)? {
         return Err(Error::NotReseatable);
     }
 

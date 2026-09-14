@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 
 use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
@@ -58,8 +59,12 @@ pub struct DisputedInfo {
 /// entry was admitted, which records `dispute_admitted_at`; its absence means a
 /// corrupt or partially-replayed log and is a hard error rather than a fall-back
 /// to the party's value.
-pub fn disputed_info(db: &Database, tx_id: &TransactionId) -> Result<DisputedInfo> {
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+pub fn disputed_info(
+    db: &Database,
+    tx_id: &TransactionId,
+    station: &PublicKey,
+) -> Result<DisputedInfo> {
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db), station)?;
     disputed_info_from_snapshot(&snapshot, tx_id)
 }
 
@@ -156,13 +161,14 @@ pub fn eligible_pool(
     info: &DisputedInfo,
     at_time: i64,
     params: &DisputeParams,
+    station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
     // The two parties are never eligible (hard recusal); their vouchers are
     // recused too but relax first if that is the only way to seat a panel.
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
     let mut vouchers = vouchers_of(db, &info.sender)?;
     vouchers.extend(vouchers_of(db, &info.receiver)?);
-    eligible_pool_excluding(db, founders, at_time, params, &parties, &vouchers)
+    eligible_pool_excluding(db, founders, at_time, params, &parties, &vouchers, station)
 }
 
 /// The shared sortition pool with an explicit two-tier recusal set — the one rule
@@ -185,15 +191,16 @@ pub fn eligible_pool_excluding(
     params: &DisputeParams,
     hard_excluded: &HashSet<Address>,
     soft_excluded: &HashSet<Address>,
+    station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
-    let electorate = grace_electorate(db, founders, at_time)?;
+    let electorate = grace_electorate(db, founders, at_time, station)?;
 
     let weigh = |db: &Database, addr: &Address| -> Result<(Address, u64)> {
         // Established members hold composite ≥ the Member band, so their raw
         // standing is positive; a founder seated during grace may have none, so the
         // `max(1)` floor — defensive against a zero weight stalling the draw — is
         // what keeps such a founder selectable.
-        Ok((*addr, tier2_stake_centi(db, addr, at_time)?.max(1)))
+        Ok((*addr, tier2_stake_centi(db, addr, at_time, station)?.max(1)))
     };
 
     let mut strict = Vec::new();
