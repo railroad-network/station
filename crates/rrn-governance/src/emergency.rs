@@ -1815,7 +1815,10 @@ fn cosign_already_present(
 /// makes it *not activatable*: fail closed here, the same way replay does, so a
 /// bypassed crossing can never be revived by a later front-door co-signature. (The
 /// broader "gossip ingest bypasses every front-door gate" surface — eligibility,
-/// duplicate co-signs, D3 — is a pre-existing residual tracked for the maintainer.)
+/// duplicate co-signs, D3 — is closed by the single-writer role split: the
+/// community's writer never pulls, so no gossiped crossing reaches its chain at
+/// all (ADR-0020 §7 Clarification). This fail-closed rule stays as defence in
+/// depth regardless.)
 ///
 /// Reads go through a fresh [`AppendLog`] over the same [`Database`] connection,
 /// so they observe the crossing record already appended into the open batch.

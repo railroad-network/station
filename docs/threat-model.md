@@ -1540,12 +1540,13 @@ daemon (one local user, one writer).
 > deliberately minimal (T0.6.6). Phase 2 **retired it in place** rather than
 > replacing it (ADR-0020 §7): read-replica gossip still exists for replica
 > copies of the chain, but the DTN bundle path is the canonical resilience
-> mechanism, and the pilot runs with `[peers] list = []`. The gossip residuals
-> below therefore still stand; the consolidated statement is the "gossip ingest
-> bypasses the front door" residual at the end of the
-> [`rrn-governance`](#rrn-governance) section, and [Known
-> limitations](#known-limitations) carries it under the unpinned
-> station-signed ledger records.
+> mechanism. The prior "gossip ingest bypasses the front door" bypass is
+> **closed** by the station-role split (ADR-0020 §7 Clarification, 2026-09-14): a
+> station is a **writer** (owns the chain; never pulls; refuses to start with a
+> peer list) or a **replica** (pulls a copy; admits nothing). A writer therefore
+> accepts nothing over gossip at all, and a replica re-derives but never
+> re-enforces (ADR-0018) and never fronts a write. The Spoofing/Tampering entries
+> below are updated to reflect this.
 
 #### Spoofing — impersonating the CLI user, or a peer
 
@@ -1554,20 +1555,25 @@ daemon (one local user, one writer).
   configured peer and feeds the station log entries.
 - *Mitigation:* the Unix socket is the authorization boundary — it is created
   with owner-only (`0o600`) permissions, so only the user who launched the
-  daemon can call it; there is no in-band CLI auth, by design. Peer entries are
-  *not* trusted on the basis of their source: every entry pulled over gossip is
-  re-verified with `AppendLog::append_raw`, which checks `signer.verify(bytes,
-  signature)` before storing — an entry whose signature does not match its bytes
-  is dropped (and never aborts the batch).
-- *Residual risk:* a valid signature only proves *authorship*, not *authority*.
-  A peer can serve a correctly-signed entry that is semantically hostile (a
-  station-signed settlement crediting itself, or a member governance record
-  that skipped the front door's eligibility and duplicate checks); the gossip
-  path applies no front-door gate. Governance station attestations are now
-  signer-pinned on replay, ledger ones are not (see `rrn-governance`, residual
-  list). Cross-community authority/fork resolution is Phase 3. The peer TCP
-  port has no transport authentication or encryption at all, and the pilot
-  configures no peers.
+  daemon can call it; there is no in-band CLI auth, by design. For the peer
+  surface, the station role is the boundary (ADR-0020 §7 Clarification): the
+  community's **writer never pulls** — it does not run the gossip client and
+  refuses to start with a peer list — so a machine impersonating a peer has
+  nothing to feed it. Only a **replica** pulls, and a replica **admits nothing**:
+  every entry it pulls is still re-verified with `AppendLog::append_raw`
+  (`signer.verify(bytes, signature)` before storing), it re-derives but never
+  re-enforces (ADR-0018), and every write surface it exposes returns a typed
+  read-replica refusal.
+- *Residual risk:* a valid signature only proves *authorship*, not *authority* —
+  but the front-door bypass this used to enable is closed: a hostile peer can no
+  longer land an ungated record on a **writer's** chain, because the writer
+  never pulls. A **replica** may copy a semantically-hostile-but-validly-signed
+  entry into its local copy, but a replica's chain is not authoritative and it
+  admits nothing, so this corrupts only that replica's view (fork detection
+  across replicas remains out of scope, below). The peer TCP port still has no
+  transport authentication or encryption at all (Phase 3); a replica pulls only
+  from the peers its operator configured. Cross-community authority/fork
+  resolution is Phase 3.
 
 #### Tampering — the IPC channel, and peer-supplied entries
 
@@ -1626,9 +1632,11 @@ daemon (one local user, one writer).
   the core processes commands serially. Peer reads are bounded by line framing,
   and a peer that errors only fails *that* gossip round.
 - *Residual risk:* there is no rate-limiting or connection cap on the socket,
-  the peer port, or the mobile listener, and the gossip stub still pulls a
-  peer's whole log each round (`gossip::gossip_with_peer`), which does not
-  scale. Phase 2 bounded the *size* of what each surface accepts (bundle caps,
+  the peer port, or the mobile listener, and a **replica** still pulls the
+  writer's whole log each round (`gossip::gossip_with_peer`; only a replica
+  pulls now — a writer runs no gossip client), which does not scale
+  (delta/cursor sync is out of scope). Phase 2 bounded the *size* of what each
+  surface accepts (bundle caps,
   `MOBILE_BODY_LIMIT`, framing/paper/SMS reassembly bounds) and the *time* an
   unreachable peer can cost (`PEER_DIAL_TIMEOUT`), but did **not** add rate
   limiting; that remains a [known limitation](#known-limitations).
@@ -2568,20 +2576,24 @@ implementation, and adds two station-signed record kinds
      one ADR should switch *both* governance and ledger to the configured key at once.)
   4. **The log-head freshness / stale-signature witness** that ADR-0027 defers is
      unchanged: pinning proves *who* signed, not that the signer's view was fresh.
-- *Residual — gossip ingest bypasses the front door (pre-existing, T2.8.2/ADR-0020).*
-  `do_append_entries` (the gossip pull path) admits any signature-valid record via
-  `append_raw` with no front-door gate — so a member `emergency_cosign` couriered to a
-  hostile peer instead of the station can reach the writer's log *markerless*,
-  bypassing eligibility, the duplicate-co-sign guard, and the D3 checks. T2.8.3 closes
-  the one consequence its own invariant depends on: `try_activate` writes a marker
-  **only** when the crossing sits at the front-door record it is deciding on, so a
-  markerless (gossiped) crossing is *not activatable* on the writer either — matching
-  replay's fail-closed rule (ADR-0027 D1b), so a later front-door co-signature can no
-  longer revive it. The **broader** bypass — gossip skipping eligibility/duplicate/D3
-  for governance kinds generally — is unchanged and remains a residual for the
-  maintainer (the clean fix, refusing member `rrn.gov.*` kinds in `do_append_entries`
-  since they arrive by DTN/RPC per ADR-0020, is an architectural change beyond this
-  ticket).
+- *Gossip ingest bypasses the front door — CLOSED (T2.11.4, ADR-0020 §7
+  Clarification).* Previously `do_append_entries` (the gossip pull path) admitted
+  any signature-valid record via `append_raw` with no front-door gate — so a
+  member `emergency_cosign` couriered to a hostile peer instead of the station
+  could reach the writer's log *markerless*, bypassing eligibility, the
+  duplicate-co-sign guard, and the D3 checks. T2.8.3 had already de-fanged the one
+  activation consequence (a markerless crossing is not activatable, ADR-0027 D1b).
+  T2.11.4 closes the general bypass by role: the community's **writer never
+  pulls** (it runs no gossip client and refuses to start with a peer list, so no
+  gossiped record — governance or otherwise — can reach the writer's chain at
+  all; `do_append_entries` also refuses on a writer as defence in depth), and a
+  **replica never admits** (it pulls a copy and re-derives, ADR-0018, but fronts
+  no writes and runs no admitting sweep timers). A gossiped `rrn.gov.*`, ledger,
+  or marketplace record can therefore land only in a *replica's* non-authoritative
+  copy, never on the writer's chain. The markerless-crossing fail-closed rule
+  stays as defence in depth (`emergency_activation_ttl.rs`). The residual below
+  (a replica's own derived views are empty until it knows the writer's key) is the
+  remaining, contained consequence.
 
 ## Mobile client (Phase 1)
 
@@ -3989,7 +4001,7 @@ picture; the boundaries that now exist, each analyzed in its own section:
 | Reticulum: `rnsd` sidecar + LXMF adapter co-process (length-prefixed pipe) | opaque frames | nothing — a dumb carrier; framing CRC/Blake3 then the signatures inside | [Reticulum transport sidecar](#reticulum-transport-sidecar-station-adr-0013--adr-0026), [DTN transport over a constrained carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026) |
 | SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station-t271) |
 | Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli-t252) |
-| Gossip peer TCP (`[peers]`, loopback by default, empty in the pilot) | line-JSON `WireEntry` | signature + content hash in `append_raw`; **no front-door gate** | [`rrn-station`](#rrn-station--rrn-cli) |
+| Gossip peer TCP — **replica-only pull** (`[network] role`; a writer never pulls and takes no peers; loopback by default, no peers in the pilot) | line-JSON `WireEntry` | signature + content hash in `append_raw`; a **replica** re-derives but admits nothing, and the **writer** never reads this boundary at all (ADR-0020 §7 Clarification) | [`rrn-station`](#rrn-station--rrn-cli) |
 | Encrypted volume: `sudo -n` mount helper, the console unlock ceremony | holders' pasted `rrnrecover-resp:` lines | the console fingerprint, then the reconstructed VMK's address | [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) |
 
 Every carrier row shares one property: **the carrier establishes no trust**.
@@ -4054,18 +4066,26 @@ entry citing its ADR or the section that owns it.
   holds a fully-signed bundle off-log. A renewal re-pins the electorate at its
   own activation. (Both charter doors — amendment *and* replacement founder
   charter — are now frozen at admission during an emergency; ADR-0023 §3(b) is
-  met, save for the ungated gossip front door tracked separately.)
-- **A gossip read-replica cannot derive governance or balances until told the
-  writer's key.** Station-signed ledger records (`SettlementRecord`,
+  met. The gossip front-door bypass that once let a gossiped record skip these
+  checks is closed by the writer/replica role split — T2.11.4, ADR-0020 §7.)
+- **The gossip front-door bypass is closed; a replica is a role, not a bypass
+  (T2.11.4).** A station is now a **writer** (owns the chain, never pulls, refuses
+  to start with peers) or a **read-replica** (pulls a copy, admits nothing —
+  every write surface refuses, and the admitting sweep timers do not run). So a
+  gossiped record can no longer reach the *writer's* chain ungated (ADR-0020 §7
+  Clarification). The surviving residual is decision (a)'s consequence for a
+  replica's own derived views: station-signed ledger records (`SettlementRecord`,
   `CancellationRecord`, `HeadroomCertificate`, `ContractCharge`, equivocation
-  records and verdicts) and governance attestations are now all signer-pinned to
-  the community station key on replay. The surviving residual is decision (a)'s
-  consequence: a peer deriving under a *different* key sees no station-signed
-  state at all — every balance reads as zero — a loud, tested failure, never a
-  silent partial. The pilot runs a single writer and no gossip peers; a configured
-  or in-log community key for replicas needs its own ADR (the `rrn-governance`
-  residual list, item 3). The log-head freshness witness ADR-0027 deferred (item 4)
-  belongs with the emergency residuals above.
+  records and verdicts) and governance attestations are signer-pinned to the
+  community station key on replay, and a replica's own key differs from the
+  writer's — so a replica sees no station-signed state (every balance reads as
+  zero) and its governance view is the genesis charter and nothing else. This is a
+  loud, tested failure, never a silent partial; a replica is a faithful copy of
+  the *chain* for audit/backup, not a second balance oracle. The pilot runs a
+  single writer and no gossip peers; a configured or in-log community key that
+  would let a replica derive correctly needs its own ADR (the `rrn-governance`
+  residual list, item 3). The log-head freshness witness ADR-0027 deferred (item
+  4) belongs with the emergency residuals above.
 - **Equivocation: two count-bounded evasions are closed, two policy gaps
   remain.** After an `Overturn`, a later genuine overspend on the same
   certificate is refused but records no fresh proof or penalty (first-wins

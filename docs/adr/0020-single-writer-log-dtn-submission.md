@@ -138,6 +138,53 @@ Concretely:
   multi-writer questions (cross-chain ordering, treaty-bounded credit) land
   where they belong, in the federation ADRs.
 
+## Clarification (2026-09-14) — the writer never pulls; a replica never admits
+
+Decision §7 says read-replica gossip "continues to exist for replica copies of
+the chain," and Decision §1 that there is one writer. This clarifies how those
+two hold together *in code*, not only in configuration, and does not change the
+decision.
+
+Until now, the single-writer property was enforced only by convention: an
+operator set `[peers] list = []` on the writer, and the read-replica gossip
+apply path (`Core::do_append_entries` → `append_raw`) appended any
+signature-valid entry a configured peer served, with no front-door gate. That
+left a bypass — a member record couriered to a *hostile* peer instead of the
+station could land on the writer's chain ungated (no eligibility, duplicate,
+window, debt-floor, tier, or emergency check). ADR-0027 D1b already closed the
+one activation-bearing case (a markerless emergency-cosign crossing is
+fail-closed); this clarifies the general rule.
+
+A station now carries an explicit role (`[network] role = "writer" | "replica"`,
+default `writer`):
+
+- **A writer never pulls.** It does not run the gossip client at all; a writer
+  configured with a non-empty `[peers] list` refuses to start (appliance
+  discipline, as with the sidecar version pin). It still *serves* the peer port,
+  so replicas can copy the chain from it. `Core::do_append_entries` refuses on a
+  writer as defence in depth — the property holds however the path is reached,
+  not only because the loop was not spawned.
+- **A replica never admits.** It pulls the writer's chain and re-derives state by
+  replay (ADR-0018 "replicas re-derive, never re-enforce"), but every write
+  surface it exposes — the operator socket's writes, the mobile channel's writes
+  (including courier `bundle_submit`), and transport DTN ingest (Reticulum, SMS)
+  — refuses with a typed *read-replica* error naming the writer as the place to
+  submit. Its log-appending sweep timers (settlement/cancellation, expiry,
+  contract charges, governance enactment, dispute resolution) do not run. A
+  replica is a warm second copy for audit/backup; it is **not** a failover
+  standby (writer succession stays Phase 3, per Consequences).
+
+A replica re-derives station-signed state (balances from settlement, governance
+tallies, emergencies) by replaying records the *writer* signed, but the ledger
+and governance readers pin those records to *this* station's signer (ADR-0022 §5
+/ the T2.1.4 and T2.11.3 signer-pinning work, decision (a)). A replica's own key
+is not the writer's, so those readers correctly decline the writer-signed
+records: a replica faithfully copies the *chain*, and its derived station-signed
+views read as "genesis and nothing else" rather than mirroring the writer's.
+Making a replica's derived views match the writer's would require a
+replica-supplied expected-writer key at the pinning boundary; that is left as a
+follow-up, not part of this clarification.
+
 ## Alternatives Considered
 
 - **Per-node chains (a small set of co-equal station-class writers), merged

@@ -672,6 +672,13 @@ pub struct Core {
     /// binding enters only via an append (the `sms_bound_senders`
     /// pattern). `None` until first resolved.
     binding_dir: Option<(u64, std::collections::HashMap<Address, String>)>,
+    /// This station's role (ADR-0020 §1/§7). A [`StationRole::Writer`] (the
+    /// default) admits records at its front door and appends its own timers'
+    /// records; a [`StationRole::Replica`] admits nothing — every write surface
+    /// refuses with [`rpc::READ_REPLICA`], and it applies only the writer's
+    /// chain it pulls over gossip (`do_append_entries`). Set from
+    /// `[network] role`; a bare test core is a writer.
+    role: crate::config::StationRole,
 }
 
 /// Default DTN receipt retention (30 days), matching `[dtn]
@@ -712,7 +719,16 @@ impl Core {
             connectivity: None,
             dtn_outbound: None,
             binding_dir: None,
+            role: crate::config::StationRole::Writer,
         }
+    }
+
+    /// Sets this station's role (`[network] role`). Builder-style; a core left
+    /// unset is a [`StationRole::Writer`] (today's behavior). A replica refuses
+    /// every write surface and only replicates the writer's chain (ADR-0020 §7).
+    pub fn with_role(mut self, role: crate::config::StationRole) -> Self {
+        self.role = role;
+        self
     }
 
     /// Attaches the wake channel to the Reticulum DTN outbound loop.
@@ -763,32 +779,66 @@ impl Core {
                 Command::Call { request, reply } => {
                     let _ = reply.send(self.handle_call(&request));
                 }
+                // The sweep timers admit station-signed records at the front door
+                // (settlement/cancellation, expiry, contract charges, governance
+                // enactment, dispute resolution), so on a read-replica they must
+                // do nothing (ADR-0020 §7): the daemon does not spawn these timers
+                // for a replica, and this guard also makes the public test hooks
+                // (`Station::sweep`/`charge_contracts`/…) inert on a replica, so a
+                // replica cannot fork its own chain by any path. A replica
+                // re-derives all of this by replay (ADR-0018).
                 Command::Sweep { reply } => {
-                    let n = self.do_sweep();
+                    let n = if self.role.admits() {
+                        self.do_sweep()
+                    } else {
+                        0
+                    };
                     let _ = reply.send(n);
                 }
                 Command::RefreshReputation { reply } => {
+                    // Reputation is a derived cache (ADR-0009), not a log append —
+                    // it runs on both roles.
                     let n = self.do_refresh_reputation();
                     let _ = reply.send(n);
                 }
                 Command::ExpireListings { reply } => {
-                    let n = self.do_expire_listings();
+                    let n = if self.role.admits() {
+                        self.do_expire_listings()
+                    } else {
+                        0
+                    };
                     let _ = reply.send(n);
                 }
                 Command::ExpireInquiries { reply } => {
-                    let n = self.do_expire_inquiries();
+                    let n = if self.role.admits() {
+                        self.do_expire_inquiries()
+                    } else {
+                        0
+                    };
                     let _ = reply.send(n);
                 }
                 Command::ChargeContracts { reply } => {
-                    let n = self.do_charge_contracts();
+                    let n = if self.role.admits() {
+                        self.do_charge_contracts()
+                    } else {
+                        0
+                    };
                     let _ = reply.send(n);
                 }
                 Command::EnactGovernance { reply } => {
-                    let n = self.do_enact_governance();
+                    let n = if self.role.admits() {
+                        self.do_enact_governance()
+                    } else {
+                        0
+                    };
                     let _ = reply.send(n);
                 }
                 Command::ResolveDisputes { reply } => {
-                    let n = self.do_resolve_disputes();
+                    let n = if self.role.admits() {
+                        self.do_resolve_disputes()
+                    } else {
+                        0
+                    };
                     let _ = reply.send(n);
                 }
                 Command::PruneReceipts { reply } => {
@@ -796,6 +846,20 @@ impl Core {
                     let _ = reply.send(n);
                 }
                 Command::IngestBundle { bytes, reply } => {
+                    // A read-replica admits nothing (ADR-0020 §7): a bundle that
+                    // arrives over a transport (Reticulum or SMS) is not ingested,
+                    // and no receipt is returned. Both carriers already treat a
+                    // `None` reply as "send nothing" — the bundle is a misroute
+                    // (bindings name the *writer*'s destination), so dropping it
+                    // silently is correct; the sender re-couriers to the writer.
+                    if self.role == crate::config::StationRole::Replica {
+                        tracing::warn!(
+                            "dropping a DTN bundle: this station is a read-replica and admits \
+                             nothing (ADR-0020 §7) — bundles belong to the community's writer"
+                        );
+                        let _ = reply.send(None);
+                        continue;
+                    }
                     let now = self.clock.now();
                     let receipt = match self.ingest_bundle(&bytes, now) {
                         Ok(r) => Some(r),
@@ -900,6 +964,19 @@ impl Core {
     // --- public RPC dispatch ------------------------------------------------
 
     fn handle_call(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        // A read-replica admits nothing (ADR-0020 §7): every write method the
+        // operator socket exposes is refused with a typed [`rpc::READ_REPLICA`]
+        // error naming the writer as the place to submit. The check is an
+        // explicit *read* allowlist rather than a write denylist, so a write
+        // method added later cannot silently slip past the gate — it defaults to
+        // refused until it is proven a read. Reads, pairing management (no log
+        // writes), and receipt *reads* stay available so a replica is a useful
+        // audit/backup copy and a phone can pair to it to browse.
+        if self.role == crate::config::StationRole::Replica
+            && !operator_method_is_replica_safe(&req.method)
+        {
+            return Err(read_replica_rpc_error(&req.method));
+        }
         match req.method.as_str() {
             "whoami" => self.m_whoami(),
             "status" => self.m_status(),
@@ -1103,6 +1180,7 @@ impl Core {
             established_members: established as u64,
             emergency: self.active_emergency_status(self.clock.now())?,
             connectivity: rpc::ConnectivityBlock {
+                role: self.role.as_str().to_string(),
                 peers,
                 mobile_listen,
                 mobile_advertising,
@@ -2776,6 +2854,22 @@ impl Core {
     }
 
     fn do_append_entries(&mut self, entries: Vec<WireEntry>) -> usize {
+        // Only a replica applies pulled entries (ADR-0020 §7): this is the
+        // read-replica gossip path. A writer never pulls — the daemon does not
+        // even spawn the gossip client for a writer — so reaching this on a
+        // writer is a bug or a hostile caller; refuse and append nothing, which
+        // keeps the single-writer property (ADR-0020 §1) true regardless of how
+        // this was reached, not only because the loop was not spawned.
+        if self.role != crate::config::StationRole::Replica {
+            if !entries.is_empty() {
+                tracing::warn!(
+                    count = entries.len(),
+                    "refusing peer log entries: this station is a writer and never pulls \
+                     (ADR-0020 §1/§7)"
+                );
+            }
+            return 0;
+        }
         let mut appended = 0;
         // Listings a replicated entry claims to be about, so the browse index
         // can be brought back in step below. Collected rather than reindexed
@@ -5494,6 +5588,21 @@ impl Core {
         &mut self,
         envelope: &RequestEnvelope,
     ) -> Result<serde_json::Value, (i32, String)> {
+        // A read-replica admits nothing (ADR-0020 §7): every mobile write —
+        // including `bundle_submit`, where the phone is a courier — is refused
+        // with a typed [`rpc::READ_REPLICA`] error. A channel-level error means
+        // "no verdict", so the record stays in the device outbox and is
+        // re-couriered to the writer, which is the correct semantics (a replica
+        // cannot sign a receipt the paired phone would accept anyway). As on the
+        // operator socket this is an explicit read allowlist, so a future write
+        // defaults to refused. Reads (browse, views, reputation, receipt reads)
+        // stay available so a phone can pair to a replica to browse.
+        if self.role == crate::config::StationRole::Replica
+            && !channel_method_is_replica_safe(&envelope.method)
+        {
+            let (code, message) = read_replica_channel_error(&envelope.method);
+            return Err((code, message));
+        }
         match envelope.method.as_str() {
             "submit_proposal" => self.channel_submit_proposal(envelope),
             "submit_confirmation" => self.channel_submit_confirmation(envelope),
@@ -6838,6 +6947,113 @@ fn internal(e: impl std::fmt::Display) -> rpc::RpcError {
     }
 }
 
+/// The human-readable refusal a read-replica returns for a write `method`
+/// (ADR-0020 §7). Shared by the operator-socket and mobile-channel gates so both
+/// carry the same wording.
+fn read_replica_message(method: &str) -> String {
+    format!(
+        "this station is a read-replica and does not admit records (ADR-0020 §7); \
+         `{method}` is a write — submit it to the community's writer instead"
+    )
+}
+
+/// The operator-socket refusal a read-replica returns for a write method.
+fn read_replica_rpc_error(method: &str) -> rpc::RpcError {
+    rpc::RpcError {
+        code: rpc::READ_REPLICA,
+        message: read_replica_message(method),
+    }
+}
+
+/// The mobile-channel refusal a read-replica returns for a write method, as the
+/// `(code, message)` pair the channel dispatch carries.
+fn read_replica_channel_error(method: &str) -> (i32, String) {
+    (rpc::READ_REPLICA, read_replica_message(method))
+}
+
+/// Whether an operator-socket `method` is safe to serve on a read-replica: the
+/// reads, pairing management (which touches no log — a phone may pair to a
+/// replica to browse), and receipt *reads*. Everything else is a write and is
+/// refused (ADR-0020 §7). An explicit allowlist, so a write method added later
+/// defaults to refused until it is proven a read here.
+fn operator_method_is_replica_safe(method: &str) -> bool {
+    matches!(
+        method,
+        // Identity / balances / history.
+        "whoami"
+            | "status"
+            | "balance"
+            | "history"
+            | "transactions"
+            | "next_nonce"
+            | "backup_export"
+            // Marketplace reads.
+            | "marketplace_search"
+            | "marketplace_listing"
+            | "marketplace_my_listings"
+            | "marketplace_matches"
+            | "marketplace_inquiry_thread"
+            | "marketplace_my_inquiries"
+            | "marketplace_contracts"
+            | "marketplace_contract_show"
+            // Governance reads.
+            | "governance_charter"
+            | "governance_proposals"
+            | "governance_proposal"
+            | "governance_statutes"
+            | "governance_pending_charter"
+            | "governance_emergency_status"
+            | "governance_emergency_report"
+            // Dispute reads.
+            | "disputes"
+            | "dispute"
+            // Pairing management (no log writes; lets a phone browse a replica).
+            | "pair_list_pending"
+            | "pair_confirm"
+            | "list_mobiles"
+            | "unpair"
+            // Certificate reads.
+            | "cert_list"
+            | "cert_export"
+            // DTN reads (a replica holds no pushes/receipts; these read empty).
+            | "dtn_pushes"
+            | "receipts_fetch"
+    )
+}
+
+/// Whether a mobile-channel `method` is safe to serve on a read-replica: the
+/// browse/view/reputation reads and the receipt read. Every `submit_*` /
+/// `bundle_submit` write is refused (ADR-0020 §7). Explicit allowlist, as on the
+/// operator socket.
+fn channel_method_is_replica_safe(method: &str) -> bool {
+    matches!(
+        method,
+        "whoami"
+            | "balance"
+            | "transactions"
+            | "next_nonce"
+            | "vouch_counts"
+            | "list_vouches"
+            | "reputation"
+            | "reputation_band"
+            | "marketplace_search"
+            | "marketplace_listing"
+            | "marketplace_my_listings"
+            | "inquiry_thread"
+            | "my_inquiries"
+            | "marketplace_contracts"
+            | "marketplace_contract_show"
+            | "governance_charter"
+            | "governance_pending_charter"
+            | "governance_proposals"
+            | "governance_proposal"
+            | "governance_statutes"
+            | "disputes"
+            | "dispute"
+            | "receipts_fetch"
+    )
+}
+
 /// The oracle tier a listing at this price defaults to — the bottom of the M1.8
 /// ladder for small trades, the next rung above it for the rest.
 ///
@@ -7369,7 +7585,10 @@ mod tests {
 
     #[test]
     fn gossip_apply_accepts_valid_and_ignores_bad_signatures() {
-        let mut core = test_core();
+        // `do_append_entries` is the read-replica gossip path (ADR-0020 §7), so
+        // the core under test is a replica; a writer refuses to pull at all
+        // (covered separately).
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
         let good = wire_vouch(false);
         let bad = wire_vouch(true);
 
@@ -7382,6 +7601,99 @@ mod tests {
         // Replaying the same good entry is deduped (idempotent).
         assert_eq!(core.do_append_entries(vec![good]), 0);
         assert_eq!(core.tail_seq(), 1);
+    }
+
+    #[test]
+    fn a_writer_never_pulls() {
+        // The writer-never-pulls property holds in code, not only because the
+        // daemon does not spawn the gossip client: `do_append_entries` on a
+        // writer (the default role) appends nothing, so even a hostile caller
+        // handing it signature-valid entries cannot land them on the chain
+        // (ADR-0020 §1/§7).
+        let mut core = test_core(); // default writer
+        let good = wire_vouch(false);
+        assert_eq!(
+            core.do_append_entries(vec![good.clone(), wire_vouch(false)]),
+            0
+        );
+        assert_eq!(core.tail_seq(), 0);
+    }
+
+    #[test]
+    fn a_replica_refuses_operator_writes_and_reports_its_role() {
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
+
+        // A write is refused with the typed READ_REPLICA code, before any params
+        // are even parsed — the gate is a front-of-dispatch role check.
+        let err = core
+            .handle_call(&rpc::Request {
+                id: "1".into(),
+                method: "propose".into(),
+                params: serde_json::Value::Null,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, rpc::READ_REPLICA);
+        assert!(
+            err.message.contains("read-replica"),
+            "message: {}",
+            err.message
+        );
+
+        // A DTN bundle submit is a write too.
+        let err = core
+            .handle_call(&rpc::Request {
+                id: "2".into(),
+                method: "bundle_submit".into(),
+                params: serde_json::Value::Null,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, rpc::READ_REPLICA);
+
+        // Reads keep working, and `status` reports the replica role.
+        let status = core
+            .handle_call(&rpc::Request {
+                id: "3".into(),
+                method: "status".into(),
+                params: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(status["connectivity"]["role"], "replica");
+    }
+
+    #[test]
+    fn a_writer_reports_its_role_in_status() {
+        let mut core = test_core(); // default writer
+        let status = core
+            .handle_call(&rpc::Request {
+                id: "1".into(),
+                method: "status".into(),
+                params: serde_json::Value::Null,
+            })
+            .unwrap();
+        assert_eq!(status["connectivity"]["role"], "writer");
+    }
+
+    #[test]
+    fn a_replica_refuses_mobile_channel_writes_but_serves_browse() {
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
+        let member = Keypair::generate();
+
+        // A mobile write (`submit_proposal`) is refused with READ_REPLICA — the
+        // record stays in the device outbox to be re-couriered to the writer.
+        let env = envelope(&member, "submit_proposal", serde_json::json!({}));
+        let (code, msg) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::READ_REPLICA);
+        assert!(msg.contains("read-replica"), "message: {msg}");
+
+        // `bundle_submit` over the mobile courier channel is refused too.
+        let env = envelope(&member, "bundle_submit", serde_json::json!({}));
+        let (code, _) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::READ_REPLICA);
+
+        // A browse read still works.
+        let env = envelope(&member, "marketplace_search", serde_json::json!({}));
+        let result = core.route_channel_method(&env).unwrap();
+        assert!(result["listings"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -9904,7 +10216,8 @@ mod tests {
 
     #[test]
     fn a_replicated_listing_reaches_browse_but_an_impostors_does_not() {
-        let mut core = test_core();
+        // Replication is the replica's job (ADR-0020 §7).
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
         let provider = Keypair::generate();
         let listing = test_listing(&provider, "Winter squash", None);
 
