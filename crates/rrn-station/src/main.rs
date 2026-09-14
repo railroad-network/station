@@ -448,9 +448,12 @@ fn cmd_run(data_dir: &std::path::Path) -> Result<()> {
     })
 }
 
-/// `station peers list` — print configured peers (read-only).
+/// `station peers list` — print this station's role and its configured peers
+/// (read-only). A writer never pulls, so it reports no peers; only a replica
+/// copies the writer's chain from the listed peers (ADR-0020 §7).
 fn cmd_peers_list(data_dir: &std::path::Path) -> Result<()> {
     let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
+    eprintln!("role: {}", config.network.role.as_str());
     if config.peers.list.is_empty() {
         eprintln!("(no peers configured)");
     } else {

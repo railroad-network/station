@@ -119,11 +119,9 @@ identity. Inside the directory:
 single-community pilot; the section you may want to touch is `[mobile]`:
 
 ```toml
-[peers]
-list = []                    # station-to-station federation: leave empty (not built yet)
-
 [network]
 listen = "127.0.0.1:7400"    # station-to-station port: loopback-only is correct today
+role = "writer"              # this station owns the community's log (the default)
 
 [mobile]
 listen = "0.0.0.0:7500"      # where phones connect; 7500 is what the app expects
@@ -133,10 +131,15 @@ advertise = true             # announce the station on the LAN (mDNS) so phones 
 
 [timers]
 sweep_interval_secs = 30
-gossip_interval_secs = 5
 
 # [settlement] uses per-tier defaults: Tier 1 = 24h, Tier 2 = 48h.
 ```
+
+Your community's station is a **writer** — it owns the log, and there is exactly
+one per community. A writer never pulls from other stations, so it has no
+`[peers]`; if you add a peer list to a writer it refuses to start (with a message
+telling you to remove the peers or set `role = "replica"`). You do not need
+`[peers]` at all for a single station.
 
 Two practical notes:
 
@@ -146,6 +149,32 @@ Two practical notes:
   the app's "Join your community" list. Leave it on unless your network
   blocks mDNS/Bonjour — in that case members type the station's IP and port
   by hand (the app has an "Add by address" option for exactly this).
+
+**Running a read-replica (optional).** You can run a second station as a
+read-only *replica*: a warm second copy of the writer's chain, useful for a live
+off-site backup or an audit workstation. A replica pulls the writer's log and
+re-derives from it, but **admits nothing** — every attempt to write to it (a
+payment, a vouch, a courier bundle) is refused with a "this station is a
+read-replica" message, so it can never accidentally fork the community. Point it
+at the writer and set the role:
+
+```toml
+[peers]
+list = ["192.168.1.10:7400"]   # the writer's station-to-station address
+
+[network]
+listen = "127.0.0.1:7401"
+role = "replica"
+```
+
+`station peers list` prints the role and peers of whichever station you run it
+against, and `rrn status` shows the role at the top. A replica is **not** a
+failover standby — if the writer is lost, you recover it from the encrypted
+backup (§4.1), not by promoting a replica; writer succession is a later-phase
+feature. Because the writer signs its own settlement and governance records, a
+replica shows the *chain* faithfully but reads its own balance/governance views
+as empty (it cannot re-derive records signed by a different station's key) — use
+the replica for chain integrity and audit, and the writer for balances.
 
 ### 1.4 Run it
 

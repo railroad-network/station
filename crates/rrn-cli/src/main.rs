@@ -698,6 +698,9 @@ async fn run(cli: Cli) -> Result<()> {
                 let r: StatusResult = parse(&v)?;
                 let c = &r.connectivity;
                 let mut out = format!("{}\n", r.address);
+                // The role governs whether this station admits records or is a
+                // read-only copy of the writer's chain (ADR-0020 §7).
+                out.push_str(&format!("role: {}\n", c.role));
                 if c.peers.is_empty() {
                     out.push_str("peers: none configured\n");
                 } else {

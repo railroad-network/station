@@ -135,6 +135,16 @@ impl Station {
         let config =
             StationConfig::load_or_create(&data_dir.join(CONFIG_FILE)).context("load config")?;
 
+        // Single-writer discipline (ADR-0020 §1/§7): a writer never pulls, so a
+        // writer configured with peers is a misconfiguration — refuse fast with a
+        // message that names the fix, rather than silently ignoring the peers and
+        // leaving the operator to think the second box is replicating. This is the
+        // same appliance posture as the sidecar version pin and the config bails
+        // below.
+        if let Err(msg) = config.check_role_peers() {
+            anyhow::bail!("config: {msg}");
+        }
+
         // Resolve the two-root layout. Under the plaintext profile both roots are the
         // flat data dir (today's behavior); under the encrypted profile the state dir
         // is the container's mount point.
@@ -309,7 +319,8 @@ impl Station {
             listings,
         )
         .with_receipt_retention_secs(config.dtn.receipt_retention_secs as i64)
-        .with_connectivity(connectivity.clone());
+        .with_connectivity(connectivity.clone())
+        .with_role(config.network.role);
         if dtn_enabled {
             core_builder = core_builder.with_dtn_outbound(dtn_tx);
         }
@@ -329,7 +340,9 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
-        // Peer TCP listener + gossip client.
+        // Peer TCP listener. Both roles *serve* the peer port so a replica can
+        // pull the chain from a writer (ADR-0020 §7) — it is a read-only surface
+        // (handshake / log_tail / log_range).
         let tcp = TcpListener::bind(&config.network.listen)
             .await
             .with_context(|| format!("bind peer listener on {}", config.network.listen))?;
@@ -340,16 +353,36 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
-        let peers = Arc::new(config.peers.list.clone());
-        tasks.push(tokio::spawn(gossip::gossip_loop(
-            Duration::from_secs(config.timers.gossip_interval_secs.max(1)),
-            peers,
-            address.clone(),
-            core.clone(),
-            connectivity.clone(),
-            params.clock.clone(),
-            shutdown_rx.clone(),
-        )));
+        // The gossip *client* (the pull loop) runs only on a replica: a writer
+        // never pulls (ADR-0020 §1/§7). A writer's peer list is empty by
+        // construction (`check_role_peers` above), so there is nothing to pull;
+        // a replica with an empty list starts but warns, since it will never
+        // receive anything.
+        match config.network.role {
+            crate::config::StationRole::Replica => {
+                if config.peers.list.is_empty() {
+                    tracing::warn!(
+                        "this station is a read-replica but [peers] list is empty — it will \
+                         never receive the writer's chain; add the writer's peer address"
+                    );
+                }
+                let peers = Arc::new(config.peers.list.clone());
+                tasks.push(tokio::spawn(gossip::gossip_loop(
+                    Duration::from_secs(config.timers.gossip_interval_secs.max(1)),
+                    peers,
+                    address.clone(),
+                    core.clone(),
+                    connectivity.clone(),
+                    params.clock.clone(),
+                    shutdown_rx.clone(),
+                )));
+            }
+            crate::config::StationRole::Writer => {
+                tracing::info!(
+                    "role=writer: serving the peer port but never pulling (ADR-0020 §7)"
+                );
+            }
+        }
 
         // Mobile-facing HTTP surface (ADR-0008 / T1.3.3+), on the port mDNS
         // advertises. Best-effort, matching the advertisement below: if the port
@@ -542,56 +575,74 @@ impl Station {
             }
         }
 
-        // Settlement sweep timer.
-        tasks.push(tokio::spawn(sweep_timer(
-            Duration::from_secs(config.timers.sweep_interval_secs.max(1)),
-            core.clone(),
-            shutdown_rx.clone(),
-        )));
+        // Log-appending sweep timers run only on a writer (ADR-0020 §1/§7): each
+        // of these admits station-signed records (settlement/cancellation,
+        // listing/inquiry expiry, contract charges, governance enactment, dispute
+        // resolution) at the front door. On a replica they must not run — a
+        // replica that swept would fork its own chain under its own key rather
+        // than remain a faithful copy of the writer's. A replica re-derives all
+        // of this state by replaying the writer's chain instead (ADR-0018).
+        if config.network.role.admits() {
+            // Settlement sweep timer.
+            tasks.push(tokio::spawn(sweep_timer(
+                Duration::from_secs(config.timers.sweep_interval_secs.max(1)),
+                core.clone(),
+                shutdown_rx.clone(),
+            )));
 
-        // Reputation snapshot refresh timer.
+            // Listing expiry sweep timer (T1.7.0).
+            tasks.push(tokio::spawn(listing_expiry_timer(
+                Duration::from_secs(config.timers.listing_expiry_interval_secs.max(1)),
+                core.clone(),
+                shutdown_rx.clone(),
+            )));
+
+            // Inquiry expiry sweep timer (T1.7.4).
+            tasks.push(tokio::spawn(inquiry_expiry_timer(
+                Duration::from_secs(config.timers.inquiry_expiry_interval_secs.max(1)),
+                core.clone(),
+                shutdown_rx.clone(),
+            )));
+
+            // Service-contract charge sweep timer (T1.7.7).
+            tasks.push(tokio::spawn(contract_charge_timer(
+                Duration::from_secs(config.timers.contract_charge_interval_secs.max(1)),
+                core.clone(),
+                shutdown_rx.clone(),
+            )));
+
+            // Governance-enactment sweep timer (T1.9.7).
+            tasks.push(tokio::spawn(governance_implementation_timer(
+                Duration::from_secs(config.timers.governance_implementation_interval_secs.max(1)),
+                core.clone(),
+                shutdown_rx.clone(),
+            )));
+
+            // Dispute-resolution sweep timer (T1.10.5).
+            tasks.push(tokio::spawn(dispute_resolution_timer(
+                Duration::from_secs(config.timers.dispute_resolution_interval_secs.max(1)),
+                core.clone(),
+                shutdown_rx.clone(),
+            )));
+        } else {
+            tracing::info!(
+                "role=replica: settlement/expiry/contract/governance/dispute sweep timers are \
+                 not spawned; this state is re-derived from the writer's chain (ADR-0018)"
+            );
+        }
+
+        // Reputation snapshot refresh timer — a *cache* rebuild (ADR-0009), not a
+        // log append, so it runs on both roles: a replica keeps its reputation
+        // snapshot warm off the chain it replicates.
         tasks.push(tokio::spawn(reputation_refresh_timer(
             Duration::from_secs(config.timers.reputation_refresh_interval_secs.max(1)),
             core.clone(),
             shutdown_rx.clone(),
         )));
 
-        // Listing expiry sweep timer (T1.7.0).
-        tasks.push(tokio::spawn(listing_expiry_timer(
-            Duration::from_secs(config.timers.listing_expiry_interval_secs.max(1)),
-            core.clone(),
-            shutdown_rx.clone(),
-        )));
-
-        // Inquiry expiry sweep timer (T1.7.4).
-        tasks.push(tokio::spawn(inquiry_expiry_timer(
-            Duration::from_secs(config.timers.inquiry_expiry_interval_secs.max(1)),
-            core.clone(),
-            shutdown_rx.clone(),
-        )));
-
-        // Service-contract charge sweep timer (T1.7.7).
-        tasks.push(tokio::spawn(contract_charge_timer(
-            Duration::from_secs(config.timers.contract_charge_interval_secs.max(1)),
-            core.clone(),
-            shutdown_rx.clone(),
-        )));
-
-        // Governance-enactment sweep timer (T1.9.7).
-        tasks.push(tokio::spawn(governance_implementation_timer(
-            Duration::from_secs(config.timers.governance_implementation_interval_secs.max(1)),
-            core.clone(),
-            shutdown_rx.clone(),
-        )));
-
-        // Dispute-resolution sweep timer (T1.10.5).
-        tasks.push(tokio::spawn(dispute_resolution_timer(
-            Duration::from_secs(config.timers.dispute_resolution_interval_secs.max(1)),
-            core.clone(),
-            shutdown_rx.clone(),
-        )));
-
-        // DTN receipt-delivery prune timer (T2.2.4).
+        // DTN receipt-delivery prune timer (T2.2.4) — local receipt-table
+        // maintenance, not a log append; harmless on a replica (which holds none)
+        // and correct on a writer.
         tasks.push(tokio::spawn(dtn_prune_timer(
             Duration::from_secs(config.timers.dtn_prune_interval_secs.max(1)),
             core.clone(),

@@ -1,19 +1,25 @@
-//! The T2.4.1 offline exit test: a single `station` daemon, bound to loopback
-//! only, with a configured but **unreachable** black-hole peer, drives a full
-//! economic lifecycle — a plain payment and a cert-backed *offline* spend
-//! delivered by DTN — with zero reachable connectivity, and shuts down cleanly.
+//! The offline exit tests, in two parts (split under the single-writer model,
+//! ADR-0020 §7: a writer never pulls, so a writer no longer carries a peer):
 //!
-//! Member model (see the T2.4.1 PR): the station **operator** is member A and the
+//! 1. [`offline_full_lifecycle_on_a_peerless_writer`] — a single **writer**
+//!    `station` daemon, bound to loopback only, with **no peers at all** (fully
+//!    offline), drives a full economic lifecycle — a plain payment and a
+//!    cert-backed *offline* spend delivered by DTN — and shuts down cleanly.
+//! 2. [`a_replica_against_an_unreachable_writer_reports_it_and_shuts_down`] — a
+//!    **replica** pointed at an unreachable **black-hole** writer proves the
+//!    bounded-dial timeout fix: a real pull round completes under
+//!    `PEER_DIAL_TIMEOUT` (`last_attempt_at` set, `reachable` false), the replica
+//!    admits nothing, and the daemon stops promptly rather than parking on the OS
+//!    SYN timeout. This is where the bounded-dial evidence lives now, because only
+//!    a replica dials.
+//!
+//! Member model: the writer **operator** is member A and the
 //! sole certificate holder (issuance is a live operator round-trip — a DTN cert
 //! request is refused `UnroutableKind`). A second test keypair is member **B**,
 //! whose confirmations reach the station **only** through `bundle_submit` — the
 //! real courier path (ADR-0020 §3). The cert-backed offline spend is the
 //! operator's own, signed in-test with the station keypair recovered from the
 //! wallet file, and delivered in a bundle alongside B's confirmation.
-//!
-//! The whole body runs under a 55s timeout: bounded-timeout gossip against the
-//! black hole (T2.4.1's `PEER_DIAL_TIMEOUT`) is exactly what keeps this — and the
-//! daemon's own shutdown — from parking on the OS TCP SYN timeout.
 
 use std::path::Path;
 use std::time::Duration;
@@ -49,14 +55,14 @@ const WINDOW: u64 = 5;
 /// timeout, is what keeps the round and shutdown prompt).
 const BLACK_HOLE: &str = "10.255.255.1:7411";
 
-/// Writes a config with an unreachable peer, mDNS advertising ON (per the ticket),
-/// loopback-only binds on ephemeral ports, and fast windows/timers.
+/// Writes a **writer** config with no peers (a writer never pulls, ADR-0020 §1),
+/// mDNS advertising ON (per the offline-hardening design), loopback-only binds on ephemeral
+/// ports, and fast windows/timers.
 fn write_config(dir: &Path) {
     let text = format!(
-        "[peers]\n\
-         list = [\"{BLACK_HOLE}\"]\n\n\
-         [network]\n\
-         listen = \"127.0.0.1:0\"\n\n\
+        "[network]\n\
+         listen = \"127.0.0.1:0\"\n\
+         role = \"writer\"\n\n\
          [mobile]\n\
          advertise = true\n\
          listen = \"127.0.0.1:0\"\n\n\
@@ -64,6 +70,24 @@ fn write_config(dir: &Path) {
          window_seconds = {WINDOW}\n\n\
          [timers]\n\
          sweep_interval_secs = 1\n\
+         gossip_interval_secs = 1\n"
+    );
+    std::fs::write(dir.join("config.toml"), text).unwrap();
+}
+
+/// Writes a **replica** config pointed at `peer` (the unreachable black-hole
+/// writer), with a fast gossip loop so the bounded dial round runs promptly.
+fn write_replica_config(dir: &Path, peer: &str) {
+    let text = format!(
+        "[peers]\n\
+         list = [\"{peer}\"]\n\n\
+         [network]\n\
+         listen = \"127.0.0.1:0\"\n\
+         role = \"replica\"\n\n\
+         [mobile]\n\
+         advertise = false\n\
+         listen = \"127.0.0.1:0\"\n\n\
+         [timers]\n\
          gossip_interval_secs = 1\n"
     );
     std::fs::write(dir.join("config.toml"), text).unwrap();
@@ -142,7 +166,7 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn offline_full_lifecycle_with_black_hole_peer() {
+async fn offline_full_lifecycle_on_a_peerless_writer() {
     tokio::time::timeout(Duration::from_secs(55), run())
         .await
         .expect("offline lifecycle must finish well under the OS SYN timeout");
@@ -177,14 +201,18 @@ async fn run() {
             .unwrap();
     assert_eq!(who.address, a);
 
-    // status reports the black-hole peer, the bound mobile listener, and empty DTN
-    // queues — degradation is legible.
+    // status reports a writer with no peers, the bound mobile listener, and empty
+    // DTN queues — degradation is legible even fully offline. (The bounded-dial
+    // evidence against an unreachable peer now lives in the replica test below,
+    // because a writer never dials.)
     let st: StatusResult =
         serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
             .unwrap();
-    assert_eq!(st.connectivity.peers.len(), 1);
-    assert_eq!(st.connectivity.peers[0].address, BLACK_HOLE);
-    assert!(!st.connectivity.peers[0].reachable);
+    assert_eq!(st.connectivity.role, "writer");
+    assert!(
+        st.connectivity.peers.is_empty(),
+        "a writer never pulls, so it has no peers (ADR-0020 §1)"
+    );
     assert!(st.connectivity.mobile_advertising);
     assert!(
         st.connectivity.mobile_listener_bound,
@@ -192,24 +220,6 @@ async fn run() {
     );
     assert_eq!(st.connectivity.pending_outbox, 0);
     assert_eq!(st.connectivity.pending_receipts, 0);
-
-    // A real gossip round against the black hole completes under the dial bound and
-    // is recorded — proving the timeout fix end-to-end (not just the default state):
-    // `last_attempt_at` becomes set while `reachable` stays false.
-    poll_until(Duration::from_secs(10), || async {
-        let st: StatusResult =
-            serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
-                .unwrap();
-        st.connectivity.peers[0].last_attempt_at.is_some()
-    })
-    .await;
-    let st: StatusResult =
-        serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
-            .unwrap();
-    assert!(
-        !st.connectivity.peers[0].reachable && st.connectivity.peers[0].last_success_at.is_none(),
-        "the black-hole peer is attempted but never reachable"
-    );
 
     // --- Phase 1: a plain payment, B's confirmation via DTN -----------------
 
@@ -402,5 +412,152 @@ async fn run() {
     assert!(
         !socket.exists(),
         "the Unix socket must be removed on clean shutdown"
+    );
+}
+
+/// A read-replica pointed at an unreachable (black-hole) writer: the bounded-dial
+/// reachability evidence now lives here, because only a replica pulls
+/// (ADR-0020 §7). The replica attempts the writer, is bounded by
+/// `PEER_DIAL_TIMEOUT` (never the OS SYN timeout), reports the peer as attempted
+/// but never reachable, admits nothing, and shuts down promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_against_an_unreachable_writer_reports_it_and_shuts_down() {
+    tokio::time::timeout(Duration::from_secs(40), replica_run())
+        .await
+        .expect("a replica against a black hole must finish under the OS SYN timeout");
+}
+
+async fn replica_run() {
+    let dir = tempfile::tempdir().unwrap();
+    Station::init(dir.path(), PASSPHRASE).unwrap();
+    write_replica_config(dir.path(), BLACK_HOLE);
+
+    let clock = Clock::manual(START);
+    let station = Station::open(StationParams {
+        data_dir: dir.path().to_path_buf(),
+        passphrase: PASSPHRASE.into(),
+        clock,
+    })
+    .await
+    .unwrap();
+    let client = UnixClient::new(station.socket_path());
+
+    // status reports the replica role and the single (unreachable) peer.
+    let st: StatusResult =
+        serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
+            .unwrap();
+    assert_eq!(st.connectivity.role, "replica");
+    assert_eq!(st.connectivity.peers.len(), 1);
+    assert_eq!(st.connectivity.peers[0].address, BLACK_HOLE);
+
+    // A real pull round against the black hole completes under the dial bound and
+    // is recorded: `last_attempt_at` set, `reachable` false — the bounded-dial
+    // timeout fix, proven on the path that actually dials.
+    poll_until(Duration::from_secs(15), || async {
+        let st: StatusResult =
+            serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
+                .unwrap();
+        st.connectivity.peers[0].last_attempt_at.is_some()
+    })
+    .await;
+    let st: StatusResult =
+        serde_json::from_value(client.call("status", serde_json::json!({})).await.unwrap())
+            .unwrap();
+    assert!(
+        !st.connectivity.peers[0].reachable && st.connectivity.peers[0].last_success_at.is_none(),
+        "the black-hole writer is attempted but never reachable"
+    );
+
+    // The replica admits nothing: an operator write is refused with the typed
+    // read-replica error, and its log stays empty (it pulled nothing).
+    let err = client
+        .call(
+            "propose",
+            serde_json::json!({ "receiver": addr(&Keypair::generate()).to_string(), "amount_centi": 100 }),
+        )
+        .await
+        .expect_err("a replica must refuse a write");
+    let msg = err.to_string();
+    assert!(msg.contains("read-replica"), "unexpected error: {msg}");
+    assert!(msg.contains("-32010"), "expected READ_REPLICA code: {msg}");
+    assert_eq!(
+        verify_chain(&dir.path().join(DB_FILE)),
+        0,
+        "a replica with an unreachable writer admits nothing"
+    );
+
+    // The transport half of "a replica never admits": a DTN bundle handed to the
+    // core directly (the code path both the Reticulum and SMS inbound loops use)
+    // is dropped — no receipt, nothing appended. Even a well-formed bundle whose
+    // records would pass a writer's front door is refused before ingest.
+    let sender = Keypair::generate();
+    let receiver = Keypair::generate();
+    let proposal = SignedProposal::sign(
+        TransactionProposal::new(
+            addr(&sender),
+            addr(&receiver),
+            100,
+            None,
+            0,
+            START,
+            START + 100_000,
+        ),
+        &sender,
+    );
+    let entry = outbox_entry(&sender, 0, Hash::from_bytes([0u8; 32]), &proposal, START);
+    let bundle = Bundle::new(vec![EntryEnvelope::from_signed(&entry)], START).encode();
+    let receipt = station.core().ingest_bundle_bytes(bundle).await;
+    assert!(
+        receipt.is_none(),
+        "a replica returns no receipt for a DTN bundle"
+    );
+    assert_eq!(
+        verify_chain(&dir.path().join(DB_FILE)),
+        0,
+        "a replica ingests nothing over a DTN transport"
+    );
+
+    // And it stops cleanly and promptly (bounded by PEER_DIAL_TIMEOUT).
+    let socket = station.socket_path().to_path_buf();
+    station.shutdown().await;
+    assert!(
+        !socket.exists(),
+        "the socket must be removed on clean shutdown"
+    );
+}
+
+/// A writer refuses to start with a peer list (ADR-0020 §1): the single-writer
+/// discipline holds at startup, not only in the config validator's unit test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_with_peers_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    Station::init(dir.path(), PASSPHRASE).unwrap();
+    // Default role is writer; give it a peer — a misconfiguration.
+    let text = format!(
+        "[peers]\n\
+         list = [\"{BLACK_HOLE}\"]\n\n\
+         [network]\n\
+         listen = \"127.0.0.1:0\"\n\n\
+         [mobile]\n\
+         advertise = false\n\
+         listen = \"127.0.0.1:0\"\n"
+    );
+    std::fs::write(dir.path().join("config.toml"), text).unwrap();
+
+    let result = Station::open(StationParams {
+        data_dir: dir.path().to_path_buf(),
+        passphrase: PASSPHRASE.into(),
+        clock: Clock::manual(START),
+    })
+    .await;
+    // `Station` is not `Debug`, so match rather than `expect_err`.
+    let err = match result {
+        Ok(_) => panic!("a writer with a peer list must refuse to start"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("writer never pulls"),
+        "unexpected error: {msg}"
     );
 }

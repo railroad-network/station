@@ -207,14 +207,17 @@ should weigh before calling the phase done:
 4. **The station is the liveness single point of failure** (ADR-0020);
    recovery is restore + outbox replay, or the holder ceremony.
 5. **Running-node seizure is not defended** (ADR-0024).
-6. **A gossip read-replica cannot derive balances or governance under its own
-   key.** Station-signed records (ledger *and* governance) are now signer-pinned
-   to the community station key on replay (T2.1.4, T2.11.3), so a forged record
-   injected via the ungated gossip pull path is inert; the surviving residual is
-   decision (a)'s consequence — a peer deriving under a *different* key sees no
-   station-signed state at all (loud, tested), and the gossip pull path still
-   applies no front-door gate. Both are reachable only through a configured gossip
-   peer; the pilot configures none.
+6. **A read-replica cannot derive balances or governance under its own key.**
+   *The gossip front-door bypass is closed (T2.11.4, ADR-0020 §7 Clarification):*
+   a station is a **writer** (owns the chain, never pulls, refuses to start with
+   peers) or a **replica** (pulls a copy, admits nothing), so no gossiped record
+   reaches the writer's chain ungated. The surviving residual is a replica's own
+   derived views: station-signed records (ledger *and* governance) are
+   signer-pinned to the community station key on replay (T2.1.4, T2.11.3), and a
+   replica's key differs from the writer's, so a replica sees no station-signed
+   state (balances read zero; governance is genesis-only) — loud and tested,
+   never silent. A replica is a faithful copy of the *chain* for audit/backup,
+   not a balance oracle; the pilot runs a single writer and no peers.
 7. **Emergency governance's structural residuals** (ADR-0023): a standing
    two-thirds faction; a ≤ 2-member grace electorate; scope as testimony; the
    off-log stale-consent bundle (ADR-0027 D2).
@@ -235,9 +238,10 @@ should weigh before calling the phase done:
   emergency holds (`CharterError::FrozenByEmergency` via `check_charter_freeze`;
   a write-path guard on the sole writer, replay trusts the log). The guard keys
   on "a root already exists", so an equal-version re-root — the reachable shape,
-  since construction paths pin version 1 — is caught too. The one surviving
-  vector is a charter injected via the ungated gossip front door, which the
-  gossip-gate follow-up addresses.
+  since construction paths pin version 1 — is caught too. The gossip-front-door
+  vector that could once have injected a charter around this guard is now closed
+  by the writer/replica split (T2.11.4, ADR-0020 §7): the writer never pulls, so
+  no gossiped charter reaches its chain.
 - **Declaration threshold is `ceil(2N/3)` in code** (`declaration_threshold`)
   where ADR-0023 §2's prose says `ceil(N × 67 / 100)`; the ADR's own worked
   examples match the code, and its dated Clarification of 2026-09-09 records

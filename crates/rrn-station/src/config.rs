@@ -12,14 +12,31 @@
 //! Note that *mobile* discovery is mDNS ([`crate::mdns`], T1.3.2) — that is a
 //! separate surface from peer gossip, and the two are not to be confused.
 //!
+//! A community's log has exactly one writer (ADR-0020 §1). The default
+//! `[network] role` is `writer`, and a writer never pulls — so a writer's
+//! `[peers] list` must be empty (a non-empty one refuses to start). Peers are
+//! configured on a **replica**, the read-only second copy of the writer's chain
+//! (ADR-0020 §7); see [`StationRole`].
+//!
 //! # Example
+//!
+//! A writer (the normal case — owns the chain, no peers):
+//!
+//! ```toml
+//! [network]
+//! listen = "127.0.0.1:7411"
+//! # role = "writer"   # the default
+//! ```
+//!
+//! A read-replica that copies the writer above:
 //!
 //! ```toml
 //! [peers]
-//! list = ["127.0.0.1:7411", "127.0.0.1:7412"]
+//! list = ["127.0.0.1:7411"]
 //!
 //! [network]
-//! listen = "127.0.0.1:7411"
+//! listen = "127.0.0.1:7412"
+//! role = "replica"
 //! ```
 
 use std::path::Path;
@@ -398,11 +415,67 @@ pub struct PeersConfig {
     pub list: Vec<String>,
 }
 
-/// `[network]` — where to accept incoming peer connections.
+/// `[network]` — where to accept incoming peer connections, and this station's
+/// role in the community's single-writer chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// `host:port` this station binds for inbound gossip.
     pub listen: String,
+    /// This station's role in the community (ADR-0020 §1/§7 Clarification).
+    /// Serde-defaulted to [`StationRole::Writer`], so a config written before
+    /// this field existed is a writer — today's behavior.
+    #[serde(default)]
+    pub role: StationRole,
+}
+
+/// `[network] role` — the station's place in the single-writer chain
+/// (ADR-0020 §1 "one chain, one writer"; §7 "read-replica gossip retired in
+/// place", and its 2026-09-14 Clarification: *the writer never pulls; a replica
+/// never admits*).
+///
+/// - **`writer`** (default) owns the community's log: it admits records only at
+///   its own front door and **never pulls** from a peer. A writer configured
+///   with a non-empty `[peers] list` refuses to start — a writer that pulled
+///   would let a record couriered to a hostile peer land on the chain ungated,
+///   defeating the single-writer property (ADR-0020 §1). A writer still *serves*
+///   its peer port so replicas can copy the chain from it.
+/// - **`replica`** is a read-only copy of the writer's chain (ADR-0020 §7): it
+///   pulls the writer's log over gossip and re-derives state by replay
+///   (ADR-0018 "replicas re-derive, never re-enforce"), but **never admits** a
+///   record itself. Every write surface on a replica — operator socket, mobile
+///   channel, and DTN ingest — refuses with a "this station is a read-replica"
+///   error. A replica is a warm second copy for audit/backup; it is **not** a
+///   failover standby (ADR-0020 Consequences: writer succession is Phase 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StationRole {
+    /// Owns the chain; admits at its front door; never pulls (default).
+    #[default]
+    Writer,
+    /// A read-only copy of the writer's chain; pulls, never admits.
+    Replica,
+}
+
+impl StationRole {
+    /// Whether this station pulls the log from its peers. Only a replica does.
+    pub fn pulls(self) -> bool {
+        matches!(self, StationRole::Replica)
+    }
+
+    /// Whether this station admits records (front door, timers, DTN ingest).
+    /// Only a writer does; a replica is a read-only copy.
+    pub fn admits(self) -> bool {
+        matches!(self, StationRole::Writer)
+    }
+
+    /// The lowercase wire spelling (`"writer"` / `"replica"`), for the `status`
+    /// RPC and logs. Matches the serde `rename_all = "lowercase"` above.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StationRole::Writer => "writer",
+            StationRole::Replica => "replica",
+        }
+    }
 }
 
 /// `[mobile]` — how paired mobile clients reach this station.
@@ -828,6 +901,26 @@ impl StationConfig {
         })
     }
 
+    /// Validates the network role against the peer list (ADR-0020 §1/§7): a
+    /// writer never pulls, so a `writer` (the default) with a non-empty
+    /// `[peers] list` is a misconfiguration — a pulled record would bypass the
+    /// front door and defeat the single-writer property. Returns an error whose
+    /// message names the fix. A replica with an empty peer list is valid (it
+    /// simply never receives anything); the daemon warns about that at startup.
+    pub fn check_role_peers(&self) -> Result<(), String> {
+        if self.network.role == StationRole::Writer && !self.peers.list.is_empty() {
+            let n = self.peers.list.len();
+            return Err(format!(
+                "[network] role is \"writer\" but [peers] list has {n} \
+                 entr{} — a writer never pulls (ADR-0020 §1). Remove the \
+                 [peers] list, or set [network] role = \"replica\" to run this \
+                 station as a read-only copy of the writer's chain.",
+                if n == 1 { "y" } else { "ies" },
+            ));
+        }
+        Ok(())
+    }
+
     /// Writes the config to `path` as TOML.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self).expect("config serializes");
@@ -843,6 +936,7 @@ impl StationConfig {
             peers: PeersConfig::default(),
             network: NetworkConfig {
                 listen: format!("127.0.0.1:{}", random_port()),
+                role: StationRole::Writer,
             },
             mobile: MobileConfig::default(),
             settlement: SettlementSection::default(),
@@ -889,6 +983,8 @@ mod tests {
         let cfg = StationConfig::parse(text, &p()).unwrap();
         assert_eq!(cfg.peers.list, vec!["127.0.0.1:7412"]);
         assert_eq!(cfg.network.listen, "127.0.0.1:7411");
+        // A config written before [network] role existed is a writer (ADR-0020 §7).
+        assert_eq!(cfg.network.role, StationRole::Writer);
         // Optional sections fall back to defaults.
         assert_eq!(cfg.settlement.window_seconds, None);
         assert_eq!(
@@ -921,6 +1017,58 @@ mod tests {
         assert_eq!(cfg.mobile.listen, "0.0.0.0:7500");
         assert!(cfg.mobile.advertise);
         assert_eq!(cfg.mobile.name, None);
+    }
+
+    #[test]
+    fn role_replica_parses_and_role_peers_validation() {
+        // A replica config parses the role and keeps its peers.
+        let replica = StationConfig::parse(
+            r#"
+                [peers]
+                list = ["127.0.0.1:7411"]
+
+                [network]
+                listen = "127.0.0.1:7412"
+                role = "replica"
+            "#,
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(replica.network.role, StationRole::Replica);
+        assert_eq!(replica.peers.list, vec!["127.0.0.1:7411"]);
+        // A replica may name peers (that is the whole point).
+        assert!(replica.check_role_peers().is_ok());
+
+        // A writer with peers is refused, and the message names the fix.
+        let writer_with_peers = StationConfig::parse(
+            r#"
+                [peers]
+                list = ["127.0.0.1:7411"]
+
+                [network]
+                listen = "127.0.0.1:7412"
+            "#,
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(writer_with_peers.network.role, StationRole::Writer);
+        let err = writer_with_peers.check_role_peers().unwrap_err();
+        assert!(err.contains("writer never pulls"), "message: {err}");
+        assert!(err.contains("role = \"replica\""), "message: {err}");
+
+        // A writer with no peers is the normal case and is valid.
+        let writer = StationConfig::parse(
+            r#"
+                [network]
+                listen = "127.0.0.1:7411"
+            "#,
+            &p(),
+        )
+        .unwrap();
+        assert!(writer.check_role_peers().is_ok());
+
+        // The generated default is a valid (peerless) writer.
+        assert!(StationConfig::default_config().check_role_peers().is_ok());
     }
 
     #[test]

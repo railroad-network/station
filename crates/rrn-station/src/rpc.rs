@@ -24,6 +24,11 @@ pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 /// The method failed while executing (a ledger/storage error, etc.).
 pub const INTERNAL_ERROR: i32 = -32603;
+/// This station is a read-replica and does not admit records (ADR-0020 §7): the
+/// method is a write and must be submitted to the community's writer instead.
+/// In JSON-RPC's application-defined server-error range (`-32000..=-32099`),
+/// distinct from the standard codes above so a client can single it out.
+pub const READ_REPLICA: i32 = -32010;
 
 /// A request line: an opaque `id` echoed back in the response, a `method` name,
 /// and free-form `params` interpreted per method.
@@ -327,6 +332,11 @@ pub struct StatusResult {
 /// needs to read "am I isolated, and is anything stuck?" at a glance (T2.4.1).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectivityBlock {
+    /// This station's role — `"writer"` (owns the chain, never pulls) or
+    /// `"replica"` (a read-only copy that pulls, never admits). ADR-0020 §7.
+    /// A writer reports an empty `peers` table; only a replica has peers.
+    #[serde(default = "default_role")]
+    pub role: String,
     /// One row per configured peer, with its last-observed reachability. Empty
     /// when no peers are configured, or all rows `reachable=false, last_success_at
     /// absent` before the first gossip round (or in a bare test core).
@@ -357,6 +367,12 @@ pub struct ConnectivityBlock {
     /// `disabled` on a station with no sidecar configured (or a bare test core).
     #[serde(default)]
     pub sidecar: SidecarStatus,
+}
+
+/// Default `role` for a [`ConnectivityBlock`] deserialized from an older
+/// station that predates the field: a writer (today's behavior, ADR-0020 §7).
+fn default_role() -> String {
+    "writer".to_string()
 }
 
 /// The Reticulum sidecar's state in a [`ConnectivityBlock`] (T2.6.1). Purely
