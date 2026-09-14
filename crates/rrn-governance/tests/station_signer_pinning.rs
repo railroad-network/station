@@ -96,7 +96,7 @@ fn publish_charter(db: &Database, founders: &[Keypair]) {
     };
     let signed = create_charter(params, founders).unwrap();
     let mut log = AppendLog::new(db);
-    store_charter(&mut log, &founders[0], signed, 0).unwrap();
+    store_charter(&mut log, db, &founders[0], signed, 0).unwrap();
 }
 
 /// A 3-founder bootstrap-grace community with its charter published.

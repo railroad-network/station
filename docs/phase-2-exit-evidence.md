@@ -218,10 +218,17 @@ should weigh before calling the phase done:
 
 ### Findings surfaced by the consolidation, for the maintainer
 
-- **Founder-charter door not frozen during an emergency.** ADR-0023 §3(b)
-  requires it; `charter::founder_charter` selects the highest-version
-  founder-authorized charter with no emergency check. Latent (reachable only via
-  gossip today), recorded as a residual, needs a follow-up.
+- **Founder-charter door not frozen during an emergency.** *Closed (this PR).*
+  ADR-0023 §3(b) requires freezing the replacement founder charter, not only the
+  amendment path. Both founder-charter write doors (`charter::store_charter` and
+  the ceremony's `store_pending_charter`) now refuse, at the monotone-clamped
+  admission instant, any charter that would re-root the community while an
+  emergency holds (`CharterError::FrozenByEmergency` via `check_charter_freeze`;
+  a write-path guard on the sole writer, replay trusts the log). The guard keys
+  on "a root already exists", so an equal-version re-root — the reachable shape,
+  since construction paths pin version 1 — is caught too. The one surviving
+  vector is a charter injected via the ungated gossip front door, which the
+  gossip-gate follow-up addresses.
 - **Declaration threshold is `ceil(2N/3)` in code** (`declaration_threshold`)
   where ADR-0023 §2's prose says `ceil(N × 67 / 100)`; the ADR's own worked
   examples match the code, and its dated Clarification of 2026-09-09 records

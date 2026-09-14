@@ -934,17 +934,21 @@ fn derive_emergencies(
     let founders = founder_set(db)?;
 
     // The community id, the declaration bar, and the renewal cap are resolved from
-    // the **genesis (founder) charter**, never the amendable effective charter. The
-    // founder charter and the founding set are immutable genesis facts (charter.rs:
-    // founders are "retained unchanged on amendment"), so which past activations were
-    // legitimate is a pure function of genesis + signed records that no later
-    // amendment can rewrite — the replica-determinism invariant 1 demands this, and
-    // deriving the bar from a signed-but-forgeable attestation field would instead let
-    // a forged attestation set its own bar. (Divergence noted in the PR: this makes
-    // the emergency-*legitimacy* parameters non-amendable in Phase 2; a general
-    // position-bounded charter resolution — which the ordinary tally thresholds also
-    // want — is recommended follow-up.) Reading founder_charter, not effective_charter,
-    // also keeps the timeline off the tally/charter-resolution path entirely.
+    // the **founder root charter** (the highest-version founder-authorized charter),
+    // never the amendable effective charter. The founding *set* is retained unchanged
+    // across amendments (charter.rs: founders are "retained unchanged on amendment"),
+    // and a founder-charter *replacement* cannot be admitted while an emergency holds
+    // (`crate::charter::check_charter_freeze`), so for the life of an emergency which
+    // past activations were legitimate is a pure function of the root + signed records
+    // — the replica-determinism invariant 1 demands this, and deriving the bar from a
+    // signed-but-forgeable attestation field would instead let a forged attestation
+    // set its own bar. (Divergences noted in the PR: this makes the emergency-
+    // *legitimacy* parameters non-amendable in Phase 2; and a founder-charter
+    // replacement admitted *after* an emergency lapses re-judges past activations on
+    // re-derivation — a general position-bounded charter resolution, which the ordinary
+    // tally thresholds also want, is recommended follow-up.) Reading founder_charter,
+    // not effective_charter, also keeps the timeline off the tally/charter-resolution
+    // path entirely.
     let genesis = founder_charter(db)?;
     let community = genesis.as_ref().map(|c| c.charter().community_id.clone());
     let declaration_pct = genesis
@@ -1516,10 +1520,12 @@ fn next_admission(log: &AppendLog, now: i64) -> Result<(u64, i64), EmergencyErro
 }
 
 /// The `(declaration_pct, max_renewals)` that govern emergency *legitimacy*, read
-/// from the immutable **genesis (founder) charter** so the append-time activation
-/// decision matches [`emergency_timeline`]'s re-derivation exactly and no later
-/// amendment can move it. Falls back to the hard floors/ceiling if
-/// no Charter is published.
+/// from the **highest-version founder-authorized charter** so the append-time
+/// activation decision matches [`emergency_timeline`]'s re-derivation exactly and
+/// no later amendment can move it. A *new* founder charter cannot be admitted while
+/// an emergency holds either ([`crate::charter::store_charter`]'s §3b guard), so
+/// these bars cannot be re-tuned mid-crisis. Falls back to the hard floors/ceiling
+/// if no Charter is published.
 fn emergency_params(db: &Database) -> Result<(u8, u32), EmergencyError> {
     Ok(match founder_charter(db)? {
         Some(c) => (
@@ -1559,13 +1565,13 @@ pub fn append_declaration(
             named: decl.author,
         });
     }
-    // The community is checked against the immutable **genesis** charter, matching
+    // The community is checked against the **founder root** charter, matching
     // `emergency_timeline`'s replay resolution. Checking the amendable *effective*
     // charter here would let a community-renaming amendment silently and permanently
     // make emergencies un-declarable: the front door would accept a declaration under
-    // the new name while replay (anchored on genesis) would forever skip it.
-    if let Some(genesis) = founder_charter(db)? {
-        let expected = &genesis.charter().community_id;
+    // the new name while replay (anchored on the founder root) would forever skip it.
+    if let Some(root) = founder_charter(db)? {
+        let expected = &root.charter().community_id;
         if decl.community_id != *expected {
             return Err(EmergencyError::WrongCommunity {
                 declared: decl.community_id.clone(),
