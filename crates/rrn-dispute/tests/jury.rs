@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_identity::attestation::Attestation;
@@ -18,7 +19,8 @@ use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
 
 use rrn_dispute::escalation::{
-    EscalationBallot, EscalationReason, EscalationRecord, SignedEscalation, SignedEscalationBallot,
+    escalation_electorate, escalation_of, EscalationBallot, EscalationReason, EscalationRecord,
+    SignedEscalation, SignedEscalationBallot,
 };
 use rrn_dispute::panel::resolve_panel;
 use rrn_dispute::resolution::{
@@ -207,7 +209,7 @@ fn params() -> DisputeParams {
 /// The deterministic seating order for a dispute.
 fn sequence(db: &Database, tx_id: &TransactionId, p: &DisputeParams) -> Vec<Address> {
     let info = disputed_info(db, tx_id).unwrap();
-    let pool = eligible_pool(db, &[], &info, info.opened_at, p).unwrap();
+    let pool = eligible_pool(db, &[], &info, info.opened_at, info.opened_seq, p).unwrap();
     draw_sequence(&pool, sortition_seed(tx_id, ANCHOR))
 }
 
@@ -369,7 +371,7 @@ fn parties_and_their_vouchers_are_recused() {
     let p = params();
 
     let info = disputed_info(&db, &tx).unwrap();
-    let pool = eligible_pool(&db, &[], &info, info.opened_at, &p).unwrap();
+    let pool = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
     let pool_addrs: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
 
     // The party (members[0]) and its voucher (members[1]) are both excluded;
@@ -395,7 +397,7 @@ fn voucher_recusal_relaxes_before_the_panel_goes_unseated() {
     let p = params();
 
     let info = disputed_info(&db, &tx).unwrap();
-    let pool = eligible_pool(&db, &[], &info, info.opened_at, &p).unwrap();
+    let pool = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
     let pool_addrs: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
     // Relaxed pool = established minus the party only: the three vouchers return.
     assert_eq!(pool_addrs.len(), 3);
@@ -1077,12 +1079,15 @@ fn grace_seats_founders_in_the_jury_pool() {
         sender: addr(&sender),
         receiver: addr(&receiver),
         opened_at: T,
+        // No real dispute entry in this synthetic case; the pool is bounded by the
+        // explicit `max_seq` argument below, so a whole-log bound stands in.
+        opened_seq: u64::MAX,
     };
     let p = params();
 
     // With founders supplied, the pool is exactly the four founders (none is a
     // party), enough to seat a panel of three.
-    let pool = eligible_pool(&db, &founder_addrs, &info, T, &p).unwrap();
+    let pool = eligible_pool(&db, &founder_addrs, &info, T, u64::MAX, &p).unwrap();
     let members: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
     assert_eq!(members.len(), 4);
     for f in &founder_addrs {
@@ -1091,7 +1096,7 @@ fn grace_seats_founders_in_the_jury_pool() {
     assert!(pool.len() >= p.panel_size);
 
     // Without founders (the steady-state call), the fresh community seats no one.
-    let empty = eligible_pool(&db, &[], &info, T, &p).unwrap();
+    let empty = eligible_pool(&db, &[], &info, T, u64::MAX, &p).unwrap();
     assert!(empty.is_empty());
 }
 
@@ -1108,11 +1113,304 @@ fn grace_still_recuses_a_party_who_is_a_founder() {
         sender: addr(&founders[0]),
         receiver: addr(&receiver),
         opened_at: T,
+        opened_seq: u64::MAX,
     };
     let p = params();
 
-    let pool = eligible_pool(&db, &founder_addrs, &info, T, &p).unwrap();
+    let pool = eligible_pool(&db, &founder_addrs, &info, T, u64::MAX, &p).unwrap();
     let members: Vec<Address> = pool.iter().map(|(a, _)| *a).collect();
     assert_eq!(members.len(), 3);
     assert!(!members.contains(&addr(&founders[0])));
+}
+
+// --- Position-bounded pool, electorate, and weights (ADR-0022 §5) --------------
+//
+// The jury pool, its recusal graph, and every draw weight are computed over the log
+// prefix ending at the dispute's admission seq, never the whole log filtered by
+// time. Nothing admitted after the dispute opened — whatever timestamp it back-dates
+// to (ADR-0022 §3 makes arbitrarily-old testimony legal) — may enter the pool,
+// recuse a candidate, or shift a weight. These port the governance regression
+// (`a_back_dated_member_admitted_after_open_does_not_join_the_electorate`) to the
+// three dispute-native derivations.
+
+/// A deterministic keypair from a label, so two builds produce identical logs — the
+/// basis of the cross-replica determinism test (mirrors `equivocation.rs::kp`).
+fn kp(label: &str) -> Keypair {
+    Keypair::from_secret(SecretKey::from_bytes(Hash::of(label.as_bytes()).to_bytes()))
+}
+
+fn pool_has(pool: &[(Address, u64)], a: &Address) -> bool {
+    pool.iter().any(|(x, _)| x == a)
+}
+
+fn pool_weight(pool: &[(Address, u64)], a: &Address) -> u64 {
+    pool.iter().find(|(x, _)| x == a).map(|(_, w)| *w).unwrap()
+}
+
+#[test]
+fn a_back_dated_vouch_cannot_pack_the_jury_pool() {
+    // Invariant 1: a member established by a vouch admitted *after* the dispute
+    // opened — back-dated so its issued_at predates the open — must not join that
+    // dispute's pool, and the drawn panel is byte-identical to the one drawn before
+    // the vouch landed.
+    let db = fresh_db();
+    let jurors = established_members(&db, 4, T);
+    // A would-be juror with raw standing over the band but *unanchored* (nobody has
+    // vouched for them): capped below the band, so not yet in the electorate.
+    let newcomer = Keypair::generate();
+    earn_raw_standing(&db, &newcomer, T);
+
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let info = disputed_info(&db, &tx).unwrap();
+    let p = params();
+
+    let pool_before = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
+    let draw_before = sequence(&db, &tx, &p);
+    assert!(!pool_has(&pool_before, &addr(&newcomer)));
+    assert_eq!(
+        pool_before.len(),
+        4,
+        "the four jurors; both parties recused"
+    );
+
+    // A back-dated anchoring vouch for the newcomer, admitted *after* the dispute's
+    // seq: legal old testimony (ADR-0022 §3) that anchors them and reveals their
+    // over-band raw composite.
+    append_vouch(&db, &jurors[0], &addr(&newcomer), T);
+
+    // Bounded at the dispute's admission seq, the pool and the draw are unchanged.
+    let pool_after = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
+    assert!(!pool_has(&pool_after, &addr(&newcomer)));
+    assert_eq!(pool_after.len(), 4);
+    assert_eq!(
+        draw_before,
+        sequence(&db, &tx, &p),
+        "the drawn panel is byte-identical after the back-dated vouch lands"
+    );
+
+    // The vector is real: without the bound (whole log) the newcomer packs the pool.
+    let unbounded = eligible_pool(&db, &[], &info, info.opened_at, u64::MAX, &p).unwrap();
+    assert!(
+        pool_has(&unbounded, &addr(&newcomer)),
+        "the back-dated vouch anchors the newcomer in the unbounded pool"
+    );
+    assert_eq!(unbounded.len(), 5);
+}
+
+#[test]
+fn a_back_dated_settlement_does_not_shift_a_draw_weight() {
+    // Invariant 4: a settlement admitted after the dispute opened must not change a
+    // juror's draw weight for that dispute. In bootstrap grace the founders are
+    // seated at the floor weight (1); a back-dated settlement raises a founder's raw
+    // standing only in the unbounded view, never in the bounded pool.
+    let db = fresh_db();
+    let founders: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
+    let founder_addrs: Vec<Address> = founders.iter().map(addr).collect();
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let info = disputed_info(&db, &tx).unwrap();
+    let p = params();
+
+    let seed = sortition_seed(&tx, ANCHOR);
+    let pool_before = eligible_pool(
+        &db,
+        &founder_addrs,
+        &info,
+        info.opened_at,
+        info.opened_seq,
+        &p,
+    )
+    .unwrap();
+    let draw_before = draw_sequence(&pool_before, seed);
+    assert_eq!(
+        pool_weight(&pool_before, &addr(&founders[0])),
+        1,
+        "a zero-standing founder is floored at weight 1"
+    );
+
+    // Back-dated settled trades for founders[0], admitted after the dispute seq.
+    for nonce in 0..5 {
+        append_settled(&db, &founders[0], &Keypair::generate(), nonce, T);
+    }
+
+    let pool_after = eligible_pool(
+        &db,
+        &founder_addrs,
+        &info,
+        info.opened_at,
+        info.opened_seq,
+        &p,
+    )
+    .unwrap();
+    assert_eq!(
+        pool_weight(&pool_after, &addr(&founders[0])),
+        1,
+        "the weight is bounded at the dispute seq — still the floor"
+    );
+    assert_eq!(
+        draw_before,
+        draw_sequence(&pool_after, seed),
+        "the draw is unchanged"
+    );
+
+    // Unbounded, the extra trades raise the weight — proof the bound bites.
+    let unbounded =
+        eligible_pool(&db, &founder_addrs, &info, info.opened_at, u64::MAX, &p).unwrap();
+    assert!(
+        pool_weight(&unbounded, &addr(&founders[0])) > 1,
+        "the back-dated settlements raise the weight only in the unbounded view"
+    );
+}
+
+#[test]
+fn a_voucher_admitted_after_the_open_neither_recuses_nor_seats() {
+    // Invariant 5: recusal graph and pool agree on one prefix. A vouch from a juror
+    // for a party, admitted after the dispute opened, must not recuse that juror.
+    let db = fresh_db();
+    let jurors = established_members(&db, 4, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let info = disputed_info(&db, &tx).unwrap();
+    let p = params();
+
+    let pool_before = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
+    assert!(pool_has(&pool_before, &addr(&jurors[0])));
+
+    // jurors[0] vouches for a party (alice) *after* the dispute opened, back-dated.
+    append_vouch(&db, &jurors[0], &addr(&alice), T);
+
+    // Bounded at the dispute seq, jurors[0] is still eligible (not recused).
+    let pool_after = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
+    assert!(
+        pool_has(&pool_after, &addr(&jurors[0])),
+        "a vouch admitted after the open does not recuse the voucher"
+    );
+    assert_eq!(pool_after.len(), 4);
+
+    // Unbounded, the same vouch recuses jurors[0] (proof the bound bites): with four
+    // jurors, strict recusal leaves exactly a panel of three, so no relaxation.
+    let unbounded = eligible_pool(&db, &[], &info, info.opened_at, u64::MAX, &p).unwrap();
+    assert!(
+        !pool_has(&unbounded, &addr(&jurors[0])),
+        "unbounded, the voucher of a party is recused"
+    );
+    assert_eq!(unbounded.len(), 3);
+}
+
+#[test]
+fn two_replicas_with_post_open_back_dated_evidence_draw_the_same_panel() {
+    // Invariant 6 (jury): the draw is a pure function of the bounded log, so two
+    // replicas built from the same operations — including a vouch admitted after the
+    // dispute opened — seat a byte-identical panel. Deterministic keypairs make the
+    // two builds identical logs.
+    let build = || {
+        let db = fresh_db();
+        let jurors: Vec<Keypair> = (0..4).map(|i| kp(&format!("juror:{i}"))).collect();
+        for m in &jurors {
+            earn_raw_standing(&db, m, T);
+        }
+        for i in 0..jurors.len() {
+            append_vouch(&db, &jurors[(i + 1) % jurors.len()], &addr(&jurors[i]), T);
+        }
+        let newcomer = kp("newcomer");
+        earn_raw_standing(&db, &newcomer, T);
+        let (alice, bob) = (kp("alice"), kp("bob"));
+        let tx = append_disputed(&db, &alice, &bob, 300, T);
+        // Post-open, back-dated anchoring vouch — inert under the bound on both.
+        append_vouch(&db, &jurors[0], &addr(&newcomer), T);
+        sequence(&db, &tx, &params())
+    };
+    let (a, b) = (build(), build());
+    assert_eq!(a, b, "two identical chains draw the identical panel");
+    assert!(!a.is_empty());
+}
+
+#[test]
+fn a_back_dated_vouch_cannot_pack_the_escalation_electorate() {
+    // Invariant 2: a member established by a vouch admitted after the escalation's
+    // admission seq is neither in its electorate nor counted; their ballot is refused.
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+
+    // A valid cannot-seat escalation (the pool is too small to seat a panel).
+    open_escalation(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+    )
+    .unwrap();
+    let (_esc, esc_at, esc_seq) = escalation_of(&db, &tx).unwrap().unwrap();
+    let info = disputed_info(&db, &tx).unwrap();
+
+    // The electorate is the lone eligible member (both parties recused).
+    let before = escalation_electorate(&db, &[], &info, esc_at, esc_seq).unwrap();
+    assert!(before.contains(&addr(&lone)));
+    assert_eq!(before.len(), 1);
+
+    // A newcomer earns over-band raw standing, then is anchored by a back-dated vouch
+    // admitted *after* the escalation opened.
+    let newcomer = Keypair::generate();
+    earn_raw_standing(&db, &newcomer, T);
+    append_vouch(&db, &lone, &addr(&newcomer), T);
+
+    // Bounded at the escalation's seq the newcomer never joins the electorate.
+    let after = escalation_electorate(&db, &[], &info, esc_at, esc_seq).unwrap();
+    assert!(!after.contains(&addr(&newcomer)));
+    assert_eq!(
+        after.len(),
+        1,
+        "the electorate is bounded at the escalation seq"
+    );
+
+    // Unbounded, the newcomer would join — proof the bound bites.
+    let unbounded = escalation_electorate(&db, &[], &info, esc_at, u64::MAX).unwrap();
+    assert!(unbounded.contains(&addr(&newcomer)));
+
+    // And the newcomer's ballot is refused (not in the bounded electorate).
+    let err = append_escalation_ballot(
+        &db,
+        &[],
+        &p,
+        signed_ballot(&tx, &newcomer, true, esc_at + 10),
+        esc_at + 10,
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
+}
+
+#[test]
+fn a_tail_anchored_dispute_bounds_to_the_whole_log() {
+    // Invariant 8: when the dispute entry is the current tail, the prefix [1, seq] is
+    // the whole log, so the bounded pool, weights, and draw equal the unbounded
+    // (time-only) computation — a guard against an off-by-one in the bound.
+    let db = fresh_db();
+    let _jurors = established_members(&db, 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T); // the dispute is the tail
+    let info = disputed_info(&db, &tx).unwrap();
+    let p = params();
+    // Nothing is admitted after the dispute, so opened_seq is exactly the tail.
+    assert_eq!(
+        info.opened_seq,
+        AppendLog::new(&db).tail().unwrap().unwrap().seq
+    );
+
+    let bounded = eligible_pool(&db, &[], &info, info.opened_at, info.opened_seq, &p).unwrap();
+    let whole = eligible_pool(&db, &[], &info, info.opened_at, u64::MAX, &p).unwrap();
+
+    // Same members and weights (compare as pubkey-sorted vectors), and same draw.
+    let sort = |mut v: Vec<(Address, u64)>| {
+        v.sort_by_key(|(a, _)| a.public_key().to_bytes());
+        v
+    };
+    assert_eq!(sort(bounded.clone()), sort(whole.clone()));
+    assert_eq!(
+        draw_sequence(&bounded, sortition_seed(&tx, ANCHOR)),
+        draw_sequence(&whole, sortition_seed(&tx, ANCHOR)),
+    );
+    assert_eq!(bounded.len(), 5, "the five jurors; both parties recused");
 }

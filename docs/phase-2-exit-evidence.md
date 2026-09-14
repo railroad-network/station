@@ -214,7 +214,11 @@ should weigh before calling the phase done:
    two-thirds faction; a ≤ 2-member grace electorate; scope as testimony; the
    off-log stale-consent bundle (ADR-0027 D2).
 8. **The dispute/jury electorates are time-bounded**, not position-bounded like
-   governance's (follow-up).
+   governance's. *Closed:* `rrn-dispute` now computes every pool, electorate, and
+   weight over `grace_electorate_asof`/`tier2_stake_centi_asof` at the anchoring
+   admission seq (the dispute entry's seq for the jury, the escalation entry's for
+   its electorate, the round's own for equivocation), so back-dated standing
+   admitted after a round opened cannot pack it (ADR-0022 §5).
 
 ### Findings surfaced by the consolidation, for the maintainer
 
