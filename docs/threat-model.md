@@ -902,7 +902,20 @@ transition; the derivability of all state from the log.
   window, signed `opened_at` diverging in both directions) and
   `jury.rs::escalation_opened_at_is_ignored_for_the_window_and_electorate` (a
   backdated escalation whose ballot lands outside the lie's window but inside the
-  admitted one still counts). The residual is now the same station-clock trust
+  admitted one still counts). Beyond the *time* anchor, the *membership*
+  computations are now **prefix-bounded at the anchoring admission seq**: the jury
+  pool, its recusal (voucher) graph, and every draw weight are computed over the
+  log prefix ending at the dispute entry's seq; the escalation electorate over the
+  escalation entry's seq; and each equivocation round's pool and re-seat
+  eligibility over that round's own anchoring seq (`eligible_pool`/
+  `escalation_electorate`/`reseat_eligible` on `grace_electorate_asof` +
+  `tier2_stake_centi_asof`, the position-bounded reputation forms). A vouch or
+  settlement admitted *after* a round opened — however old the `issued_at`/
+  `settled_at` it back-dates to (ADR-0022 §3 makes such testimony legal) — can no
+  longer pack a pool, recuse a candidate, or shift a weight (ADR-0022 §5,
+  T2.11.2), closing the back-dated-evidence packing vector for the jury draw, the
+  escalation vote, and the equivocation re-seat that the governance path had
+  already closed. The residual is now the same station-clock trust
   root as the settlement windows above, not a per-member timestamp attack; verdict
   determinism holds because the sole-writer station (ADR-0020) computes the draw
   and the escalation tally from its own local admission metadata and enacts the
@@ -2207,10 +2220,12 @@ channel.
   now applies to `ProposalImplemented` and the three emergency attestations (see
   "Emergency activation + declaration TTL" below for the consolidated residual list).
   The station clock at admission remains the operational trust root
-  (ADR-0022 §6). The dispute-escalation electorate still uses the *time*-based
-  `grace_electorate` and shares the residual back-dating vector this ticket closed only
-  for the governance path; `grace_electorate_asof` is now the tool to close it there too
-  (follow-up).
+  (ADR-0022 §6). **The dispute-escalation, jury, and equivocation electorates are
+  now prefix-bounded too** (T2.11.2): `rrn-dispute` computes every pool, electorate,
+  and weight over `grace_electorate_asof`/`tier2_stake_centi_asof` at the anchoring
+  admission seq, so the back-dating vector the governance path closed is closed for
+  the dispute paths as well (see the `rrn-ledger` "Resolution-layer re-anchoring"
+  note above).
 
 #### DTN-carried governance records
 
@@ -4035,11 +4050,6 @@ entry citing its ADR or the section that owns it.
   the log-head freshness witness ADR-0027 deferred, belongs with the emergency
   residuals above); the pilot mitigation is a single writer and no gossip
   peers.
-- **The dispute-escalation and jury electorates are time-bounded, not
-  position-bounded** (`rrn-dispute` still calls `grace_electorate(at)`, not
-  `grace_electorate_asof`): admission-anchored, so ADR-0022 holds, but the
-  back-dated-vouch electorate-packing vector the ADR-0022 conformance pass
-  closed for governance is open here (follow-up).
 - **Equivocation: two count-bounded evasions are closed, two policy gaps
   remain.** After an `Overturn`, a later genuine overspend on the same
   certificate is refused but records no fresh proof or penalty (first-wins
