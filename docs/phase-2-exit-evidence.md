@@ -207,9 +207,14 @@ should weigh before calling the phase done:
 4. **The station is the liveness single point of failure** (ADR-0020);
    recovery is restore + outbox replay, or the holder ceremony.
 5. **Running-node seizure is not defended** (ADR-0024).
-6. **Ledger station-signed records are unpinned on replay**, and the gossip
-   pull path applies no front-door gate. Both are reachable only through a
-   configured gossip peer; the pilot configures none.
+6. **A gossip read-replica cannot derive balances or governance under its own
+   key.** Station-signed records (ledger *and* governance) are now signer-pinned
+   to the community station key on replay (T2.1.4, T2.11.3), so a forged record
+   injected via the ungated gossip pull path is inert; the surviving residual is
+   decision (a)'s consequence — a peer deriving under a *different* key sees no
+   station-signed state at all (loud, tested), and the gossip pull path still
+   applies no front-door gate. Both are reachable only through a configured gossip
+   peer; the pilot configures none.
 7. **Emergency governance's structural residuals** (ADR-0023): a standing
    two-thirds faction; a ≤ 2-member grace electorate; scope as testimony; the
    off-log stale-consent bundle (ADR-0027 D2).

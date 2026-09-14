@@ -173,7 +173,7 @@ mod tests {
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
         for nonce in 0..10 {
-            append_settled(db, who, station, station, nonce, at);
+            append_settled(db, who, station, &test_station(), nonce, at);
         }
         for _ in 0..10 {
             append_vouch(db, who, &addr(&Keypair::generate()), at);

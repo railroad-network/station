@@ -773,12 +773,13 @@ fn eligible_signatures(
     pin_time: i64,
     pin_seq: u64,
     upto_seq: u64,
+    station: &PublicKey,
 ) -> Result<Vec<(u64, Address)>, EmergencyError> {
     let mut seen = std::collections::HashSet::new();
     let mut sigs: Vec<(u64, Address)> = Vec::new();
 
     if author_seq <= upto_seq
-        && is_eligible_asof(db, founders, author, pin_time, pin_seq)?
+        && is_eligible_asof(db, founders, author, pin_time, pin_seq, station)?
         && seen.insert(*author)
     {
         sigs.push((author_seq, *author));
@@ -798,7 +799,7 @@ fn eligible_signatures(
         if Address::from_public_key(entry.payload.signer) != cosign.signer {
             continue;
         }
-        if !is_eligible_asof(db, founders, &cosign.signer, pin_time, pin_seq)? {
+        if !is_eligible_asof(db, founders, &cosign.signer, pin_time, pin_seq, station)? {
             continue;
         }
         if seen.insert(cosign.signer) {
@@ -984,7 +985,7 @@ fn derive_emergencies(
                             pin_time: i64,
                             pin_seq: u64|
      -> Result<bool, EmergencyError> {
-        let n = grace_electorate_asof(db, &founders, pin_time, pin_seq)?.len();
+        let n = grace_electorate_asof(db, &founders, pin_time, pin_seq, station)?.len();
         let threshold = declaration_threshold(n, declaration_pct);
         let sigs = eligible_signatures(
             &log,
@@ -996,6 +997,7 @@ fn derive_emergencies(
             pin_time,
             pin_seq,
             pin_seq,
+            station,
         )?;
         Ok(crossing_seq(&sigs, threshold).is_some())
     };
@@ -1124,7 +1126,7 @@ fn derive_emergencies(
 
         // Legitimate. Find any lapse that reached its own threshold, pinned at the
         // same activation position (the lapse answers to the same electorate and bar).
-        let n = grace_electorate_asof(db, &founders, pin_time, activation_seq)?.len();
+        let n = grace_electorate_asof(db, &founders, pin_time, activation_seq, station)?.len();
         let threshold = declaration_threshold(n, declaration_pct);
         let lapsed_at_seq = lapse_boundary(
             &log,
@@ -1134,6 +1136,7 @@ fn derive_emergencies(
             pin_time,
             activation_seq,
             threshold,
+            station,
         )?;
 
         seen_decls.insert(act.declaration_hash);
@@ -1180,6 +1183,7 @@ fn lapse_boundary(
     pin_time: i64,
     pin_seq: u64,
     threshold: usize,
+    station: &PublicKey,
 ) -> Result<Option<u64>, EmergencyError> {
     // Pass 1: every self-signed lapse record for this declaration — collect its hash
     // (a valid co-sign target) and count its author as a candidate signature.
@@ -1225,7 +1229,7 @@ fn lapse_boundary(
     let mut seen = std::collections::HashSet::new();
     let mut sigs: Vec<(u64, Address)> = Vec::new();
     for (seq, addr) in candidates {
-        if !is_eligible_asof(db, founders, &addr, pin_time, pin_seq)? {
+        if !is_eligible_asof(db, founders, &addr, pin_time, pin_seq, station)? {
             continue;
         }
         if seen.insert(addr) {
@@ -1584,7 +1588,14 @@ pub fn append_declaration(
         return Err(EmergencyError::AlreadyPresent);
     }
     let (open_seq, open_time) = next_admission(log, now)?;
-    if !is_eligible_asof(db, &founder_set(db)?, &decl.author, open_time, open_seq)? {
+    if !is_eligible_asof(
+        db,
+        &founder_set(db)?,
+        &decl.author,
+        open_time,
+        open_seq,
+        &station.public_key(),
+    )? {
         return Err(EmergencyError::NotEligible { who: decl.author });
     }
     // ADR-0027 D2 atomicity: the declaration and its station-signed admission
@@ -1658,7 +1669,14 @@ pub fn append_cosign(
             return Err(EmergencyError::UnknownTarget(target));
         };
 
-    if !is_eligible_asof(db, &founders, &cosign.signer, pin_time, pin_seq)? {
+    if !is_eligible_asof(
+        db,
+        &founders,
+        &cosign.signer,
+        pin_time,
+        pin_seq,
+        &station.public_key(),
+    )? {
         return Err(EmergencyError::NotEligible { who: cosign.signer });
     }
     // Idempotent re-carriage is answered before the D3 state check, so a benign
@@ -1746,6 +1764,7 @@ pub fn append_lapse(
         &lapse.author,
         active.activation_instant,
         active.activation_seq,
+        station,
     )? {
         return Err(EmergencyError::NotEligible { who: lapse.author });
     }
@@ -1833,7 +1852,7 @@ fn try_activate(
     let tail_seq = act_seq - 1;
     let (declaration_pct, max_renewals) = emergency_params(db)?;
 
-    let n = grace_electorate_asof(db, &founders, act_time, act_seq)?.len();
+    let n = grace_electorate_asof(db, &founders, act_time, act_seq, &station.public_key())?.len();
     let threshold = declaration_threshold(n, declaration_pct);
     let sigs = eligible_signatures(
         &log,
@@ -1845,6 +1864,7 @@ fn try_activate(
         act_time,
         act_seq,
         tail_seq,
+        &station.public_key(),
     )?;
     match crossing_seq(&sigs, threshold) {
         // This front-door record *is* the first crossing — write its marker.

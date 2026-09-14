@@ -13,7 +13,7 @@
 //! it settle. Every path is bounded by the resolution window and fails open: an
 //! unresolved dispute **lapses** and settles as confirmed (ADR-0014 §5).
 
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_identity::address::Address;
 use rrn_ledger::engine::Engine;
 use rrn_ledger::settlement::{SettlementConfig, Settler};
@@ -59,8 +59,8 @@ pub enum Resolution {
 
 /// Every transaction currently in the `Disputed` state — the set a resolution
 /// sweep iterates.
-pub fn find_disputed(db: &Database) -> Result<Vec<TransactionId>> {
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+pub fn find_disputed(db: &Database, station: &PublicKey) -> Result<Vec<TransactionId>> {
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db), station)?;
     Ok(snapshot
         .iter()
         .filter_map(|(id, state)| matches!(state, TransactionState::Disputed { .. }).then_some(*id))
@@ -81,6 +81,7 @@ pub fn append_verdict(
     anchor: &[u8],
     verdict: SignedVerdict,
     now: i64,
+    station: &PublicKey,
 ) -> Result<()> {
     verdict.verify().map_err(|_| Error::BadVerdict)?;
     // These are all `Copy`; take them out so the verdict can be moved into the log
@@ -95,7 +96,7 @@ pub fn append_verdict(
         return Err(Error::BadVerdict);
     }
 
-    let info = disputed_info(db, &proposal_id)?;
+    let info = disputed_info(db, &proposal_id, station)?;
     // A verdict cannot predate the dispute, be dated into the future, or land
     // after the resolution window has closed (the dispute is lapsing by then).
     if cast_at < info.opened_at
@@ -113,7 +114,15 @@ pub fn append_verdict(
     // Re-derive the panel as of the verdict's own instant. The juror must occupy a
     // seat that is still awaiting a verdict then — which also proves they are
     // within their response window (a lapsed occupant would have been redrawn).
-    let pool = eligible_pool(db, founders, &info, info.opened_at, info.opened_seq, params)?;
+    let pool = eligible_pool(
+        db,
+        founders,
+        &info,
+        info.opened_at,
+        info.opened_seq,
+        params,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, sortition_seed(&proposal_id, anchor));
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, cast_at);
     match panel.seat_of(&juror) {
@@ -144,6 +153,7 @@ pub fn open_escalation(
     anchor: &[u8],
     escalation: SignedEscalation,
     now: i64,
+    station: &PublicKey,
 ) -> Result<()> {
     escalation.verify().map_err(|_| Error::BadEscalation)?;
     let record = escalation.payload.clone();
@@ -151,7 +161,7 @@ pub fn open_escalation(
         return Err(Error::BadEscalation);
     }
 
-    let info = disputed_info(db, &record.proposal_id)?;
+    let info = disputed_info(db, &record.proposal_id, station)?;
     if record.initiator != info.sender && record.initiator != info.receiver {
         return Err(Error::BadEscalation);
     }
@@ -175,6 +185,7 @@ pub fn open_escalation(
         params,
         anchor,
         now,
+        station,
     )?;
     if !escalation_applies(&record, now, &info, &jury, params) {
         return Err(Error::NotEscalatable);
@@ -199,6 +210,7 @@ pub fn append_escalation_ballot(
     params: &DisputeParams,
     ballot: SignedEscalationBallot,
     now: i64,
+    station: &PublicKey,
 ) -> Result<()> {
     ballot.verify().map_err(|_| Error::BadBallot)?;
     let (proposal_id, voter, cast_at) = (
@@ -210,12 +222,12 @@ pub fn append_escalation_ballot(
         return Err(Error::BadBallot);
     }
 
-    let info = disputed_info(db, &proposal_id)?;
+    let info = disputed_info(db, &proposal_id, station)?;
     let (_escalation, esc_admitted_at, esc_seq) =
         escalation_of(db, &proposal_id)?.ok_or(Error::NotEscalated)?;
     let close = escalation_close(esc_admitted_at, &info, params);
 
-    let electorate = escalation_electorate(db, founders, &info, esc_admitted_at, esc_seq)?;
+    let electorate = escalation_electorate(db, founders, &info, esc_admitted_at, esc_seq, station)?;
     if !electorate.contains(&voter) || cast_at < esc_admitted_at || cast_at > close || cast_at > now
     {
         return Err(Error::NotEligible);
@@ -246,7 +258,15 @@ pub fn resolve(
     anchor: &[u8],
     now: i64,
 ) -> Result<Resolution> {
-    let outcome = decide(db, founders, tx_id, params, anchor, now)?;
+    let outcome = decide(
+        db,
+        founders,
+        tx_id,
+        params,
+        anchor,
+        now,
+        &station.public_key(),
+    )?;
     enact_resolution(db, station, tx_id, outcome, now)?;
     Ok(outcome)
 }
@@ -260,8 +280,9 @@ pub fn preview(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<Resolution> {
-    decide(db, founders, tx_id, params, anchor, now)
+    decide(db, founders, tx_id, params, anchor, now, station)
 }
 
 /// The pure decision: derives the jury and any escalation and reduces them to the
@@ -274,10 +295,11 @@ fn decide(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<Resolution> {
-    let info = disputed_info(db, tx_id)?;
+    let info = disputed_info(db, tx_id, station)?;
     let main_close = info.opened_at.saturating_add(params.window_seconds);
-    let jury = jury_view(db, founders, tx_id, &info, params, anchor, now)?;
+    let jury = jury_view(db, founders, tx_id, &info, params, anchor, now, station)?;
 
     // A validly-opened escalation governs the outcome; a bogus or inapplicable one
     // is ignored, and the jury path resumes.
@@ -293,6 +315,7 @@ fn decide(
                 esc_seq,
                 params,
                 now,
+                station,
             );
         }
     }
@@ -336,6 +359,7 @@ struct JuryView {
 }
 
 /// Derives the [`JuryView`] for a dispute as of `now`.
+#[allow(clippy::too_many_arguments)]
 fn jury_view(
     db: &Database,
     founders: &[Address],
@@ -344,8 +368,17 @@ fn jury_view(
     params: &DisputeParams,
     anchor: &[u8],
     now: i64,
+    station: &PublicKey,
 ) -> Result<JuryView> {
-    let pool = eligible_pool(db, founders, info, info.opened_at, info.opened_seq, params)?;
+    let pool = eligible_pool(
+        db,
+        founders,
+        info,
+        info.opened_at,
+        info.opened_seq,
+        params,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let existing = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, now);
@@ -407,12 +440,13 @@ fn decide_escalation(
     admitted_seq: u64,
     params: &DisputeParams,
     now: i64,
+    station: &PublicKey,
 ) -> Result<Resolution> {
     let close = escalation_close(admitted_at, info, params);
     if now < close {
         return Ok(Resolution::EscalationPending);
     }
-    let electorate = escalation_electorate(db, founders, info, admitted_at, admitted_seq)?;
+    let electorate = escalation_electorate(db, founders, info, admitted_at, admitted_seq, station)?;
     let ballots = escalation_ballots(db, tx_id)?;
     let tallied = count_escalation(&ballots, &electorate, params, admitted_at, close);
     Ok(match tallied.terminal_outcome() {

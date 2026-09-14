@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 
 use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
@@ -67,8 +68,12 @@ pub struct DisputedInfo {
 /// entry was admitted, which records `dispute_admitted_at`; its absence means a
 /// corrupt or partially-replayed log and is a hard error rather than a fall-back
 /// to the party's value.
-pub fn disputed_info(db: &Database, tx_id: &TransactionId) -> Result<DisputedInfo> {
-    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db))?;
+pub fn disputed_info(
+    db: &Database,
+    tx_id: &TransactionId,
+    station: &PublicKey,
+) -> Result<DisputedInfo> {
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db), station)?;
     disputed_info_from_snapshot(&snapshot, tx_id)
 }
 
@@ -184,6 +189,7 @@ pub fn eligible_pool(
     at_time: i64,
     max_seq: u64,
     params: &DisputeParams,
+    station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
     // The two parties are never eligible (hard recusal); their vouchers are
     // recused too but relax first if that is the only way to seat a panel. The
@@ -192,7 +198,9 @@ pub fn eligible_pool(
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
     let mut vouchers = vouchers_of_until(db, &info.sender, max_seq)?;
     vouchers.extend(vouchers_of_until(db, &info.receiver, max_seq)?);
-    eligible_pool_excluding(db, founders, at_time, max_seq, params, &parties, &vouchers)
+    eligible_pool_excluding(
+        db, founders, at_time, max_seq, params, &parties, &vouchers, station,
+    )
 }
 
 /// The shared sortition pool with an explicit two-tier recusal set — the one rule
@@ -216,6 +224,7 @@ pub fn eligible_pool(
 /// entry's seq for a transaction jury, the round's anchoring seq for an equivocation
 /// round — so the recusal set (also bounded at `max_seq` by the caller) and the pool
 /// agree on one prefix.
+#[allow(clippy::too_many_arguments)]
 pub fn eligible_pool_excluding(
     db: &Database,
     founders: &[Address],
@@ -224,8 +233,9 @@ pub fn eligible_pool_excluding(
     params: &DisputeParams,
     hard_excluded: &HashSet<Address>,
     soft_excluded: &HashSet<Address>,
+    station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
-    let electorate = grace_electorate_asof(db, founders, at_time, max_seq)?;
+    let electorate = grace_electorate_asof(db, founders, at_time, max_seq, station)?;
 
     let weigh = |db: &Database, addr: &Address| -> Result<(Address, u64)> {
         // Established members hold composite ≥ the Member band, so their raw
@@ -235,7 +245,7 @@ pub fn eligible_pool_excluding(
         // electorate so a back-dated settlement cannot shift a draw weight.
         Ok((
             *addr,
-            tier2_stake_centi_asof(db, addr, at_time, max_seq)?.max(1),
+            tier2_stake_centi_asof(db, addr, at_time, max_seq, station)?.max(1),
         ))
     };
 

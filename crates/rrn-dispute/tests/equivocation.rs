@@ -45,6 +45,14 @@ fn kp(label: &str) -> Keypair {
     Keypair::from_secret(SecretKey::from_bytes(Hash::of(label.as_bytes()).to_bytes()))
 }
 
+/// The one community station key every test in this file shares (the fixture's
+/// own `kp("equiv:station")`): standing settlements, certificates, equivocation
+/// records and every derivation pin against it, so station-signed records count
+/// under the station-signer pin exactly as before (genuine path unchanged).
+fn test_station() -> Keypair {
+    kp("equiv:station")
+}
+
 fn addr(k: &Keypair) -> Address {
     Address::from_public_key(k.public_key())
 }
@@ -98,7 +106,9 @@ fn append_settled(db: &Database, sender: &Keypair, receiver: &Keypair, nonce: u6
                 amount_centi: 300,
                 settled_at: at,
             },
-            receiver,
+            // Station-signed, as in production (ADR-0005): the station-signer pin counts
+            // a settlement only when the community station signed it.
+            &test_station(),
         ),
         0,
     )
@@ -238,7 +248,15 @@ fn cast(
         },
         juror,
     );
-    append_equivocation_ballot(db, &[], &params(), ANCHOR, signed, now)
+    append_equivocation_ballot(
+        db,
+        &[],
+        &params(),
+        ANCHOR,
+        signed,
+        now,
+        &test_station().public_key(),
+    )
 }
 
 /// A five-member established community with a subject, a payee (both established),
@@ -293,7 +311,7 @@ fn setup() -> Fixture {
 #[test]
 fn case_opens_by_replay_with_the_right_subject() {
     let fx = setup();
-    let cases = equivocation_cases(&fx.db).unwrap();
+    let cases = equivocation_cases(&fx.db, &fx.station.public_key()).unwrap();
     assert_eq!(cases.len(), 1);
     assert_eq!(cases[0].subject, addr(&fx.subject));
     assert_eq!(cases[0].basis, EquivocationBasis::CertOverspend);
@@ -319,7 +337,7 @@ fn two_proofs_of_one_offence_are_one_case() {
         T + 1,
     );
     assert_ne!(fx.id, id2);
-    let cases = equivocation_cases(&fx.db).unwrap();
+    let cases = equivocation_cases(&fx.db, &fx.station.public_key()).unwrap();
     assert_eq!(cases.len(), 1, "two proofs of one offence are one case");
     assert_eq!(cases[0].attached.len(), 2);
 }
@@ -370,9 +388,9 @@ fn a_majority_overturn_neutralizes_the_penalty_end_to_end() {
     let fx = setup();
     // Before any ruling the equivocation is active and blocks issuance, and the
     // penalty has zeroed the subject's trade reliability in scoring.
-    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db)).unwrap();
+    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db), &fx.station.public_key()).unwrap();
     assert!(snap.has_active_equivocation(&addr(&fx.subject)));
-    let scorer = ReputationScorer::new(&fx.db);
+    let scorer = ReputationScorer::new(&fx.db, &fx.station.public_key());
     assert_eq!(
         scorer
             .score(&addr(&fx.subject), T + 5)
@@ -399,7 +417,7 @@ fn a_majority_overturn_neutralizes_the_penalty_end_to_end() {
         &fx.db,
         &[],
         &fx.station,
-        &equivocation_cases(&fx.db).unwrap()[0],
+        &equivocation_cases(&fx.db, &fx.station.public_key()).unwrap()[0],
         &params(),
         ANCHOR,
         T + 20,
@@ -409,7 +427,7 @@ fn a_majority_overturn_neutralizes_the_penalty_end_to_end() {
 
     // The station-signed terminal Overturn neutralizes the record: no longer active,
     // and scoring restores the subject's trade reliability end-to-end.
-    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db)).unwrap();
+    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db), &fx.station.public_key()).unwrap();
     assert!(snap.is_equivocation_overturned(&fx.id));
     assert!(!snap.has_active_equivocation(&addr(&fx.subject)));
     assert!(
@@ -427,7 +445,7 @@ fn a_majority_overturn_neutralizes_the_penalty_end_to_end() {
         &fx.db,
         &[],
         &fx.station,
-        &equivocation_cases(&fx.db).unwrap()[0],
+        &equivocation_cases(&fx.db, &fx.station.public_key()).unwrap()[0],
         &params(),
         ANCHOR,
         T + 30,
@@ -456,14 +474,14 @@ fn a_majority_confirm_is_final_and_leaves_the_penalty_standing() {
         &fx.db,
         &[],
         &fx.station,
-        &equivocation_cases(&fx.db).unwrap()[0],
+        &equivocation_cases(&fx.db, &fx.station.public_key()).unwrap()[0],
         &params(),
         ANCHOR,
         T + 20,
     )
     .unwrap();
     assert_eq!(outcome, EquivResolution::Confirmed);
-    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db)).unwrap();
+    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db), &fx.station.public_key()).unwrap();
     // A confirm records finality but leaves the penalty (and the gate) standing.
     assert!(!snap.is_equivocation_overturned(&fx.id));
     assert!(snap.has_active_equivocation(&addr(&fx.subject)));
@@ -472,14 +490,32 @@ fn a_majority_confirm_is_final_and_leaves_the_penalty_standing() {
 #[test]
 fn an_unruled_case_lapses_then_can_be_reseated() {
     let fx = setup();
-    let case = &equivocation_cases(&fx.db).unwrap()[0];
+    let case = &equivocation_cases(&fx.db, &fx.station.public_key()).unwrap()[0];
     // Before its window closes: pending. After: lapsed (penalty stands).
     assert_eq!(
-        preview_equivocation(&fx.db, &[], case, &params(), ANCHOR, T + 500).unwrap(),
+        preview_equivocation(
+            &fx.db,
+            &[],
+            case,
+            &params(),
+            ANCHOR,
+            T + 500,
+            &fx.station.public_key()
+        )
+        .unwrap(),
         EquivResolution::Pending
     );
     assert_eq!(
-        preview_equivocation(&fx.db, &[], case, &params(), ANCHOR, T + 1000).unwrap(),
+        preview_equivocation(
+            &fx.db,
+            &[],
+            case,
+            &params(),
+            ANCHOR,
+            T + 1000,
+            &fx.station.public_key()
+        )
+        .unwrap(),
         EquivResolution::Lapsed
     );
 
@@ -494,7 +530,15 @@ fn an_unruled_case_lapses_then_can_be_reseated() {
             },
             who,
         );
-        append_equivocation_reseat(&fx.db, &[], &params(), ANCHOR, signed, now)
+        append_equivocation_reseat(
+            &fx.db,
+            &[],
+            &params(),
+            ANCHOR,
+            signed,
+            now,
+            &fx.station.public_key(),
+        )
     };
     assert!(matches!(
         reseat_by(&fx.subject, 1, T + 1000),
@@ -503,9 +547,18 @@ fn an_unruled_case_lapses_then_can_be_reseated() {
     reseat_by(&fx.members[2], 1, T + 1000).unwrap();
 
     // Round 1 is open again; a fresh majority in round 1 confirms.
-    let case = &equivocation_cases(&fx.db).unwrap()[0];
+    let case = &equivocation_cases(&fx.db, &fx.station.public_key()).unwrap()[0];
     assert_eq!(
-        preview_equivocation(&fx.db, &[], case, &params(), ANCHOR, T + 1100).unwrap(),
+        preview_equivocation(
+            &fx.db,
+            &[],
+            case,
+            &params(),
+            ANCHOR,
+            T + 1100,
+            &fx.station.public_key()
+        )
+        .unwrap(),
         EquivResolution::Pending
     );
     for m in &fx.members[2..5] {
@@ -524,7 +577,7 @@ fn an_unruled_case_lapses_then_can_be_reseated() {
         &fx.db,
         &[],
         &fx.station,
-        &equivocation_cases(&fx.db).unwrap()[0],
+        &equivocation_cases(&fx.db, &fx.station.public_key()).unwrap()[0],
         &params(),
         ANCHOR,
         T + 1200,
@@ -598,7 +651,9 @@ fn two_identical_logs_reach_identical_outcomes() {
             )
             .unwrap();
         }
-        let case = equivocation_cases(&fx.db).unwrap().remove(0);
+        let case = equivocation_cases(&fx.db, &fx.station.public_key())
+            .unwrap()
+            .remove(0);
         let id = case.case_id;
         let outcome =
             resolve_equivocation(&fx.db, &[], &fx.station, &case, &params(), ANCHOR, T + 20)
@@ -634,12 +689,14 @@ fn overturn_neutralizes_every_attached_proof() {
         )
         .unwrap();
     }
-    let case = equivocation_cases(&fx.db).unwrap().remove(0);
+    let case = equivocation_cases(&fx.db, &fx.station.public_key())
+        .unwrap()
+        .remove(0);
     assert_eq!(case.attached.len(), 2);
     resolve_equivocation(&fx.db, &[], &fx.station, &case, &params(), ANCHOR, T + 20).unwrap();
 
     // One terminal Overturn per attached record — both are neutralized.
-    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db)).unwrap();
+    let snap = LedgerSnapshot::derive(&AppendLog::new(&fx.db), &fx.station.public_key()).unwrap();
     assert!(snap.is_equivocation_overturned(&fx.id));
     assert!(snap.is_equivocation_overturned(&id2));
     assert!(!snap.has_active_equivocation(&addr(&fx.subject)));
@@ -651,7 +708,9 @@ fn a_small_pool_relaxes_voucher_recusal() {
     // voucher. Strict recusal leaves only members[2..4] (2 < panel 3), so the
     // voucher-recusal relaxes and members[1] is seated — exactly as ADR-0014 does.
     let db = fresh_db();
-    let station = kp("relax:station");
+    // The community station is the shared one every settlement is signed by, so the
+    // certificate and equivocation record this test writes pin consistently.
+    let station = test_station();
     let members: Vec<Keypair> = (0..4).map(|i| kp(&format!("relax:member:{i}"))).collect();
     establish_ring(&db, &members, T);
     let subject = kp("relax:subject");
@@ -723,7 +782,7 @@ fn a_juror_established_after_a_round_opens_is_not_on_its_panel() {
     ));
     // The latecomer really is an established member as of now (unbounded) — so their
     // exclusion from round 0 is the position bound, not a lack of standing.
-    let composite = ReputationScorer::new(&fx.db)
+    let composite = ReputationScorer::new(&fx.db, &fx.station.public_key())
         .score(&addr(&latecomer), T + 10)
         .unwrap()
         .composite();
@@ -744,7 +803,9 @@ fn a_juror_established_after_a_round_opens_is_not_on_its_panel() {
         )
         .unwrap();
     }
-    let case = equivocation_cases(&fx.db).unwrap().remove(0);
+    let case = equivocation_cases(&fx.db, &fx.station.public_key())
+        .unwrap()
+        .remove(0);
     assert_eq!(
         resolve_equivocation(&fx.db, &[], &fx.station, &case, &params(), ANCHOR, T + 20).unwrap(),
         EquivResolution::Overturned
@@ -788,8 +849,19 @@ fn a_back_dated_vouch_cannot_retroactively_validate_a_reseat() {
             reseat(&fx.db);
             vouch(&fx.db);
         }
-        let case = equivocation_cases(&fx.db).unwrap().remove(0);
-        preview_equivocation(&fx.db, &[], &case, &params(), ANCHOR, T + 1100).unwrap()
+        let case = equivocation_cases(&fx.db, &fx.station.public_key())
+            .unwrap()
+            .remove(0);
+        preview_equivocation(
+            &fx.db,
+            &[],
+            &case,
+            &params(),
+            ANCHOR,
+            T + 1100,
+            &fx.station.public_key(),
+        )
+        .unwrap()
     };
 
     // Vouch admitted after the re-seat: bounded out, round 1 never opens, lapsed.

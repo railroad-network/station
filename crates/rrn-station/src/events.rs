@@ -101,9 +101,15 @@ pub struct VouchRow {
 /// The events after `after_seq` (exclusive) through `tail` (inclusive) that are
 /// relevant to `member`, oldest first. Bounds are log seqs; `after_seq` is the
 /// mobile's cursor and `tail` the current log tail the caller already observed.
-pub fn events_since(db: &Database, member: &Address, after_seq: u64, tail: u64) -> Vec<Event> {
+pub fn events_since(
+    db: &Database,
+    member: &Address,
+    after_seq: u64,
+    tail: u64,
+    station: &PublicKey,
+) -> Vec<Event> {
     let log = AppendLog::new(db);
-    let snapshot = match LedgerSnapshot::derive(&log) {
+    let snapshot = match LedgerSnapshot::derive(&log, station) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "events_since: could not derive snapshot");
@@ -123,7 +129,13 @@ pub fn events_since(db: &Database, member: &Address, after_seq: u64, tail: u64) 
         if entry.seq > tail {
             break; // past the observed tail (iter is ascending)
         }
-        if let Some((kind, tx_id)) = classify(&entry.payload.bytes, member, &snapshot) {
+        if let Some((kind, tx_id)) = classify(
+            &entry.payload.bytes,
+            &entry.payload.signer,
+            member,
+            &snapshot,
+            station,
+        ) {
             if let Some(row) = snapshot.get(&tx_id).and_then(|s| row_for(s, member)) {
                 out.push(Event {
                     id: entry.seq,
@@ -152,8 +164,10 @@ pub fn events_since(db: &Database, member: &Address, after_seq: u64, tail: u64) 
 /// [`classify_vouch`]) or a transition that does not target this member.
 fn classify(
     bytes: &[u8],
+    signer: &PublicKey,
     member: &Address,
     snapshot: &LedgerSnapshot,
+    station: &PublicKey,
 ) -> Option<(EventKind, TransactionId)> {
     if let Ok(proposal) = from_canonical_bytes::<TransactionProposal>(bytes) {
         // The sender already knows they proposed; notify only the receiver.
@@ -167,10 +181,18 @@ fn classify(
             .then_some((EventKind::ConfirmationReceived, confirmation.proposal_id));
     }
     if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
+        // A settlement is station-signed; a forged one raises no event.
+        if signer != station {
+            return None;
+        }
         return (member == &settlement.sender || member == &settlement.receiver)
             .then_some((EventKind::Settlement, settlement.proposal_id));
     }
     if let Ok(cancellation) = from_canonical_bytes::<CancellationRecord>(bytes) {
+        // A cancellation is station-signed; a forged one raises no event.
+        if signer != station {
+            return None;
+        }
         let (sender, receiver) = parties(snapshot, &cancellation.proposal_id)?;
         let targets_member = match cancellation.reason {
             CancelReason::WithdrawnBySender => member == &receiver,
@@ -318,13 +340,20 @@ mod tests {
         let (alice, bob) = (Keypair::generate(), Keypair::generate());
         append_proposal(&db, &alice, &addr(&bob), 0);
 
-        let to_bob = events_since(&db, &addr(&bob), 0, ALL);
+        let to_bob = events_since(&db, &addr(&bob), 0, ALL, &Keypair::generate().public_key());
         assert_eq!(kinds(&to_bob), vec![EventKind::ProposalReceived]);
         assert_eq!(to_bob[0].transaction.as_ref().unwrap().direction, "in");
         assert_eq!(to_bob[0].id, 1);
 
         // The sender is never told about their own proposal.
-        assert!(events_since(&db, &addr(&alice), 0, ALL).is_empty());
+        assert!(events_since(
+            &db,
+            &addr(&alice),
+            0,
+            ALL,
+            &Keypair::generate().public_key()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -334,14 +363,26 @@ mod tests {
         let id = append_proposal(&db, &alice, &addr(&bob), 0);
         append_confirmation(&db, &bob, id);
 
-        let to_alice = events_since(&db, &addr(&alice), 0, ALL);
+        let to_alice = events_since(
+            &db,
+            &addr(&alice),
+            0,
+            ALL,
+            &Keypair::generate().public_key(),
+        );
         assert_eq!(kinds(&to_alice), vec![EventKind::ConfirmationReceived]);
         assert_eq!(to_alice[0].transaction.as_ref().unwrap().state, "confirmed");
         assert_eq!(to_alice[0].id, 2);
 
         // Bob (the confirmer/receiver) only ever saw the proposal, not his own confirmation.
         assert_eq!(
-            kinds(&events_since(&db, &addr(&bob), 0, ALL)),
+            kinds(&events_since(
+                &db,
+                &addr(&bob),
+                0,
+                ALL,
+                &Keypair::generate().public_key()
+            )),
             vec![EventKind::ProposalReceived]
         );
     }
@@ -358,8 +399,22 @@ mod tests {
         append_confirmation(&db, &bob, id);
         append_settlement(&db, &station, &addr(&alice), &addr(&bob), id);
 
-        assert!(kinds(&events_since(&db, &addr(&alice), 0, ALL)).contains(&EventKind::Settlement));
-        assert!(kinds(&events_since(&db, &addr(&bob), 0, ALL)).contains(&EventKind::Settlement));
+        assert!(kinds(&events_since(
+            &db,
+            &addr(&alice),
+            0,
+            ALL,
+            &station.public_key()
+        ))
+        .contains(&EventKind::Settlement));
+        assert!(kinds(&events_since(
+            &db,
+            &addr(&bob),
+            0,
+            ALL,
+            &station.public_key()
+        ))
+        .contains(&EventKind::Settlement));
     }
 
     #[test]
@@ -373,12 +428,19 @@ mod tests {
         let id = append_proposal(&db, &alice, &addr(&bob), 0);
         append_cancellation(&db, &station, id, CancelReason::RejectedByReceiver);
 
-        let to_alice = events_since(&db, &addr(&alice), 0, ALL);
+        let to_alice = events_since(&db, &addr(&alice), 0, ALL, &station.public_key());
         assert_eq!(kinds(&to_alice), vec![EventKind::Cancellation]);
         assert_eq!(to_alice[0].transaction.as_ref().unwrap().state, "cancelled");
 
         // Bob rejected it, so he is not notified of the cancellation.
-        assert!(!kinds(&events_since(&db, &addr(&bob), 0, ALL)).contains(&EventKind::Cancellation));
+        assert!(!kinds(&events_since(
+            &db,
+            &addr(&bob),
+            0,
+            ALL,
+            &station.public_key()
+        ))
+        .contains(&EventKind::Cancellation));
     }
 
     #[test]
@@ -392,8 +454,22 @@ mod tests {
         let id = append_proposal(&db, &alice, &addr(&bob), 0);
         append_cancellation(&db, &station, id, CancelReason::Expired);
 
-        assert!(kinds(&events_since(&db, &addr(&alice), 0, ALL)).contains(&EventKind::Cancellation));
-        assert!(kinds(&events_since(&db, &addr(&bob), 0, ALL)).contains(&EventKind::Cancellation));
+        assert!(kinds(&events_since(
+            &db,
+            &addr(&alice),
+            0,
+            ALL,
+            &station.public_key()
+        ))
+        .contains(&EventKind::Cancellation));
+        assert!(kinds(&events_since(
+            &db,
+            &addr(&bob),
+            0,
+            ALL,
+            &station.public_key()
+        ))
+        .contains(&EventKind::Cancellation));
     }
 
     #[test]
@@ -409,11 +485,11 @@ mod tests {
         append_settlement(&db, &station, &addr(&alice), &addr(&bob), id); // seq 3
 
         // From the start, Bob sees the proposal (1) and the settlement (3).
-        let all = events_since(&db, &addr(&bob), 0, ALL);
+        let all = events_since(&db, &addr(&bob), 0, ALL, &station.public_key());
         assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 3]);
 
         // With the cursor past seq 1, only the settlement remains.
-        let after_one = events_since(&db, &addr(&bob), 1, ALL);
+        let after_one = events_since(&db, &addr(&bob), 1, ALL, &station.public_key());
         assert_eq!(after_one.iter().map(|e| e.id).collect::<Vec<_>>(), vec![3]);
     }
 
@@ -425,7 +501,7 @@ mod tests {
         append_proposal(&db, &alice, &addr(&bob), 1); // seq 2
 
         // Observing tail = 1 must not leak the seq-2 proposal.
-        let bounded = events_since(&db, &addr(&bob), 0, 1);
+        let bounded = events_since(&db, &addr(&bob), 0, 1, &Keypair::generate().public_key());
         assert_eq!(bounded.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1]);
     }
 
@@ -443,7 +519,7 @@ mod tests {
         let expected_id = vouch.payload_hash().to_hex();
         rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch, 0).unwrap();
 
-        let to_bob = events_since(&db, &addr(&bob), 0, ALL);
+        let to_bob = events_since(&db, &addr(&bob), 0, ALL, &Keypair::generate().public_key());
         assert_eq!(kinds(&to_bob), vec![EventKind::VouchReceived]);
         assert!(to_bob[0].transaction.is_none());
         let row = to_bob[0].vouch.as_ref().unwrap();
@@ -454,7 +530,14 @@ mod tests {
         assert_eq!(row.stake_centi, 150);
 
         // The voucher already knows they vouched; they are not notified.
-        assert!(events_since(&db, &addr(&alice), 0, ALL).is_empty());
+        assert!(events_since(
+            &db,
+            &addr(&alice),
+            0,
+            ALL,
+            &Keypair::generate().public_key()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -468,7 +551,14 @@ mod tests {
         let vouch = rrn_identity::vouch::create_vouch(&alice, &addr(&bob), "rrn-phase0", "", 0);
         rrn_identity::vouch::append_vouch(&mut AppendLog::new(&db), vouch, 0).unwrap();
 
-        assert!(events_since(&db, &addr(&carol), 0, ALL).is_empty());
+        assert!(events_since(
+            &db,
+            &addr(&carol),
+            0,
+            ALL,
+            &Keypair::generate().public_key()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -484,6 +574,6 @@ mod tests {
         append_confirmation(&db, &bob, id);
         append_settlement(&db, &station, &addr(&alice), &addr(&bob), id);
 
-        assert!(events_since(&db, &addr(&carol), 0, ALL).is_empty());
+        assert!(events_since(&db, &addr(&carol), 0, ALL, &station.public_key()).is_empty());
     }
 }

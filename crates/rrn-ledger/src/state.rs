@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 
 use dcbor::prelude::*;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
 use rrn_storage::log::{AppendLog, LogEntry};
@@ -383,11 +384,11 @@ pub struct LedgerSnapshot {
     /// position (outbox-fork basis), keyed by `(author pubkey, position)`.
     equivocation_by_fork: BTreeMap<([u8; 32], u64), EquivocationId>,
     /// The terminal jury ruling on each equivocation case, once one is admitted
-    /// (ADR-0025 §5–§6). An id lands here only when a station-signed
+    /// (ADR-0025 §5–§6). An id lands here only when an
     /// [`EquivocationVerdictRecord`](crate::escrow::EquivocationVerdictRecord) is
-    /// admitted whose signer matches the equivocation record's own signer — so a
-    /// peer-relayed member-signed verdict cannot forge a ruling (the same
-    /// station-signer gate reputation scoring applies). An
+    /// admitted whose signer is the **community station key** — so a peer-relayed
+    /// member-signed verdict cannot forge a ruling (the same station-signer gate
+    /// reputation scoring applies). An
     /// [`Overturn`](crate::escrow::VerdictDecision::Overturn) neutralizes the record
     /// (lifts the penalty and the issuance gate); a
     /// [`Confirm`](crate::escrow::VerdictDecision::Confirm) records finality but
@@ -397,8 +398,19 @@ pub struct LedgerSnapshot {
 
 impl LedgerSnapshot {
     /// Replays the whole log into a snapshot.
-    pub fn derive(log: &AppendLog) -> Result<Self> {
-        Self::derive_to(log, u64::MAX)
+    ///
+    /// `station` is the community's station public key (ADR-0020: one fixed key per
+    /// community). Every station-signed ledger record — settlement, cancellation,
+    /// headroom certificate, equivocation, equivocation verdict — is trusted only
+    /// when its envelope signer is this key; a record of one of those kinds signed
+    /// by any other key is skipped during derivation, so a forged record injected
+    /// via gossip `append_raw` is invisible to the ledger state (ADR-0018:
+    /// replicas re-derive, and pinning *is* derivation). The caller supplies the
+    /// key; a gossip read-replica deriving under its own (different) key sees no
+    /// settlements/certificates/equivocations — a loud, diagnosable failure, never
+    /// a silent partial (the same loud-failure replica residual the governance signer-pin already accepts, applied to balances too).
+    pub fn derive(log: &AppendLog, station: &PublicKey) -> Result<Self> {
+        Self::derive_to(log, u64::MAX, station)
     }
 
     /// Replays the log prefix `[1, max_seq]` into a snapshot — the ledger state as
@@ -410,14 +422,17 @@ impl LedgerSnapshot {
     /// cannot leak into a pinned score however old its self-asserted timestamp is.
     /// Entries arrive in ascending `seq` (`iter_from`), so the scan stops at the
     /// first entry past the bound.
-    pub fn derive_to(log: &AppendLog, max_seq: u64) -> Result<Self> {
+    ///
+    /// `station` pins station-signed records to the community key; see
+    /// [`derive`](Self::derive).
+    pub fn derive_to(log: &AppendLog, max_seq: u64, station: &PublicKey) -> Result<Self> {
         let mut snapshot = LedgerSnapshot::default();
         for entry in log.iter_from(1) {
             let entry = entry?;
             if entry.seq > max_seq {
                 break;
             }
-            snapshot.apply(&entry)?;
+            snapshot.apply(&entry, station)?;
         }
         Ok(snapshot)
     }
@@ -428,12 +443,19 @@ impl LedgerSnapshot {
     /// and `created_at` (ADR-0022) — for the transaction it advances.
     ///
     /// Returns `Err` only for a structurally impossible entry in a well-formed
-    /// log — currently a headroom certificate whose request is not already on the
-    /// log (ADR-0021 §1 requires request-before-certificate, and the station is
-    /// the sole writer, so this can only mean a corrupted or tampered log). Every
-    /// other precondition miss (a confirmation for an unknown proposal, a return
-    /// of an unknown certificate) is tolerated by skipping, as before.
-    fn apply(&mut self, entry: &LogEntry) -> Result<()> {
+    /// log — currently a *station-signed* headroom certificate whose request is not
+    /// already on the log (ADR-0021 §1 requires request-before-certificate, and the
+    /// station is the sole writer, so this can only mean a corrupted or tampered
+    /// log). Every other precondition miss (a confirmation for an unknown proposal,
+    /// a return of an unknown certificate) is tolerated by skipping, as before.
+    ///
+    /// `station` is the community station key. Records whose authority is "the
+    /// station said so" — settlements, cancellations, headroom certificates,
+    /// equivocations and their verdicts — are applied only when their envelope
+    /// signer is `station`; a mismatch is skipped, so a forged station-kind record
+    /// is inert (it moves no balance, reserves no headroom, occupies no dedup slot,
+    /// and lifts no penalty) and the genuine record still applies.
+    fn apply(&mut self, entry: &LogEntry, station: &PublicKey) -> Result<()> {
         let stored = &entry.payload;
         let bytes = &stored.bytes;
 
@@ -565,6 +587,13 @@ impl LedgerSnapshot {
         }
 
         if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
+            // Only the community station settles (ADR-0005). A settlement record
+            // signed by any other key — a forgery injected via gossip `append_raw`
+            // — is skipped, so it moves no balance and the transaction stays
+            // `Confirmed`, still eligible for the genuine settlement.
+            if stored.signer != *station {
+                return Ok(());
+            }
             // A settlement closes either a `Confirmed` transaction (the normal
             // path) or a `Disputed` one whose dispute was rejected or lapsed
             // (ADR-0014 §6) — both carry the proposal and confirmation it needs.
@@ -594,6 +623,13 @@ impl LedgerSnapshot {
         }
 
         if let Ok(cancellation) = from_canonical_bytes::<CancellationRecord>(bytes) {
+            // The station signs cancellations (no party need be present to
+            // withdraw/reject, and expiry is automatic). A cancellation signed by
+            // any other key is a forgery and is skipped, leaving the state
+            // unchanged.
+            if stored.signer != *station {
+                return Ok(());
+            }
             // A cancellation retires a `Proposed` transaction (withdraw / reject /
             // expire) or voids a `Disputed` one whose dispute was upheld
             // (`DisputeUpheld` — ADR-0014 §6). The reason and the prior stage must
@@ -636,14 +672,21 @@ impl LedgerSnapshot {
             return Ok(());
         }
 
-        // A headroom certificate opens an Outstanding reservation. It must name a
-        // request already admitted from the same member and for the same cap
-        // (ADR-0021 §1) — a certificate without its request, or one that inflates
-        // the consented cap, cannot exist in a well-formed single-writer log, so
-        // it is a hard derive error rather than a silent skip. Signatures are
-        // trusted here as everywhere in replay (the log is append-only and
-        // station-written; `verify` re-checks on demand).
+        // A headroom certificate opens an Outstanding reservation. The station is
+        // the sole issuer (ADR-0021 §1); a certificate signed by any other key is a
+        // forgery injected via gossip `append_raw`, and is **skipped** — it
+        // reserves nothing, so a cert-backed spend naming it is later refused
+        // `UnknownCertificate`. The signer pin is checked *first*, before the
+        // request-consistency invariant below: a forged-signer certificate must be
+        // inert, never a hard error that would wedge replay on a hostile log copy.
+        // Only for a genuine *station-signed* certificate does an unknown or
+        // cap-inflating request remain a hard derive error — it must name a request
+        // already admitted from the same member and for the same cap (ADR-0021 §1),
+        // which cannot happen in a well-formed single-writer log.
         if let Ok(certificate) = from_canonical_bytes::<HeadroomCertificate>(bytes) {
+            if stored.signer != *station {
+                return Ok(());
+            }
             match self.cert_requests.get(&certificate.request_id) {
                 Some((member, cap))
                     if *member == certificate.member && *cap == certificate.cap_centi => {}
@@ -686,16 +729,23 @@ impl LedgerSnapshot {
             return Ok(());
         }
 
-        // A station-signed equivocation record (ADR-0021 §5). Replay **re-verifies
-        // the evidence** before indexing it (re-derive, never re-enforce — ADR-0018):
-        // a record whose embedded member-signed artifacts do not actually prove the
-        // conflict is ignored entirely, so a bogus record on a hostile or
-        // peer-gossiped log copy cannot reserve the one-record-per-offence dedup slot
-        // (which would otherwise suppress the genuine record) nor surface through the
-        // counterparty accessor. The cap for a cert-overspend is read from the
-        // certificate already folded into this snapshot. The first *verifying* record
-        // for a given `(member, cert)` / `(member, fork position)` wins.
+        // A station-signed equivocation record (ADR-0021 §5). The station is the
+        // sole author of these records; one signed by any other key — even one
+        // wrapping genuine member-signed evidence of that member's own overspend,
+        // self-signed to win the first-wins dedup slot — is skipped before it can
+        // occupy that slot or levy any penalty, so the station's genuine record
+        // still lands and applies. Then replay **re-verifies the evidence** before
+        // indexing it (re-derive, never re-enforce — ADR-0018): a genuine
+        // station-signed record whose embedded member-signed artifacts do not
+        // actually prove the conflict is ignored entirely, so it cannot reserve the
+        // dedup slot nor surface through the counterparty accessor. The cap for a
+        // cert-overspend is read from the certificate already folded into this
+        // snapshot. The first station-signed, *verifying* record for a given
+        // `(member, cert)` / `(member, fork position)` wins.
         if let Ok(record) = from_canonical_bytes::<EquivocationRecord>(bytes) {
+            if stored.signer != *station {
+                return Ok(());
+            }
             let cap = match record.basis {
                 EquivocationBasis::CertOverspend => record
                     .cert_id
@@ -736,24 +786,26 @@ impl LedgerSnapshot {
         }
 
         // A jury's terminal ruling on an equivocation case (ADR-0025 §5). Only a
-        // station-signed `Overturn` neutralizes the record: the equivocation record
-        // was station-signed, so an authentic terminal ruling carries the same
-        // signer. A juror-cast ballot (kind `rrn.dispute.equivocation_ballot`) is a
-        // *different* record kind and never decodes here, and a peer-relayed
-        // member-signed verdict would not match the record's station signer — so
-        // neither can lift the penalty (mirrors the gate in reputation scoring).
-        // `Confirm` and a lapse touch nothing: the penalty (and this gate) simply
-        // stand. The equivocation record precedes its verdict in the single-writer
-        // log (ADR-0020), so it is already indexed when the verdict is folded.
+        // ruling signed by the **community station key** neutralizes the record: the
+        // terminal `EquivocationVerdictRecord` is station-authored, so its signer is
+        // pinned to `station`, not to the equivocation record's own signer. A
+        // juror-cast ballot (kind `rrn.dispute.equivocation_ballot`) is a *different*
+        // record kind and never decodes here; a peer-relayed member-signed verdict —
+        // including one a member signs to overturn their own penalty — does not match
+        // the station key and is skipped, so it lifts nothing (mirrors the gate in
+        // reputation scoring). `Confirm` and a lapse touch nothing: the penalty (and
+        // this gate) simply stand. The equivocation record precedes its verdict in
+        // the single-writer log (ADR-0020), so it is already indexed when the verdict
+        // is folded.
         if let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(bytes) {
-            if let Some(record) = self.equivocations.get(&verdict.equivocation_id) {
-                if record.signer == stored.signer {
-                    // First station-signed ruling per id wins (the sole-writer
-                    // station appends at most one; dedup defends a hostile copy).
-                    self.equivocation_verdict
-                        .entry(verdict.equivocation_id)
-                        .or_insert(verdict.decision);
-                }
+            if stored.signer == *station
+                && self.equivocations.contains_key(&verdict.equivocation_id)
+            {
+                // First station-signed ruling per id wins (the sole-writer
+                // station appends at most one; dedup defends a hostile copy).
+                self.equivocation_verdict
+                    .entry(verdict.equivocation_id)
+                    .or_insert(verdict.decision);
             }
             return Ok(());
         }
@@ -1055,6 +1107,7 @@ mod tests {
     #[test]
     fn snapshot_carries_admission_times() {
         let db = fresh_db();
+        let station = Keypair::generate();
         let sender = Keypair::generate();
         let receiver = Keypair::generate();
         let p = proposal(&sender, &receiver);
@@ -1068,7 +1121,7 @@ mod tests {
             log.append(c, 250).unwrap();
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         let admission = snapshot.admission(&id).expect("admission present");
         assert_eq!(admission.proposal_seq, 1);
         assert_eq!(admission.proposal_admitted_at, 100);
@@ -1108,7 +1161,7 @@ mod tests {
             .unwrap();
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert!(matches!(
             snapshot.get(&id),
             Some(TransactionState::Settled { .. })
@@ -1158,7 +1211,7 @@ mod tests {
             log.append(SignedPayload::sign(ret, &alice), 200).unwrap();
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         let state = snapshot.certificate(&cert_id).expect("certificate present");
         assert!(matches!(state.status, CertificateStatus::Returned { .. }));
         // A returned certificate is not counted among the outstanding ones.
@@ -1191,7 +1244,7 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            LedgerSnapshot::derive(&AppendLog::new(&db)),
+            LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()),
             Err(Error::Invalid(_))
         ));
     }
@@ -1215,7 +1268,7 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            LedgerSnapshot::derive(&AppendLog::new(&db)),
+            LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()),
             Err(Error::Invalid(_))
         ));
     }
@@ -1224,6 +1277,7 @@ mod tests {
     fn a_dangling_request_replays_cleanly_and_reserves_nothing() {
         use rrn_crypto::signed::SignedPayload;
         let db = fresh_db();
+        let station = Keypair::generate();
         let alice = Keypair::generate();
         let member = Address::from_public_key(alice.public_key());
 
@@ -1233,7 +1287,7 @@ mod tests {
             let mut log = AppendLog::new(&db);
             log.append(SignedPayload::sign(req, &alice), 100).unwrap();
         }
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         // No certificate exists, so nothing is reserved…
         assert!(snapshot.outstanding_certs_of(&member).is_empty());
         assert_eq!(
@@ -1294,7 +1348,7 @@ mod tests {
             log.append(SignedPayload::sign(second_return, &alice), 300)
                 .unwrap(); // seq 5, ignored (already returned)
         }
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         let state = snapshot.certificate(&cert_id).expect("certificate present");
         assert!(matches!(
             state.status,
@@ -1348,7 +1402,7 @@ mod tests {
             .unwrap();
 
         // Replay ignores it: it neither reserves the dedup slot nor surfaces.
-        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert!(
             !snap.has_cert_equivocation(&cert_id),
             "bogus record must not reserve the slot"
@@ -1367,7 +1421,7 @@ mod tests {
         AppendLog::new(&db)
             .append(SignedPayload::sign(genuine, &station), 0)
             .unwrap();
-        let snap = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert!(snap.has_cert_equivocation(&cert_id));
         assert_eq!(snap.equivocations().count(), 1);
     }

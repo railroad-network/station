@@ -9,6 +9,7 @@
 
 use dcbor::prelude::*;
 
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes};
 use rrn_identity::vouch::Vouch;
 use rrn_ledger::settlement::SettlementRecord;
@@ -25,11 +26,12 @@ pub fn history(
     db: &Database,
     limit: Option<u64>,
     offset: Option<u64>,
+    station: &PublicKey,
 ) -> rrn_storage::Result<Vec<HistoryEntry>> {
     let log = AppendLog::new(db);
     let mut all: Vec<HistoryEntry> = Vec::new();
     for entry in log.iter_from(1) {
-        all.push(summarize(&entry?));
+        all.push(summarize(&entry?, station));
     }
     // Most recent first.
     all.reverse();
@@ -43,9 +45,9 @@ pub fn history(
 }
 
 /// Decodes one entry's payload into a `(kind, summary)` row.
-fn summarize(entry: &LogEntry) -> HistoryEntry {
+fn summarize(entry: &LogEntry, station: &PublicKey) -> HistoryEntry {
     let bytes = &entry.payload.bytes;
-    let (kind, summary) = decode_summary(bytes);
+    let (kind, summary) = decode_summary(bytes, &entry.payload.signer, station);
     HistoryEntry {
         seq: entry.seq,
         kind,
@@ -54,7 +56,15 @@ fn summarize(entry: &LogEntry) -> HistoryEntry {
     }
 }
 
-fn decode_summary(bytes: &[u8]) -> (String, String) {
+/// `signer`/`station`: the rich, authoritative summary of a balance record
+/// (settlement, cancellation) — its amount and parties — is shown only when the
+/// community station signed it. A forged one falls through to the generic
+/// `kind`-tag naming, so it still names itself by its `kind` (e.g. "settlement")
+/// but carries none of the numbers a reader would take as real. History is
+/// presentation only and nothing here is authoritative, but it should not dress a
+/// forgery in the full detail of a genuine record.
+fn decode_summary(bytes: &[u8], signer: &PublicKey, station: &PublicKey) -> (String, String) {
+    let station_signed = signer == station;
     if let Ok(p) = from_canonical_bytes::<TransactionProposal>(bytes) {
         return (
             "proposal".into(),
@@ -77,7 +87,10 @@ fn decode_summary(bytes: &[u8]) -> (String, String) {
             ),
         );
     }
-    if let Ok(s) = from_canonical_bytes::<SettlementRecord>(bytes) {
+    if let Some(s) = from_canonical_bytes::<SettlementRecord>(bytes)
+        .ok()
+        .filter(|_| station_signed)
+    {
         return (
             "settlement".into(),
             format!(
@@ -89,7 +102,10 @@ fn decode_summary(bytes: &[u8]) -> (String, String) {
             ),
         );
     }
-    if let Ok(c) = from_canonical_bytes::<CancellationRecord>(bytes) {
+    if let Some(c) = from_canonical_bytes::<CancellationRecord>(bytes)
+        .ok()
+        .filter(|_| station_signed)
+    {
         return (
             "cancellation".into(),
             format!("cancel tx {} ({:?})", short_tx(&c.proposal_id), c.reason),

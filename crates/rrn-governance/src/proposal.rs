@@ -412,12 +412,13 @@ pub fn effective_cosign_threshold(
     db: &Database,
     open_time: i64,
     open_seq: u64,
+    station: &PublicKey,
 ) -> Result<u32, ProposalError> {
-    if !in_grace_asof(db, open_time, open_seq)? {
+    if !in_grace_asof(db, open_time, open_seq, station)? {
         return Ok(DEFAULT_COSIGN_THRESHOLD);
     }
     let electorate =
-        grace_electorate_asof(db, &founder_set(db)?, open_time, open_seq)?.len() as u32;
+        grace_electorate_asof(db, &founder_set(db)?, open_time, open_seq, station)?.len() as u32;
     Ok(DEFAULT_COSIGN_THRESHOLD.min(electorate.saturating_sub(1)))
 }
 
@@ -431,8 +432,9 @@ pub(crate) fn composite_at_position(
     address: &Address,
     at_time: i64,
     max_seq: u64,
+    station: &PublicKey,
 ) -> Result<f32, ProposalError> {
-    Ok(ReputationScorer::new(db)
+    Ok(ReputationScorer::new(db, station)
         .score_at_position(address, at_time, max_seq)?
         .composite())
 }
@@ -449,11 +451,12 @@ pub(crate) fn is_eligible_asof(
     address: &Address,
     at_time: i64,
     max_seq: u64,
+    station: &PublicKey,
 ) -> Result<bool, ProposalError> {
-    if composite_at_position(db, address, at_time, max_seq)? >= BAND_MEMBER_MIN {
+    if composite_at_position(db, address, at_time, max_seq, station)? >= BAND_MEMBER_MIN {
         return Ok(true);
     }
-    Ok(in_grace_asof(db, at_time, max_seq)? && founders.contains(address))
+    Ok(in_grace_asof(db, at_time, max_seq, station)? && founders.contains(address))
 }
 
 /// Finds a proposal's authorized record without caring about its co-signatures.
@@ -506,7 +509,14 @@ fn find_proposal(
         // not forge the station's attestation). The author must have been eligible
         // at that open position.
         let open_time = w.admitted_at;
-        if !is_eligible_asof(db, &founders, &proposal.author, open_time, open_seq)? {
+        if !is_eligible_asof(
+            db,
+            &founders,
+            &proposal.author,
+            open_time,
+            open_seq,
+            station,
+        )? {
             continue;
         }
         return Ok(Some((proposal, open_seq, open_time)));
@@ -552,7 +562,14 @@ pub fn proposal_records(
         // Eligibility is pinned at the proposal's open position (T2.1.3): the
         // co-signing electorate is frozen when the proposal opens, so standing
         // manufactured during the window does not admit a co-signer.
-        if !is_eligible_asof(db, &founders, &cosign.cosigner, open_time, open_seq)? {
+        if !is_eligible_asof(
+            db,
+            &founders,
+            &cosign.cosigner,
+            open_time,
+            open_seq,
+            station,
+        )? {
             continue;
         }
         cosigners.insert(cosign.cosigner);
@@ -606,7 +623,14 @@ pub fn all_proposals(
         // Author eligibility at the proposal's open position: the attestation's seq
         // and the attested admission instant (ADR-0022 §5, T2.1.3).
         let open_time = w.admitted_at;
-        if !is_eligible_asof(db, &founders, &proposal.author, open_time, open_seq)? {
+        if !is_eligible_asof(
+            db,
+            &founders,
+            &proposal.author,
+            open_time,
+            open_seq,
+            station,
+        )? {
             continue;
         }
         if seen.insert(proposal.proposal_id) {
@@ -651,10 +675,23 @@ pub fn append_proposal(
         Some(t) => (t.seq + 1, now.max(t.created_at)),
         None => (1, now),
     };
-    if !is_eligible_asof(db, &founder_set(db)?, &proposal.author, open_time, open_seq)? {
+    if !is_eligible_asof(
+        db,
+        &founder_set(db)?,
+        &proposal.author,
+        open_time,
+        open_seq,
+        &station.public_key(),
+    )? {
         return Err(ProposalError::AuthorNotEstablished {
             author: proposal.author,
-            composite: composite_at_position(db, &proposal.author, open_time, open_seq)?,
+            composite: composite_at_position(
+                db,
+                &proposal.author,
+                open_time,
+                open_seq,
+                &station.public_key(),
+            )?,
         });
     }
     if find_proposal(log, &proposal.proposal_id, db, &station_pk)?.is_some() {
@@ -751,10 +788,17 @@ pub fn append_cosign(
     // Co-signer eligibility is pinned at the proposal's open position (T2.1.3),
     // the same electorate replay counts, not the co-signer's own clock.
     let (open_seq, open_time) = (records.open_seq, records.open_time);
-    if !is_eligible_asof(db, &founder_set(db)?, &cosign.cosigner, open_time, open_seq)? {
+    if !is_eligible_asof(
+        db,
+        &founder_set(db)?,
+        &cosign.cosigner,
+        open_time,
+        open_seq,
+        station,
+    )? {
         return Err(ProposalError::CosignerNotEstablished {
             cosigner: cosign.cosigner,
-            composite: composite_at_position(db, &cosign.cosigner, open_time, open_seq)?,
+            composite: composite_at_position(db, &cosign.cosigner, open_time, open_seq, station)?,
         });
     }
     if records.cosigners.contains(&cosign.cosigner) {
@@ -1092,7 +1136,7 @@ mod tests {
 
     fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
         for nonce in 0..10 {
-            append_settled(db, who, station, station, nonce, at);
+            append_settled(db, who, station, &test_station(), nonce, at);
         }
         for _ in 0..10 {
             append_vouch(db, who, &addr(&Keypair::generate()), at);

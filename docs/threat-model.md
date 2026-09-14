@@ -1087,12 +1087,13 @@ The record kinds are `rrn.credit.equivocation` and
 - *Threat: a peer-gossiped member-signed `Overturn` lifting a genuine penalty.*
   Once cross-station sync admits foreign records, a member could relay a self-signed
   `Overturn` to neutralize their own equivocation.
-- *Mitigation / residual:* not reachable today — the verdict kind is refused
+- *Mitigation:* not reachable today — the verdict kind is refused
   (`UnroutableKind`) on DTN and has no RPC surface, so only the station can append
   one — and both reputation (`overturned_equivocations`) and the snapshot honor
-  an `Overturn` only from the signer of the equivocation record it names. That
-  is a record-author gate, not a pin to the community key; see the residual in
-  the jury subsection below.
+  an `Overturn` only when its envelope signer is the **community station key**
+  (T2.11.3): the scorer and `LedgerSnapshot::derive` are handed that key and gate
+  `signer == station`, so a member's self-signed `Overturn` (even one relayed once
+  cross-station sync admits foreign records) is inert.
 - *Threat: evidence-size denial of service.* A record padded with many or huge
   evidence blobs bloats the log and every replica's replay.
 - *Mitigation:* front-door caps — at most `MAX_EVIDENCE_ITEMS` (16) items, each at
@@ -1175,19 +1176,19 @@ distinct discriminators, canonical dCBOR, and cross-platform fixtures.
   admits foreign records) could lift a member's own penalty.
 - *Mitigation:* ballots are a **distinct kind** reputation never decodes, and both
   the reputation neutralization and the certificate-issuance gate honor only a
-  terminal `EquivocationVerdictRecord` **signed by the same key that signed the
-  equivocation record** (`overturned_equivocations` and the snapshot's
-  `equivocation_verdict` both gate `signer == the record's signer`). Because the
-  equivocation record is station-signed, that is the recording station; a member's
-  self-signed "overturn" is inert (tested at the ledger and reputation layers).
-  *Residual:* this is a **record-author** gate, not a check against a known station
-  key (neither the snapshot nor the scorer is handed the station pubkey). It is
-  airtight today — no surface admits a *foreign* `EquivocationRecord` (DTN
-  `UnroutableKind`, no RPC), so every record on the log is this station's. Once
-  cross-station sync admits foreign records, a member could self-sign a genuine
-  record of *their own* overspend (winning the first-wins dedup) and then self-sign
-  an `Overturn` both gates would honor; closing that needs the station key threaded
-  into `LedgerSnapshot::derive`/the scorer, deferred to that sync work.
+  terminal `EquivocationVerdictRecord` **signed by the community station key**
+  (`overturned_equivocations` and the snapshot's `equivocation_verdict` both gate
+  `signer == station`, the key threaded into the scorer and
+  `LedgerSnapshot::derive` by T2.11.3). The equivocation record itself is pinned to
+  the same key, so the two agree for every genuine record; a member's self-signed
+  "overturn" is inert (tested at the ledger and reputation layers). *Mitigated
+  (T2.11.3):* this is now a pin to the known community key, not a record-author
+  gate, so the vector holds even once cross-station sync admits foreign records — a
+  member who self-signs a genuine record of *their own* overspend to win the
+  first-wins dedup is skipped at derivation (wrong signer), and a self-signed
+  `Overturn` lifts nothing. The surviving cross-cutting residual is the read-replica
+  one (a peer deriving under a different key sees no equivocations at all); see the
+  `rrn-governance` residual list.
 - *Threat: re-seat spam to retry the draw, or to keep a case open forever.* An
   established member repeatedly re-seating a lapsed case to grind for a friendly
   round.
@@ -2533,26 +2534,38 @@ implementation, and adds two station-signed record kinds
   replay either (skip-not-halt). The invariant suite is
   `crates/rrn-governance/tests/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
   attests) already made this decision, so no new ADR was needed.
-- *Residual — surviving after T2.1.4.* Four same-class gaps remain, all narrower than
-  the one just closed:
-  1. **Ledger station-signed records are still unpinned.** `SettlementRecord`,
-     `ContractCharge`, and headroom certificates (`rrn-ledger`) are station-signed and
-     replay-trusted with no signer pin — the same injection vector (gossip `append_raw`)
-     and a higher-value target (a forged `SettlementRecord` settles a `Confirmed` tx at
-     an attacker-chosen instant). Scoped to a **sibling ticket** by the T2.1.4 decision
-     (governance-only); the pilot mitigation is the same "no untrusted gossip peers."
-  2. **The equivocation verdict pins to the equivocation *record's* signer, not the
-     community key** (`rrn-reputation::scoring::overturned_equivocations`, and
-     the snapshot's `equivocation_verdict`) — same class, tracked follow-up.
-  3. **A gossip read-replica cannot derive governance until it is told the writer's
-     key.** Per the T2.1.4 decision (a), the pin is against the writer's own key; a
-     second-`init`ed peer that derives under a *different* key gets the **genesis
-     charter and nothing else** — no windows, proposals, tallies, statutes, or
-     emergencies — a **loud, diagnosable** failure, never a silent partial (pinned by
-     `deriving_under_a_different_key_yields_genesis_and_nothing_else`). This already held
-     for marketplace station attestations; the pilot runs a single writer station, so no
-     replica derives governance in production. (An in-log genesis station-key binding —
-     which would let a replica pin correctly — needs its own ADR and is out of scope.)
+- *Residual — surviving after T2.1.4 and T2.11.3.* Items 1 and 2 below are now
+  **closed** by T2.11.3 (the ledger sibling of T2.1.4); the read-replica consequence
+  and the freshness witness remain:
+  1. **Ledger station-signed records — CLOSED (T2.11.3).** `SettlementRecord`,
+     `CancellationRecord`, `HeadroomCertificate`, `ContractCharge`,
+     `EquivocationRecord` and `EquivocationVerdictRecord` (`rrn-ledger`) are now pinned
+     to the community station key at every replay reader — `LedgerSnapshot::derive`,
+     `balance_of`, `events`, `history`, portability selection, and the reputation
+     scorer all gate `signer == station`, threaded in as a parameter exactly as T2.1.4
+     did for governance. A forged `SettlementRecord` injected via gossip `append_raw`
+     is skipped (moves no balance; leaves the tx `Confirmed`); a forged certificate
+     reserves nothing (a spend naming it is refused `UnknownCertificate`); a forged
+     equivocation record occupies no dedup slot. Invariant suite in
+     `crates/rrn-ledger/tests/ledger_signer_pinning.rs`.
+  2. **The equivocation verdict community-key pin — CLOSED (T2.11.3).**
+     `rrn-reputation::scoring::overturned_equivocations` and the snapshot's
+     `equivocation_verdict` now gate `signer == station` (the community key), not the
+     equivocation record's own signer, so a member cannot self-sign an `Overturn` even
+     once cross-station sync admits foreign records.
+  3. **A gossip read-replica cannot derive governance *or balances* until it is told
+     the writer's key.** Per the T2.1.4/T2.11.3 decision (a), the pin is against the
+     writer's own key; a second-`init`ed peer that derives under a *different* key gets
+     the **genesis charter and nothing else** for governance, and — heavier for the
+     ledger — **no settlements, certificates or equivocations at all**, so every
+     balance reads as zero. This is a **loud, diagnosable** failure, never a silent
+     partial (pinned by governance's
+     `deriving_under_a_different_key_yields_genesis_and_nothing_else` and the ledger's
+     legible-replica test). The pilot runs a single writer station, so no replica
+     derives in production. (A `[community] station_pubkey` config field, or an in-log
+     genesis station-key binding, would let a replica pin correctly — each needs its
+     own ADR and is out of scope; if replica derivation becomes a real deployment need,
+     one ADR should switch *both* governance and ledger to the configured key at once.)
   4. **The log-head freshness / stale-signature witness** that ADR-0027 defers is
      unchanged: pinning proves *who* signed, not that the signer's view was fresh.
 - *Residual — gossip ingest bypasses the front door (pre-existing, T2.8.2/ADR-0020).*
@@ -4042,14 +4055,17 @@ entry citing its ADR or the section that owns it.
   own activation. (Both charter doors — amendment *and* replacement founder
   charter — are now frozen at admission during an emergency; ADR-0023 §3(b) is
   met, save for the ungated gossip front door tracked separately.)
-- **Station-signed ledger records are replay-trusted with no signer pin**
-  (`SettlementRecord`, `ContractCharge`, `HeadroomCertificate`); the
-  equivocation `Overturn` gate pins to the record's author, not the community
-  key; a gossip read-replica cannot derive governance until told the writer's
-  key. All three are in the `rrn-governance` residual list (whose fourth item,
-  the log-head freshness witness ADR-0027 deferred, belongs with the emergency
-  residuals above); the pilot mitigation is a single writer and no gossip
-  peers.
+- **A gossip read-replica cannot derive governance or balances until told the
+  writer's key.** Station-signed ledger records (`SettlementRecord`,
+  `CancellationRecord`, `HeadroomCertificate`, `ContractCharge`, equivocation
+  records and verdicts) and governance attestations are now all signer-pinned to
+  the community station key on replay. The surviving residual is decision (a)'s
+  consequence: a peer deriving under a *different* key sees no station-signed
+  state at all — every balance reads as zero — a loud, tested failure, never a
+  silent partial. The pilot runs a single writer and no gossip peers; a configured
+  or in-log community key for replicas needs its own ADR (the `rrn-governance`
+  residual list, item 3). The log-head freshness witness ADR-0027 deferred (item 4)
+  belongs with the emergency residuals above.
 - **Equivocation: two count-bounded evasions are closed, two policy gaps
   remain.** After an `Overturn`, a later genuine overspend on the same
   certificate is refused but records no fresh proof or penalty (first-wins

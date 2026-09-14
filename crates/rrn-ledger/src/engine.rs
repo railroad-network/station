@@ -210,7 +210,8 @@ impl<'db> Engine<'db> {
             });
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
 
         // Uniqueness: never process the same proposal twice.
         if snapshot.get(&p.id).is_some() {
@@ -272,7 +273,8 @@ impl<'db> Engine<'db> {
         confirmation.verify().map_err(|_| Error::BadSignature)?;
         let c = &confirmation.payload;
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         let proposal = match snapshot.get(&c.proposal_id) {
             Some(TransactionState::Proposed { proposal }) => proposal,
             Some(_) => return Err(Error::NotProposed),
@@ -368,7 +370,8 @@ impl<'db> Engine<'db> {
             });
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
 
         // Nonce ordering: exactly the member's next, shared with proposals.
         let expected = snapshot.next_nonce(&r.member.public_key().to_bytes());
@@ -462,7 +465,8 @@ impl<'db> Engine<'db> {
             return Err(Error::FutureDated);
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         let state = snapshot
             .certificate(&r.cert_id)
             .ok_or(Error::UnknownCertificate)?;
@@ -487,7 +491,8 @@ impl<'db> Engine<'db> {
         reason: CancelReason,
         now: i64,
     ) -> Result<()> {
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         match snapshot.get(tx_id) {
             Some(TransactionState::Proposed { .. }) => {}
             Some(_) => return Err(Error::NotProposed),
@@ -528,7 +533,8 @@ impl<'db> Engine<'db> {
             return Err(Error::DisputeReasonTooLong);
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         // The window now runs from confirmation *admission* (below), not from any
         // field of the confirmation record, so only the proposal is bound here.
         let proposal = match snapshot.get(&d.proposal_id) {
@@ -589,7 +595,8 @@ impl<'db> Engine<'db> {
     /// Deciding *which* outcome applies is the dispute layer's job; this method is
     /// the ledger primitive that enacts an upheld ruling.
     pub fn uphold_dispute(&mut self, tx_id: &TransactionId, now: i64) -> Result<()> {
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         match snapshot.get(tx_id) {
             Some(TransactionState::Disputed { .. }) => {}
             Some(_) => return Err(Error::NotDisputed),
@@ -628,7 +635,8 @@ impl<'db> Engine<'db> {
             return Err(Error::FutureDated);
         }
 
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         let proposal = match snapshot.get(&r.proposal_id) {
             Some(TransactionState::Disputed { proposal, .. }) => proposal,
             Some(_) => return Err(Error::NotDisputed),
@@ -660,7 +668,8 @@ impl<'db> Engine<'db> {
 
     /// The current derived state of a transaction, or `None` if unknown.
     pub fn get_state(&self, tx_id: &TransactionId) -> Result<Option<TransactionState>> {
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(self.db))?;
+        let snapshot =
+            LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station.public_key())?;
         Ok(snapshot.get(tx_id).cloned())
     }
 }

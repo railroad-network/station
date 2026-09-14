@@ -215,6 +215,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         let (alice, bob) = (Keypair::generate(), Keypair::generate());
+        let station = Keypair::generate();
         let mut log = AppendLog::new(&db);
 
         // Alice proposes to pay Bob 300: binds Alice immediately.
@@ -230,7 +231,7 @@ mod tests {
             .unwrap();
 
         let cfg = CreditConfig::default();
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert_eq!(
             committed_debits_centi(&snapshot, &addr(&alice), 150, &cfg),
             300
@@ -246,7 +247,7 @@ mod tests {
         AppendLog::new(&db)
             .append(SignedConfirmation::sign(c, &bob), 200)
             .unwrap();
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert_eq!(
             committed_debits_centi(&snapshot, &addr(&bob), 250, &cfg),
             200
@@ -262,12 +263,13 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         let (alice, bob) = (Keypair::generate(), Keypair::generate());
+        let station = Keypair::generate();
         let mut log = AppendLog::new(&db);
 
         // Alice proposes 300 to Bob, valid from t=100 to t=1_000.
         let pay = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 100, 1_000);
         log.append(SignedProposal::sign(pay, &alice), 100).unwrap();
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
 
         // Within the window (and its skew tolerance) the 300 binds Alice; once
         // the proposal can no longer be confirmed, the headroom is released.
@@ -328,7 +330,7 @@ mod tests {
             1_000,
             cfg.cert_validity_seconds,
         );
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         // The full cap is reserved against the member's committed position, like
         // a pending debit — and nobody else's.
         assert_eq!(
@@ -356,7 +358,7 @@ mod tests {
         let issued_at = 1_000;
         let validity = cfg.cert_validity_seconds;
         issue_cert(&db, &station, &alice, 1_000, 0, issued_at, validity);
-        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db)).unwrap();
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
 
         let cert = snapshot.outstanding_certs_of(&addr(&alice))[0]
             .certificate

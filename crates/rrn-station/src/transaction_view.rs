@@ -310,7 +310,7 @@ mod tests {
         }
 
         let log = AppendLog::new(&db);
-        let snapshot = LedgerSnapshot::derive(&log).unwrap();
+        let snapshot = LedgerSnapshot::derive(&log, &station_pk).unwrap();
         let rows = member_transactions(&snapshot, &receiver_addr, None, &log, &station_pk, &config);
 
         let tier1 = rows

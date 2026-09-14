@@ -37,7 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::{Hash, Hasher};
-use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
@@ -156,7 +156,10 @@ pub fn export_history_at(
     signer: &Keypair,
     computed_at: i64,
 ) -> Result<PortableReputationHistory> {
-    let log_entries = exportable_entries(db, address, computed_at)?;
+    // The exporter is this community's station, so its own key pins the
+    // station-signed records (settlements, cancellations) selected into the
+    // bundle: a record not signed by it is never exported.
+    let log_entries = exportable_entries(db, address, computed_at, &signer.public_key())?;
     let root = HistoryRoot {
         address: *address,
         from_seq: log_entries.first().map(|e| e.seq).unwrap_or(0),
@@ -239,7 +242,13 @@ fn replay_into_profile(
             log.append_raw(entry.payload.clone(), computed_at)?;
         }
     }
-    ReputationScorer::new(&db).score_at(&history.address, computed_at)
+    // A portable bundle carries records signed by the *exporting* station, which
+    // is a different community than the verifier. The bundle's own attesting key
+    // is `signed_root.signer` — already checked authentic by
+    // [`verify_history`] before this runs — so it is what pins the station-signed
+    // records on the verifier's replay, keeping the re-derived profile identical to
+    // the one the exporter computed.
+    ReputationScorer::new(&db, &history.signed_root.signer).score_at(&history.address, computed_at)
 }
 
 /// Everything a remote verifier needs to reach the exporter's profile: the
@@ -260,11 +269,16 @@ fn replay_into_profile(
 /// still a real privacy cost — the voucher's trade history travels inside someone
 /// else's bundle — and a succinct proof of the voucher's standing, rather than
 /// their raw evidence, is the Phase 2 improvement.
-fn exportable_entries(db: &Database, address: &Address, at_time: i64) -> Result<Vec<LogEntry>> {
-    let mut entries = entries_concerning(db, address)?;
+fn exportable_entries(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    station: &PublicKey,
+) -> Result<Vec<LogEntry>> {
+    let mut entries = entries_concerning(db, address, station)?;
 
-    if let Some(voucher) = anchoring_voucher(db, address, at_time)? {
-        entries.extend(entries_concerning(db, &voucher)?);
+    if let Some(voucher) = anchoring_voucher(db, address, at_time, station)? {
+        entries.extend(entries_concerning(db, &voucher, station)?);
         // Both sets can name the same entry (the anchoring vouch itself, or a
         // trade between the two); the log's order is the one the verifier checks.
         entries.sort_by_key(|entry| entry.seq);
@@ -281,7 +295,11 @@ fn exportable_entries(db: &Database, address: &Address, at_time: i64) -> Result<
 /// because a settlement is signed by the station and a confirmation by the
 /// counterparty: selecting only entries the member signed would ship an
 /// incomplete lifecycle, which replays to a different profile.
-fn entries_concerning(db: &Database, address: &Address) -> Result<Vec<LogEntry>> {
+fn entries_concerning(
+    db: &Database,
+    address: &Address,
+    station: &PublicKey,
+) -> Result<Vec<LogEntry>> {
     let log = AppendLog::new(db);
 
     let mut transactions: HashSet<TransactionId> = HashSet::new();
@@ -297,15 +315,23 @@ fn entries_concerning(db: &Database, address: &Address) -> Result<Vec<LogEntry>>
     let mut selected = Vec::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
-        if concerns(&entry, address, &transactions) {
+        if concerns(&entry, address, &transactions, station) {
             selected.push(entry);
         }
     }
     Ok(selected)
 }
 
-/// Whether one entry belongs in `address`'s bundle.
-fn concerns(entry: &LogEntry, address: &Address, transactions: &HashSet<TransactionId>) -> bool {
+/// Whether one entry belongs in `address`'s bundle. A settlement or cancellation
+/// is included only when signed by the community `station`: a forged
+/// station-kind record is never shipped in a bundle, and the verifier's replay
+/// pins the same key, so the two agree.
+fn concerns(
+    entry: &LogEntry,
+    address: &Address,
+    transactions: &HashSet<TransactionId>,
+    station: &PublicKey,
+) -> bool {
     let bytes = &entry.payload.bytes;
 
     if let Ok(proposal) = from_canonical_bytes::<TransactionProposal>(bytes) {
@@ -315,10 +341,11 @@ fn concerns(entry: &LogEntry, address: &Address, transactions: &HashSet<Transact
         return transactions.contains(&confirmation.proposal_id);
     }
     if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
-        return transactions.contains(&settlement.proposal_id);
+        return entry.payload.signer == *station && transactions.contains(&settlement.proposal_id);
     }
     if let Ok(cancellation) = from_canonical_bytes::<CancellationRecord>(bytes) {
-        return transactions.contains(&cancellation.proposal_id);
+        return entry.payload.signer == *station
+            && transactions.contains(&cancellation.proposal_id);
     }
     if let Ok(vouch) = from_canonical_bytes::<Vouch>(bytes) {
         // Vouches in both directions: the ones the member signed feed its own
@@ -530,7 +557,7 @@ mod tests {
         let db_a = populated_db(&alice, &bob, &station);
         let now = 9 * MONTH;
 
-        let expected = ReputationScorer::new(&db_a)
+        let expected = ReputationScorer::new(&db_a, &station.public_key())
             .score_at(&addr(&alice), now)
             .unwrap();
         let bundle = export_history_at(&db_a, &addr(&alice), &station, now).unwrap();
@@ -585,7 +612,7 @@ mod tests {
         append_vouch(&db, &patron, &addr(&alice), t);
 
         let now = 6 * MONTH;
-        let expected = ReputationScorer::new(&db)
+        let expected = ReputationScorer::new(&db, &station.public_key())
             .score_at(&addr(&alice), now)
             .unwrap();
         assert!(expected.trade_reliability > 1.0, "alice must be anchored");

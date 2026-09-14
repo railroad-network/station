@@ -34,7 +34,7 @@
 //! every station, or a reputation exported from one would not reconcile on
 //! another.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::from_canonical_bytes;
@@ -86,12 +86,22 @@ pub const EQUIVOCATION_WEIGHT: f32 = DIMENSION_MAX;
 /// Computes reputation profiles by replaying the log behind a borrowed database.
 pub struct ReputationScorer<'db> {
     db: &'db Database,
+    /// The community station key (ADR-0020). Ledger derivation and the
+    /// equivocation-verdict gate pin station-signed records to this key, so a
+    /// forged settlement or self-signed `Overturn` on the log counts for nothing. The caller supplies it — the writer's own key on the writer;
+    /// for a portable bundle, the bundle's authenticated exporting-station key
+    /// (`signed_root.signer`).
+    station: PublicKey,
 }
 
 impl<'db> ReputationScorer<'db> {
-    /// Wraps a database handle for scoring.
-    pub fn new(db: &'db Database) -> Self {
-        Self { db }
+    /// Wraps a database handle for scoring, pinning station-signed records to the
+    /// community station key `station` (ADR-0020).
+    pub fn new(db: &'db Database, station: &PublicKey) -> Self {
+        Self {
+            db,
+            station: *station,
+        }
     }
 
     /// The address's reputation as of `now`.
@@ -136,7 +146,7 @@ impl<'db> ReputationScorer<'db> {
         max_seq: u64,
     ) -> Result<ReputationProfile> {
         let raw = self.score_raw_at_bounded(address, at_time, max_seq)?;
-        let anchored = is_anchored_bounded(self.db, address, at_time, max_seq)?;
+        let anchored = is_anchored_bounded(self.db, address, at_time, max_seq, &self.station)?;
         Ok(anchored_profile(&raw, anchored))
     }
 
@@ -179,7 +189,7 @@ impl<'db> ReputationScorer<'db> {
         // replayed ledger state, which has already folded proposals, confirmations
         // and settlements into per-transaction lifecycle states — bounded to the
         // same log prefix so a late-admitted settlement cannot leak in.
-        let ledger = LedgerSnapshot::derive_to(&log, max_seq)?;
+        let ledger = LedgerSnapshot::derive_to(&log, max_seq, &self.station)?;
         for (_, state) in ledger.iter() {
             if let TransactionState::Settled {
                 proposal,
@@ -254,19 +264,23 @@ impl<'db> ReputationScorer<'db> {
         //      record — tampered evidence, amounts within cap, a mislabeled member —
         //      produces no penalty. The cap for a cert-overspend basis is read from
         //      the certificate on the same log.
-        // The station that recorded each equivocation, so an `Overturn` counts only
-        // when signed by that same station (step 8 below). The records are
-        // station-signed, and `ledger.equivocations()` already dropped any that do
-        // not verify.
-        let station_signers: HashMap<EquivocationId, PublicKey> = ledger
-            .equivocations()
-            .map(|r| (r.payload.equivocation_id, r.signer))
-            .collect();
-        let overturned = overturned_equivocations(&log, &station_signers, at_time, max_seq)?;
+        // An `Overturn` counts only when signed by the community station key
+        // (step 8 below). The equivocation record itself is station-authored
+        // (ADR-0021 §5), so both the penalty loop below and the overturn gate pin
+        // the envelope signer to that key: a record signed by any other key — even
+        // one a member self-signs over genuine evidence of their own overspend to
+        // levy a penalty they could never overturn (no case forms for a record the
+        // snapshot skipped) — counts for nothing.
+        let overturned = overturned_equivocations(&log, &self.station, at_time, max_seq)?;
         for entry in log.iter_from(1) {
             let entry = entry?;
             if entry.seq > max_seq {
                 break;
+            }
+            // Pin the equivocation record to the community station key, exactly as
+            // `LedgerSnapshot::derive` does, so a forged record levies no penalty.
+            if entry.payload.signer != self.station {
+                continue;
             }
             let Ok(record) = from_canonical_bytes::<EquivocationRecord>(&entry.payload.bytes)
             else {
@@ -319,7 +333,7 @@ fn confirmation_of(state: &TransactionState) -> Option<&TransactionConfirmation>
 /// (ADR-0021 §5). A non-verdict payload is skipped.
 fn overturned_equivocations(
     log: &AppendLog,
-    station_signers: &HashMap<EquivocationId, PublicKey>,
+    station: &PublicKey,
     at_time: i64,
     max_seq: u64,
 ) -> Result<HashSet<EquivocationId>> {
@@ -333,18 +347,16 @@ fn overturned_equivocations(
         else {
             continue;
         };
-        // Gate on the station signer (T2.3.4 step 8): an `Overturn` neutralizes a
-        // record only when signed by the *same* station that recorded the
-        // equivocation. The equivocation record is station-signed, so an authentic
-        // terminal ruling carries that signer; a juror ballot (a distinct record
-        // kind) never decodes here, and a member-relayed `Overturn` — possible once
-        // cross-station sync admits foreign records — would not match and is
-        // ignored, so a member cannot neutralize their own penalty. A verdict for an
-        // unknown/unverified equivocation (absent from the map) counts for nothing.
-        let Some(expected) = station_signers.get(&verdict.equivocation_id) else {
-            continue;
-        };
-        if entry.payload.signer != *expected {
+        // Gate on the community station key (step 8, ADR-0025): an `Overturn`
+        // neutralizes a record only when signed by the community station. The
+        // terminal `EquivocationVerdictRecord` is station-authored, so an authentic
+        // ruling carries that key; a juror ballot (a distinct record kind) never
+        // decodes here, and a member-relayed `Overturn` — including one a member
+        // signs to lift their own penalty — does not match and is ignored. Pinning
+        // to the community key rather than the equivocation record's own signer
+        // closes the last self-sign vector (the record itself is already pinned to
+        // the station in ledger derivation, so the two agree for genuine records).
+        if entry.payload.signer != *station {
             continue;
         }
         if verdict.decision == VerdictDecision::Overturn && verdict.decided_at <= at_time {
@@ -672,10 +684,17 @@ mod tests {
     /// dimensions. `member` is the *sender* of both trades, so the trades give no
     /// attestation credit (the receiver confirms), keeping the two dimensions
     /// independent.
-    fn seed_trade_and_attestation_baseline(db: &Database, member: &Keypair, at: i64) {
+    fn seed_trade_and_attestation_baseline(
+        db: &Database,
+        member: &Keypair,
+        station: &Keypair,
+        at: i64,
+    ) {
         let other = Keypair::generate();
-        append_settled(db, member, &other, &Keypair::generate(), 0, at);
-        append_settled(db, member, &other, &Keypair::generate(), 1, at);
+        // Settlements must be signed by the same `station` the test scores against,
+        // or the signer pin skips them and the trade baseline reads zero.
+        append_settled(db, member, &other, station, 0, at);
+        append_settled(db, member, &other, station, 1, at);
         seed_attestation_baseline(db, member, at);
     }
 
@@ -685,8 +704,8 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_trade_and_attestation_baseline(&db, &mallory, t);
-        let base = ReputationScorer::new(&db)
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
+        let base = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         assert!(
@@ -703,7 +722,7 @@ mod tests {
         let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         append_equivocation(&db, &mallory, &station, cert, t);
 
-        let after = ReputationScorer::new(&db)
+        let after = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         // Both live dimensions floor at zero — the equivocator is de-established.
@@ -730,12 +749,12 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
         let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         let id = append_equivocation(&db, &mallory, &station, cert, t);
         append_overturn(&db, &station, id, t);
 
-        let after = ReputationScorer::new(&db)
+        let after = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         // The overturn lifts the penalty on both dimensions: clean baseline.
@@ -760,13 +779,13 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
         let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         let id = append_equivocation(&db, &mallory, &station, cert, t);
 
         // Mallory signs her own "overturn" — wrong signer, so the penalty stands.
         append_overturn(&db, &mallory, id, t);
-        let after = ReputationScorer::new(&db)
+        let after = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         assert!(
@@ -782,7 +801,7 @@ mod tests {
 
         // The station's overturn does lift it.
         append_overturn(&db, &station, id, t);
-        let after = ReputationScorer::new(&db)
+        let after = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         assert!(
@@ -798,7 +817,7 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
         let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
 
         // A station-signed record whose evidence has been tampered: one embedded
@@ -821,7 +840,7 @@ mod tests {
             .unwrap();
 
         // No penalty: both baselines stand.
-        let after = ReputationScorer::new(&db)
+        let after = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         assert!(
@@ -837,6 +856,59 @@ mod tests {
     }
 
     #[test]
+    fn a_non_station_equivocation_record_levies_no_penalty() {
+        // A record carrying genuine, verifying evidence of the member's own
+        // overspend, but signed by the MEMBER rather than the station — the shape a
+        // member would inject to zero their own reputation with a penalty no jury
+        // could ever overturn (no case forms for a record the snapshot skipped).
+        // The scorer pins the record signer to the community station key, so it
+        // levies nothing; a genuine station-signed record then does.
+        let db = fresh_db();
+        let (mallory, station) = (Keypair::generate(), Keypair::generate());
+        let t = 10 * MONTH;
+
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
+        let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
+
+        // Genuine evidence, but the record is self-signed by mallory (not station).
+        let record = EquivocationRecord::new(
+            addr(&mallory),
+            EquivocationBasis::CertOverspend,
+            Some(cert),
+            vec![
+                cert_evidence(&mallory, cert, 300, 1),
+                cert_evidence(&mallory, cert, 300, 2),
+            ],
+            t,
+        );
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(record, &mallory), 0)
+            .unwrap();
+
+        let after = ReputationScorer::new(&db, &station.public_key())
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(
+            approx(after.trade_reliability, 1.0),
+            "self-signed record must not dent trade: {}",
+            after.trade_reliability
+        );
+        assert!(
+            approx(after.attestation_accuracy, 1.5),
+            "self-signed record must not dent attestation: {}",
+            after.attestation_accuracy
+        );
+
+        // The station's genuine record then zeroes both dimensions.
+        append_equivocation(&db, &mallory, &station, cert, t);
+        let after = ReputationScorer::new(&db, &station.public_key())
+            .score_raw_at(&addr(&mallory), t)
+            .unwrap();
+        assert!(approx(after.trade_reliability, 0.0));
+        assert!(approx(after.attestation_accuracy, 0.0));
+    }
+
+    #[test]
     fn equivocation_scoring_is_deterministic_across_replays() {
         // Two independent replays of the same log reduce to the same score — the
         // property `verify_history` and dispute review depend on — both with and
@@ -844,12 +916,12 @@ mod tests {
         let db = fresh_db();
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
-        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
         let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         let id = append_equivocation(&db, &mallory, &station, cert, t);
 
         let replay = || {
-            let p = ReputationScorer::new(&db)
+            let p = ReputationScorer::new(&db, &station.public_key())
                 .score_raw_at(&addr(&mallory), t)
                 .unwrap();
             (p.trade_reliability, p.attestation_accuracy)
@@ -873,13 +945,13 @@ mod tests {
         let (mallory, station) = (Keypair::generate(), Keypair::generate());
         let t = 10 * MONTH;
 
-        seed_trade_and_attestation_baseline(&db, &mallory, t);
+        seed_trade_and_attestation_baseline(&db, &mallory, &station, t);
         let cert = append_certificate(&db, &mallory, &station, 500, 2, t);
         // The equivocation is recorded a month after the baseline activity.
         append_equivocation(&db, &mallory, &station, cert, t + MONTH);
 
         // Scored before the record exists: no penalty.
-        let before = ReputationScorer::new(&db)
+        let before = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t)
             .unwrap();
         assert!(
@@ -889,7 +961,7 @@ mod tests {
         );
 
         // Scored at the record's instant: both dimensions are zeroed.
-        let at = ReputationScorer::new(&db)
+        let at = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&mallory), t + MONTH)
             .unwrap();
         assert!(
@@ -922,7 +994,9 @@ mod tests {
         append_vouch(&db, &alice, &addr(&bob), t);
 
         // Scored exactly at the activity instant, so no decay applies.
-        let p = ReputationScorer::new(&db).score(&addr(&alice), t).unwrap();
+        let p = ReputationScorer::new(&db, &station.public_key())
+            .score(&addr(&alice), t)
+            .unwrap();
         assert!(
             approx(p.trade_reliability, 1.0),
             "trade = {}",
@@ -950,7 +1024,9 @@ mod tests {
         let t = 10 * MONTH;
         append_cancelled(&db, &alice, &bob, &station, 0, t);
 
-        let p = ReputationScorer::new(&db).score(&addr(&alice), t).unwrap();
+        let p = ReputationScorer::new(&db, &station.public_key())
+            .score(&addr(&alice), t)
+            .unwrap();
         assert!(approx(p.trade_reliability, 0.0));
         assert!(approx(p.attestation_accuracy, 0.0));
     }
@@ -968,7 +1044,7 @@ mod tests {
         // Bob confirms two clean settled trades → 2 attestations, raw 1.0.
         append_settled(&db, &alice, &bob, &station, 0, t);
         append_settled(&db, &alice, &bob, &station, 1, t);
-        let base = ReputationScorer::new(&db)
+        let base = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&bob), t)
             .unwrap();
         assert!(
@@ -981,7 +1057,7 @@ mod tests {
         // no attestation credit (a cancelled state carries no confirmation) *and*
         // levies a 0.5 penalty: 1.0 − 0.5 = 0.5, below the clean baseline.
         append_disputed_upheld(&db, &alice, &bob, &station, 2, t, t);
-        let after = ReputationScorer::new(&db)
+        let after = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&bob), t)
             .unwrap();
         assert!(
@@ -990,7 +1066,7 @@ mod tests {
             after.attestation_accuracy
         );
         // The raiser (alice) is untouched — the dent lands only on the confirmer.
-        let alice_p = ReputationScorer::new(&db)
+        let alice_p = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&alice), t)
             .unwrap();
         assert!(approx(alice_p.attestation_accuracy, 0.0));
@@ -1016,7 +1092,7 @@ mod tests {
         // proven wrong, so no penalty — only the clean 0.5 remains (the disputed
         // one already carries no confirmation credit). Scored at its own instant,
         // so no decay either.
-        let before = ReputationScorer::new(&db)
+        let before = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&bob), t)
             .unwrap();
         assert!(
@@ -1028,7 +1104,7 @@ mod tests {
         // Scored at the ruling: the 0.5 penalty applies, bottoming the dimension
         // out at zero (a dimension floors at zero, not below) — 0.5 earned − 0.5
         // penalty, then a month of decay, all floored.
-        let at_ruling = ReputationScorer::new(&db)
+        let at_ruling = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&bob), ruling)
             .unwrap();
         assert!(
@@ -1051,7 +1127,7 @@ mod tests {
         for nonce in 0..12 {
             append_settled(&db, &alice, &bob, &station, nonce, t);
         }
-        let p = ReputationScorer::new(&db)
+        let p = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&alice), t)
             .unwrap();
         assert!(
@@ -1075,7 +1151,7 @@ mod tests {
         }
 
         // Nobody has vouched for alice, so the evidence accrues but does not show.
-        let scorer = ReputationScorer::new(&db);
+        let scorer = ReputationScorer::new(&db, &station.public_key());
         let scored = scorer.score(&addr(&alice), t).unwrap();
         assert!(
             approx(scored.trade_reliability, ANCHOR_DIMENSION_CAP),
@@ -1113,7 +1189,7 @@ mod tests {
             append_vouch(&db, &patron, &addr(&Keypair::generate()), t);
         }
 
-        let scorer = ReputationScorer::new(&db);
+        let scorer = ReputationScorer::new(&db, &station.public_key());
         assert!(approx(
             scorer.score(&addr(&alice), t).unwrap().trade_reliability,
             ANCHOR_DIMENSION_CAP
@@ -1141,7 +1217,7 @@ mod tests {
         append_settled(&db, &alice, &bob, &station, 0, t);
         append_settled(&db, &alice, &bob, &station, 1, t);
 
-        let scorer = ReputationScorer::new(&db);
+        let scorer = ReputationScorer::new(&db, &station.public_key());
         let now = scorer.score(&addr(&alice), t).unwrap();
         assert!(approx(now.trade_reliability, 1.0));
         // Two months later: 1.0 − 0.1·2 = 0.8.
@@ -1164,7 +1240,7 @@ mod tests {
         let settled_at = 5 * MONTH;
         append_settled(&db, &alice, &bob, &station, 0, settled_at);
 
-        let scorer = ReputationScorer::new(&db);
+        let scorer = ReputationScorer::new(&db, &station.public_key());
         // One second before settlement: the event has not happened yet.
         let before = scorer.score_at(&addr(&alice), settled_at - 1).unwrap();
         assert!(approx(before.trade_reliability, 0.0));
@@ -1198,10 +1274,10 @@ mod tests {
         build(&db_b);
 
         let now = t + 3 * MONTH;
-        let pa = ReputationScorer::new(&db_a)
+        let pa = ReputationScorer::new(&db_a, &station.public_key())
             .score(&addr(&alice), now)
             .unwrap();
-        let pb = ReputationScorer::new(&db_b)
+        let pb = ReputationScorer::new(&db_b, &station.public_key())
             .score(&addr(&alice), now)
             .unwrap();
         assert_eq!(pa, pb);
