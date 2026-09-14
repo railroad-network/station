@@ -29,7 +29,7 @@ use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::transaction::TransactionId;
-use rrn_reputation::staking::grace_electorate;
+use rrn_reputation::staking::grace_electorate_asof;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -177,17 +177,19 @@ impl TryFrom<CBOR> for EscalationBallot {
 /// The open escalation on `tx_id`, if any — the **first** one appended (a dispute
 /// escalates at most once; the append gate refuses a second, and replay keeps the
 /// first regardless) — paired with its **admission time** (the log entry's
-/// `created_at`).
+/// `created_at`) and its **admission position** (the entry's `seq`).
 ///
-/// The admission time, not the initiator's signed `opened_at`, is what applicability,
-/// the electorate snapshot, and the sub-window key on (ADR-0022 §5): a party's
-/// asserted timestamp is testimony and must never enter window, ordering, or
-/// eligibility arithmetic. The signed `opened_at` rides along on the returned record
-/// for display only.
+/// The admission time, not the initiator's signed `opened_at`, is what applicability
+/// and the sub-window key on; the admission *position* (`seq`) is what the electorate
+/// snapshot is bounded to (ADR-0022 §5), so a member established by evidence admitted
+/// after the escalation opened cannot join its electorate whatever timestamp that
+/// evidence claims. A party's asserted timestamp is testimony and never enters
+/// window, ordering, or eligibility arithmetic; the signed `opened_at` rides along on
+/// the returned record for display only.
 pub fn escalation_of(
     db: &Database,
     tx_id: &TransactionId,
-) -> Result<Option<(EscalationRecord, i64)>> {
+) -> Result<Option<(EscalationRecord, i64, u64)>> {
     let log = AppendLog::new(db);
     for entry in log.iter_from(1) {
         let entry = entry?;
@@ -195,7 +197,7 @@ pub fn escalation_of(
             continue;
         };
         if esc.proposal_id == *tx_id {
-            return Ok(Some((esc, entry.created_at)));
+            return Ok(Some((esc, entry.created_at, entry.seq)));
         }
     }
     Ok(None)
@@ -227,20 +229,27 @@ pub fn escalation_ballots(
 }
 
 /// The electorate eligible to vote in an escalation, snapshotted as of `at` (the
-/// escalation's **admission** time, never the initiator's signed `opened_at`;
+/// escalation's **admission** time) over the log prefix `[1, max_seq]` (the
+/// escalation's **admission position**, never the initiator's signed `opened_at`;
 /// ADR-0022 §5) — the governance electorate (established members, plus
 /// the genesis `founders` while the community is in bootstrap grace, per
 /// ADR-0015) minus the two parties, who never vote on their own dispute. Vouchers
 /// are *not* recused: unlike the jury, this is the whole community ruling.
+///
+/// Bounding the established set at `max_seq` closes the back-dated-evidence packing
+/// vector: a member lifted over the band by a vouch or settlement admitted after the
+/// escalation opened is not counted, however old that evidence claims to be. Pass the
+/// escalation's `seq` from [`escalation_of`].
 pub fn escalation_electorate(
     db: &Database,
     founders: &[Address],
     info: &DisputedInfo,
     at: i64,
+    max_seq: u64,
     station: &PublicKey,
 ) -> Result<HashSet<Address>> {
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
-    Ok(grace_electorate(db, founders, at, station)?
+    Ok(grace_electorate_asof(db, founders, at, max_seq, station)?
         .into_iter()
         .filter(|a| !parties.contains(a))
         .collect())

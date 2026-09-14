@@ -76,6 +76,26 @@ pub fn tier2_stake_centi(
     Ok(composite_to_centi(raw))
 }
 
+/// Position-bounded [`tier2_stake_centi`] (ADR-0022 §5): the reputation `address`
+/// would stake, computed from only the log prefix `[1, max_seq]`. A dispute jury weights
+/// each candidate by this so no standing manufactured after the round's anchoring
+/// seq — a settlement or vouch back-dated past the anchor (ADR-0022 §3 makes such
+/// old testimony legal) — can change a draw weight (ADR-0022 §5). Bounds evidence
+/// and anchoring to the same prefix the pool's electorate is bounded to.
+/// `max_seq == u64::MAX` is exactly [`tier2_stake_centi`].
+pub fn tier2_stake_centi_asof(
+    db: &Database,
+    address: &Address,
+    at_time: i64,
+    max_seq: u64,
+    station: &PublicKey,
+) -> Result<u64> {
+    let raw = ReputationScorer::new(db, station)
+        .score_raw_at_bounded(address, at_time, max_seq)?
+        .composite();
+    Ok(composite_to_centi(raw))
+}
+
 /// Every known member holding an **effective** (anchored) composite at or above
 /// the Member band as of `at_time` — the community's established-member set. This
 /// is the same electorate governance ballots on ([ADR-0012]) and the pool a

@@ -59,7 +59,7 @@ use rrn_ledger::escrow::{
 use rrn_ledger::state::LedgerSnapshot;
 use rrn_ledger::transaction::TransactionProposal;
 use rrn_protocol::outbox::OutboxEntry;
-use rrn_reputation::staking::grace_electorate;
+use rrn_reputation::staking::grace_electorate_asof;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -481,13 +481,17 @@ fn rounds(
         {
             continue;
         }
-        // The requester must be an established, non-subject member at admission.
+        // The requester must be an established, non-subject member at admission,
+        // judged over the prefix ending at this re-seat's own admission position —
+        // the seq the new round anchors at — so standing back-dated past it does not
+        // qualify a requester (ADR-0022 §5).
         if !reseat_eligible(
             db,
             founders,
             case,
             &reseat.requester,
             entry.created_at,
+            entry.seq,
             station,
         )? {
             continue;
@@ -502,19 +506,26 @@ fn rounds(
 }
 
 /// Whether `requester` is an established, non-subject member of the case's
-/// electorate at `at_time` (ADR-0025 §5, using the grace electorate per ADR-0015).
+/// electorate as of `at_time` and the log prefix `[1, max_seq]` (ADR-0025 §5, using
+/// the grace electorate per ADR-0015).
+///
+/// `max_seq` is the round's anchoring admission position: the re-seat record's own
+/// seq (ADR-0022 §5), so a requester whose standing was manufactured after that
+/// position — by evidence back-dated past it — is not eligible whatever timestamp
+/// that evidence claims.
 fn reseat_eligible(
     db: &Database,
     founders: &[Address],
     case: &EquivCase,
     requester: &Address,
     at_time: i64,
+    max_seq: u64,
     station: &PublicKey,
 ) -> Result<bool> {
     if *requester == case.subject {
         return Ok(false);
     }
-    Ok(grace_electorate(db, founders, at_time, station)?.contains(requester))
+    Ok(grace_electorate_asof(db, founders, at_time, max_seq, station)?.contains(requester))
 }
 
 /// The seated panel for one round of a case as of `now` — the shared derivation
@@ -532,8 +543,21 @@ fn round_panel(
 ) -> Result<Panel> {
     let hard = case.hard_excluded();
     let soft = vouchers_of_until(db, &case.subject, round.anchor_seq)?;
-    let pool =
-        eligible_pool_excluding(db, founders, round.opened_at, params, &hard, &soft, station)?;
+    // The pool's electorate and weights are bounded to the round's own anchoring
+    // admission position — the same prefix the recusal graph above is read at
+    // (ADR-0022 §5 / ADR-0025 §2) — so a juror established, or a weight lifted, by
+    // evidence admitted after this round opened cannot enter the round's panel,
+    // whatever timestamp that evidence back-dates to.
+    let pool = eligible_pool_excluding(
+        db,
+        founders,
+        round.opened_at,
+        round.anchor_seq,
+        params,
+        &hard,
+        &soft,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, case.seed(round.anchor_seq, anchor));
     let ballots = round_ballots(db, case, round.index)?;
     Ok(resolve_panel(
@@ -806,7 +830,13 @@ pub fn append_equivocation_reseat(
     if round != cur.index + 1 {
         return Err(Error::NotReseatable);
     }
-    if !reseat_eligible(db, founders, &case, &requester, now, station)? {
+    // The live front door has no admitted position yet, so eligibility is judged
+    // over the prefix ending at the seq this re-seat will occupy — the tail seq plus
+    // one — matching the anchor `rounds()` re-derives the round with on replay
+    // (ADR-0022 §5). Never `u64::MAX`: standing manufactured concurrently must not
+    // qualify a requester the replayed bound would reject.
+    let will_be_seq = AppendLog::new(db).tail()?.map_or(1, |t| t.seq + 1);
+    if !reseat_eligible(db, founders, &case, &requester, now, will_be_seq, station)? {
         return Err(Error::NotReseatable);
     }
 

@@ -633,6 +633,12 @@ fn two_identical_logs_reach_identical_outcomes() {
     // same deterministic operations seat the same jury and reach the same verdict.
     let build = || {
         let fx = setup();
+        // A post-anchor, back-dated anchoring vouch establishing a latecomer: inert
+        // under round 0's bound on both replicas (its seq is past the round's anchor),
+        // so it can neither desync the seated jury nor the outcome (ADR-0022 §5).
+        let latecomer = kp("equiv:det:latecomer");
+        earn_raw_standing(&fx.db, &latecomer, "det-latecomer", T);
+        append_vouch(&fx.db, &fx.members[0], &addr(&latecomer), T);
         for m in &fx.members[2..5] {
             cast(
                 &fx.db,
@@ -745,6 +751,123 @@ fn a_small_pool_relaxes_voucher_recusal() {
         ),
         Err(Error::NotSeated)
     ));
+}
+
+// --- Position-bounded panel and re-seat eligibility (ADR-0022 §5) --------------
+
+#[test]
+fn a_juror_established_after_a_round_opens_is_not_on_its_panel() {
+    // Invariant 3 (panel): a round's panel is drawn from the electorate as of the
+    // round's anchoring seq. A juror established by a vouch admitted after round 0
+    // opened is not seatable in round 0, and the original jury (and outcome) is
+    // untouched.
+    let fx = setup();
+    let latecomer = kp("equiv:latecomer");
+    earn_raw_standing(&fx.db, &latecomer, "latecomer", T);
+    // Anchored *after* the overspend (round 0's anchor), back-dated to T.
+    append_vouch(&fx.db, &fx.members[0], &addr(&latecomer), T);
+
+    // Round 0's panel excludes the latecomer, whatever the vouch's timestamp claims.
+    assert!(matches!(
+        cast(
+            &fx.db,
+            fx.id,
+            &latecomer,
+            0,
+            VerdictDecision::Overturn,
+            T + 10,
+            T + 10
+        ),
+        Err(Error::NotSeated)
+    ));
+    // The latecomer really is an established member as of now (unbounded) — so their
+    // exclusion from round 0 is the position bound, not a lack of standing.
+    let composite = ReputationScorer::new(&fx.db, &fx.station.public_key())
+        .score(&addr(&latecomer), T + 10)
+        .unwrap()
+        .composite();
+    assert!(
+        composite >= rrn_reputation::model::BAND_MEMBER_MIN,
+        "the latecomer is established now; only round 0's anchor bound excludes them"
+    );
+    // The original seated jury (members[2..5]) is unaffected and can still rule.
+    for m in &fx.members[2..5] {
+        cast(
+            &fx.db,
+            fx.id,
+            m,
+            0,
+            VerdictDecision::Overturn,
+            T + 10,
+            T + 10,
+        )
+        .unwrap();
+    }
+    let case = equivocation_cases(&fx.db, &fx.station.public_key())
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        resolve_equivocation(&fx.db, &[], &fx.station, &case, &params(), ANCHOR, T + 20).unwrap(),
+        EquivResolution::Overturned
+    );
+}
+
+#[test]
+fn a_back_dated_vouch_cannot_retroactively_validate_a_reseat() {
+    // Invariant 3 (re-seat): re-seat eligibility is judged over the prefix ending at
+    // the re-seat's own admission position. A requester established only by a vouch
+    // admitted *after* their re-seat record cannot re-seat, whatever the vouch's
+    // timestamp claims. Two replicas differ only in the vouch/re-seat ordering:
+    // vouch-after leaves the case lapsed (bounded out), vouch-before opens round 1 —
+    // proving the machinery opens rounds when the requester is eligible at the bound.
+    let build = |vouch_before_reseat: bool| {
+        let fx = setup();
+        // A requester with over-band raw standing but unanchored: not established
+        // until an anchoring vouch reveals their composite.
+        let newreq = kp("equiv:newreq");
+        earn_raw_standing(&fx.db, &newreq, "newreq", T);
+
+        let vouch = |db: &Database| append_vouch(db, &fx.members[0], &addr(&newreq), T);
+        let reseat = |db: &Database| {
+            let signed = SignedPayload::sign(
+                EquivocationReseat {
+                    equivocation_id: fx.id,
+                    requester: addr(&newreq),
+                    round: 1,
+                    requested_at: T + 1000,
+                },
+                &newreq,
+            );
+            // Raw append models a hostile log copy that bypassed the live front-door
+            // gate; replay must still bound the requester's eligibility at this seq.
+            AppendLog::new(db).append(signed, T + 1000).unwrap();
+        };
+        if vouch_before_reseat {
+            vouch(&fx.db);
+            reseat(&fx.db);
+        } else {
+            reseat(&fx.db);
+            vouch(&fx.db);
+        }
+        let case = equivocation_cases(&fx.db, &fx.station.public_key())
+            .unwrap()
+            .remove(0);
+        preview_equivocation(
+            &fx.db,
+            &[],
+            &case,
+            &params(),
+            ANCHOR,
+            T + 1100,
+            &fx.station.public_key(),
+        )
+        .unwrap()
+    };
+
+    // Vouch admitted after the re-seat: bounded out, round 1 never opens, lapsed.
+    assert_eq!(build(false), EquivResolution::Lapsed);
+    // Vouch admitted before the re-seat: eligible at the bound, round 1 opens.
+    assert_eq!(build(true), EquivResolution::Pending);
 }
 
 impl Fixture {

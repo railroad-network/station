@@ -114,7 +114,15 @@ pub fn append_verdict(
     // Re-derive the panel as of the verdict's own instant. The juror must occupy a
     // seat that is still awaiting a verdict then — which also proves they are
     // within their response window (a lapsed occupant would have been redrawn).
-    let pool = eligible_pool(db, founders, &info, info.opened_at, params, station)?;
+    let pool = eligible_pool(
+        db,
+        founders,
+        &info,
+        info.opened_at,
+        info.opened_seq,
+        params,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, sortition_seed(&proposal_id, anchor));
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, cast_at);
     match panel.seat_of(&juror) {
@@ -215,11 +223,11 @@ pub fn append_escalation_ballot(
     }
 
     let info = disputed_info(db, &proposal_id, station)?;
-    let (_escalation, esc_admitted_at) =
+    let (_escalation, esc_admitted_at, esc_seq) =
         escalation_of(db, &proposal_id)?.ok_or(Error::NotEscalated)?;
     let close = escalation_close(esc_admitted_at, &info, params);
 
-    let electorate = escalation_electorate(db, founders, &info, esc_admitted_at, station)?;
+    let electorate = escalation_electorate(db, founders, &info, esc_admitted_at, esc_seq, station)?;
     if !electorate.contains(&voter) || cast_at < esc_admitted_at || cast_at > close || cast_at > now
     {
         return Err(Error::NotEligible);
@@ -295,7 +303,7 @@ fn decide(
 
     // A validly-opened escalation governs the outcome; a bogus or inapplicable one
     // is ignored, and the jury path resumes.
-    if let Some((escalation, esc_admitted_at)) = escalation_of(db, tx_id)? {
+    if let Some((escalation, esc_admitted_at, esc_seq)) = escalation_of(db, tx_id)? {
         let by_party = escalation.initiator == info.sender || escalation.initiator == info.receiver;
         if by_party && escalation_applies(&escalation, esc_admitted_at, &info, &jury, params) {
             return decide_escalation(
@@ -304,6 +312,7 @@ fn decide(
                 tx_id,
                 &info,
                 esc_admitted_at,
+                esc_seq,
                 params,
                 now,
                 station,
@@ -361,7 +370,15 @@ fn jury_view(
     now: i64,
     station: &PublicKey,
 ) -> Result<JuryView> {
-    let pool = eligible_pool(db, founders, info, info.opened_at, params, station)?;
+    let pool = eligible_pool(
+        db,
+        founders,
+        info,
+        info.opened_at,
+        info.opened_seq,
+        params,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let existing = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, now);
@@ -410,6 +427,9 @@ fn escalation_applies(
 /// Tallies an open escalation's electorate into the [`Resolution`] it implies:
 /// pending while the sub-window is open, then upheld/rejected on a quorum, or lapsed
 /// (fail open) once the window closes without one. Writes nothing.
+///
+/// Takes the escalation's admission `(admitted_at, admitted_seq)` pair — the time
+/// anchors the sub-window, the seq bounds the electorate (ADR-0022 §5).
 #[allow(clippy::too_many_arguments)]
 fn decide_escalation(
     db: &Database,
@@ -417,6 +437,7 @@ fn decide_escalation(
     tx_id: &TransactionId,
     info: &DisputedInfo,
     admitted_at: i64,
+    admitted_seq: u64,
     params: &DisputeParams,
     now: i64,
     station: &PublicKey,
@@ -425,7 +446,7 @@ fn decide_escalation(
     if now < close {
         return Ok(Resolution::EscalationPending);
     }
-    let electorate = escalation_electorate(db, founders, info, admitted_at, station)?;
+    let electorate = escalation_electorate(db, founders, info, admitted_at, admitted_seq, station)?;
     let ballots = escalation_ballots(db, tx_id)?;
     let tallied = count_escalation(&ballots, &electorate, params, admitted_at, close);
     Ok(match tallied.terminal_outcome() {

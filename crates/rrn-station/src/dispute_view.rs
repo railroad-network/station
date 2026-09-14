@@ -207,7 +207,15 @@ pub fn dispute_view(
     // (ADR-0022), so this view cannot drift from the resolution path. Reuses the
     // snapshot already derived above rather than replaying the log again.
     let info = disputed_info_from_snapshot(&snapshot, tx_id)?;
-    let pool = eligible_pool(db, founders, &info, info.opened_at, params, station)?;
+    let pool = eligible_pool(
+        db,
+        founders,
+        &info,
+        info.opened_at,
+        info.opened_seq,
+        params,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let cast = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &cast, info.opened_at, params, now);
@@ -231,11 +239,12 @@ pub fn dispute_view(
     // (ADR-0022 §5), so this view matches the resolution path exactly.
     let escalation = escalation_of(db, tx_id)?
         .map(
-            |(esc, admitted_at)| -> rrn_dispute::Result<EscalationView> {
+            |(esc, admitted_at, esc_seq)| -> rrn_dispute::Result<EscalationView> {
                 let closes_at = admitted_at
                     .saturating_add(params.escalation_window_seconds)
                     .min(info.opened_at.saturating_add(params.window_seconds));
-                let electorate = escalation_electorate(db, founders, &info, admitted_at, station)?;
+                let electorate =
+                    escalation_electorate(db, founders, &info, admitted_at, esc_seq, station)?;
                 let ballots = escalation_ballots(db, tx_id)?;
                 let t = count_escalation(&ballots, &electorate, params, admitted_at, closes_at);
                 Ok(EscalationView {
@@ -292,7 +301,15 @@ fn summarize(
     // (ADR-0022), so the summary matches the resolution path exactly. Reuses the
     // caller's snapshot rather than replaying the log again.
     let info = disputed_info_from_snapshot(snapshot, tx_id)?;
-    let pool = eligible_pool(db, founders, &info, info.opened_at, params, station)?;
+    let pool = eligible_pool(
+        db,
+        founders,
+        &info,
+        info.opened_at,
+        info.opened_seq,
+        params,
+        station,
+    )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
     let cast = verdicts(db, tx_id)?;
     let panel = resolve_panel(&sequence, &cast, info.opened_at, params, now);

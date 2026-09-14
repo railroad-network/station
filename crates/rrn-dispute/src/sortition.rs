@@ -18,7 +18,7 @@ use rrn_identity::address::Address;
 use rrn_identity::vouch::Vouch;
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionId;
-use rrn_reputation::staking::{grace_electorate, tier2_stake_centi};
+use rrn_reputation::staking::{grace_electorate_asof, tier2_stake_centi_asof};
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -48,6 +48,15 @@ pub struct DisputedInfo {
     ///
     /// [`DisputeRecord`]: rrn_ledger::dispute::DisputeRecord
     pub opened_at: i64,
+    /// The **admission log position** (`seq`) of the dispute entry — the prefix the
+    /// jury pool, its recusal graph, and every draw weight are bounded to (ADR-0022
+    /// §5). Nothing admitted after this seq may enter the pool or shift a weight,
+    /// whatever timestamp it claims, so a vouch or settlement back-dated past the
+    /// dispute's open cannot pack the jury. Paired with [`opened_at`](Self::opened_at)
+    /// exactly as governance pairs `(pin_time, pin_seq)`; sourced from the same
+    /// dispute-entry admission metadata as `opened_at`
+    /// ([`AdmissionTimes::dispute_seq`](rrn_ledger::state::AdmissionTimes::dispute_seq)).
+    pub opened_seq: u64,
 }
 
 /// Reads the parties and admitted open time of a transaction that must currently
@@ -78,14 +87,21 @@ pub fn disputed_info_from_snapshot(
 ) -> Result<DisputedInfo> {
     match snapshot.get(tx_id) {
         Some(TransactionState::Disputed { proposal, .. }) => {
-            let opened_at = snapshot
-                .admission(tx_id)
-                .and_then(|a| a.dispute_admitted_at)
+            // Both the admitted open time and the admitted open *position* come from
+            // the same dispute-entry metadata (ADR-0022). A `Disputed` state exists
+            // only because a dispute entry was admitted, which records both, so a
+            // missing value means a corrupt or partially-replayed log — a hard error,
+            // never a fall-back to a party's signed value.
+            let admission = snapshot.admission(tx_id).ok_or(Error::MissingAdmission)?;
+            let opened_at = admission
+                .dispute_admitted_at
                 .ok_or(Error::MissingAdmission)?;
+            let opened_seq = admission.dispute_seq.ok_or(Error::MissingAdmission)?;
             Ok(DisputedInfo {
                 sender: proposal.payload.sender,
                 receiver: proposal.payload.receiver,
                 opened_at,
+                opened_seq,
             })
         }
         _ => Err(Error::NotDisputed),
@@ -104,9 +120,12 @@ pub fn sortition_seed(tx_id: &TransactionId, anchor: &[u8]) -> [u8; 32] {
     Hash::of(&buf).to_bytes()
 }
 
-/// The distinct members who have vouched for `subject`, read from the vouch graph
-/// on the log. These are recused from judging that party's dispute (the obvious
-/// collusion edge — ADR-0014 §2).
+/// The distinct members who have vouched for `subject` over the whole vouch graph on
+/// the log — the unbounded convenience wrapper over [`vouchers_of_until`]. These are
+/// recused from judging that party's dispute (the obvious collusion edge — ADR-0014
+/// §2). Both dispute paths now recuse over a bounded prefix (ADR-0022 §5), so this
+/// whole-graph form has no in-crate caller today; it stays as the natural public
+/// reader of the full graph.
 pub fn vouchers_of(db: &Database, subject: &Address) -> Result<HashSet<Address>> {
     vouchers_of_until(db, subject, u64::MAX)
 }
@@ -114,11 +133,12 @@ pub fn vouchers_of(db: &Database, subject: &Address) -> Result<HashSet<Address>>
 /// [`vouchers_of`] restricted to vouches admitted at log sequence `until_seq` or
 /// earlier — the vouch graph *as of an admission position*, not the present.
 ///
-/// The equivocation jury (ADR-0025 §3) computes recusal at the round's admission
-/// log position so a voucher cannot revoke to become seatable, nor a friend vouch
-/// to get recused, after a case's seed is fixed. The transaction path takes
-/// `u64::MAX` through [`vouchers_of`] for the whole graph. Entries arrive in `seq`
-/// order, so the scan stops at the first entry past the bound.
+/// Both dispute paths recuse over the same admission prefix their pool is bounded to
+/// (ADR-0022 §5): the transaction jury passes the dispute entry's seq (via
+/// [`eligible_pool`]), and the equivocation jury the round's admission position
+/// (ADR-0025 §3), so a voucher cannot revoke to become seatable, nor a friend vouch
+/// to get recused, after a round's seed is fixed. Entries arrive in `seq` order, so
+/// the scan stops at the first entry past the bound.
 pub fn vouchers_of_until(
     db: &Database,
     subject: &Address,
@@ -141,7 +161,9 @@ pub fn vouchers_of_until(
 }
 
 /// The eligible jury pool for a dispute, each candidate paired with the
-/// raw-standing weight the draw uses, as of `at_time` (the dispute's open time).
+/// raw-standing weight the draw uses, as of `at_time` (the dispute's open time) and
+/// the log prefix `[1, max_seq]` (the dispute's admission position — pass
+/// [`DisputedInfo::opened_seq`]).
 ///
 /// Eligibility is the governance electorate — established members (effective
 /// composite ≥ the Member band), plus the genesis `founders` while the community
@@ -152,23 +174,33 @@ pub fn vouchers_of_until(
 /// eligible). The returned pool may still be smaller than the panel — the caller
 /// treats an unseatable jury as a dispute that will lapse.
 ///
+/// The electorate, the weights, **and** the recusal (voucher) graph are all bounded
+/// to the same `max_seq` prefix (ADR-0022 §5), so nothing admitted after the dispute
+/// opened — whatever timestamp it back-dates to — can enter the pool, recuse a
+/// candidate, or change a draw weight. Pool and recusal agree on one prefix.
+///
 /// `founders` is supplied by the caller (from the effective Charter); it is only
 /// consulted while the community is bootstrapping, matching
-/// [`rrn_reputation::staking::grace_electorate`].
+/// [`rrn_reputation::staking::grace_electorate_asof`].
 pub fn eligible_pool(
     db: &Database,
     founders: &[Address],
     info: &DisputedInfo,
     at_time: i64,
+    max_seq: u64,
     params: &DisputeParams,
     station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
     // The two parties are never eligible (hard recusal); their vouchers are
-    // recused too but relax first if that is the only way to seat a panel.
+    // recused too but relax first if that is the only way to seat a panel. The
+    // voucher graph is read as of the same admission prefix as the electorate, so a
+    // vouch admitted after the dispute opened neither recuses nor seats anyone.
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
-    let mut vouchers = vouchers_of(db, &info.sender)?;
-    vouchers.extend(vouchers_of(db, &info.receiver)?);
-    eligible_pool_excluding(db, founders, at_time, params, &parties, &vouchers, station)
+    let mut vouchers = vouchers_of_until(db, &info.sender, max_seq)?;
+    vouchers.extend(vouchers_of_until(db, &info.receiver, max_seq)?);
+    eligible_pool_excluding(
+        db, founders, at_time, max_seq, params, &parties, &vouchers, station,
+    )
 }
 
 /// The shared sortition pool with an explicit two-tier recusal set — the one rule
@@ -184,23 +216,37 @@ pub fn eligible_pool(
 /// a zero-standing founder seated during grace stays selectable. The returned pool
 /// may still be smaller than the panel; the caller treats an unseatable jury as a
 /// case that will lapse.
+///
+/// The electorate and the weights are computed over only the log prefix
+/// `[1, max_seq]` (ADR-0022 §5): a member established, or a weight lifted, by
+/// evidence admitted after the case's anchoring seq is excluded whatever timestamp
+/// that evidence claims. Callers pass the anchoring admission position — the dispute
+/// entry's seq for a transaction jury, the round's anchoring seq for an equivocation
+/// round — so the recusal set (also bounded at `max_seq` by the caller) and the pool
+/// agree on one prefix.
+#[allow(clippy::too_many_arguments)]
 pub fn eligible_pool_excluding(
     db: &Database,
     founders: &[Address],
     at_time: i64,
+    max_seq: u64,
     params: &DisputeParams,
     hard_excluded: &HashSet<Address>,
     soft_excluded: &HashSet<Address>,
     station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
-    let electorate = grace_electorate(db, founders, at_time, station)?;
+    let electorate = grace_electorate_asof(db, founders, at_time, max_seq, station)?;
 
     let weigh = |db: &Database, addr: &Address| -> Result<(Address, u64)> {
         // Established members hold composite ≥ the Member band, so their raw
         // standing is positive; a founder seated during grace may have none, so the
         // `max(1)` floor — defensive against a zero weight stalling the draw — is
-        // what keeps such a founder selectable.
-        Ok((*addr, tier2_stake_centi(db, addr, at_time, station)?.max(1)))
+        // what keeps such a founder selectable. Bounded to the same prefix as the
+        // electorate so a back-dated settlement cannot shift a draw weight.
+        Ok((
+            *addr,
+            tier2_stake_centi_asof(db, addr, at_time, max_seq, station)?.max(1),
+        ))
     };
 
     let mut strict = Vec::new();
