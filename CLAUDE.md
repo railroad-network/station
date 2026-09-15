@@ -133,7 +133,9 @@ anywhere in a signed payload.
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo nextest run --workspace   # preferred: overlaps binaries, per-test times, slow warnings
+cargo test --workspace          # still works; also runs doc-tests (nextest does not)
+cargo test --workspace --doc    # doc-tests only (run alongside a nextest run)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo deny check          # license/advisory/bans/sources
@@ -143,12 +145,29 @@ cargo audit                # known CVEs
 cargo test -p rrn-crypto
 cargo test --test lifecycle -p rrn-ledger
 
+# per-test timing (per-binary totals + slowest tests); libtest mode is the
+# nextest-free path for when nextest's --list stalls (see hygiene note below)
+scripts/test-timings.sh nextest
+scripts/test-timings.sh libtest -p rrn-crypto
+
 # fuzz targets (nightly toolchain, own workspace under fuzz/)
 cargo +nightly fuzz run verify_signature
 
 # end-to-end demo
 ./scripts/demo-phase-0.sh
 ```
+
+Install nextest once with `cargo install cargo-nextest --locked`.
+
+**Local build hygiene.** A `target/debug/deps` that grows to ~1M entries (tens
+of GB) makes every freshly linked test binary stall tens of seconds before
+`main()` on its first exec on macOS — a fresh binary runs in under a second
+from any other directory, so it is that directory's accumulated size, not the
+binary. When `target/` passes ~20 GB, or a test binary takes more than a few
+seconds to start, sweep it: `cargo install cargo-sweep --locked` then
+`cargo sweep --time 14` (keeps the last 14 days), or `cargo clean`.
+`scripts/target-hygiene.sh` reports the size and entry count and, with
+`--sweep`, runs the sweep.
 
 CI (`.github/workflows/ci.yml`) runs `test`, `clippy`, `fmt`, `deny`, `audit` in parallel on
 every push/PR. `cargo fmt --check` is also enforced locally via a pre-commit hook

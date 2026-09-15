@@ -22,4 +22,4 @@
 .env
 
 # Local AI-agent work tickets (not for humans; never committed)
-/.tickets/
+/.tickets/__pycache__/
