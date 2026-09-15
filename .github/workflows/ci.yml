@@ -20,7 +20,28 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      # nextest overlaps test binaries (cargo test runs them serially) and
+      # emits per-test times, a JUnit report, and slow-test warnings. Install
+      # the prebuilt binary — `cargo install` here would cost 3-5 min/job.
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features --profile ci
+      # nextest does not run doc-tests; run them explicitly to keep coverage.
+      - run: cargo test --workspace --all-features --doc
+      - name: Slowest tests
+        if: always()
+        # Guard: a build failure leaves no JUnit; don't traceback over red.
+        run: |
+          if [ -f target/nextest/ci/junit.xml ]; then
+            python3 scripts/ci/slowest-tests.py target/nextest/ci/junit.xml 20
+          else
+            echo "no JUnit report (nextest did not produce one)"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
 
   clippy:
     name: clippy
