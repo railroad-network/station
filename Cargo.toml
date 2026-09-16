@@ -29,3 +29,31 @@ authors = ["Railroad Network contributors"]
 
 [workspace.dependencies]
 # Shared dependencies are added here as tasks require them.
+
+# Build profiles.
+#
+# Dependencies are compiled optimized even in dev/test: the signature, hash,
+# KDF, canonical-CBOR and SQLite work every test does lives in dependencies,
+# and at opt-level 0 it is 10–50× slower than it needs to be (the test-suite
+# audit of 2026-09-14 measured a 24 s proptest and 7 s argon2 unit tests).
+# Workspace crates stay unoptimized so our own code keeps full debug
+# assertions, overflow checks, and coverage fidelity. Debuginfo is trimmed to
+# line tables (panics and backtraces still show file:line); set
+# CARGO_PROFILE_DEV_DEBUG=2 for a full-debuginfo build when using a debugger.
+# `split-debuginfo` is left at its default (already "unpacked" for dev on
+# Apple targets, a no-op elsewhere).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = "line-tables-only"
+
+# `test` inherits from `dev`; restated so a future `[profile.test]` edit does
+# not silently drop the overrides.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = "line-tables-only"
