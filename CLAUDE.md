@@ -159,6 +159,19 @@ cargo +nightly fuzz run verify_signature
 
 Install nextest once with `cargo install cargo-nextest --locked`.
 
+**Build profiles.** The root `Cargo.toml` compiles *dependencies* at
+`opt-level = 2` in the `dev` and `test` profiles (`[profile.dev.package."*"]`
+and `[profile.test.package."*"]`) — the ed25519/blake3/argon2/dCBOR/SQLite work
+every test does lives in dependencies and is 10–50× slower unoptimized.
+Workspace crates stay at `opt-level = 0`, so our own code stays unoptimized for
+debugging and coverage fidelity. Debug assertions and overflow checks remain on
+everywhere (they are separate profile keys, unaffected by `opt-level`).
+Debuginfo is trimmed to
+`line-tables-only`: panics and `RUST_BACKTRACE` still show `file:line`, but
+debuggers lose variable/type info — get it back with
+`CARGO_PROFILE_DEV_DEBUG=2 cargo build`. Changing these settings forces a
+one-time cold rebuild of all dependencies.
+
 **Local build hygiene.** A `target/debug/deps` that grows to ~1M entries (tens
 of GB) makes every freshly linked test binary stall tens of seconds before
 `main()` on its first exec on macOS — a fresh binary runs in under a second
