@@ -23,3 +23,7 @@ dcbor = "0.25"
 # Typed scoring/portability errors, and diagnostics for the refresh task.
 thiserror = "1"
 tracing = "0.1"
+
+[dev-dependencies]
+# Drives the scoring-context equivalence property test (old scorer as oracle).
+proptest = "1"

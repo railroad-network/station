@@ -24,11 +24,15 @@
 //! home station, and [`sybil`] holds the velocity and identity-anchoring
 //! defenses. The M1.5 modules began as placeholders (T1.5.2), each filled in by
 //! its own later M1.5 task. [`staking`] is the M1.8 addition: the Tier-2 oracle's
-//! reputation stake and its bootstrap grace.
+//! reputation stake and its bootstrap grace. [`context`] holds the shared engine
+//! all of these delegate to: one replay of the log prefix, indexed and memoized,
+//! answering a whole scoring query at `O(N + A)` instead of re-replaying per
+//! address.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod context;
 pub mod decay;
 pub mod model;
 pub mod portability;

@@ -1982,6 +1982,14 @@ prevents).
 evidence; the honesty of the evidence set; resistance to manufactured or
 inherited standing.
 
+> As of the Phase-2 test-suite work, every scoring query is answered from a
+> `ScoringContext` (`rrn-reputation::context`): a single in-memory, per-query view
+> of the log prefix `[1, max_seq]`, indexed by address and memoized, built once
+> and dropped when the query returns. It persists nothing and adds no table, so
+> the "reputation is never stored authoritatively" mitigation is unchanged — a
+> context is exactly as re-derivable as the profile it produces, and the
+> `reputation_snapshots` table remains a droppable cache (ADR-0009).
+
 > As of M1.6 a score has a second consumer: search ranking multiplies text
 > relevance by the provider's current composite, read from the snapshot cache
 > ([`rrn-marketplace`](#rrn-marketplace)). That makes standing worth
