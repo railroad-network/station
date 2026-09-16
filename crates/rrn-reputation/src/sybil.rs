@@ -24,14 +24,11 @@
 //! ([`crate::snapshot`]) and scoring proceeds unchanged.
 
 use rrn_crypto::keypair::PublicKey;
-use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
-use rrn_identity::vouch::Vouch;
 use rrn_storage::db::Database;
-use rrn_storage::log::AppendLog;
 
+use crate::context::ScoringContext;
 use crate::model::{DomainTag, ReputationProfile};
-use crate::scoring::ReputationScorer;
 use crate::Result;
 
 /// Most a single dimension may gain in one week before the gain is flagged
@@ -182,7 +179,7 @@ pub fn is_anchored_bounded(
     max_seq: u64,
     station: &PublicKey,
 ) -> Result<bool> {
-    Ok(anchoring_voucher_bounded(db, address, at_time, max_seq, station)?.is_some())
+    Ok(ScoringContext::new(db, station, max_seq)?.is_anchored(address, at_time))
 }
 
 /// The member whose vouch anchors `address`, if any: the first, in log order, to
@@ -195,7 +192,7 @@ pub fn is_anchored_bounded(
 ///
 /// # Why the voucher is judged uncapped
 ///
-/// The voucher's composite is read from the scorer's internal `score_raw_at` —
+/// The voucher's composite is read raw (the context's `score_raw`) —
 /// their score *before* anchoring is applied. This is not a shortcut; it is what
 /// makes the rule computable. Judging a voucher by their anchored profile would
 /// make two members who vouch for each other mutually undecidable, and no member
@@ -226,35 +223,7 @@ pub fn anchoring_voucher_bounded(
     max_seq: u64,
     station: &PublicKey,
 ) -> Result<Option<Address>> {
-    let log = AppendLog::new(db);
-    let scorer = ReputationScorer::new(db, station);
-
-    for entry in log.iter_from(1) {
-        let entry = entry?;
-        if entry.seq > max_seq {
-            break;
-        }
-        let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) else {
-            continue;
-        };
-        if vouch.subject != *address || vouch.issued_at > at_time {
-            continue;
-        }
-        let voucher = Address::from_public_key(entry.payload.signer);
-        // A vouch for oneself anchors nothing; self-anchoring is the whole thing
-        // the rule exists to prevent.
-        if voucher == *address {
-            continue;
-        }
-        if scorer
-            .score_raw_at_bounded(&voucher, at_time, max_seq)?
-            .composite()
-            >= ANCHOR_VOUCHER_MIN_COMPOSITE
-        {
-            return Ok(Some(voucher));
-        }
-    }
-    Ok(None)
+    Ok(ScoringContext::new(db, station, max_seq)?.anchoring_voucher(address, at_time))
 }
 
 /// `profile` with every dimension held to [`ANCHOR_DIMENSION_CAP`] when
@@ -295,7 +264,10 @@ mod tests {
     use rrn_identity::vouch::{VouchBody, VouchKind};
     use rrn_ledger::settlement::SettlementRecord;
     use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_storage::log::AppendLog;
     use rrn_storage::migrations;
+
+    use crate::scoring::ReputationScorer;
 
     const WEEK: i64 = 7 * 86_400;
     const MONTH: i64 = 30 * 86_400;

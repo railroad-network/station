@@ -8,7 +8,8 @@
 //! # What a confirmer stakes
 //!
 //! The stake is the confirmer's **raw (uncapped) composite** as of the moment of
-//! confirmation — [`ReputationScorer::score_raw_at`], the same uncapped score
+//! confirmation — [`ScoringContext::score_raw`](crate::context::ScoringContext::score_raw),
+//! the same uncapped score
 //! [`crate::sybil::anchoring_voucher`] judges a voucher on. High-standing
 //! attestors therefore carry more weight (§4.2.2), and the value is fully
 //! replayable from the log at any later time (the score is a pure function of
@@ -39,9 +40,8 @@ use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
 use rrn_storage::db::Database;
 
+use crate::context::ScoringContext;
 use crate::model::{BAND_MEMBER_MIN, DIMENSION_MAX};
-use crate::scoring::ReputationScorer;
-use crate::snapshot::known_addresses;
 use crate::Result;
 
 /// Members at the Member band the community needs before the Tier-2 bootstrap
@@ -70,10 +70,7 @@ pub fn tier2_stake_centi(
     at_time: i64,
     station: &PublicKey,
 ) -> Result<u64> {
-    let raw = ReputationScorer::new(db, station)
-        .score_raw_at(address, at_time)?
-        .composite();
-    Ok(composite_to_centi(raw))
+    tier2_stake_centi_asof(db, address, at_time, u64::MAX, station)
 }
 
 /// Position-bounded [`tier2_stake_centi`] (ADR-0022 §5): the reputation `address`
@@ -90,8 +87,8 @@ pub fn tier2_stake_centi_asof(
     max_seq: u64,
     station: &PublicKey,
 ) -> Result<u64> {
-    let raw = ReputationScorer::new(db, station)
-        .score_raw_at_bounded(address, at_time, max_seq)?
+    let raw = ScoringContext::new(db, station, max_seq)?
+        .score_raw(address, at_time)
         .composite();
     Ok(composite_to_centi(raw))
 }
@@ -112,14 +109,7 @@ pub fn established_members(
     at_time: i64,
     station: &PublicKey,
 ) -> Result<Vec<Address>> {
-    let scorer = ReputationScorer::new(db, station);
-    let mut members = Vec::new();
-    for address in known_addresses(db, station)? {
-        if scorer.score(&address, at_time)?.composite() >= BAND_MEMBER_MIN {
-            members.push(address);
-        }
-    }
-    Ok(members)
+    established_members_asof(db, at_time, u64::MAX, station)
 }
 
 /// How many known members hold an **effective** (anchored) composite at or above
@@ -163,17 +153,7 @@ pub fn grace_electorate(
     at_time: i64,
     station: &PublicKey,
 ) -> Result<Vec<Address>> {
-    // `established_members().len()` is the grace predicate, so reuse the set we
-    // just computed rather than scoring the community a second time.
-    let mut electorate = established_members(db, at_time, station)?;
-    if electorate.len() < BOOTSTRAP_GRACE_THRESHOLD {
-        for founder in founders {
-            if !electorate.contains(founder) {
-                electorate.push(*founder);
-            }
-        }
-    }
-    Ok(electorate)
+    grace_electorate_asof(db, founders, at_time, u64::MAX, station)
 }
 
 /// Like [`established_members`], but each identity is scored from only the log
@@ -188,18 +168,7 @@ pub fn established_members_asof(
     max_seq: u64,
     station: &PublicKey,
 ) -> Result<Vec<Address>> {
-    let scorer = ReputationScorer::new(db, station);
-    let mut members = Vec::new();
-    for address in known_addresses(db, station)? {
-        if scorer
-            .score_at_position(&address, at_time, max_seq)?
-            .composite()
-            >= BAND_MEMBER_MIN
-        {
-            members.push(address);
-        }
-    }
-    Ok(members)
+    Ok(ScoringContext::new(db, station, max_seq)?.established_members(at_time))
 }
 
 /// Position-bounded [`established_member_count`] (T2.1.3): the count as of the log
@@ -235,15 +204,7 @@ pub fn grace_electorate_asof(
     max_seq: u64,
     station: &PublicKey,
 ) -> Result<Vec<Address>> {
-    let mut electorate = established_members_asof(db, at_time, max_seq, station)?;
-    if electorate.len() < BOOTSTRAP_GRACE_THRESHOLD {
-        for founder in founders {
-            if !electorate.contains(founder) {
-                electorate.push(*founder);
-            }
-        }
-    }
-    Ok(electorate)
+    Ok(ScoringContext::new(db, station, max_seq)?.grace_electorate(founders, at_time))
 }
 
 /// The outcome of checking whether `confirmer` may confirm a Tier-2 transaction.
@@ -308,12 +269,15 @@ pub fn evaluate_tier2_confirmation(
     at_time: i64,
     station: &PublicKey,
 ) -> Result<Tier2Eligibility> {
-    let scorer = ReputationScorer::new(db, station);
-    let effective = scorer.score(confirmer, at_time)?.composite();
-    let stake_centi = composite_to_centi(scorer.score_raw_at(confirmer, at_time)?.composite());
+    // One context serves the confirmer's effective and raw scores and, if needed,
+    // the community-wide established count — all at the same position, so the
+    // memoized scores are shared rather than recomputed per query.
+    let ctx = ScoringContext::new(db, station, u64::MAX)?;
+    let effective = ctx.score(confirmer, at_time).composite();
+    let stake_centi = composite_to_centi(ctx.score_raw(confirmer, at_time).composite());
 
-    // Short-circuit the established path so we do not score the whole community
-    // on every ordinary Tier-2 confirmation.
+    // Short-circuit the established path so we do not enumerate the whole
+    // community on every ordinary Tier-2 confirmation.
     if effective >= BAND_MEMBER_MIN {
         return Ok(Tier2Eligibility::Allowed {
             stake_centi,
@@ -321,7 +285,7 @@ pub fn evaluate_tier2_confirmation(
         });
     }
     // Below the floor: the count decides grace vs. refusal.
-    let established = established_member_count(db, at_time, station)?;
+    let established = ctx.established_member_count(at_time);
     Ok(decide(effective, stake_centi, established))
 }
 

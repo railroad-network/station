@@ -28,62 +28,40 @@
 //!
 //! A dimension's raw value is `EVENT_INCREMENT` (0.5) per qualifying event,
 //! capped at
-//! [`DIMENSION_MAX`]; [`crate::decay`] then subtracts its monthly rate per 30-day
-//! month since that dimension's most recent event. These constants are
-//! protocol-locked alongside the ADR-0009 weights: they must be identical on
-//! every station, or a reputation exported from one would not reconcile on
-//! another.
-
-use std::collections::HashSet;
+//! [`DIMENSION_MAX`](crate::model::DIMENSION_MAX); [`crate::decay`] then subtracts
+//! its monthly rate per 30-day month since that dimension's most recent event.
+//! These constants are protocol-locked alongside the ADR-0009 weights: they must
+//! be identical on every station, or a reputation exported from one would not
+//! reconcile on another.
+//!
+//! # A thin facade over [`crate::context`]
+//!
+//! [`ReputationScorer`] now builds a [`ScoringContext`](crate::context::ScoringContext)
+//! per call and delegates: the actual replay-and-fold lives there, once, indexed
+//! by address so a whole scoring query costs `O(N + A)` rather than one full
+//! replay per address (see the context module for the algorithm and its
+//! equivalence proof). A caller making several queries at the same
+//! `(at_time, max_seq)` should build one `ScoringContext` and reuse it instead of
+//! calling these wrappers repeatedly.
 
 use rrn_crypto::keypair::PublicKey;
-use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
-use rrn_identity::vouch::Vouch;
-use rrn_ledger::escrow::{
-    EquivocationBasis, EquivocationId, EquivocationRecord, EquivocationVerdictRecord,
-    VerdictDecision,
-};
-use rrn_ledger::state::{CancelReason, LedgerSnapshot, TransactionState};
-use rrn_ledger::transaction::TransactionConfirmation;
 use rrn_storage::db::Database;
-use rrn_storage::log::AppendLog;
 
-use crate::decay::decayed;
-use crate::model::{ReputationProfile, DIMENSION_MAX};
-use crate::sybil::{anchored_profile, is_anchored_bounded};
+use crate::context::ScoringContext;
+use crate::model::ReputationProfile;
 use crate::Result;
 
-/// Points one qualifying event contributes to its dimension, before capping and
-/// decay. Protocol-locked (ADR-0009): 10 lifetime events reach [`DIMENSION_MAX`].
-const EVENT_INCREMENT: f32 = 0.5;
-
-/// Penalty weight a proven equivocation levies on **each** of the two dimensions
-/// it dents (ADR-0021 §5, ADR-0009). **Maintainer-ratified 2026-09-04** (ADR-0025).
-///
-/// ADR-0009's scoring is additive/linear and floors each dimension at zero, so it
-/// has no signed negative-weight table to scale. Rather than a fixed small
-/// subtraction — which is regressive (invisible on a newcomer, trivial on a
-/// veteran) and, at any value that keeps a maxed member's composite ≥ the Member
-/// band, leaves the equivocator established with their vote and jury seat intact —
-/// the penalty is [`DIMENSION_MAX`], which **zeroes** whichever dimension it is
-/// applied to. That is the heaviest expressible consequence within the locked,
-/// floored formula, and the only one with a governance effect (de-establishment).
-/// It is fully reversible: the penalty is derived on replay and lifted the instant
-/// a jury `Overturn` verdict lands (ADR-0021 §5). While it stands the dimension is
-/// pinned at zero (a deliberate, proportional cost for a proven, deliberate act);
-/// the newcomer-with-no-history case is covered out-of-formula by an
-/// equivocation → cert-issuance disqualification gate (ADR-0025 / T2.3.4).
-///
-/// Equivocation is dented on **both** live dimensions — a signed statement proven
-/// false (attestation accuracy, ADR-0009's "proven wrong" slot) *and* the paradigm
-/// disputed-against trade (trade reliability, its reserved negative slot, and the
-/// highest-weighted dimension a counterparty reads before accepting an offline
-/// spend). It is two proven-wrong facts (a false headroom claim and a failed
-/// settlement), not one event double-counted.
-pub const EQUIVOCATION_WEIGHT: f32 = DIMENSION_MAX;
+// Re-exported so `rrn_reputation::scoring::EQUIVOCATION_WEIGHT` keeps resolving;
+// the constant and its rationale now live with the tally in [`crate::context`].
+pub use crate::context::EQUIVOCATION_WEIGHT;
 
 /// Computes reputation profiles by replaying the log behind a borrowed database.
+///
+/// A thin handle over a database and the community station key; each scoring
+/// method builds a [`ScoringContext`] for the requested position and answers from
+/// it. It carries no state of its own beyond those two, so constructing one is
+/// free — the replay happens in the context.
 pub struct ReputationScorer<'db> {
     db: &'db Database,
     /// The community station key (ADR-0020). Ledger derivation and the
@@ -106,10 +84,9 @@ impl<'db> ReputationScorer<'db> {
 
     /// The address's reputation as of `now`.
     ///
-    /// Equivalent to [`score_at`](Self::score_at) at `now`. The whole log is
-    /// replayed each call, once for the address and once more per member who has
-    /// vouched for it (to judge the anchor), so the cost is `O(V·N)` — fine at
-    /// Phase 1 scale, and [`crate::snapshot`] caches the result for hot paths.
+    /// Equivalent to [`score_at`](Self::score_at) at `now`. Builds one
+    /// [`ScoringContext`] over the whole log; [`crate::snapshot`] caches the
+    /// result for hot paths.
     pub fn score(&self, address: &Address, now: i64) -> Result<ReputationProfile> {
         self.score_at(address, now)
     }
@@ -145,17 +122,15 @@ impl<'db> ReputationScorer<'db> {
         at_time: i64,
         max_seq: u64,
     ) -> Result<ReputationProfile> {
-        let raw = self.score_raw_at_bounded(address, at_time, max_seq)?;
-        let anchored = is_anchored_bounded(self.db, address, at_time, max_seq, &self.station)?;
-        Ok(anchored_profile(&raw, anchored))
+        Ok(ScoringContext::new(self.db, &self.station, max_seq)?.score(address, at_time))
     }
 
-    /// The address's reputation from evidence alone, before identity anchoring.
-    ///
-    /// This is what [`crate::sybil::anchoring_voucher`] judges a prospective
-    /// voucher on, and the two functions must not be swapped: scoring a voucher
-    /// through [`score_at`](Self::score_at) would call back into anchoring and
-    /// recurse without terminating on a pair of members who vouch for each other.
+    /// The address's reputation from evidence alone, before identity anchoring —
+    /// the uncapped score [`crate::sybil::anchoring_voucher`] judges a prospective
+    /// voucher on (production reads it through [`ScoringContext::score_raw`], which
+    /// is where the anchoring rule now lives; this thin wrapper is retained for the
+    /// crate's own tests).
+    #[cfg(test)]
     pub(crate) fn score_raw_at(
         &self,
         address: &Address,
@@ -166,258 +141,16 @@ impl<'db> ReputationScorer<'db> {
 
     /// Like [`score_raw_at`](Self::score_raw_at), but only evidence admitted within
     /// the log prefix `[1, max_seq]` counts — the position-bounded form (T2.1.3).
-    ///
-    /// Both time bounds still apply (evidence must be `<= at_time` *and* admitted
-    /// `<= max_seq`), but the position bound is what closes the back-dating vector:
-    /// a vouch or settlement admitted after a governance window's close has
-    /// `seq > max_seq` and is excluded regardless of how old its self-asserted
-    /// `issued_at`/`settled_at` claims to be (ADR-0022 §3 makes arbitrarily-old
-    /// testimony legal). `max_seq == u64::MAX` recovers the unbounded scorer
-    /// exactly.
+    /// Retained for the crate's tests; production builds a [`ScoringContext`]
+    /// directly.
+    #[cfg(test)]
     pub(crate) fn score_raw_at_bounded(
         &self,
         address: &Address,
         at_time: i64,
         max_seq: u64,
     ) -> Result<ReputationProfile> {
-        let log = AppendLog::new(self.db);
-
-        let mut trade = DimensionTally::default();
-        let mut attestation = DimensionTally::default();
-
-        // Trade reliability and confirmations-as-attestations come from the
-        // replayed ledger state, which has already folded proposals, confirmations
-        // and settlements into per-transaction lifecycle states — bounded to the
-        // same log prefix so a late-admitted settlement cannot leak in.
-        let ledger = LedgerSnapshot::derive_to(&log, max_seq, &self.station)?;
-        for (_, state) in ledger.iter() {
-            if let TransactionState::Settled {
-                proposal,
-                settled_at,
-                ..
-            } = state
-            {
-                let p = &proposal.payload;
-                if (p.sender == *address || p.receiver == *address) && *settled_at <= at_time {
-                    trade.record(*settled_at);
-                }
-            }
-            // A confirmation is an attestation by the confirmer whether or not the
-            // transaction has settled yet, so it is read from the state directly.
-            if let Some(confirmation) = confirmation_of(state) {
-                if confirmation.confirmer == *address && confirmation.confirmed_at <= at_time {
-                    attestation.record(confirmation.confirmed_at);
-                }
-            }
-            // A dispute upheld against a confirmation is the "proven wrong" event
-            // ADR-0009's attestation-accuracy dimension was documented to hold and
-            // ADR-0014 §6 delivers: the transaction is now
-            // `Cancelled { DisputeUpheld }`, which already strips the confirmer's
-            // positive credit (a cancelled state carries no confirmation), and this
-            // penalty drags the dimension *below* neutral so the Tier-2 stake
-            // actually costs them. The confirmer is always the proposal's receiver
-            // (a confirmation can only come from the receiver), so it is derivable
-            // even though the cancelled state no longer carries the confirmation.
-            // Gated on `cancelled_at` so a profile scored before the ruling is not
-            // dented — the attestation was not yet proven wrong then.
-            if let TransactionState::Cancelled {
-                proposal,
-                reason: CancelReason::DisputeUpheld,
-                cancelled_at,
-            } = state
-            {
-                if proposal.payload.receiver == *address && *cancelled_at <= at_time {
-                    attestation.penalize();
-                }
-            }
-        }
-
-        // Vouches are written by `rrn-identity` and ignored by the ledger replay,
-        // so they need a direct scan. A payload that is not a vouch is skipped.
-        for entry in log.iter_from(1) {
-            let entry = entry?;
-            if entry.seq > max_seq {
-                break;
-            }
-            let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) else {
-                continue;
-            };
-            let voucher = Address::from_public_key(entry.payload.signer);
-            if voucher == *address && vouch.issued_at <= at_time {
-                attestation.record(vouch.issued_at);
-            }
-        }
-
-        // A proven equivocation zeroes both live dimensions — trade reliability and
-        // attestation accuracy (ADR-0021 §5 / ADR-0025). Like vouches, equivocation
-        // records are standalone station-signed log entries the ledger replay
-        // ignores, so they need a direct scan. Two guards
-        // make this a pure function of the log that convicts no one wrongly:
-        //   1. A jury `Overturn` verdict (ADR-0021 §5) neutralizes the record — its
-        //      penalty lifts. Gated on the verdict's `decided_at <= at_time` so a
-        //      profile scored before the ruling still carries the penalty and one
-        //      scored after does not (mirroring the upheld-dispute `cancelled_at`
-        //      gate). The jury *path* is a follow-up ticket; the verdict record kind
-        //      is defined now so this neutralization is exact and testable.
-        //   2. [`EquivocationRecord::verify_evidence`] re-derives the conflict from
-        //      the embedded member-signed artifacts, so a hostile log copy's bogus
-        //      record — tampered evidence, amounts within cap, a mislabeled member —
-        //      produces no penalty. The cap for a cert-overspend basis is read from
-        //      the certificate on the same log.
-        // An `Overturn` counts only when signed by the community station key
-        // (step 8 below). The equivocation record itself is station-authored
-        // (ADR-0021 §5), so both the penalty loop below and the overturn gate pin
-        // the envelope signer to that key: a record signed by any other key — even
-        // one a member self-signs over genuine evidence of their own overspend to
-        // levy a penalty they could never overturn (no case forms for a record the
-        // snapshot skipped) — counts for nothing.
-        let overturned = overturned_equivocations(&log, &self.station, at_time, max_seq)?;
-        for entry in log.iter_from(1) {
-            let entry = entry?;
-            if entry.seq > max_seq {
-                break;
-            }
-            // Pin the equivocation record to the community station key, exactly as
-            // `LedgerSnapshot::derive` does, so a forged record levies no penalty.
-            if entry.payload.signer != self.station {
-                continue;
-            }
-            let Ok(record) = from_canonical_bytes::<EquivocationRecord>(&entry.payload.bytes)
-            else {
-                continue;
-            };
-            if record.member != *address || record.recorded_at > at_time {
-                continue;
-            }
-            if overturned.contains(&record.equivocation_id) {
-                continue;
-            }
-            let cap = match record.basis {
-                EquivocationBasis::CertOverspend => record
-                    .cert_id
-                    .and_then(|c| ledger.certificate(&c))
-                    .map(|c| c.certificate.payload.cap_centi),
-                EquivocationBasis::OutboxFork => None,
-            };
-            if record.verify_evidence(cap) {
-                // Zero both live dimensions (ADR-0025): a false headroom claim
-                // (trade reliability, the dimension a counterparty reads) and a
-                // signed statement proven false (attestation accuracy).
-                trade.penalize_by(EQUIVOCATION_WEIGHT);
-                attestation.penalize_by(EQUIVOCATION_WEIGHT);
-            }
-        }
-
-        let mut profile = ReputationProfile::empty(*address);
-        profile.trade_reliability = trade.score(at_time);
-        profile.attestation_accuracy = attestation.score(at_time);
-        // governance_participation, community_contribution and domain_competence
-        // stay at their `empty()` zeros — no Phase 1 inputs (ADR-0009).
-        profile.last_updated = at_time;
-        Ok(profile)
-    }
-}
-
-/// The confirmation embedded in a transaction state, if it carries one.
-fn confirmation_of(state: &TransactionState) -> Option<&TransactionConfirmation> {
-    match state {
-        TransactionState::Confirmed { confirmation, .. }
-        | TransactionState::Settled { confirmation, .. } => Some(&confirmation.payload),
-        _ => None,
-    }
-}
-
-/// The set of equivocation records overturned by a jury as of `at_time` — those
-/// with an [`Overturn`](VerdictDecision::Overturn) verdict whose `decided_at` is
-/// at or before `at_time`. An overturned record levies no reputation penalty
-/// (ADR-0021 §5). A non-verdict payload is skipped.
-fn overturned_equivocations(
-    log: &AppendLog,
-    station: &PublicKey,
-    at_time: i64,
-    max_seq: u64,
-) -> Result<HashSet<EquivocationId>> {
-    let mut out = HashSet::new();
-    for entry in log.iter_from(1) {
-        let entry = entry?;
-        if entry.seq > max_seq {
-            break;
-        }
-        let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(&entry.payload.bytes)
-        else {
-            continue;
-        };
-        // Gate on the community station key (step 8, ADR-0025): an `Overturn`
-        // neutralizes a record only when signed by the community station. The
-        // terminal `EquivocationVerdictRecord` is station-authored, so an authentic
-        // ruling carries that key; a juror ballot (a distinct record kind) never
-        // decodes here, and a member-relayed `Overturn` — including one a member
-        // signs to lift their own penalty — does not match and is ignored. Pinning
-        // to the community key rather than the equivocation record's own signer
-        // closes the last self-sign vector (the record itself is already pinned to
-        // the station in ledger derivation, so the two agree for genuine records).
-        if entry.payload.signer != *station {
-            continue;
-        }
-        if verdict.decision == VerdictDecision::Overturn && verdict.decided_at <= at_time {
-            out.insert(verdict.equivocation_id);
-        }
-    }
-    Ok(out)
-}
-
-/// Running tally for one dimension: how many qualifying positive events, the
-/// total penalty weight counted against it, and when the most recent positive
-/// event happened (for decay).
-#[derive(Default)]
-struct DimensionTally {
-    count: u32,
-    /// Total penalty weight subtracted from the dimension. An upheld dispute adds
-    /// [`EVENT_INCREMENT`]; a proven equivocation adds the heavier
-    /// [`EQUIVOCATION_WEIGHT`]. Held as a weight (not a count) so inputs of
-    /// different severities compose.
-    penalty: f32,
-    last_activity: Option<i64>,
-}
-
-impl DimensionTally {
-    /// Folds in one positive event that occurred at `event_time`.
-    fn record(&mut self, event_time: i64) {
-        self.count += 1;
-        self.last_activity = Some(match self.last_activity {
-            Some(prev) => prev.max(event_time),
-            None => event_time,
-        });
-    }
-
-    /// Counts one upheld-dispute penalty against the dimension — a positive
-    /// contribution later proven wrong (ADR-0014 §6). Subtracts a full
-    /// [`EVENT_INCREMENT`].
-    fn penalize(&mut self) {
-        self.penalize_by(EVENT_INCREMENT);
-    }
-
-    /// Subtracts `weight` from the dimension. Deliberately does *not* touch
-    /// `last_activity`: a penalty must not reset the decay clock and thereby
-    /// preserve more of the positive score it is meant to erode. A dimension with
-    /// no positive events stays at zero regardless — a dimension floors at zero,
-    /// so there is nothing below neutral to reach.
-    fn penalize_by(&mut self, weight: f32) {
-        self.penalty += weight;
-    }
-
-    /// The dimension's score as of `at_time`: capped linear accrual less its
-    /// penalties, then decayed from the most recent positive event, floored at
-    /// zero. Zero when there is no positive evidence.
-    fn score(&self, at_time: i64) -> f32 {
-        let Some(last) = self.last_activity else {
-            return 0.0;
-        };
-        let earned = (EVENT_INCREMENT * self.count as f32).min(DIMENSION_MAX);
-        let net = earned - self.penalty;
-        // `decayed` floors at zero, so a net driven negative by penalties reads as
-        // a bottomed-out dimension rather than an impossible negative one.
-        decayed(net, last, at_time)
+        Ok(ScoringContext::new(self.db, &self.station, max_seq)?.score_raw(address, at_time))
     }
 }
 
@@ -429,12 +162,17 @@ mod tests {
     use rrn_identity::attestation::Attestation;
     use rrn_identity::vouch::{VouchBody, VouchKind};
     use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
+    use rrn_ledger::escrow::{
+        EquivocationBasis, EquivocationId, EquivocationRecord, EquivocationVerdictRecord,
+        VerdictDecision,
+    };
     use rrn_ledger::settlement::SettlementRecord;
     use rrn_ledger::state::{CancelReason, CancellationRecord};
-    use rrn_ledger::transaction::TransactionProposal;
+    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_storage::log::AppendLog;
     use rrn_storage::migrations;
 
-    use crate::model::ReputationBand;
+    use crate::model::{ReputationBand, DIMENSION_MAX};
     use crate::sybil::ANCHOR_DIMENSION_CAP;
 
     const MONTH: i64 = 30 * 86_400;

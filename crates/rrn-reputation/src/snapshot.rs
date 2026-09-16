@@ -14,20 +14,16 @@
 //! same profile from the same log, the only thing a merge has to decide is which
 //! computation is fresher.
 
-use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_identity::address::Address;
-use rrn_identity::vouch::Vouch;
-use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_storage::db::Database;
-use rrn_storage::log::AppendLog;
 use rrn_storage::reputation_snapshot as store;
 
+use crate::context::ScoringContext;
 use crate::model::ReputationProfile;
-use crate::scoring::ReputationScorer;
 use crate::sybil::check_velocity;
 use crate::Result;
 
@@ -68,10 +64,25 @@ pub fn refresh_snapshot(
     now: i64,
     station: &PublicKey,
 ) -> Result<ReputationProfile> {
-    let profile = ReputationScorer::new(db, station).score(address, now)?;
+    let profile = ScoringContext::unbounded(db, station)?.score(address, now);
+    persist_scored(db, address, now, &profile)?;
+    Ok(profile)
+}
 
+/// Runs the velocity check against the previous snapshot and writes the fresh
+/// profile to the cache, last-write-wins on `now`. The shared tail of
+/// [`refresh_snapshot`] and [`refresh_all_snapshots`], so a single sweep and a
+/// single refresh persist a score identically. A velocity violation is logged for
+/// operator review and nothing else — the snapshot is still written and the score
+/// still stands (see [`crate::sybil::check_velocity`]).
+fn persist_scored(
+    db: &Database,
+    address: &Address,
+    now: i64,
+    profile: &ReputationProfile,
+) -> Result<()> {
     if let Some(previous) = stored_profile(db, address)? {
-        if let Err(violation) = check_velocity(&previous, &profile) {
+        if let Err(violation) = check_velocity(&previous, profile) {
             // The operator UI that surfaces this is a later milestone; the log
             // line is the Phase 1 alert.
             tracing::warn!(
@@ -84,7 +95,7 @@ pub fn refresh_snapshot(
 
     let bytes = to_canonical_bytes(profile.clone());
     store::put(db, &address.public_key().to_bytes(), now, &bytes)?;
-    Ok(profile)
+    Ok(())
 }
 
 /// The stored profile for `address` whatever its age, or `None` if there is no
@@ -103,60 +114,17 @@ fn stored_profile(db: &Database, address: &Address) -> Result<Option<ReputationP
 /// Returns how many identities were refreshed. This is the body of the station's
 /// hourly background refresh.
 pub fn refresh_all_snapshots(db: &Database, now: i64, station: &PublicKey) -> Result<usize> {
-    let addresses = known_addresses(db, station)?;
+    // One context serves the whole sweep: every known address is scored from the
+    // same single replay, and a member who vouches for several others is scored
+    // once (the raw memo shares it), rather than re-replaying the log per address.
+    let ctx = ScoringContext::unbounded(db, station)?;
+    let addresses = ctx.known_addresses().to_vec();
     let count = addresses.len();
-    for address in addresses {
-        refresh_snapshot(db, &address, now, station)?;
+    for address in &addresses {
+        let profile = ctx.score(address, now);
+        persist_scored(db, address, now, &profile)?;
     }
     Ok(count)
-}
-
-/// Every distinct identity that appears anywhere in the log — as a transacting
-/// party or on either side of a vouch. These are exactly the identities that can
-/// have a non-empty profile, and the set is derived from the canonical log so it
-/// is identical on every replica.
-pub(crate) fn known_addresses(db: &Database, station: &PublicKey) -> Result<Vec<Address>> {
-    let log = AppendLog::new(db);
-    let mut addresses: HashSet<Address> = HashSet::new();
-
-    let ledger = LedgerSnapshot::derive(&log, station)?;
-    for (_, state) in ledger.iter() {
-        if let Some(proposal) = proposal_of(state) {
-            addresses.insert(proposal.sender);
-            addresses.insert(proposal.receiver);
-        }
-    }
-
-    for entry in log.iter_from(1) {
-        let entry = entry?;
-        if let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) {
-            addresses.insert(Address::from_public_key(entry.payload.signer));
-            addresses.insert(vouch.subject);
-        }
-    }
-
-    Ok(addresses.into_iter().collect())
-}
-
-/// The (sender, receiver) of a transaction state. Every lifecycle state carries
-/// the proposal, so this is always `Some`.
-fn proposal_of(state: &TransactionState) -> Option<Parties> {
-    match state {
-        TransactionState::Proposed { proposal }
-        | TransactionState::Confirmed { proposal, .. }
-        | TransactionState::Settled { proposal, .. }
-        | TransactionState::Cancelled { proposal, .. }
-        | TransactionState::Disputed { proposal, .. } => Some(Parties {
-            sender: proposal.payload.sender,
-            receiver: proposal.payload.receiver,
-        }),
-    }
-}
-
-/// The two parties to a transaction.
-struct Parties {
-    sender: Address,
-    receiver: Address,
 }
 
 /// Current wall-clock Unix seconds — used only for cache-freshness decisions.
@@ -174,6 +142,7 @@ mod tests {
     use rrn_crypto::signed::SignedPayload;
     use rrn_ledger::settlement::SettlementRecord;
     use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_storage::log::AppendLog;
     use rrn_storage::migrations;
 
     const MONTH: i64 = 30 * 86_400;
