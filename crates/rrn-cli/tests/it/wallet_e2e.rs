@@ -232,12 +232,75 @@ async fn wrong_station_at_pair_refused() {
         stderr.contains("not the pinned") || stderr.contains("identifies as"),
         "expected a station-mismatch refusal, got: {stderr}"
     );
+    // The failed pair must not have stored station B's URL.
+    let after_fail = wjson(&home, &["status"]).await;
+    assert_ne!(
+        after_fail["url"].as_str().unwrap(),
+        b.url,
+        "a refused pair must not persist the wrong URL"
+    );
+
     // Pairing to the right station still works afterward.
     pair_and_confirm(&a, &home, &member).await;
     let status = wjson(&home, &["status"]).await;
     assert_eq!(status["url"].as_str().unwrap(), a.url);
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_against_station_with_no_record_stays_unknown() {
+    // The no-self-fork guard (ADR-0028 §7): a restored wallet whose key the
+    // station has no record of — e.g. synced against a read replica (which never
+    // sees carried bundles) or the wrong station — must NOT conclude "fresh" and
+    // sign position 0. It stays `unknown` and keeps refusing to sign.
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // A known key with NO history at this station, written into a backup file.
+    let m = Keypair::generate();
+    let m_addr = Address::from_public_key(m.public_key());
+    let mut metadata = BTreeMap::new();
+    metadata.insert("role".to_string(), "member".to_string());
+    metadata.insert("schema".to_string(), "1".to_string());
+    let contents = WalletContents {
+        secret_key: m.secret_key().clone(),
+        address: m_addr,
+        created_at: now_secs(),
+        metadata,
+    };
+    let backup = dir.path().join("backup.rrnwallet");
+    contents.save_to_file(&backup, PASS).unwrap();
+
+    let home = dir.path().join("w");
+    wjson(
+        &home,
+        &[
+            "init",
+            "--station",
+            &h.station_addr,
+            "--restore",
+            backup.to_str().unwrap(),
+        ],
+    )
+    .await;
+    pair_and_confirm(&h, &home, &m_addr.to_string()).await;
+
+    // Sync finds no station record → the chain stays `unknown`, not `fresh`.
+    let synced = wjson(&home, &["sync"]).await;
+    assert_eq!(
+        synced["chain_state"], "unknown",
+        "a restored key the station has never seen must not become fresh"
+    );
+    assert!(
+        synced["blocked"].is_string(),
+        "sync surfaces why it is blocked"
+    );
+
+    // Signing is still refused (no silent fork of position 0).
+    let stderr = wfail(&home, Some(PASS), &["pay", &h.station_addr, "1"]).await;
+    assert!(stderr.contains("re-anchor"), "got: {stderr}");
+    h.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

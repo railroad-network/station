@@ -643,8 +643,12 @@ impl Wallet {
         signed_record: &SignedPayload<T>,
         now: i64,
     ) -> Result<()> {
-        let author = self.author()?;
+        // Both the chain owner and the entry's author come from the unlocked
+        // keypair, never the plaintext meta `address` — a tampered meta row must
+        // not be able to store rows under one key while they are signed by
+        // another (finding: store/entry author must agree).
         let address = Address::from_public_key(keypair.public_key());
+        let author = address.public_key().to_bytes();
         let mut store = OutboxStore::new(&self.db);
         let (position, prev_hash) = match store.head(&author)? {
             Some(h) => (h.position + 1, Hash::from_bytes(h.entry_hash)),
@@ -717,30 +721,84 @@ impl Wallet {
         let entry_hash_hex = head.get("entry_hash").and_then(|v| v.as_str());
 
         let local_head = OutboxStore::new(&self.db).head(&author)?;
+        let seen_hash: Option<[u8; 32]> = entry_hash_hex
+            .and_then(rrn_station::core::unhex)
+            .and_then(|b| <[u8; 32]>::try_from(b).ok());
+        let was_unknown = self.chain_state()? == "unknown";
         let mut reanchored = false;
-        if self.chain_state()? == "unknown" {
-            if local_head.is_some() {
-                bail!("this store already has a chain; do not restore over it");
+        // A message that means "do not sign": set when the station's view and the
+        // local chain cannot be reconciled without a self-fork (ADR-0028 §7).
+        let mut blocked: Option<String> = None;
+
+        match (local_head.as_ref(), seen_position) {
+            // No local chain, and the station has history for this key: anchor
+            // onto its highest-seen position so the next record chains forward
+            // (a restore, or a fresh key a paper submit already reached the
+            // writer with).
+            (None, Some(pos)) => {
+                let bytes =
+                    seen_hash.ok_or_else(|| anyhow!("station returned a position with no hash"))?;
+                OutboxStore::new(&self.db).anchor(&author, pos, &bytes, now())?;
+                reanchored = true;
+                self.set_meta(K_CHAIN_STATE, "anchored")?;
             }
-            match (seen_position, entry_hash_hex) {
-                (Some(pos), Some(hash_hex)) => {
-                    let bytes = rrn_station::core::unhex(hash_hex)
-                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                        .ok_or_else(|| anyhow!("station returned a malformed entry hash"))?;
-                    OutboxStore::new(&self.db).anchor(&author, pos, &bytes, now())?;
-                    reanchored = true;
+            // No local chain and the station has no record of this key.
+            (None, None) => {
+                if was_unknown {
+                    // A *restored* wallet almost certainly transacted before, so a
+                    // null answer does not mean the key is fresh — it means we
+                    // reached a read replica (which never sees carried bundles) or
+                    // the wrong station. Concluding "fresh" and signing position 0
+                    // would fork against the writer, which re-anchoring exists to
+                    // prevent (ADR-0028 §7). Stay unknown and refuse. (This departs
+                    // from the ticket's "null → fresh" sketch: the ADR's
+                    // no-self-fork guarantee wins against observed replica
+                    // behavior.)
+                    blocked = Some(
+                        "the station has no record of this key. You may have synced against a \
+                         read replica (which never sees carried bundles) or the wrong station — \
+                         reach the writer once before signing. If this key truly never \
+                         transacted, start over with `rrn wallet init` (without --restore)."
+                            .into(),
+                    );
+                }
+                // A non-restored fresh key with no history stays `fresh` (position
+                // 0 is legitimately ours to write) — leave the state unchanged.
+            }
+            // A local chain and the station has seen this author.
+            (Some(h), Some(pos)) => {
+                if pos > h.position || (pos == h.position && seen_hash != Some(h.entry_hash)) {
+                    // The station holds outbox positions this device does not (a
+                    // rollback or a stale whole-home restore), or its head
+                    // disagrees with ours at the same position: signing the next
+                    // record would fork. Refuse and block signing until it is
+                    // resolved.
+                    blocked = Some(format!(
+                        "your local outbox ends at position {}, but the station has seen up to \
+                         {pos} — this device's chain is behind the station (a rollback or stale \
+                         backup). Signing now would fork; do not sign. Restore the current \
+                         wallet home, or reach the writer.",
+                        h.position
+                    ));
+                    self.set_meta(K_CHAIN_STATE, "unknown")?;
+                } else {
+                    // The station is at or behind our head with matching hashes:
+                    // we are level with it or ahead with pending, unsubmitted
+                    // entries. Anchored to real history.
                     self.set_meta(K_CHAIN_STATE, "anchored")?;
                 }
-                _ => {
-                    // The station has never seen this author: a fresh chain.
-                    self.set_meta(K_CHAIN_STATE, "fresh")?;
-                }
             }
-        } else if seen_position.is_some() {
-            // The station has seen at least one of our entries: the chain is
-            // anchored to real history. A chain the station has never seen stays
-            // `fresh` (position 0 is still legitimately ours to write).
-            self.set_meta(K_CHAIN_STATE, "anchored")?;
+            // A local chain the station has not seen at all.
+            (Some(_), None) => {
+                if was_unknown {
+                    bail!(
+                        "this store already has a chain but the station has no record of it; \
+                         do not restore over an existing chain"
+                    );
+                }
+                // Otherwise all our entries are pending, never submitted — nothing
+                // to anchor onto; keep the current state.
+            }
         }
 
         // 2. Nonce cursor: reconcile with the station's next nonce for us.
@@ -805,10 +863,14 @@ impl Wallet {
         );
         if let Some((from, to)) = hole {
             text.push_str(&format!(
-                "\nWARNING: the station has a gap in your outbox chain at {from}..{to} \
-                 (an in-flight record this device cannot reproduce); your chain will never \
-                 be contiguous again — do not attempt to fill it. New records still admit."
+                "\nWARNING: the station is missing part of your outbox chain below the head at \
+                 position {to} (positions {from}..{to} are not all present — an in-flight record \
+                 this device cannot reproduce); your chain will never be contiguous again — do \
+                 not attempt to fill it. New records still admit."
             ));
+        }
+        if let Some(msg) = &blocked {
+            text.push_str(&format!("\nWARNING: {msg}"));
         }
         crate::emit(
             fmt,
@@ -820,6 +882,7 @@ impl Wallet {
                 "balance_centi": balance_centi,
                 "receipts_applied": applied,
                 "hole": hole.map(|(f, t)| json!({ "from": f, "to": t })),
+                "blocked": blocked,
             }),
             || Ok(text),
         )
@@ -902,21 +965,12 @@ impl Wallet {
             None => None,
         };
 
-        // Expiry: carrier default, then a cert floor, then an explicit override.
-        let mut expires_at = match carrier {
-            Carrier::Fast => now.saturating_add(PROPOSAL_TTL_SECS),
-            Carrier::Slow => {
-                now.saturating_add(rrn_ledger::credit::DEFAULT_CERT_DELIVERY_GRACE_SECS)
-            }
-        };
-        if let Some(c) = &cert_state {
-            // A cert-backed spend must not expire before the certificate does, or
-            // the certificate's grace could outlive the spend it backs.
-            expires_at = expires_at.max(c.payload.expires_at);
-        }
-        if let Some(secs) = expires_in {
-            expires_at = now.saturating_add(secs);
-        }
+        let expires_at = resolve_expiry(
+            now,
+            carrier,
+            expires_in,
+            cert_state.as_ref().map(|c| c.payload.expires_at),
+        );
 
         let mut proposal = TransactionProposal::new(
             sender,
@@ -1045,8 +1099,8 @@ impl Wallet {
         statement: &str,
         stake: &str,
     ) -> Result<()> {
-        // Vouches are online-only and never chained into the outbox (ADR-0028
-        // §D2): a vouch is not nonce-tracked, and making it DTN-routable is a
+        // Vouches are online-only and never chained into the outbox (ADR-0028):
+        // a vouch is not nonce-tracked, and making it DTN-routable is a
         // reputation/sybil change out of scope here.
         let subject: Address = address
             .parse()
@@ -1088,6 +1142,9 @@ impl Wallet {
     }
 
     async fn cert_request(&self, fmt: Format, cap: &str) -> Result<()> {
+        // A certificate request consumes a nonce, so it is a signing verb: a
+        // restored chain must re-anchor first (ADR-0028 §7).
+        self.require_signable()?;
         let keypair = self.unlock()?;
         let cap_centi = crate::parse_amount(cap)?;
         let now = now();
@@ -1216,6 +1273,9 @@ impl Wallet {
         max_entries: Option<usize>,
     ) -> Result<()> {
         let (bundle_bytes, count) = self.pending_bundle(max_entries)?;
+        if count == 0 {
+            bail!("nothing pending to export");
+        }
         std::fs::create_dir_all(out).context("create export directory")?;
         match format {
             ExportFormat::Bundle => {
@@ -1425,6 +1485,7 @@ impl Wallet {
             .map(|r| r.record_hash)
             .collect();
         let mut applied = 0usize;
+        let mut nonce_gap = false;
         for outcome in &signed.payload.outcomes {
             let (ack, seq, reason) = match &outcome.disposition {
                 Disposition::Admitted { seq } => (AckOutcome::Admitted, Some(*seq), None),
@@ -1435,14 +1496,40 @@ impl Wallet {
                     Some(reason.as_slug().to_string()),
                 ),
             };
+            if matches!(reason.as_deref(), Some(slug) if slug.contains("nonce")) {
+                nonce_gap = true;
+            }
             let record_hash = outcome.record_hash.to_bytes();
-            let matched = store.apply_ack(&author, &record_hash, ack, seq, reason.as_deref())?;
-            if matched && pending_before.contains(&record_hash) {
-                applied += 1;
+            // A `receipts_fetch` marks its whole page delivered on the station
+            // *before* replying (ADR-0020 §3), so one bad outcome must not abort
+            // the rest. A `ConflictingAck` here is a row already terminally acked
+            // with a different-but-final outcome (e.g. an inline `known` from a
+            // re-submit, then a queued `admitted` for the same record) — the row
+            // is settled either way, so skip it rather than losing the page.
+            match store.apply_ack(&author, &record_hash, ack, seq, reason.as_deref()) {
+                Ok(matched) => {
+                    if matched && pending_before.contains(&record_hash) {
+                        applied += 1;
+                    }
+                }
+                Err(rrn_storage::Error::ConflictingAck) => {
+                    eprintln!(
+                        "warning: receipt outcome for {} conflicts with an already-recorded \
+                         final outcome; skipping it",
+                        short_hex(&record_hash)
+                    );
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         // Reclaim the acked prefix, keeping the chain contiguous.
         store.prune_acked(&author)?;
+        if nonce_gap {
+            eprintln!(
+                "warning: a proposal was refused for a nonce gap. Any proposals you signed \
+                 after it will be refused too — run `rrn wallet sync` and re-pay them."
+            );
+        }
         Ok(applied)
     }
 
@@ -1782,4 +1869,87 @@ fn set_dir_private(dir: &Path) {
     }
     #[cfg(not(unix))]
     let _ = dir;
+}
+
+/// The `expires_at` a signed proposal should carry: the carrier's default TTL,
+/// overridden by an explicit `--expires-in`, and then — for a cert-backed spend —
+/// floored at the certificate's own expiry so the spend never expires before the
+/// certificate it draws against (ADR-0028; the engine does not enforce this).
+/// The cert floor is applied *last* so an override cannot undercut it.
+fn resolve_expiry(
+    now: i64,
+    carrier: Carrier,
+    expires_in: Option<i64>,
+    cert_expires_at: Option<i64>,
+) -> i64 {
+    let mut expires_at = match carrier {
+        Carrier::Fast => now.saturating_add(PROPOSAL_TTL_SECS),
+        Carrier::Slow => now.saturating_add(rrn_ledger::credit::DEFAULT_CERT_DELIVERY_GRACE_SECS),
+    };
+    if let Some(secs) = expires_in {
+        expires_at = now.saturating_add(secs);
+    }
+    if let Some(cert) = cert_expires_at {
+        expires_at = expires_at.max(cert);
+    }
+    expires_at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_carrier_defaults() {
+        let now = 1_000_000;
+        assert_eq!(
+            resolve_expiry(now, Carrier::Fast, None, None),
+            now + PROPOSAL_TTL_SECS
+        );
+        assert_eq!(
+            resolve_expiry(now, Carrier::Slow, None, None),
+            now + rrn_ledger::credit::DEFAULT_CERT_DELIVERY_GRACE_SECS
+        );
+    }
+
+    #[test]
+    fn explicit_override_replaces_the_carrier_default() {
+        let now = 1_000_000;
+        assert_eq!(resolve_expiry(now, Carrier::Fast, Some(60), None), now + 60);
+        // …but the cert floor still wins over a too-short override, so a
+        // cert-backed spend never expires before its certificate.
+        let cert_exp = now + 500_000;
+        assert_eq!(
+            resolve_expiry(now, Carrier::Fast, Some(60), Some(cert_exp)),
+            cert_exp,
+            "the cert floor must not be undercut by --expires-in"
+        );
+    }
+
+    #[test]
+    fn cert_floor_only_raises_never_lowers() {
+        let now = 1_000_000;
+        // A generous carrier default already past the cert expiry stays as-is.
+        let cert_exp = now + 10;
+        assert_eq!(
+            resolve_expiry(now, Carrier::Slow, None, Some(cert_exp)),
+            now + rrn_ledger::credit::DEFAULT_CERT_DELIVERY_GRACE_SECS
+        );
+    }
+
+    #[test]
+    fn guard_rejects_a_station_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory carrying any station-layout file is refused.
+        std::fs::write(dir.path().join(DB_FILE), b"x").unwrap();
+        let err = guard_home(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("station data directory"), "{err}");
+    }
+
+    #[test]
+    fn guard_rejects_an_uninitialized_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = guard_home(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("no member wallet"), "{err}");
+    }
 }

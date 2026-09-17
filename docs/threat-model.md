@@ -1582,11 +1582,11 @@ prevented and is a self-fork (ADR-0028 §2 forbids it by policy, not by mechanis
 station has a hole below its outbox head is told the chain will never be
 contiguous again but that admission continues (ADR-0028 §7). **Offline vouching is
 not supported** (a vouch is not nonce-tracked and DTN-routing it is a
-reputation/sybil-surface change, ADR-0028 D2): `rrn wallet vouch` needs the
+reputation/sybil-surface change, ADR-0028): `rrn wallet vouch` needs the
 station reachable and refuses cleanly otherwise. A member restoring from backup
-must reach the station's LAN once before signing again (ADR-0028 D5). Member
+must reach the station's LAN once before signing again (ADR-0028 §7). Member
 social recovery on the CLI (guardian enrollment/reconstruction) is a separate
-follow-up (ADR-0028 D8).
+follow-up (ADR-0028 §9).
 
 ### `rrn-station` / `rrn-cli`
 

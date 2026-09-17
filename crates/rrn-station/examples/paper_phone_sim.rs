@@ -5,7 +5,7 @@
 //!
 //! Why an example and not the `rrn` CLI: this stand-in mimics a *phone*, whose
 //! key lives on the device (ADR-0006) and whose offline authoring is
-//! `rrn-mobile-ffi`'s job (T2.4.2). The CLI now *does* have a member wallet
+//! `rrn-mobile-ffi`'s job. The CLI now *does* have a member wallet
 //! (`rrn wallet`, ADR-0028) for a laptop member — but this binary remains the
 //! phone mimic for the paper demo, chained state and all. This binary signs
 //! with the **same** `rrn-protocol`/`rrn-ledger`/`rrn-crypto` wire types the

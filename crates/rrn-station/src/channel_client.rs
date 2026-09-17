@@ -32,6 +32,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// The largest response the client will read, headers included: a sealed reply
+/// is at most a bundle-sized payload, so this bounds an unbounded-stream DoS from
+/// a wrong or hostile host at a mistyped `--url` before any verification.
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
 use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
 use rrn_identity::address::Address;
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
@@ -307,8 +312,13 @@ impl ChannelClient {
             stream.write_all(head.as_bytes()).await?;
             stream.write_all(body).await?;
             stream.flush().await?;
+            // Bound the read: a wrong or hostile host at a mistyped `--url` (before
+            // any pairing/verification) must not be able to stream unbounded bytes
+            // into memory. A sealed reply is at most a bundle-sized response plus
+            // HTTP headers, so this ceiling is generous.
             let mut raw = Vec::new();
-            stream.read_to_end(&mut raw).await?;
+            let mut limited = (&mut stream).take(MAX_RESPONSE_BYTES);
+            limited.read_to_end(&mut raw).await?;
             Ok::<Vec<u8>, std::io::Error>(raw)
         };
         let raw = tokio::time::timeout(RESPONSE_TIMEOUT, io)
