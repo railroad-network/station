@@ -736,7 +736,10 @@ impl Wallet {
                     self.set_meta(K_CHAIN_STATE, "fresh")?;
                 }
             }
-        } else {
+        } else if seen_position.is_some() {
+            // The station has seen at least one of our entries: the chain is
+            // anchored to real history. A chain the station has never seen stays
+            // `fresh` (position 0 is still legitimately ours to write).
             self.set_meta(K_CHAIN_STATE, "anchored")?;
         }
 
@@ -1052,7 +1055,7 @@ impl Wallet {
             .map_err(|_| anyhow!("stake must be non-negative"))?;
         let keypair = self.unlock()?;
         let signed = create_vouch(&keypair, &subject, VOUCH_COMMUNITY, statement, stake_centi);
-        let frame = signed_record_envelope(&signed);
+        let frame = channel_frame(&signed);
         // Submit directly; refuse cleanly when offline.
         let client = self
             .client()
@@ -1096,7 +1099,7 @@ impl Wallet {
             now,
         );
         let signed: SignedCertificateRequest = SignedPayload::sign(request, &keypair);
-        let frame = signed_record_envelope(&signed);
+        let frame = channel_frame(&signed);
         let client = self.client()?;
         let result = self
             .call(
@@ -1413,6 +1416,14 @@ impl Wallet {
         }
         let author = self.author()?;
         let mut store = OutboxStore::new(&self.db);
+        // Which rows are still pending *before* this receipt, so a re-applied
+        // (idempotent) receipt reports zero newly-applied outcomes.
+        let pending_before: std::collections::HashSet<[u8; 32]> = store
+            .all_rows(&author)?
+            .into_iter()
+            .filter(|r| r.acked_outcome.is_none())
+            .map(|r| r.record_hash)
+            .collect();
         let mut applied = 0usize;
         for outcome in &signed.payload.outcomes {
             let (ack, seq, reason) = match &outcome.disposition {
@@ -1424,13 +1435,9 @@ impl Wallet {
                     Some(reason.as_slug().to_string()),
                 ),
             };
-            if store.apply_ack(
-                &author,
-                &outcome.record_hash.to_bytes(),
-                ack,
-                seq,
-                reason.as_deref(),
-            )? {
+            let record_hash = outcome.record_hash.to_bytes();
+            let matched = store.apply_ack(&author, &record_hash, ack, seq, reason.as_deref())?;
+            if matched && pending_before.contains(&record_hash) {
                 applied += 1;
             }
         }
@@ -1678,6 +1685,18 @@ fn map_channel_error(e: ChannelClientError) -> anyhow::Error {
         ),
         other => anyhow!(other.to_string()),
     }
+}
+
+/// Frames a signed record for a channel `submit_*` / `cert_request` param, the
+/// way the mobile FFI does: `len ‖ canonical-payload ‖ signer ‖ sig`. This is
+/// distinct from [`signed_record_envelope`], the `{signer,sig,body}` CBOR map
+/// used for outbox entries and spend vouchers.
+fn channel_frame<T: Clone + Into<CBOR>>(signed: &SignedPayload<T>) -> Vec<u8> {
+    rrn_station::rpc_envelope::frame_signed_record(
+        &to_canonical_bytes(signed.payload.clone()),
+        &signed.signer,
+        &signed.signature,
+    )
 }
 
 /// Encodes a signed record as the repo's portable `{signer, sig, body}` envelope.
