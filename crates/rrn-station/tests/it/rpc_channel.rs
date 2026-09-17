@@ -23,8 +23,8 @@ use rrn_identity::vouch::{VouchBody, VouchKind};
 use rrn_ledger::transaction::{
     SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionProposal,
 };
+use rrn_station::channel_client::ChannelClient;
 use rrn_station::core::hex;
-use rrn_station::pairing::{request_signed_bytes, PairRequest};
 use rrn_station::rpc_envelope::{
     frame_signed_record, frame_signed_request, request_payload_bytes, RequestEnvelope,
     ResponseEnvelope, ENVELOPE_VERSION,
@@ -109,27 +109,21 @@ async fn socket_rpc(socket: &Path, method: &str, params: serde_json::Value) -> s
     serde_json::from_str(buf.trim_end()).unwrap()
 }
 
-/// Pairs `mobile` with the station: POST /pair, then operator `pair_confirm`.
-async fn pair_mobile(socket: &Path, mobile: &Keypair) {
-    let token = [0x11u8; 32];
-    // One clock read: the signature covers `requested_at`, so a second `now_secs()`
-    // that straddled a second boundary would sign a different timestamp than the one
-    // sent, and the station would reject the request as a signature mismatch (400).
-    let requested_at = now_secs();
-    let msg = request_signed_bytes(&mobile.public_key(), &token, requested_at);
-    let request = PairRequest {
-        mobile_address: Address::from_public_key(mobile.public_key()).to_string(),
-        token: hex(&token),
-        requested_at,
-        signature: hex(&mobile.sign(&msg).to_bytes()),
-    };
-    let (status, _) = http_post(
-        "/pair",
-        "application/json",
-        serde_json::to_string(&request).unwrap().as_bytes(),
-    )
-    .await;
-    assert_eq!(status, 200, "pair accepted");
+/// Pairs `mobile` with the station through the promoted [`ChannelClient`] — the
+/// same client the CLI wallet uses (ADR-0028) — then confirms it over the
+/// operator socket. Exercising the module here proves it produces bytes the
+/// station's real `/pair` accepts and that its pin/signature checks pass against
+/// a real station reply.
+async fn pair_mobile(socket: &Path, station_pk: &PublicKey, mobile: &Keypair) {
+    let client = ChannelClient::new(format!("127.0.0.1:{MOBILE_PORT}"), *station_pk);
+    let response = client
+        .pair(mobile, now_secs())
+        .await
+        .expect("pair accepted and verified against the pin");
+    assert_eq!(
+        response.station_address,
+        Address::from_public_key(*station_pk).to_string()
+    );
     let addr = Address::from_public_key(mobile.public_key()).to_string();
     let confirmed = socket_rpc(
         socket,
@@ -297,26 +291,23 @@ async fn authenticated_channel_happy_path_and_rejections() {
         .public_key();
 
     let mobile = Keypair::generate();
-    pair_mobile(&socket, &mobile).await;
+    pair_mobile(&socket, &station_pk, &mobile).await;
     let mobile_addr = Address::from_public_key(mobile.public_key()).to_string();
 
-    // --- happy path: balance of my own address (nonce 1) ---
-    let params = format!("{{\"address\":\"{mobile_addr}\"}}");
-    let req = sealed_request(
-        &mobile,
-        &station_pk,
-        &station_pk,
-        "balance",
-        &params,
-        1,
-        now_secs(),
-    );
-    let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
-    assert_eq!(status, 200, "authenticated balance accepted");
-    let reply = open_reply(&mobile, &station_pk, &body);
-    assert_eq!(reply.nonce, 1);
-    assert!(reply.error.is_none(), "no error: {:?}", reply.error);
-    let result: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
+    // --- happy path: balance of my own address (nonce 1), through the promoted
+    //     ChannelClient — proving its request bytes are what the station accepts
+    //     and its reply open/verify matches the raw path used below. ---
+    let client = ChannelClient::new(format!("127.0.0.1:{MOBILE_PORT}"), station_pk);
+    let result = client
+        .call(
+            &mobile,
+            "balance",
+            &serde_json::json!({ "address": mobile_addr }),
+            1,
+            now_secs(),
+        )
+        .await
+        .expect("authenticated balance accepted");
     assert_eq!(result["balance_centi"], 0);
 
     // --- whoami (nonce 2) returns the station's address ---
@@ -412,7 +403,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     // --- write path: the mobile submits its own signed proposal ---
     // A receiver mobile, also paired so it can later confirm over the channel.
     let receiver = Keypair::generate();
-    pair_mobile(&socket, &receiver).await;
+    pair_mobile(&socket, &station_pk, &receiver).await;
     let receiver_addr = Address::from_public_key(receiver.public_key());
     let now = now_secs();
 

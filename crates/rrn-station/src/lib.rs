@@ -32,6 +32,7 @@
 #![warn(missing_docs)]
 
 pub mod backup;
+pub mod channel_client;
 pub mod clock;
 pub mod config;
 pub mod contract_view;
