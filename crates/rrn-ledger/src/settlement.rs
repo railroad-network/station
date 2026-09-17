@@ -648,8 +648,22 @@ mod tests {
     /// The proposal's fixed `proposed_at` used by the invariance proptest below.
     const PROPOSED_AT: i64 = 100;
 
+    /// Property-test case budget: `PROPTEST_CASES` if set (the deep lane sets
+    /// 1024), else `default_cases`. Unlike `ProptestConfig::with_cases`, this
+    /// honors the env var, so the deep lane deepens this property too.
+    fn cases(default_cases: u32) -> ProptestConfig {
+        let cases = std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_cases);
+        ProptestConfig {
+            cases,
+            ..ProptestConfig::default()
+        }
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(cases(64))]
 
         /// The settlement-eligibility instant and the dispute deadline are
         /// functions of the confirmation's *admission* time only (ADR-0022 §2):

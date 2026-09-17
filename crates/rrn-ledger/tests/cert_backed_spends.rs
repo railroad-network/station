@@ -35,6 +35,19 @@ fn addr(kp: &Keypair) -> Address {
     Address::from_public_key(kp.public_key())
 }
 
+/// Property-test case budget: `PROPTEST_CASES` if set (the deep lane sets
+/// 1024), else `default_cases` — sized so the default run stays fast.
+fn cases(default_cases: u32) -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_cases);
+    ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
+    }
+}
+
 fn snapshot(db: &Database, station: &Keypair) -> LedgerSnapshot {
     LedgerSnapshot::derive(&AppendLog::new(db), &station.public_key()).unwrap()
 }
@@ -482,11 +495,14 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 }
 
 proptest! {
-    // No explicit `cases` here: `ProptestConfig::default()` honors the
-    // `PROPTEST_CASES` env var, so the ticket's acceptance command
-    // (`PROPTEST_CASES=1024 cargo test -p rrn-ledger`) actually runs 1024 cases;
-    // absent the env var it defaults to 256.
-    #![proptest_config(ProptestConfig::default())]
+    // Default run: 32 cases, chosen so the property stays under ~2 s in a debug
+    // run (each case drives up to 40 ledger ops, each a full replay). `cases`
+    // reads the `PROPTEST_CASES` env var first, so the deep lane
+    // (`PROPTEST_CASES=1024 cargo nextest run -p rrn-ledger --test
+    // cert_backed_spends`, run by `scripts/test-deep.sh`) still exercises the
+    // full 1024-case acceptance budget. The case count is moved, never lowered:
+    // `PROPTEST_CASES=N` overrides this default for every property test.
+    #![proptest_config(cases(32))]
 
     /// After every admitted operation, in any interleaving, every member's
     /// committed position stays at or above the debt floor:
@@ -515,12 +531,16 @@ proptest! {
         let mut certs: Vec<CertId> = Vec::new();
 
         let members = [addr(&alice), addr(&bob)];
-        let assert_floor = |db: &Database, now: i64| {
-            let snap = snapshot(db, &station);
+        // The loop derives one snapshot per op (after the submit) and threads it
+        // to every reader: `assert_floor` for the post-op check, and — on the next
+        // iteration — the nonce lookups and `open_proposals` as the pre-op view.
+        // So each op costs the engine's own internal derive plus this one, not a
+        // fresh derive inside every helper.
+        let assert_floor = |snap: &LedgerSnapshot, db: &Database, now: i64| {
             let balances = BalanceView::new(db);
             for m in &members {
                 let settled = balances.balance_of(m).unwrap();
-                let committed = committed_debits_centi(&snap, m, now, &cfg);
+                let committed = committed_debits_centi(snap, m, now, &cfg);
                 prop_assert!(
                     settled - committed >= cfg.debt_floor_centi,
                     "committed position {} below floor {} for member (settled {}, committed {})",
@@ -534,9 +554,9 @@ proptest! {
             Ok(())
         };
 
-        // The open alice→bob proposals available to confirm / cancel.
-        let open_proposals = |db: &Database| -> Vec<TransactionId> {
-            let snap = snapshot(db, &station);
+        // The open alice→bob proposals available to confirm / cancel, read from
+        // the pre-op snapshot.
+        let open_proposals = |snap: &LedgerSnapshot| -> Vec<TransactionId> {
             snap.iter()
                 .filter_map(|(id, st)| {
                     matches!(st, rrn_ledger::state::TransactionState::Proposed { .. }).then_some(*id)
@@ -544,10 +564,43 @@ proptest! {
                 .collect()
         };
 
+        // Plain / cert-backed alice→bob proposals whose nonce is sourced from the
+        // pre-op snapshot instead of a fresh derive (mirror the top-level helpers).
+        let plain = |snap: &LedgerSnapshot, amount: i64, now: i64| {
+            let nonce = snap.next_nonce(&alice.public_key().to_bytes());
+            let p = TransactionProposal::new(
+                addr(&alice),
+                addr(&bob),
+                amount,
+                None,
+                nonce,
+                now,
+                now + 1_000_000,
+            );
+            SignedProposal::sign(p, &alice)
+        };
+        let cert_backed = |snap: &LedgerSnapshot, amount: i64, cert: CertId, now: i64| {
+            let nonce = snap.next_nonce(&alice.public_key().to_bytes());
+            let p = TransactionProposal::new(
+                addr(&alice),
+                addr(&bob),
+                amount,
+                None,
+                nonce,
+                now,
+                now + 1_000_000,
+            )
+            .with_certificate(cert);
+            SignedProposal::sign(p, &alice)
+        };
+
+        // The pre-op view for the first iteration; refreshed after every op below.
+        let mut snap = snapshot(&db, &station);
+
         for op in ops {
             match op {
                 Op::IssueCert(cap) => {
-                    let nonce = next_nonce(&db, &station, &alice);
+                    let nonce = snap.next_nonce(&alice.public_key().to_bytes());
                     let req = CertificateRequest::new(addr(&alice), cap, nonce, now);
                     if let Ok(signed) =
                         engine.submit_certificate_request(SignedPayload::sign(req, &alice), now)
@@ -556,25 +609,25 @@ proptest! {
                     }
                 }
                 Op::PlainSpend(amount) => {
-                    let p = plain_proposal(&db, &station, &alice, &bob, amount, now);
+                    let p = plain(&snap, amount, now);
                     let _ = engine.submit_proposal(p, now);
                 }
                 Op::CertSpend(idx, amount) => {
                     if !certs.is_empty() {
                         let cert = certs[idx % certs.len()];
-                        let p = cert_proposal(&db, &station, &alice, &bob, amount, cert, now);
+                        let p = cert_backed(&snap, amount, cert, now);
                         let _ = engine.submit_proposal(p, now);
                     }
                 }
                 Op::Confirm(idx) => {
-                    let open = open_proposals(&db);
+                    let open = open_proposals(&snap);
                     if !open.is_empty() {
                         let id = open[idx % open.len()];
                         let _ = engine.submit_confirmation(confirm(&bob, id, now), now);
                     }
                 }
                 Op::Cancel(idx) => {
-                    let open = open_proposals(&db);
+                    let open = open_proposals(&snap);
                     if !open.is_empty() {
                         let id = open[idx % open.len()];
                         let _ = engine.cancel_proposal(&id, CancelReason::RejectedByReceiver, now);
@@ -598,7 +651,10 @@ proptest! {
                     settler.sweep(now).unwrap();
                 }
             }
-            assert_floor(&db, now)?;
+            // One derive per op: the post-op view for `assert_floor`, and the
+            // pre-op view the next iteration reads for nonces / open proposals.
+            snap = snapshot(&db, &station);
+            assert_floor(&snap, &db, now)?;
         }
 
         // Finally, fast-forward well past every settlement window and sweep: any
@@ -608,6 +664,7 @@ proptest! {
         now = now.saturating_add(10_000);
         let mut settler = Settler::new(&db, station.clone(), settle_cfg);
         settler.sweep(now).unwrap();
-        assert_floor(&db, now)?;
+        snap = snapshot(&db, &station);
+        assert_floor(&snap, &db, now)?;
     }
 }
