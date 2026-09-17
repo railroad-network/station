@@ -20,7 +20,7 @@
 #       LUKS header has ZERO keyslots (no wrapped key on the device).
 #
 # The interactive unlock ceremony (holder QR responses) and the crash/verify_chain
-# invariants are exercised by the Rust lane `tests/at_rest_dmcrypt.rs`, which has
+# invariants are exercised by the Rust lane `tests/it/at_rest_dmcrypt.rs`, which has
 # the ceremony helpers a shell script cannot reconstruct.
 #
 # Usage:
@@ -197,7 +197,7 @@ drill_encrypted() {
 
   echo
   pass "ENCRYPTED BRICK-PROPERTY DRILL GREEN"
-  info "the unlock ceremony + crash/verify_chain invariants run in tests/at_rest_dmcrypt.rs"
+  info "the unlock ceremony + crash/verify_chain invariants run in tests/it/at_rest_dmcrypt.rs"
 }
 
 echo "Railroad Network — node-seizure recovery drill (profile: $PROFILE)"

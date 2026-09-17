@@ -10,7 +10,7 @@ and so floats and malformed nodes are rejected with clean, named errors.
 reaches the same encoder through `canonical_bytes` rather than carrying its own.
 
 Generated and verified by
-[`tests/cross_platform_canonical.rs`](../cross_platform_canonical.rs); the mobile
+[`tests/it/cross_platform_canonical.rs`](../it/cross_platform_canonical.rs); the mobile
 repo commits a copy at `__tests__/fixtures/cross_platform_canonical.json` and its
 `cbor.test.ts` reads it. Contents: `vectors` (each a tagged `payload` and the
 `canonical_hex` it must encode to) and `invalid` (payloads that must raise a named
@@ -20,7 +20,7 @@ in `rrn-ledger` (it needs the ledger's proposal type).
 Reproducible bit-for-bit (no RNG). Regenerate:
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test cross_platform_canonical
+RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test it cross_platform_canonical
 cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_canonical.json \
    ../mobile/__tests__/fixtures/cross_platform_canonical.json
 ```
@@ -41,7 +41,7 @@ canonical dCBOR triple; `rrn_crypto::serialize` (ADR-0002) is the source of
 truth, reached through the FFI rather than reimplemented on mobile.
 
 Generated and verified by
-[`tests/cross_platform_dtn_certs.rs`](../cross_platform_dtn_certs.rs), which
+[`tests/it/cross_platform_dtn_certs.rs`](../it/cross_platform_dtn_certs.rs), which
 drives the FFI **decode/verify** functions (`bundle_parse`, `receipt_parse`,
 `certificate_parse`, `offline_spend_verify`) over the recorded bytes. The
 producer functions (`outbox_next_entry`, `certificate_request_sign`,
@@ -52,7 +52,7 @@ commits a copy at `__tests__/fixtures/cross_platform_dtn_certs.json`.
 Reproducible bit-for-bit (blake3 seeds, RFC 8032). Regenerate:
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test cross_platform_dtn_certs
+RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test it cross_platform_dtn_certs
 cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_dtn_certs.json \
    ../mobile/__tests__/fixtures/cross_platform_dtn_certs.json
 ```

@@ -11,7 +11,7 @@ Ed25519. Ed25519 signing is deterministic (RFC 8032 §5.1.6), so this is a hard
 equality check, not merely "both verify".
 
 Generated and verified by
-[`tests/cross_platform_sign.rs`](../cross_platform_sign.rs); the mobile repo
+[`tests/it/cross_platform_sign.rs`](../it/cross_platform_sign.rs); the mobile repo
 commits a copy at `__tests__/fixtures/cross_platform_sign.json` and its
 `sign.test.ts` reads it. Contents: 100 deterministic vectors (blake3-derived
 seeds → keypairs signing messages of length 0..=32), 2 locked known-answer
@@ -22,7 +22,7 @@ wrong key).
 Regenerate (reproducible bit-for-bit — no RNG):
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-crypto --test cross_platform_sign
+RRN_REGEN=1 cargo test -p rrn-crypto --test it cross_platform_sign
 cp crates/rrn-crypto/tests/fixtures/cross_platform_sign.json \
    ../mobile/__tests__/fixtures/cross_platform_sign.json
 ```

@@ -82,7 +82,7 @@ zeroize = { version = "1", features = ["derive"] }
 nix = { version = "0.29", features = ["signal"] }
 
 [dev-dependencies]
-# Only for the cross-platform vouch fixture generator (tests/cross_platform_vouch.rs):
+# Only for the cross-platform vouch fixture generator (tests/it/cross_platform_vouch.rs):
 # it asserts the mobile tagged-JSON path through `canonical_bytes` yields the same
 # bytes as the typed encoder before committing the vector. No dependency cycle —
 # rrn-mobile-ffi does not depend on rrn-station.

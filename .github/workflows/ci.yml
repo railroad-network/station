@@ -236,7 +236,7 @@ jobs:
         env:
           RRN_SPIKE_RNSD: /tmp/rns/bin/rnsd
           RRN_SPIKE_PYTHON: /tmp/rns/bin/python
-        run: cargo test -p rrn-station --test reticulum_spike -- --ignored --nocapture
+        run: "cargo test -p rrn-station --test it -- --ignored --nocapture reticulum_spike::"
 
   at-rest-dmcrypt:
     name: at-rest-dmcrypt
@@ -271,7 +271,7 @@ jobs:
         # so the lane cannot quietly become a no-op.
         run: |
           set -euo pipefail
-          cargo test -p rrn-station --test at_rest_dmcrypt -- --ignored --nocapture | tee /tmp/dmcrypt.log
+          cargo test -p rrn-station --test it -- --ignored --nocapture at_rest_dmcrypt:: | tee /tmp/dmcrypt.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/dmcrypt.log
       - name: Run the encrypted-profile seizure-recovery drill
         run: ./scripts/drill-seizure-recovery.sh --profile encrypted

@@ -143,7 +143,9 @@ cargo audit                # known CVEs
 
 # single crate / single integration test
 cargo test -p rrn-crypto
-cargo test --test lifecycle -p rrn-ledger
+# each crate compiles its integration tests into one `it` binary; the former
+# file name is the module (and a name filter): `--test it <module>`
+cargo test --test it lifecycle -p rrn-ledger
 
 # per-test timing (per-binary totals + slowest tests); libtest mode is the
 # nextest-free path for when nextest's --list stalls (see hygiene note below)

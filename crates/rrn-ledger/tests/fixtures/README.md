@@ -19,14 +19,14 @@ encoders are proven equal, not assumed. The generic dCBOR type-surface vectors
 live in `rrn-mobile-ffi` (`cross_platform_canonical.json`).
 
 Generated and verified by
-[`tests/cross_platform_signed_payload.rs`](../cross_platform_signed_payload.rs)
+[`tests/it/cross_platform_signed_payload.rs`](../it/cross_platform_signed_payload.rs)
 (dev-depends on `rrn-mobile-ffi` to drive the real FFI); the mobile repo commits a
 copy at `__tests__/fixtures/cross_platform_signed_payload.json` and its
 `SignedPayload.test.ts` reads it. Deterministic (blake3 seeds + RFC 8032 Ed25519),
 reproducible bit-for-bit. Regenerate:
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-ledger --test cross_platform_signed_payload
+RRN_REGEN=1 cargo test -p rrn-ledger --test it cross_platform_signed_payload
 cp crates/rrn-ledger/tests/fixtures/cross_platform_signed_payload.json \
    ../mobile/__tests__/fixtures/cross_platform_signed_payload.json
 ```
@@ -46,12 +46,12 @@ hop into JavaScript doubles.
 Unlike `cross_platform_signed_payload.json` this vector does **not** drive the
 mobile FFI (the certificate signing FFI is T2.4.2); it is a pure typed-encoder
 vector, generated and verified by
-[`tests/cross_platform_certificates.rs`](../cross_platform_certificates.rs).
+[`tests/it/cross_platform_certificates.rs`](../it/cross_platform_certificates.rs).
 Deterministic (blake3 seeds + RFC 8032 Ed25519), reproducible bit-for-bit.
 Regenerate:
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-ledger --test cross_platform_certificates
+RRN_REGEN=1 cargo test -p rrn-ledger --test it cross_platform_certificates
 cp crates/rrn-ledger/tests/fixtures/cross_platform_certificates.json \
    ../mobile/__tests__/fixtures/cross_platform_certificates.json
 ```

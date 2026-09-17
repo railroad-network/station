@@ -283,7 +283,7 @@ impl DmCryptVolume {
 /// environment, or in a temp file.
 ///
 /// Linux only. Everything here is validated by the `at-rest-dmcrypt` CI lane
-/// (`tests/at_rest_dmcrypt.rs`), which needs a real kernel, loop devices, and
+/// (`tests/it/at_rest_dmcrypt.rs`), which needs a real kernel, loop devices, and
 /// passwordless sudo — none of which exist on the macOS dev host.
 #[cfg(target_os = "linux")]
 pub struct SudoCryptsetupHelper;

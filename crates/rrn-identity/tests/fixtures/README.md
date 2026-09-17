@@ -3,7 +3,7 @@
 > Note: the signing parity fixture lives in the **`rrn-crypto`** crate
 > (`crates/rrn-crypto/tests/fixtures/cross_platform_sign.json`), since signing is
 > `rrn_crypto::keypair`, not identity. See T1.1.4 and
-> [`crates/rrn-crypto/tests/cross_platform_sign.rs`](../../../rrn-crypto/tests/cross_platform_sign.rs).
+> [`crates/rrn-crypto/tests/it/cross_platform_sign.rs`](../../../rrn-crypto/tests/it/cross_platform_sign.rs).
 
 ## `cross_platform_address.json` — mobile/station address parity (T1.1.3)
 
@@ -14,7 +14,7 @@ source of truth, and mobile reaches the same code through the uniffi FFI
 (`rrn-mobile-ffi`) rather than reimplementing bech32.
 
 Generated and round-trip-verified by
-[`tests/cross_platform_address.rs`](../cross_platform_address.rs); the mobile
+[`tests/it/cross_platform_address.rs`](../it/cross_platform_address.rs); the mobile
 repo commits a copy at `__tests__/fixtures/cross_platform_address.json` and its
 `address.test.ts` reads it. Contents: 100 deterministic vectors (blake3-derived
 seeds → keypairs → addresses), 2 locked known-answer vectors (all-zero and
@@ -23,7 +23,7 @@ all-ones seed), and 7 malformed strings the parser must reject.
 Regenerate (reproducible bit-for-bit — no RNG):
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-identity --test cross_platform_address
+RRN_REGEN=1 cargo test -p rrn-identity --test it cross_platform_address
 cp crates/rrn-identity/tests/fixtures/cross_platform_address.json \
    ../mobile/__tests__/fixtures/cross_platform_address.json
 ```
@@ -39,7 +39,7 @@ XChaCha20-Poly1305) so a wallet created on one platform opens on the other.
 through the uniffi FFI (`rrn-mobile-ffi`).
 
 Generated and verified by
-[`tests/cross_platform_wallet.rs`](../cross_platform_wallet.rs); the mobile repo
+[`tests/it/cross_platform_wallet.rs`](../it/cross_platform_wallet.rs); the mobile repo
 commits a copy at `__tests__/fixtures/cross_platform_wallet.json` and its
 `Wallet.test.ts` reads it. Contents: 8 wallets, each a deterministic
 (blake3-derived) identity — seed, address, `created_at`, metadata — sealed into
@@ -56,7 +56,7 @@ tampered bytes must be rejected.
 Regenerate (ciphertext changes each run; identities stay fixed):
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-identity --test cross_platform_wallet
+RRN_REGEN=1 cargo test -p rrn-identity --test it cross_platform_wallet
 cp crates/rrn-identity/tests/fixtures/cross_platform_wallet.json \
    ../mobile/__tests__/fixtures/cross_platform_wallet.json
 ```
@@ -72,7 +72,7 @@ primitive, not two. (This test lives in `rrn-identity` rather than `rrn-crypto`,
 where the T1.1.6 spec text places it, because the consolidated invariants span
 both crates and `rrn-identity` is the one that can reach both.)
 
-Generated and verified by [`tests/ffi_invariants.rs`](../ffi_invariants.rs); the
+Generated and verified by [`tests/it/ffi_invariants.rs`](../it/ffi_invariants.rs); the
 mobile repo commits a copy at `__tests__/fixtures/ffi_invariants.json` and its
 `ffi_invariants.test.ts` reads it. Contents: 100 address round-trip vectors, 100
 signing vectors + tamper triples, 100 hashing vectors + 2 known-answer hashes
@@ -93,7 +93,7 @@ ciphertext and are checked by invariant, not by bytes.
 Regenerate (deterministic sections bit-for-bit; wallet ciphertext changes):
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-identity --test ffi_invariants
+RRN_REGEN=1 cargo test -p rrn-identity --test it ffi_invariants
 cp crates/rrn-identity/tests/fixtures/ffi_invariants.json \
    ../mobile/__tests__/fixtures/ffi_invariants.json
 ```
@@ -106,7 +106,7 @@ cp crates/rrn-identity/tests/fixtures/ffi_invariants.json \
 implementation (`rrn_identity::recovery::shamir`, see
 [ADR-0004](../../../../docs/adr/0004-own-shamir-implementation.md)) against an
 **independent, published** implementation, so the test
-([`tests/shamir_reference_vectors.rs`](../shamir_reference_vectors.rs)) has **no
+([`tests/it/shamir_reference_vectors.rs`](../it/shamir_reference_vectors.rs)) has **no
 Python dependency at test time** — it reads the committed JSON.
 
 ## Reference implementation used
@@ -153,7 +153,7 @@ python3 -m venv venv
 The generator ([`generate_shamir_vectors.py`](generate_shamir_vectors.py)) is
 committed and self-documenting. `cross_impl` output is reproducible bit-for-bit
 across runs (fixed seed); `slip0039` output changes per run by design. After
-regenerating, `cargo test --test shamir_reference_vectors -p rrn-identity` must
+regenerating, `cargo test --test it shamir_reference_vectors -p rrn-identity` must
 still pass.
 
 > Note on scope: we validate only the **raw Shamir step**, not full SLIP-0039

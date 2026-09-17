@@ -657,7 +657,7 @@ mod tests {
         // empty history for a 300 spend against a 1000 cap: the offline check
         // passes (the receiver cannot see what was withheld). This is the ADR-0021
         // §3 residual — the cap still bounds the damage and the station refuses the
-        // overspend. `rrn-ledger/tests/cert_backed_spends.rs`
+        // overspend. `rrn-ledger/tests/it/cert_backed_spends.rs`
         // (`overspend_past_cap_is_refused`) proves the excess spend is refused with
         // `CertificateOverspent`; the station's appending of an `EquivocationRecord`
         // for it is proven in `rrn-ledger/src/engine.rs`'s equivocation tests.

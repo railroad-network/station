@@ -39,7 +39,7 @@ flagged three things to verify before committing: the exact pinned versions, the
 Rust↔`rnsd` interface for T2.6.2, and the Reticulum-License distribution posture.
 
 This ADR is that follow-up. Its inputs are the T2.6.1 spike
-(`crates/rrn-station/tests/reticulum_spike.rs`, run against a pinned `rnsd`) and a
+(`crates/rrn-station/tests/it/reticulum_spike.rs`, run against a pinned `rnsd`) and a
 fresh survey of the Reticulum ecosystem as of the ticket date (2026-09-07); the
 out-of-tree Reticulum fit assessment (2026-08-10) is its predecessor and several
 of its facts have since moved.
@@ -235,7 +235,7 @@ criteria / open decisions it must settle, none of which reopens *this* decision:
 - [ADR-0002](0002-canonical-serialization-dcbor.md) — the canonical dCBOR the app
   layer signs, transport-independent.
 - T2.6.1 — this ticket: the supervisor (`rrn-station::sidecar`), the spike
-  (`crates/rrn-station/tests/reticulum_spike.rs`), the spike helper
+  (`crates/rrn-station/tests/it/reticulum_spike.rs`), the spike helper
   (`scripts/spike/lxmf_pingpong.py`), and the CI `reticulum-spike` lane.
 - T2.6.2 (next) — the `FrameTransport` backend and announce/airtime budget over
   the interface decided in §3; T2.6.3 — RNode/LoRa interface template and hardware

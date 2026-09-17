@@ -5,7 +5,7 @@
 #
 # With no arguments it runs the whole workspace. Any arguments are passed to
 # nextest verbatim and REPLACE the default `--workspace` — so
-# `scripts/test-deep.sh -p rrn-ledger --test cert_backed_spends` scopes the run
+# `scripts/test-deep.sh -p rrn-ledger --test it cert_backed_spends` scopes the run
 # (cargo silently ignores `-p` when `--workspace` is also present, so the two
 # must not be combined).
 set -euo pipefail

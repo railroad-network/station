@@ -19,13 +19,13 @@ delay-tolerant-submission wire records, so the mobile repo can prove it produces
 
 Numeric values are decimal **strings** to survive the JSON hop into JavaScript's
 doubles. Generated and verified by
-[`tests/cross_platform_dtn.rs`](../cross_platform_dtn.rs); the
+[`tests/it/cross_platform_dtn.rs`](../it/cross_platform_dtn.rs); the
 `committed_bytes_match_the_typed_encoders` test rebuilds every value from the
 recorded seeds and fails on any encoding or field-order change. Deterministic
 (blake3-derived seeds + RFC 8032 Ed25519), reproducible bit-for-bit. Regenerate:
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-protocol --test cross_platform_dtn
+RRN_REGEN=1 cargo test -p rrn-protocol --test it cross_platform_dtn
 # then copy crates/rrn-protocol/tests/fixtures/cross_platform_dtn.json into the
 # mobile repo alongside the other cross_platform_* fixtures.
 ```
@@ -36,7 +36,7 @@ Exact emitted QR strings (one per line) for the paper-fallback forms of
 `docs/spec/qr-payloads.md` §§5–7, so the mobile repo's paper parser can verify
 byte-identical output. A paper payload is opaque bytes to the encoding layer, so
 these are built from fully-specified deterministic input bytes — no signing
-needed — documented in `tests/paper_qr.rs`:
+needed — documented in `tests/it/paper_qr.rs`:
 
 - `multipart_bundle.txt` — a 1500-byte bundle payload (`b[i] = (i·31 + 7) mod
   256`) split into three `rrnp:b/<id8>/<i>/3/<base64url>` chunks.
@@ -48,10 +48,10 @@ needed — documented in `tests/paper_qr.rs`:
   cert, six 300-byte history entries) that overflows the single-QR budget and so
   rides as `rrnp:s/<id8>/<i>/<n>/<base64url>` chunks — the kind-`s` route.
 
-Generated and verified by [`tests/paper_qr.rs`](../paper_qr.rs), which also
+Generated and verified by [`tests/it/paper_qr.rs`](../it/paper_qr.rs), which also
 reassembles/decodes each vector back to its input. Regenerate:
 
 ```sh
-RRN_REGEN=1 cargo test -p rrn-protocol --test paper_qr
+RRN_REGEN=1 cargo test -p rrn-protocol --test it paper_qr
 # then copy crates/rrn-protocol/tests/fixtures/paper/ into the mobile repo.
 ```
