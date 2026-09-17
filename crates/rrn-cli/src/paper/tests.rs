@@ -1,6 +1,6 @@
 //! Unit tests for the local paper codecs and renderers (no station needed).
 //! The end-to-end export→ingest→receipts path is exercised against a real
-//! station daemon in `tests/paper_roundtrip.rs`.
+//! station daemon in `tests/it/paper_roundtrip.rs`.
 
 use super::*;
 

@@ -8,7 +8,7 @@
 # lost, then reconnect, reconcile, and settle — with each guarantee checked in turn.
 #
 # It is the human-narrated companion to the plain test run,
-# `cargo test -p rrn-station --test outage_72h`. Simulated time keeps the whole
+# `cargo test -p rrn-station --test it outage_72h`. Simulated time keeps the whole
 # 72-hour scenario to a few seconds of wall-clock.
 #
 # Usage:  scripts/demo-phase-2-outage.sh [SCENARIO]   (1, 2, or 3; defaults to 1)
@@ -49,11 +49,11 @@ echo
 # on (the same test stays silent under a plain `cargo test`).
 RRN_OUTAGE_NARRATE=1 cargo test \
   --manifest-path "$REPO_ROOT/Cargo.toml" \
-  -p rrn-station --test outage_72h "$TEST" \
+  -p rrn-station --test it "outage_72h::$TEST" \
   -- --exact --nocapture
 
 echo
 echo "=== Simulation complete (scenario $SEED). ==="
 echo "Run every scenario plus the reproducibility check with:"
-echo "    cargo test -p rrn-station --test outage_72h"
+echo "    cargo test -p rrn-station --test it outage_72h"
 echo "See docs/phase-2-exit-evidence.md for what this proves and what it does not."

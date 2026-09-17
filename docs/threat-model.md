@@ -2548,7 +2548,7 @@ implementation, and adds two station-signed record kinds
   electorate pin, block a genuine enactment, or fold a phantom amendment). A forged
   record is invisible to derivation, never a hard error, so a hostile peer cannot wedge
   replay either (skip-not-halt). The invariant suite is
-  `crates/rrn-governance/tests/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
+  `crates/rrn-governance/tests/it/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
   attests) already made this decision, so no new ADR was needed.
 - *Residual — surviving after T2.1.4 and T2.11.3.* Items 1 and 2 below are now
   **closed** by T2.11.3 (the ledger sibling of T2.1.4); the read-replica consequence
@@ -2563,7 +2563,7 @@ implementation, and adds two station-signed record kinds
      is skipped (moves no balance; leaves the tx `Confirmed`); a forged certificate
      reserves nothing (a spend naming it is refused `UnknownCertificate`); a forged
      equivocation record occupies no dedup slot. Invariant suite in
-     `crates/rrn-ledger/tests/ledger_signer_pinning.rs`.
+     `crates/rrn-ledger/tests/it/ledger_signer_pinning.rs`.
   2. **The equivocation verdict community-key pin — CLOSED (T2.11.3).**
      `rrn-reputation::scoring::overturned_equivocations` and the snapshot's
      `equivocation_verdict` now gate `signer == station` (the community key), not the
@@ -3372,7 +3372,7 @@ property, restated so nothing downstream forgets it: **Reticulum is a dumb
 carrier**. It moves opaque bytes that are already sealed and signed at the app
 layer (ADR-0002/0008/0020); it is never the identity, integrity, or encryption
 boundary (ADR-0013 non-goals). The spike that ratified this path is
-`crates/rrn-station/tests/reticulum_spike.rs`.
+`crates/rrn-station/tests/it/reticulum_spike.rs`.
 
 **Assets:** the availability and clean lifecycle of the daemon (a failed or
 failing sidecar must never take the station down); the app-layer integrity
@@ -3822,7 +3822,7 @@ the boot-dir descriptor.
   keyslot. `< K` shards reveal nothing (ADR-0004), and the boot-dir descriptor
   discloses only the VMK address and `K`/`N` — **never the holder set** (a coercion
   map). The brick property is asserted on raw container bytes with a plaintext
-  positive control (`crates/rrn-station/tests/at_rest_dmcrypt.rs`, `scripts/drill-seizure-recovery.sh`).
+  positive control (`crates/rrn-station/tests/it/at_rest_dmcrypt.rs`, `scripts/drill-seizure-recovery.sh`).
 - *Information disclosure (key handling):* the reconstructed VMK is never written to
   disk, is held in a `ZeroizeOnDrop` type with a redacting `Debug`, is passed to the
   mount helper **by file descriptor** (`/dev/stdin`, never argv/env/temp file), and is
@@ -3835,7 +3835,7 @@ the boot-dir descriptor.
   unlocked would otherwise create a fresh plaintext `station.db` on the unencrypted
   root and serve it. *Mitigation:* `Station::open` verifies the state dir is a **live
   `dm-crypt` mount** (an unprivileged `/proc/self/mountinfo` check) *before touching
-  any file*, and refuses otherwise (`crates/rrn-station/tests/at_rest_dmcrypt.rs`,
+  any file*, and refuses otherwise (`crates/rrn-station/tests/it/at_rest_dmcrypt.rs`,
   `station_open_refuses_an_unmounted_state_dir_and_writes_nothing`).
 - *Denial of service:* every power loss unmaps the volume, so the node is a locked
   brick until `K` holders converge — the availability cost, paid by design. A UPS is
@@ -4042,7 +4042,7 @@ entry citing its ADR or the section that owns it.
 - **Forged station governance attestations are invisible on replay**
   (station-signer pinning; `rrn-governance` residual list for what is still
   unpinned).
-- **The daemon's offline posture is tested** (`crates/rrn-station/tests/offline_lifecycle.rs`): no
+- **The daemon's offline posture is tested** (`crates/rrn-station/tests/it/offline_lifecycle.rs`): no
   internet, no NTP, an unreachable peer is bounded by `PEER_DIAL_TIMEOUT` (3 s),
   and `rrn status` exposes a derived `connectivity` block. *Residual:* a peer
   configured as a **hostname** resolves via `getaddrinfo` on a blocking thread

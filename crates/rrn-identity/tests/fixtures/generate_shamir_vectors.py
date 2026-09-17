@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate cross-implementation Shamir reference vectors for rrn-identity.
 
-The committed output (`shamir_vectors.json`) lets `tests/shamir_reference_vectors.rs`
+The committed output (`shamir_vectors.json`) lets `tests/it/shamir_reference_vectors.rs`
 check our own Shamir implementation byte-for-byte against an *independent*,
 *published* one — Trezor's `shamir-mnemonic`, the reference implementation of
 SLIP-0039 — without any Python dependency at test time.

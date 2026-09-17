@@ -6,7 +6,7 @@ resort, records carried on paper. This document describes the automated simulati
 that tests that promise, what it verifies, what it deliberately leaves to field
 testing, and how to run it yourself.
 
-The simulation lives at `crates/rrn-station/tests/outage_72h.rs` and runs as an
+The simulation lives at `crates/rrn-station/tests/it/outage_72h.rs` and runs as an
 ordinary `cargo test`. Because it drives simulated time, a full 72-hour scenario
 completes in a few seconds.
 
@@ -125,7 +125,7 @@ substitute for it.
 
 ```sh
 # The full run: several independent scenarios plus the reproducibility check.
-cargo test -p rrn-station --test outage_72h
+cargo test -p rrn-station --test it outage_72h
 
 # A single scenario, narrated step by step for a human reader.
 scripts/demo-phase-2-outage.sh
@@ -171,7 +171,7 @@ carries as well.
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
-| Survives a simulated 72-hour full connectivity loss with real economic activity | **Met (simulation)** | `crates/rrn-station/tests/outage_72h.rs`: three independent seeded scenarios (`outage_72h_seed_1..3`) drive one real daemon and ~20 members through 72 simulated hours over courier, paper, and a lossy radio model; runs in CI. |
+| Survives a simulated 72-hour full connectivity loss with real economic activity | **Met (simulation)** | `crates/rrn-station/tests/it/outage_72h.rs`: three independent seeded scenarios (`outage_72h_seed_1..3`) drive one real daemon and ~20 members through 72 simulated hours over courier, paper, and a lossy radio model; runs in CI. |
 | Full reconciliation | **Met (simulation)** | `assert_no_phantom_admissions` + the harness's independent intent ledger reconciled against every receipt and final balance; `outage_lost_then_reexport` proves a lost bundle re-exports and lands. |
 | No credits lost | **Met (simulation)** | `assert_conservation` (balances sum to zero) at T0, at reconnect, and after settlement; `assert_conservation_from_log` re-derives it from the log. |
 | No ledger forks | **Met (by construction + simulation)** | ADR-0020 single writer; `assert_no_forks` over the final chain; `outage_72h_is_deterministic` reproduces a byte-identical chain digest. |
@@ -182,13 +182,13 @@ carries as well.
 
 | Deliverable | Status | Evidence / what remains |
 | --- | --- | --- |
-| Offline-first hardening | **Met** | `crates/rrn-station/tests/offline_lifecycle.rs`; no NTP, bounded peer dial, `rrn status` connectivity block. |
+| Offline-first hardening | **Met** | `crates/rrn-station/tests/it/offline_lifecycle.rs`; no NTP, bounded peer dial, `rrn status` connectivity block. |
 | Delay-tolerant networking | **Met** | Outbox chains, bundles, receipts, courier relay, station-originated push and receipt correlation (`rrn dtn push/status`). |
 | LoRa radio integration | **Software met; field sign-off pending** | RNode templating, airtime budget, `scripts/field-test-lora.sh` (dry-run in CI); two radios bench-verified over the air on 2026-09-11 (RSSI −40 dBm, SNR 12–14 dB). **Human step:** record the §5 field-acceptance checklist of `docs/lora-radio-bringup.md` at real range. **Scope note:** the field run proves bundle-push + receipt; a full propose → confirm → settle round-trip over radio waits on a station-side outbox export (no CLI wallet exists — needs an ADR). |
-| SMS interface | **Seam met; gateway not built** | Codec, sender registry, per-sender cap, money-first relay, all against a mock gateway (`crates/rrn-station/tests/sms_carrier.rs`). **Open:** the physical modem gateway (a human-gated hardware ticket). The custodial feature-phone model is out of scope by decision (ADR-0006). |
+| SMS interface | **Seam met; gateway not built** | Codec, sender registry, per-sender cap, money-first relay, all against a mock gateway (`crates/rrn-station/tests/it/sms_carrier.rs`). **Open:** the physical modem gateway (a human-gated hardware ticket). The custodial feature-phone model is out of scope by decision (ADR-0006). |
 | Physical credential layer | **Met** | `rrn paper` family, `scripts/demo-phase-2-paper.sh` end to end. |
-| Emergency governance | **Met** | ADR-0023 + ADR-0027 implemented and tested (`crates/rrn-governance/tests/{emergency_governance,emergency_activation_ttl,station_signer_pinning}.rs`). |
-| Node seizure resistance | **Met (opt-in, Linux)** | ADR-0024 encrypted profile; `crates/rrn-station/tests/at_rest_dmcrypt.rs` and the `at-rest-dmcrypt` CI lane; `scripts/drill-seizure-recovery.sh`. **Human step:** verify Adiantum throughput on a Raspberry Pi 4 in the field; a mobile client that reproduces the ceremony fingerprint. |
+| Emergency governance | **Met** | ADR-0023 + ADR-0027 implemented and tested (`crates/rrn-governance/tests/it/{emergency_governance,emergency_activation_ttl,station_signer_pinning}.rs`). |
+| Node seizure resistance | **Met (opt-in, Linux)** | ADR-0024 encrypted profile; `crates/rrn-station/tests/it/at_rest_dmcrypt.rs` and the `at-rest-dmcrypt` CI lane; `scripts/drill-seizure-recovery.sh`. **Human step:** verify Adiantum throughput on a Raspberry Pi 4 in the field; a mobile client that reproduces the ceremony fingerprint. |
 | "Red team the physical security" | **Checklist delivered; exercise pending** | `docs/security/phase-2-redteam.md` (by attacker, each defense traced to code, residuals stated); the community outage drill facilitator's guide in `docs/community-setup.md` Part 6. **Human step:** run the drill with real people; the independent professional audit is still pending. |
 
 ### Open residuals accepted at exit

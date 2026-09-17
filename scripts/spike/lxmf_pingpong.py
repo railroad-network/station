@@ -5,7 +5,7 @@
 # opaque LXMF message end to end. It exists because RNS/LXMF expose no
 # language-neutral send/receive RPC — the supported programmatic surface is the
 # in-process Python `RNS` + `LXMF` API (see ADR-0026). The Rust spike test
-# (crates/rrn-station/tests/reticulum_spike.rs) orchestrates two of these against
+# (crates/rrn-station/tests/it/reticulum_spike.rs) orchestrates two of these against
 # two supervised `rnsd` instances. Keep this small; it is deliberately not a
 # reusable library.
 #
