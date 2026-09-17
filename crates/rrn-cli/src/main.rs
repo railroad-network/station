@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod paper;
+mod wallet;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -409,6 +410,17 @@ enum Command {
     Dtn {
         #[command(subcommand)]
         cmd: DtnCmd,
+    },
+    /// The self-custody member wallet (ADR-0028): hold your own key on a computer
+    /// with no phone, sign payments offline into a durable outbox, carry them on
+    /// paper or a DTN bundle, and pair/sync over the sealed channel when online.
+    Wallet {
+        /// The wallet home directory (else `$RRN_WALLET_HOME`, else
+        /// `$HOME/.railroad/wallet`).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: wallet::WalletCmd,
     },
 }
 
@@ -1174,6 +1186,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Cert { cmd } => cmd_cert(&client, fmt, cmd).await,
         Command::Paper { cmd } => paper::cmd_paper(&client, fmt, cmd).await,
         Command::Dtn { cmd } => cmd_dtn(&client, fmt, cmd).await,
+        Command::Wallet { home, cmd } => wallet::cmd_wallet(fmt, color, home, cmd).await,
     }
 }
 

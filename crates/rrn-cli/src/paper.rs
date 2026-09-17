@@ -1087,8 +1087,10 @@ fn clear_rendered(dir: &Path) {
 }
 
 /// Writes `<basename>.txt` (the raw QR strings, one per line — the no-printer /
-/// debug path) then renders the sheet next to it.
-fn write_lines_and_render(dir: &Path, basename: &str, lines: &[String]) -> Result<()> {
+/// debug path) then renders the sheet next to it. Shared with the member wallet
+/// (`rrn wallet export`, ADR-0028): the wallet *calls* this render helper; this
+/// module never calls the wallet.
+pub(crate) fn write_lines_and_render(dir: &Path, basename: &str, lines: &[String]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let txt = dir.join(format!("{basename}.txt"));
     std::fs::write(&txt, format!("{}\n", lines.join("\n")))
