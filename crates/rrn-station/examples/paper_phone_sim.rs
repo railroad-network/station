@@ -3,9 +3,11 @@
 //! exists so `scripts/demo-phase-2-paper.sh` (and a human) can play the offline
 //! member whose records travel only on paper.
 //!
-//! Why an example and not the `rrn` CLI: a member's key lives on the phone
-//! (ADR-0006), and offline authoring is `rrn-mobile-ffi`'s job (T2.4.2) — the CLI
-//! is the operator's station console and holds no member key. This binary signs
+//! Why an example and not the `rrn` CLI: this stand-in mimics a *phone*, whose
+//! key lives on the device (ADR-0006) and whose offline authoring is
+//! `rrn-mobile-ffi`'s job. The CLI now *does* have a member wallet
+//! (`rrn wallet`, ADR-0028) for a laptop member — but this binary remains the
+//! phone mimic for the paper demo, chained state and all. This binary signs
 //! with the **same** `rrn-protocol`/`rrn-ledger`/`rrn-crypto` wire types the
 //! mobile FFI wraps, so the bytes it emits are exactly what a real phone would.
 //!

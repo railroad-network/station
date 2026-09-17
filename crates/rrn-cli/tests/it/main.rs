@@ -6,3 +6,4 @@
 //! `cargo test -p rrn-cli --test it <name>`.
 mod cli_e2e;
 mod paper_roundtrip;
+mod wallet_e2e;

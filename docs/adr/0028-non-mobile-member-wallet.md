@@ -454,3 +454,32 @@ Concretely:
 - `docs/threat-model.md`, `docs/phase-2-exit-evidence.md`,
   `docs/lora-radio-bringup.md`, `docs/design/Railroad-Network-Overview.md` — the
   recorded "no CLI wallet — needs an ADR" blockers this closes
+
+## Clarifications (2026-09-17) — the one new write, and the additive head field
+
+Two points, recorded when the wallet was implemented; neither changes the
+decision (Status stays Accepted).
+
+**§5's "one new station surface" is one read plus one live write that §4 already
+presupposed.** §4 lists certificate requests among the records the wallet
+produces, and §5 says every online interaction reuses existing channel methods.
+In the code as built there was no member-facing certificate-request door at all:
+the only `cert_request` was the operator socket's, which signs a request for the
+station's *own* wallet, and over DTN `rrn.credit.cert_request` is deliberately
+refused (`unroutable-kind` — issuance is a live round-trip for the station's
+signed reply). So a member — mobile included — had nowhere to land a signed
+certificate request. The wallet therefore adds one member-signed channel write,
+`cert_request` (`{"signed_request"}` → `{"certificate_hex"}`), signer-bound like
+`submit_vouch` and calling the existing `Engine::submit_certificate_request`. No
+new record kind, no fixture change: the `CertificateRequest`/`HeadroomCertificate`
+kinds and their encodings already exist. This is the single live write §4
+presupposed, alongside the single new read (`outbox_head`), not a new surface.
+
+**`outbox_head` returns the contiguous head additively.** §5 fixes the read's
+result as the highest-*seen* `(position, entry_hash)` — the re-anchor target that
+keeps a restored wallet from resuming into a gap-ahead entry and self-equivocating
+(point 7). The implementation also returns `contiguous_position` (the highest
+*contiguous* position, already stored in `seen_outbox_heads`), so the wallet can
+*tell the member* when a hole sits below the head — admission continues over a
+gap, contiguity does not — rather than resuming silently. It is the same
+already-derived state, an additive field the decision does not forbid.

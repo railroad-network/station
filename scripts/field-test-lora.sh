@@ -15,11 +15,13 @@
 # antennas, spectrum compliance, placement — are the human's, per that runbook.
 #
 # SCOPE: this exercises the DTN bundle-push + receipt path (the "a signed record
-# crosses A→B over radio and its receipt returns" check). A *full*
-# propose→confirm→settle payment round-trip over radio additionally needs a
-# station-side outbox export that does not exist yet (deferred to a later ticket:
-# `rrn paper export-outbox` / a CLI wallet); supply the bundle to push with
-# `--bundle` (e.g. one produced by the paper/mobile tooling) until then.
+# crosses A→B over radio and its receipt returns" check). The member-side outbox
+# export a full propose→confirm→settle round-trip needs now exists — the sending
+# member runs `rrn wallet pay … --carrier slow` and `rrn wallet export bundle`,
+# and you push the resulting `payload.bundle` here with `--bundle`. The receiving
+# member's receipt comes back via its own `rrn wallet sync` / `rrn paper
+# export-receipts`, not from `rrn dtn status` (which shows only a summary). See
+# docs/lora-radio-bringup.md.
 #
 # TOPOLOGY: run one station on each of two machines (two `rnsd` instances cannot
 # share one host's Reticulum control ports). Start each station yourself per the

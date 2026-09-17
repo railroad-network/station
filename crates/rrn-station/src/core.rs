@@ -4279,6 +4279,78 @@ impl Core {
         }))
     }
 
+    /// `outbox_head` (paired member / sealed channel): the station's view of the
+    /// authenticated author's DTN outbox chain, so a restored or paper-first
+    /// wallet can re-anchor and resume without forking (ADR-0028 §5/§7).
+    ///
+    /// Signer-scoped — any params are ignored; a member reads only their own
+    /// chain. `position`/`entry_hash` are the author's highest *seen* position
+    /// (the re-anchor target: chaining onto anything below a gap-ahead entry would
+    /// re-use a position the station already saw a different entry at — a
+    /// self-fork). `contiguous_position` is additively the highest *contiguous*
+    /// position, so the wallet can tell the member when a hole sits below the head
+    /// (ADR-0028 §7); it is `null` when the chain has never reached position 0
+    /// contiguously. A read: served on a replica.
+    fn channel_outbox_head(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let author = envelope.signer.to_bytes();
+        let dtn = DtnStore::new(&self.db);
+        let highest = dtn
+            .highest_seen(&author)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        let contiguous = dtn
+            .head(&author)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(serde_json::json!({
+            "position": highest.map(|h| h.position),
+            "entry_hash": highest.map(|h| hex(&h.entry_hash)),
+            "contiguous_position": contiguous.map(|h| h.position),
+        }))
+    }
+
+    /// `cert_request` (paired member / sealed channel): a member submits their
+    /// own signed headroom-certificate request and gets back the station-signed
+    /// certificate (ADR-0021 §1, ADR-0028 §4).
+    ///
+    /// Signer-bound like [`channel_submit_vouch`](Self::channel_submit_vouch): the
+    /// request's signer must be the authenticated member. The engine independently
+    /// re-checks the signature, signer-is-member, nonce, cap, and floor, so this
+    /// binds the request to *this* paired member and hands off. The reply is the
+    /// portable `{signer, sig, body}` certificate envelope, hex-encoded — the same
+    /// bytes a `rrncert:` card carries and `certificate_parse` decodes.
+    fn channel_cert_request(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let bytes = hex_param(&envelope.params, "signed_request")?;
+        let signed: rrn_ledger::escrow::SignedCertificateRequest =
+            rpc_envelope::parse_signed_record(&bytes).map_err(|_| {
+                (
+                    rpc::INVALID_PARAMS,
+                    "malformed signed certificate request".into(),
+                )
+            })?;
+        // A member requests only their own certificate: the requester must be the
+        // authenticated signer bound to this paired member.
+        if signed.signer.to_bytes() != envelope.signer.to_bytes() {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "certificate requester is not the authenticated member".into(),
+            ));
+        }
+        let now = self.clock.now();
+        let station = self.station_keypair();
+        let mut engine = Engine::new(&self.db, station).with_credit_config(self.credit);
+        let certificate = engine
+            .submit_certificate_request(signed, now)
+            .map_err(ledger_err_pair)?;
+        Ok(serde_json::json!({
+            "certificate_hex": hex(&rrn_ledger::escrow::encode_certificate_envelope(&certificate)),
+        }))
+    }
+
     /// Prunes DTN receipt-delivery rows past their retention (ADR-0020 §3,
     /// T2.2.4); returns the number removed. Driven by the daemon's prune timer and
     /// directly by tests.
@@ -5649,6 +5721,16 @@ impl Core {
             // authenticated identity, and confirms delivery of the returned rows —
             // the sealed-channel stand-in for the ticket's `GET /receipts`.
             "receipts_fetch" => self.channel_receipts_fetch(envelope),
+            // DTN outbox re-anchor read (ADR-0028 §5): the authenticated member
+            // reads the station's view of their own outbox chain so a restored or
+            // paper-first wallet resumes without forking. A read; served on a
+            // replica.
+            "outbox_head" => self.channel_outbox_head(envelope),
+            // Live headroom-certificate issuance (ADR-0021 §1, ADR-0028 §4): a
+            // member submits their own signed request and gets the station-signed
+            // certificate back. Issuance is a live round-trip (refused over DTN),
+            // so this is a member's only door to a certificate.
+            "cert_request" => self.channel_cert_request(envelope),
             "submit_dispute" => self.channel_submit_dispute(envelope),
             "submit_dispute_response" => self.channel_submit_dispute_response(envelope),
             "submit_verdict" => self.channel_submit_verdict(envelope),
@@ -7051,6 +7133,7 @@ fn channel_method_is_replica_safe(method: &str) -> bool {
             | "disputes"
             | "dispute"
             | "receipts_fetch"
+            | "outbox_head"
     )
 }
 
@@ -8263,6 +8346,147 @@ mod tests {
             "expected a cap error, got: {}",
             err.message
         );
+    }
+
+    // --- member wallet channel arms: outbox_head + cert_request (ADR-0028) ---
+
+    /// Frames a member-signed certificate request the way the wallet's channel
+    /// client does: canonical payload bytes + signer + signature.
+    fn framed_cert_request(member: &Keypair, cap_centi: i64, nonce: u64, now: i64) -> Vec<u8> {
+        let req = rrn_ledger::escrow::CertificateRequest::new(
+            Address::from_public_key(member.public_key()),
+            cap_centi,
+            nonce,
+            now,
+        );
+        let signed = rrn_ledger::escrow::SignedCertificateRequest::sign(req, member);
+        rpc_envelope::frame_signed_record(
+            &to_canonical_bytes(signed.payload.clone()),
+            &signed.signer,
+            &signed.signature,
+        )
+    }
+
+    #[test]
+    fn outbox_head_reports_null_contiguous_and_gap_ahead() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+
+        // An author the station has never seen reads all-null.
+        let env = envelope(&member, "outbox_head", serde_json::json!({}));
+        let head = core.route_channel_method(&env).unwrap();
+        assert!(head["position"].is_null());
+        assert!(head["entry_hash"].is_null());
+        assert!(head["contiguous_position"].is_null());
+
+        // Admit a contiguous chain (positions 0 and 1): both heads equal 1.
+        let receiver = Keypair::generate();
+        let p0 = member_proposal(&member, &receiver, 100, 0, 900, 900 + 1_000_000);
+        let e0 = outbox_entry(&member, 0, zero(), &p0, 900);
+        let p1 = member_proposal(&member, &receiver, 100, 1, 900, 900 + 1_000_000);
+        let e1 = outbox_entry(&member, 1, e0.payload.entry_hash(), &p1, 901);
+        submit_bundle(&mut core, &[e0.clone(), e1.clone()], 1000);
+
+        let head = core.route_channel_method(&env).unwrap();
+        assert_eq!(head["position"], 1);
+        assert_eq!(head["contiguous_position"], 1);
+        assert_eq!(
+            head["entry_hash"].as_str().unwrap(),
+            hex(&e1.payload.entry_hash().to_bytes())
+        );
+
+        // Admit an entry ahead of a gap (position 3, with 2 absent): the highest
+        // seen advances to 3 but the contiguous head stays at 1.
+        let p3 = member_proposal(&member, &receiver, 100, 3, 900, 900 + 1_000_000);
+        let e3 = outbox_entry(&member, 3, Hash::from_bytes([0x33u8; 32]), &p3, 903);
+        submit_bundle(&mut core, std::slice::from_ref(&e3), 1001);
+
+        let head = core.route_channel_method(&env).unwrap();
+        assert_eq!(head["position"], 3);
+        assert_eq!(head["contiguous_position"], 1);
+        assert_eq!(
+            head["entry_hash"].as_str().unwrap(),
+            hex(&e3.payload.entry_hash().to_bytes())
+        );
+    }
+
+    #[test]
+    fn cert_request_over_channel_issues_a_station_signed_certificate() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        let now = core.clock.now();
+
+        let frame = framed_cert_request(&member, 500, 0, now);
+        let env = envelope(
+            &member,
+            "cert_request",
+            serde_json::json!({ "signed_request": hex(&frame) }),
+        );
+        let result = core.route_channel_method(&env).unwrap();
+        let cert_hex = result["certificate_hex"].as_str().unwrap();
+        let cert =
+            rrn_ledger::escrow::decode_certificate_envelope(&unhex(cert_hex).unwrap()).unwrap();
+
+        // The certificate is signed by the station and reserves the member's cap.
+        assert!(cert.verify().is_ok());
+        assert_eq!(cert.signer.to_bytes(), core.station_pubkey().to_bytes());
+        assert_eq!(cert.payload.cap_centi, 500);
+        assert_eq!(
+            cert.payload.member.to_string(),
+            Address::from_public_key(member.public_key()).to_string()
+        );
+    }
+
+    #[test]
+    fn cert_request_over_channel_binds_the_signer() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        let other = Keypair::generate();
+        let now = core.clock.now();
+
+        // A request signed by `other` but presented on `member`'s channel is
+        // refused before the engine sees it.
+        let frame = framed_cert_request(&other, 500, 0, now);
+        let env = envelope(
+            &member,
+            "cert_request",
+            serde_json::json!({ "signed_request": hex(&frame) }),
+        );
+        let (code, msg) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(msg.contains("not the authenticated member"), "{msg}");
+    }
+
+    #[test]
+    fn cert_request_over_channel_refuses_over_the_max_cap() {
+        let mut core = test_core(); // default cert_max_cap_centi = 1000
+        let member = Keypair::generate();
+        let now = core.clock.now();
+
+        let frame = framed_cert_request(&member, 1_001, 0, now);
+        let env = envelope(
+            &member,
+            "cert_request",
+            serde_json::json!({ "signed_request": hex(&frame) }),
+        );
+        let (_, msg) = core.route_channel_method(&env).unwrap_err();
+        assert!(msg.contains("cap"), "expected a cap error, got: {msg}");
+    }
+
+    #[test]
+    fn replica_serves_outbox_head_but_refuses_cert_request() {
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
+        let member = Keypair::generate();
+
+        // The read works on a replica (it reads empty).
+        let env = envelope(&member, "outbox_head", serde_json::json!({}));
+        let head = core.route_channel_method(&env).unwrap();
+        assert!(head["position"].is_null());
+
+        // The write is refused with the typed READ_REPLICA code, before params.
+        let env = envelope(&member, "cert_request", serde_json::json!({}));
+        let (code, _) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::READ_REPLICA);
     }
 
     // --- DTN bundle ingest (T2.2.3, ADR-0020) -------------------------------

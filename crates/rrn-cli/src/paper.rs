@@ -12,12 +12,12 @@
 //! scanned QR text is untrusted courier input and a courier must be able to
 //! inspect a sheet with no station reachable (`rrn paper show`). That is the only
 //! reason this module links `rrn-protocol`/`rrn-ledger`/`rrn-crypto`. It holds no
-//! key and touches no SQLite: it cannot author records. Offline *signing* — a
-//! member spending from a partitioned phone — lives in `rrn-mobile-ffi`
-//! (T2.4.2), not here; a member is a phone, and the CLI is the operator's
-//! station console. (`rrn paper export-outbox` and a CLI-side wallet are
-//! deliberately **not** in this ticket — there is no non-mobile member wallet in
-//! the system today; that is deferred to T2.5.3 behind a new ADR.)
+//! key and touches no SQLite: it cannot author records. A member's self-custody
+//! wallet on a computer is `rrn wallet` (ADR-0028); it *calls* these render
+//! helpers (`write_lines_and_render`) and this module never calls it — the arrow
+//! points one way, so a member key and its outbox database never leak into the
+//! courier tools. Offline *signing* on a phone lives in `rrn-mobile-ffi`; this
+//! module signs nothing.
 //!
 //! # Scanning is out of band
 //!
@@ -1087,8 +1087,10 @@ fn clear_rendered(dir: &Path) {
 }
 
 /// Writes `<basename>.txt` (the raw QR strings, one per line — the no-printer /
-/// debug path) then renders the sheet next to it.
-fn write_lines_and_render(dir: &Path, basename: &str, lines: &[String]) -> Result<()> {
+/// debug path) then renders the sheet next to it. Shared with the member wallet
+/// (`rrn wallet export`, ADR-0028): the wallet *calls* this render helper; this
+/// module never calls the wallet.
+pub(crate) fn write_lines_and_render(dir: &Path, basename: &str, lines: &[String]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let txt = dir.join(format!("{basename}.txt"));
     std::fs::write(&txt, format!("{}\n", lines.join("\n")))

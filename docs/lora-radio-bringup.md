@@ -228,11 +228,20 @@ are minute-scale because radio is slow.
 
 > **Scope — what crosses the radio here.** This run verifies the DTN
 > bundle-push + receipt path: a signed record travels A → B over LoRa and its
-> receipt returns. A *full* propose → confirm → settle payment round-trip over
-> radio additionally needs a station-side outbox export that is not built yet
-> (`rrn paper export-outbox` / a CLI wallet, deferred to a later ticket). Until
-> then, supply the bundle to push with `--bundle` — e.g. one produced by the
-> paper/mobile tooling.
+> receipt returns. The member-side outbox export a full payment round-trip needs
+> now exists — `rrn wallet` (ADR-0028). The sending member runs
+> `rrn wallet pay … --carrier slow` (the two-week expiry survives a slow carrier)
+> and `rrn wallet export bundle --out .`, and the sender station pushes the
+> resulting `payload.bundle` with `rrn dtn push --peer <hex> --bundle
+> payload.bundle`. The receiving member confirms with their own `rrn wallet`.
+>
+> **Carrying the receipt back.** `rrn dtn status` on the sender shows only a
+> one-line `receipt_summary` for a delivered push, not the receipt bytes, so the
+> member does *not* apply a receipt from `dtn status`. The receiving member gets
+> its station-signed receipt the normal way — `rrn wallet sync` when it can reach
+> the writer's LAN, or a courier carrying `rrn paper export-receipts` output from
+> the writer, applied with `rrn wallet receipts apply`. Settlement is observed on
+> the writer (`rrn balance`). The human field sign-off is still what remains.
 
 ### Troubleshooting
 

@@ -49,6 +49,7 @@ not optional homework for later — do it the same day you found the community.
 | A station machine | Any always-on Linux or macOS box: a Raspberry Pi 4/5 with a 64-bit OS (4 GB+ RAM), a spare laptop, a mini-PC. It must stay powered and on the network. |
 | A network | A Wi‑Fi network all members' phones can join. The station needs a stable reachable address on it — give it a DHCP reservation or static IP in your router if you can. |
 | Phones | Android, arm64 (roughly anything from 2017 on). iPhones can only run development builds today. |
+| Laptops (optional) | A member with a computer and no phone can use the built-in `rrn wallet` instead (§2.4) — same self-custody key, driven from the command line, works offline. |
 | The software | The `station` binary is built from source (10–30 minutes, once). The phone app is a single `app-release.apk` file. |
 | Two safe places | For the passphrase and backups: e.g. a fireproof folder at home plus a sealed envelope with a trusted member. You'll thank yourself in Part 4. |
 
@@ -236,7 +237,7 @@ rrn history       # the ledger log (empty at first — that's fine)
 
 ---
 
-## Part 2 — Get the phones on
+## Part 2 — Get the members on
 
 ### 2.1 Install the app
 
@@ -300,6 +301,44 @@ Housekeeping commands you'll use over the community's life:
 station list-mobiles          # who is paired
 station unpair <rrn1-addr>    # revoke a lost or departed member's phone
 ```
+
+### 2.4 Members without a smartphone — the CLI wallet
+
+A member with a computer and no Android phone can still hold their own key and
+transact, using the built-in `rrn wallet` (ADR-0028). It is the same identity
+model as the phone — the member's key never leaves their machine — driven from
+the command line, and it works offline (sign now, carry on paper or a USB stick
+later).
+
+**They learn the station's address from you, in person.** The wallet *pins*
+that address, and every station-signed thing it later accepts (receipts,
+certificates, the pairing reply) is checked against the pin. That in-person
+hand-off is the security boundary here, exactly as the code comparison is for a
+phone — so read the station's `rrn1…` address to them, don't email it.
+
+```sh
+# on the member's laptop (set a passphrase once; it is never taken on the command line):
+export RRN_WALLET_PASSPHRASE='something the member chooses'
+rrn wallet init  --station rrn1<your-station-address>   # prints their new rrn1… address
+rrn wallet pair  --url 192.168.4.1:7500                 # shows an 8-char SAS
+```
+
+**Confirm the pair as in §2.3:** compare the SAS the wallet prints with what
+`station pair-mobile` lists, then `station pair-mobile <their-rrn1-address>`.
+The member then runs `rrn wallet sync` to pull their nonce, balance, and any
+receipts. To pay offline they `rrn wallet pay …` and `rrn wallet export qr`
+(or `--format bundle`); a courier carries the sheets to you, you `rrn paper
+ingest` them, and the member applies the returned receipts with `rrn wallet
+receipts apply`. Online, `rrn wallet submit` does the whole round trip.
+
+**Two things the member must understand.** First, **back up the whole wallet
+home directory** (`~/.railroad/wallet` by default), not just the key file — the
+outbox and its cursors live beside the key, and a backup of the key alone loses
+the chain. Second, **full-disk encryption is their responsibility**: the wallet
+encrypts its key file, but the decrypted key is in memory while a command runs.
+If a member restores from a backup, they must reach the station's LAN once and
+run `rrn wallet sync` before they can sign again (this re-anchors their chain so
+it cannot fork).
 
 ---
 
@@ -742,10 +781,13 @@ is identifiable by eye), and a `*.txt` of the raw strings (the no-printer path).
 certificate carries no secret, so losing one is a **delay, not a loss of funds**.
 Re-scanning the same sheet is safe: the station recognizes it and never admits a
 payment twice. If a receipt sheet goes missing, just run `export-receipts` again;
-the receipt is proof of what actually landed. The one thing paper cannot do yet
-is originate a payment *from* the station side offline — that is the member's
-phone's job. See the end-to-end walkthrough in
-[`scripts/demo-phase-2-paper.sh`](../scripts/demo-phase-2-paper.sh).
+the receipt is proof of what actually landed. A member without a phone originates
+their own payments offline with `rrn wallet` and prints them with `rrn wallet
+export` (§2.4); these `rrn paper` tools are the *courier's* verify-and-ingest
+side. See the end-to-end walkthroughs in
+[`scripts/demo-phase-2-paper.sh`](../scripts/demo-phase-2-paper.sh) (the phone)
+and [`scripts/demo-phase-2-wallet.sh`](../scripts/demo-phase-2-wallet.sh) (the
+laptop member).
 
 ### Reticulum carrier — optional, off by default (experimental)
 

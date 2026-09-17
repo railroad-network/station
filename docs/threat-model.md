@@ -1522,13 +1522,82 @@ malicious oversized single-QR string.
 voucher is community-public data like any other carried record — a photographed
 sheet leaks the same as an intercepted bundle, §Information-disclosure above).
 
+#### CLI member wallet (`rrn wallet`, ADR-0028)
+
+*Implemented in the member-wallet ticket.* The self-custody wallet
+([`wallet`](../crates/rrn-cli/src/wallet.rs)) is the non-mobile member device: a
+laptop that holds its own Ed25519 key in an `EncryptedWallet` `member.rrnwallet`
+and its own hash-chained outbox in a `wallet.db`, signs records offline, and
+pairs/syncs over the ADR-0008 sealed channel. It is the first CLI role to hold a
+key and open a database, so it inherits the phone's key-custody threats
+(ADR-0006/0007) without the phone's OS keystore.
+
+**Assets:** the member's secret key (in `member.rrnwallet`, argon2id + XChaCha20
+at rest); the outbox database (the member's own unsettled signed history and its
+cursors); the wallet's trust anchor (the pinned station address).
+
+- *Spoofing (a forged station).* Every station-signed artifact the wallet accepts
+  — delivery receipts, issued certificates, the pairing response — is checked
+  against the **pinned** station key, not merely self-verified: a receipt must be
+  signed by the pin *and* name it (mirroring `rrn_mobile_ffi::dtn::receipt_parse`),
+  and `pair` refuses a URL whose station address is not the pin before it even
+  verifies the response signature. A forged or wrong-station receipt is rejected
+  and the outbox rows stay pending (test: `forged_receipt_is_rejected`,
+  `wrong_station_at_pair_refused`). *Residual:* the pin is learned out of band (the
+  operator, in person) — a member who pins the wrong address trusts the wrong
+  station, exactly as the SAS depends on an in-person comparison.
+- *Tampering / self-fork.* The outbox is a single hash chain over `OutboxStore`,
+  which enforces dense positions and prev-hash linkage. A restored wallet
+  (`init --restore`) is marked `unknown` and refuses every signing verb until one
+  `sync` re-anchors it on the station's **highest-seen** position, so it cannot
+  resume into a gap-ahead position the station already saw a different entry at and
+  self-equivocate (ADR-0028 §7; tests `restore_reanchors_and_never_forks`,
+  `restore_into_gap_still_admits_and_warns`). There is no manual position/hash
+  override. *Residual:* deleting or rolling back `wallet.db` and re-signing is a
+  self-fork the device cannot prevent — the station detects and records it as
+  equivocation evidence (ADR-0021 §5), and the member is accountable for their own
+  key, as on a phone.
+- *Information disclosure.* The passphrase is read from `RRN_WALLET_PASSPHRASE`
+  or a hidden `rpassword` prompt, never taken on argv (so it is not in `ps` or
+  shell history) and never logged. The secret is zeroized on drop
+  (`WalletContents`). *Residual:* no `mlock` — the decrypted key can reach swap or
+  a core dump; full-disk encryption is the member's responsibility, as stated in
+  the operator runbook. QR sheets and DTN bundles carry the same
+  community-public metadata a bundle does (§Information-disclosure).
+- *Elevation / wrong home.* A pre-unlock guard refuses a home that looks like a
+  station data directory (`station.db`/`config.toml`/`wallet.rrnwallet`/
+  `station.sock`) or whose `wallet_meta.role ≠ member`, before any passphrase is
+  read (test: `station_dir_refused`). `--home`/`RRN_WALLET_HOME` still let a member
+  point the wallet at an attacker-seeded chain; the pin and the re-anchor rule
+  bound the damage to that member's own accountability, not the community's log.
+- *The new station surface.* The wallet adds one member-signed channel write,
+  `cert_request` (signer-bound like `submit_vouch`, calling the existing engine
+  door), and one read, `outbox_head` (a read, served on a replica). Neither is a
+  new record kind or fixture; the write is refused with `READ_REPLICA` on a
+  replica (test: `replica_serves_outbox_head_but_refuses_cert_request`).
+
+**Known limitations.** Concurrent use of one key on two devices cannot be
+prevented and is a self-fork (ADR-0028 §2 forbids it by policy, not by mechanism)
+— the advisory `wallet.lock` is belt-and-braces for one host only. A member whose
+station has a hole below its outbox head is told the chain will never be
+contiguous again but that admission continues (ADR-0028 §7). **Offline vouching is
+not supported** (a vouch is not nonce-tracked and DTN-routing it is a
+reputation/sybil-surface change, ADR-0028): `rrn wallet vouch` needs the
+station reachable and refuses cleanly otherwise. A member restoring from backup
+must reach the station's LAN once before signing again (ADR-0028 §7). Member
+social recovery on the CLI (guardian enrollment/reconstruction) is a separate
+follow-up (ADR-0028 §9).
+
 ### `rrn-station` / `rrn-cli`
 
 The daemon that holds an open database and decrypted wallet, runs the settlement
 sweep on a timer, gossips log entries with peers, and serves the `rrn` CLI; plus
-the CLI itself. This layer adds three new boundaries the lower crates did not
-have: a **local IPC socket** (CLI ↔ daemon), a **peer TCP surface** (the gossip
-stub), and a **long-lived process holding key material in memory**.
+the CLI itself. The CLI is the **operator console** here (a thin client over the
+socket); the CLI's **member-device** role, which holds its own key and database
+and never touches this socket, has its own section above (`rrn wallet`,
+ADR-0028). This layer adds three new boundaries the lower crates did not have: a
+**local IPC socket** (CLI ↔ daemon), a **peer TCP surface** (the gossip stub),
+and a **long-lived process holding key material in memory**.
 
 **Assets:** the in-memory station secret key (held decrypted for the daemon's
 lifetime); the integrity of the local log under entries pulled from peers; the
@@ -3332,13 +3401,16 @@ core against malformed scanned input; the invariant that the CLI remains a
   the unconfirmed row is retained four times longer and re-exported, and the
   author's re-submission of the record returns `known`. Only the author's own
   device confirms delivery — the CLI never acks receipts it merely carried.
-- *Elevation of privilege — the CLI as a new key-holder.* The paper tools link
-  `rrn-protocol`/`rrn-ledger`/`rrn-crypto` **for decode and verification only**;
-  the CLI holds no key and opens no database, so it cannot author or sign a
-  record. Offline *signing* stays on the phone (`rrn-mobile-ffi`, ADR-0006). The
-  ticket's `export-outbox` and any CLI-side member wallet are deliberately **not**
-  built here — there is no non-mobile member wallet in the system, and creating
-  one is an identity-architecture decision deferred to T2.5.3 behind a new ADR.
+- *Elevation of privilege — key-holding stays out of the courier tools.* The
+  paper tools link `rrn-protocol`/`rrn-ledger`/`rrn-crypto` **for decode and
+  verification only**: this module holds no key and opens no database, so it
+  cannot author or sign a record. The CLI *does* now hold a member key — but in a
+  **different module**, `rrn wallet` (ADR-0028), with its own section above. The
+  `paper` module's one-directional contract is what keeps that key and its outbox
+  database from leaking into the courier tools: the wallet calls `paper`'s render
+  helpers, `paper` imports nothing from the wallet (a build-time test,
+  `paper_module_stays_keyless`, pins this). Offline *signing* on a phone stays in
+  `rrn-mobile-ffi` (ADR-0006).
 - *Disclosure — a lost sheet.* Sheets are **public information**: a bundle, a
   receipt, or a headroom certificate carries no secret (the same posture as the
   DTN receipt disclosure note above — a certificate reserves the member's *own*
@@ -4050,6 +4122,14 @@ entry citing its ADR or the section that owns it.
   wait out its timeout. Configure peers by IP.
 - **Every untrusted decode boundary is depth-guarded** (`MAX_CBOR_DEPTH`), and
   every carrier bounds what it will reassemble.
+- **A member without a smartphone can transact.** `rrn wallet` (ADR-0028) is a
+  self-custody sealed-channel client with an offline outbox: it holds the
+  member's own key, signs payments/confirmations offline, exports them as QR or a
+  DTN bundle, and applies station-signed receipts checked against a pinned key.
+  The recorded "no non-mobile member wallet — needs an ADR" blocker on the full
+  offline payment round-trip is closed; its residuals (concurrent two-device use,
+  the LAN-once-after-restore rule, offline vouching, a hole below the head) are in
+  the `rrn wallet` section above.
 
 ### Identity, reputation, and governance (standing)
 
@@ -4146,10 +4226,10 @@ entry citing its ADR or the section that owns it.
 - **Some Phase 2 deliverables stop at a software seam.** The SMS *modem
   gateway* is not built (only the codec, registry, relay, and a mock gateway);
   the RNode/LoRa field round-trip is bench-verified but the human field sign-off
-  is pending; there is no station-side outbox export (`rrn paper export-outbox`
-  / a CLI wallet — needs an ADR), so a full propose → confirm → settle payment
-  round-trip over radio is not yet field-provable; `rrn paper show` on a spend
-  voucher is a structural check only. See
+  is pending; `rrn paper show` on a spend voucher is a structural check only. The
+  member-side outbox export the round-trip needed now exists (`rrn wallet export`,
+  ADR-0028), so a full propose → confirm → settle payment over radio is provable
+  in software; only the human LoRa field sign-off remains. See
   [`phase-2-exit-evidence.md`](phase-2-exit-evidence.md).
 
 ### Marketplace and mobile (standing, from Phase 1)
