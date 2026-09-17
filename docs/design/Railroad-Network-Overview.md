@@ -847,7 +847,7 @@ IDENTITY LAYER
 > | Full internet / LAN | Phones ↔ station over the sealed channel on the local network; couriers' phones submit carried bundles. | No inter-community sync (Phase 3). |
 > | Partial / regional | Reticulum over TCP links via the supervised `rnsd` sidecar (ADR-0026); station-originated bundle push with receipt correlation; airtime-budgeted, money first. | Propagation-node (LXMF `PROPAGATED`) store-and-forward with neither endpoint online is not exercised. |
 > | Local network only | Wi-Fi to the station. | Bluetooth mesh is not built. |
-> | LoRa | RNode radio templated from `[lora.rnode]`; bench-verified over the air (2026-09-11); sustained ≈ 2.5 B/s at the EU 1 % duty cycle, paced economic-first. | Human field sign-off pending; a full payment round-trip over radio waits on a station-side outbox export (no CLI wallet yet). |
+> | LoRa | RNode radio templated from `[lora.rnode]`; bench-verified over the air (2026-09-11); sustained ≈ 2.5 B/s at the EU 1 % duty cycle, paced economic-first. | Human field sign-off pending; the member-side outbox export the round-trip needed now exists (`rrn wallet export`, ADR-0028), so a full payment round-trip is software-provable — only the field sign-off remains. |
 > | Complete isolation | Paper/QR end to end (bundles, receipts, certificates, credential cards); SMS codec, sender registry, and relay against a mock gateway. | The SMS modem gateway is not built. Conductors as *inter*-community carriers are Phase 3. |
 >
 > The automated proof that a community reconciles after a 72-hour loss over
@@ -932,7 +932,7 @@ Each protocol is a defined message format plus a state machine. Any node impleme
 | Class | Description |
 |---|---|
 | **Class 1 — Full node** | Raspberry Pi 4, 4GB RAM, 128GB storage. Runs full ledger, all protocols, local API server. Solar-powered. Community's primary node. ~$80 hardware cost. |
-| **Class 2 — Light node** | Smartphone or low-power laptop. Holds personal wallet and identity. Connects to full node via local WiFi or Bluetooth. |
+| **Class 2 — Light node** | Smartphone or low-power laptop. Holds personal wallet and identity. Connects to full node via local WiFi or Bluetooth. *(Updated 2026-09-17: the "low-power laptop" half is built — `rrn wallet`, ADR-0028, a self-custody sealed-channel client with an offline outbox.)* |
 | **Class 3 — Minimal node** | Basic phone with SMS capability. Interacts via structured SMS commands to a community hub. Functional for core credit transactions and governance votes. *(Updated 2026-09-13: the "structured SMS commands" model would require the hub to hold the member's keys, which ADR-0006 forbids; what Phase 2 built is SMS as a **carrier** for records a smartphone already signed — see `spec/sms-carrier.md` §7. A true feature-phone node needs a custody decision in a new ADR.)* |
 | **Class 4 — Paper fallback** | Printed QR codes representing signed transaction records. Physically carried between communities by conductors. Scanned and ingested on reconnect. |
 

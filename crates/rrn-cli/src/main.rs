@@ -1,8 +1,14 @@
 //! `rrn` — the Railroad Network command-line client.
 //!
-//! Each subcommand maps to exactly one daemon RPC method: parse args, build the
-//! request, send it over the station's Unix socket, format the reply. Output is
-//! deliberately terse and machine-friendly — greppable in `text` mode,
+//! Most subcommands are the **operator console**: each maps to exactly one daemon
+//! RPC method — parse args, build the request, send it over the station's Unix
+//! socket, format the reply. Two families are different: `paper` is the
+//! verify-only courier tool (it holds no key and opens no database), and `wallet`
+//! is the self-custody **member device** (ADR-0028) — the one role that holds a
+//! key and its own outbox database, talking to the station over the sealed
+//! channel and paper/DTN rather than the operator socket.
+//!
+//! Output is deliberately terse and machine-friendly — greppable in `text` mode,
 //! one-line-JSON in `json` mode (pipe to `jq` if you want it pretty). Results go
 //! to stdout, errors to stderr, and any failure exits non-zero.
 
@@ -399,7 +405,8 @@ enum Command {
     /// Paper fallback: export payloads to printable QR sheets and ingest scanned
     /// QR text (M2.5, ADR-0020 §3 / ADR-0021 §4). The CLI consumes scanned QR
     /// *text* — one payload string per line, from any scanner app — it does not
-    /// read camera images.
+    /// read camera images. A member exporting their *own* signed records prints
+    /// them with `rrn wallet export` (ADR-0028); these tools are the courier's.
     Paper {
         #[command(subcommand)]
         cmd: paper::PaperCmd,
@@ -1758,7 +1765,9 @@ fn cmd_init() -> Result<()> {
         "`rrn init` does not run here: initialization creates the wallet the\n\
          daemon opens, so run it against the daemon's data dir directly:\n\n\
          \tstation init --data-dir <dir>\n\n\
-         then start the daemon with `station run --data-dir <dir>`."
+         then start the daemon with `station run --data-dir <dir>`.\n\n\
+         If you are a member with a computer and no phone, you want the\n\
+         self-custody wallet instead: `rrn wallet init --station rrn1…`."
     );
     Ok(())
 }
