@@ -1,29 +1,94 @@
 name: CI
 
 on:
+  # A PR push runs this workflow once, via `pull_request`. Pushes to `main`
+  # (post-merge) also run it, and additionally the `coverage` + `fuzz-smoke`
+  # lanes that are held off the PR path. A push to a feature branch with no
+  # open PR runs nothing — open a (draft) PR to get CI.
   push:
+    branches: [main]
   pull_request:
-  # Manual trigger for the non-hermetic `reticulum-spike` lane (T2.6.1), which is
-  # gated on this event so it never blocks a normal push/PR.
+  # Weekly deep lane + coverage + fuzz (see the `deep`/`coverage` jobs).
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  # Manual trigger for the non-hermetic `reticulum-spike` lane (ADR-0026), the
+  # `deep` proptest lane, and coverage on demand.
   workflow_dispatch:
+
+# One in-flight run per PR: a superseded PR push cancels its predecessor. Non-PR
+# events (main pushes, schedule, dispatch) each get a unique group keyed on the
+# run id, so they never cancel one another — a shared main group would cancel a
+# still-pending run when a third is queued, losing a merged commit's CI record.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Path filter used only to gate `fuzz-smoke` on PRs (see that job). `on.paths`
+  # is workflow-wide, so this per-job filter is the way to scope one lane.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    # paths-filter only needs to read the PR's changed files.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+    steps:
+      - uses: actions/checkout@v4
+      # Only meaningful on a PR (it needs a base to diff against). On every
+      # other event the step is skipped, `fuzz` resolves to empty, and
+      # `fuzz-smoke` runs anyway via its `!= pull_request` clause.
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            # Every crate compiled into the fuzz targets: fuzz/Cargo.toml's deps
+            # (rrn-crypto, rrn-storage, rrn-identity, rrn-ledger) plus their
+            # normal-dependency closure — rrn-ledger pulls in rrn-protocol.
+            # (rrn-mobile-ffi is only a dev-dep of rrn-ledger, so it is not.)
+            fuzz:
+              - 'crates/rrn-crypto/**'
+              - 'crates/rrn-storage/**'
+              - 'crates/rrn-identity/**'
+              - 'crates/rrn-ledger/**'
+              - 'crates/rrn-protocol/**'
+              - 'fuzz/**'
+              - 'Cargo.lock'
+
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Share the compile cache with `deep` (identical build inputs), so the
+          # weekly deep run does not cold-build after cache eviction.
+          shared-key: test-suite
       # nextest overlaps test binaries (cargo test runs them serially) and
       # emits per-test times, a JUnit report, and slow-test warnings. Install
       # the prebuilt binary — `cargo install` here would cost 3-5 min/job.
       - uses: taiki-e/install-action@nextest
+      # One shard: the warm `test` wall is ~2 min after the test-perf work
+      # (nextest, optimized dependency profiles, single-replay scoring, kind
+      # dispatch, proptest budgets), well under the 8-min budget, so
+      # partitioning would only add scheduling overhead.
+      # To shard later, add `strategy.matrix.partition: [1, 2, …]` and append
+      # `--partition hash:${{ matrix.partition }}/${{ strategy.job-total }}`
+      # here: nextest assigns tests by a stable hash of the test name, so the
+      # shards are deterministic and their union is the full suite. Keep the
+      # doc-test step below on `partition == 1` when you do.
       - run: cargo nextest run --workspace --all-features --profile ci
       # nextest does not run doc-tests; run them explicitly to keep coverage.
       - run: cargo test --workspace --all-features --doc
@@ -40,6 +105,33 @@ jobs:
         if: always()
         with:
           name: test-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  deep:
+    name: deep (proptest 1024 cases)
+    # The deep property lane: every proptest at 1024 cases (PROPTEST_CASES
+    # overrides the fast per-test defaults, matching scripts/test-deep.sh).
+    # Slow by design — schedule/dispatch only, never on the PR path.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PROPTEST_CASES: "1024"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Reuse the `test` job's cache (same Cargo.lock, profile, features).
+          shared-key: test-suite
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features --profile ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deep-junit
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
 
@@ -91,6 +183,11 @@ jobs:
 
   fuzz-smoke:
     name: fuzz-smoke
+    # Gates the audit-boundary crates. On a PR it runs only when a crate the
+    # fuzz targets exercise (or Cargo.lock / fuzz/) changed; on `main`, the
+    # schedule, and manual dispatch it always runs.
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,7 +212,7 @@ jobs:
 
   reticulum-spike:
     name: reticulum-spike
-    # Non-hermetic integration spike (T2.6.1, ADR-0013 / ADR-0026): installs the
+    # Non-hermetic integration spike (ADR-0013 / ADR-0026): installs the
     # pinned Python Reticulum daemon + LXMF and runs the `#[ignore]`d spike that
     # carries a real signed Bundle across two supervised `rnsd` instances over
     # LXMF store-and-forward. Manual only (`workflow_dispatch`) — it needs a
@@ -181,7 +278,11 @@ jobs:
 
   coverage:
     name: coverage
+    # Held off the PR path (maintainer decision 2026-09-14): runs on `main`
+    # pushes, the weekly schedule, and manual dispatch.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -190,17 +291,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: true
-      - run: cargo install cargo-tarpaulin --locked
-      # Tarpaulin is run on Linux for the official numbers (it is unreliable on
-      # macOS). HTML + LCOV are uploaded as a build artifact rather than
-      # committed — coverage reports are large and noisy in git (T0.7.2).
-      #
-      # --engine llvm: the default ptrace engine times out ("Timed out waiting
-      # for test response") on the multi-threaded tokio e2e tests (gossip/IPC
-      # daemons in two_station_e2e, ipc, backup_recover, cli_e2e). LLVM
-      # source-based coverage doesn't trace syscalls, so it handles async +
-      # networking reliably. --timeout covers the cross-station convergence waits.
-      - run: cargo tarpaulin --workspace --engine llvm --timeout 300 --out Html --out Lcov --output-dir target/coverage
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # LLVM source-based instrumentation (same engine tarpaulin used via
+      # --engine llvm, chosen because the ptrace engine times out on the
+      # multi-threaded tokio e2e tests), driven by nextest so binaries run in
+      # parallel. `--no-report` runs the suite once and keeps the profraw; the
+      # two `report` calls then emit LCOV + HTML without re-running tests.
+      - run: cargo llvm-cov nextest --workspace --all-features --profile ci --no-report
+      # --html --output-dir creates the directory; --lcov --output-path does a
+      # bare write and would fail if target/coverage/ did not exist yet, so run
+      # the HTML report first.
+      - run: cargo llvm-cov report --html --output-dir target/coverage
+      - run: cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-report
