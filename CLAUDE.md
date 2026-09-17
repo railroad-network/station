@@ -186,9 +186,17 @@ seconds to start, sweep it: `cargo install cargo-sweep --locked` then
 `scripts/target-hygiene.sh` reports the size and entry count and, with
 `--sweep`, runs the sweep.
 
-CI (`.github/workflows/ci.yml`) runs `test`, `clippy`, `fmt`, `deny`, `audit` in parallel on
-every push/PR. `cargo fmt --check` is also enforced locally via a pre-commit hook
-(`git config core.hooksPath .githooks`, set up by `scripts/install-hooks.sh`).
+CI (`.github/workflows/ci.yml`) runs once per push (a PR push runs the workflow a single
+time — via `pull_request`; a push to a branch with no open PR runs nothing, so open a draft
+PR to get CI). A superseded PR run is cancelled. On every PR: `test` (nextest + doc-tests),
+`clippy`, `fmt`, `deny`, `audit`, `at-rest-dmcrypt`, and `fuzz-smoke` (only when a
+fuzz-relevant crate, `fuzz/`, or `Cargo.lock` changed). On `main` pushes: all of the above
+(`fuzz-smoke` always) plus `coverage` (cargo-llvm-cov). On the weekly schedule and manual
+`workflow_dispatch`: the standard jobs (`test`, `clippy`, `fmt`, `deny`, `audit`,
+`at-rest-dmcrypt`) plus coverage, `fuzz-smoke`, and the `deep` lane (`PROPTEST_CASES=1024`);
+`reticulum-spike` is `workflow_dispatch`-only. `cargo fmt --check` is also enforced locally
+via a pre-commit hook (`git config core.hooksPath .githooks`, set up by
+`scripts/install-hooks.sh`).
 
 ## Conventions
 
