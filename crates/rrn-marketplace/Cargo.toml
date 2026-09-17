@@ -36,3 +36,5 @@ tracing = "0.1"
 # The persistent tantivy index is exercised against a real directory, since
 # open-write-reopen is the part an in-RAM index cannot check.
 tempfile = "3"
+# Generates random listing lifecycles for the replay dispatch equivalence proof.
+proptest = "1"

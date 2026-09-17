@@ -45,14 +45,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dcbor::prelude::*;
 use rrn_crypto::keypair::PublicKey;
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::{decode_kinded, from_canonical_bytes_if_kind, KindedCbor};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::transaction::TransactionId;
 use rrn_storage::log::{AppendLog, LogEntry};
 use serde::{Deserialize, Serialize};
 
-use crate::listing::{Availability, Listing, ListingId, Pricing, SignedListing};
+use crate::listing::{Availability, Listing, ListingId, Pricing, SignedListing, LISTING_KIND};
 use crate::Result;
 
 /// Discriminant strings carried in the `kind` field of each record's canonical
@@ -458,6 +458,83 @@ impl Scope<'_> {
     }
 }
 
+/// Folds a decoded creation record into `found` (first valid creation per id
+/// wins).
+fn fold_created(
+    found: &mut BTreeMap<ListingId, ListingRecords>,
+    scope: &Scope<'_>,
+    listing: Listing,
+    signer: &Address,
+) {
+    if scope.wants(&listing.id) && *signer == listing.provider && listing.validate().is_ok() {
+        // First creation wins; a later duplicate id is not a second listing, and
+        // `append_listing_created` refuses to write one.
+        found
+            .entry(listing.id)
+            .or_default()
+            .created
+            .get_or_insert(listing);
+    }
+}
+
+/// Folds a decoded update: kept only for a listing already created here, by its
+/// provider, and not yet closed.
+fn fold_updated(
+    found: &mut BTreeMap<ListingId, ListingRecords>,
+    update: ListingUpdated,
+    signer: &Address,
+) {
+    // Only a listing this station has already seen created can have authorized
+    // records, so anything before its creation is ignored.
+    let Some(records) = found.get_mut(&update.listing_id) else {
+        return;
+    };
+    let Some(provider) = records.created.as_ref().map(|c| c.provider) else {
+        return;
+    };
+    if records.closed.is_none() && update.signed_by == provider && *signer == update.signed_by {
+        records.updates.push(update);
+    }
+}
+
+/// Folds a decoded stock-consumed sale: kept only against a created listing and
+/// only when signed by the station (ADR-0005).
+fn fold_consumed(
+    found: &mut BTreeMap<ListingId, ListingRecords>,
+    consumed: StockConsumed,
+    signer: &Address,
+    station: &PublicKey,
+) {
+    let Some(records) = found.get_mut(&consumed.listing_id) else {
+        return;
+    };
+    // Only the station attests a sale (ADR-0005). A record from anyone else is
+    // not evidence of anything and is dropped, exactly as an unauthorized close
+    // would be.
+    if records.created.is_some() && *signer == Address::from_public_key(*station) {
+        records.consumed.push(consumed);
+    }
+}
+
+/// Folds a decoded close: kept for a created, not-yet-closed listing when the
+/// signer is entitled to close it for that reason.
+fn fold_closed(
+    found: &mut BTreeMap<ListingId, ListingRecords>,
+    close: ListingClosed,
+    signer: &Address,
+    station: &PublicKey,
+) {
+    let Some(records) = found.get_mut(&close.listing_id) else {
+        return;
+    };
+    let Some(provider) = records.created.as_ref().map(|c| c.provider) else {
+        return;
+    };
+    if records.closed.is_none() && closer_is_entitled(signer, &provider, station, close.reason) {
+        records.closed = Some(close);
+    }
+}
+
 /// Collects the records for every listing in `scope` in **one** pass.
 ///
 /// A payload that is not one of the three marketplace kinds is skipped, as are
@@ -478,60 +555,42 @@ fn scan(
         let entry = entry?;
         let signer = Address::from_public_key(entry.payload.signer);
 
-        if let Ok(listing) = from_canonical_bytes::<Listing>(&entry.payload.bytes) {
-            if scope.wants(&listing.id) && signer == listing.provider && listing.validate().is_ok()
-            {
-                // First creation wins; a later duplicate id is not a second
-                // listing, and `append_listing_created` refuses to write one.
-                found
-                    .entry(listing.id)
-                    .or_default()
-                    .created
-                    .get_or_insert(listing);
-            }
+        // Parse the entry once and dispatch on its `kind`, instead of
+        // trial-decoding each of the four listing record types in turn — this scan
+        // runs once per listing when the daemon reindexes, so shaving the per-entry
+        // decode cost matters quadratically. A malformed or non-listing entry is
+        // skipped, exactly as four failed trial decodes were. Each fold is shared
+        // with [`scan_all_reference`], so the two differ only in how they select the
+        // record type — proven equivalent by `tests/compute_all_dispatch_equivalence.rs`.
+        let Ok(KindedCbor {
+            kind: Some(kind),
+            cbor,
+        }) = decode_kinded(&entry.payload.bytes)
+        else {
             continue;
-        }
-        if let Ok(update) = from_canonical_bytes::<ListingUpdated>(&entry.payload.bytes) {
-            // Only a listing this station has already seen created can have
-            // authorized records, so anything before its creation is ignored.
-            let Some(records) = found.get_mut(&update.listing_id) else {
-                continue;
-            };
-            let Some(provider) = records.created.as_ref().map(|c| c.provider) else {
-                continue;
-            };
-            if records.closed.is_none()
-                && update.signed_by == provider
-                && signer == update.signed_by
-            {
-                records.updates.push(update);
+        };
+        match kind.as_str() {
+            LISTING_KIND => {
+                if let Ok(listing) = Listing::try_from(cbor) {
+                    fold_created(&mut found, &scope, listing, &signer);
+                }
             }
-            continue;
-        }
-        if let Ok(consumed) = from_canonical_bytes::<StockConsumed>(&entry.payload.bytes) {
-            let Some(records) = found.get_mut(&consumed.listing_id) else {
-                continue;
-            };
-            // Only the station attests a sale (ADR-0005). A record from anyone
-            // else is not evidence of anything and is dropped, exactly as an
-            // unauthorized close would be.
-            if records.created.is_some() && signer == Address::from_public_key(*station) {
-                records.consumed.push(consumed);
+            UPDATED_KIND => {
+                if let Ok(update) = ListingUpdated::try_from(cbor) {
+                    fold_updated(&mut found, update, &signer);
+                }
             }
-            continue;
-        }
-        if let Ok(close) = from_canonical_bytes::<ListingClosed>(&entry.payload.bytes) {
-            let Some(records) = found.get_mut(&close.listing_id) else {
-                continue;
-            };
-            let Some(provider) = records.created.as_ref().map(|c| c.provider) else {
-                continue;
-            };
-            if records.closed.is_none()
-                && closer_is_entitled(&signer, &provider, station, close.reason)
-            {
-                records.closed = Some(close);
+            CONSUMED_KIND => {
+                if let Ok(consumed) = StockConsumed::try_from(cbor) {
+                    fold_consumed(&mut found, consumed, &signer, station);
+                }
             }
+            CLOSED_KIND => {
+                if let Ok(close) = ListingClosed::try_from(cbor) {
+                    fold_closed(&mut found, close, &signer, station);
+                }
+            }
+            _ => {}
         }
     }
     Ok(found)
@@ -717,26 +776,30 @@ pub fn append_stock_consumed(
 /// — so pointing this at an impostor's record costs a wasted recompute and
 /// changes no view.
 pub fn touched_listing(payload_bytes: &[u8]) -> Option<ListingId> {
-    if let Ok(listing) = from_canonical_bytes::<Listing>(payload_bytes) {
-        return Some(listing.id);
+    // Parse once and dispatch on `kind` rather than trial-decoding each type.
+    let KindedCbor {
+        kind: Some(kind),
+        cbor,
+    } = decode_kinded(payload_bytes).ok()?
+    else {
+        return None;
+    };
+    match kind.as_str() {
+        LISTING_KIND => Listing::try_from(cbor).ok().map(|l| l.id),
+        UPDATED_KIND => ListingUpdated::try_from(cbor).ok().map(|u| u.listing_id),
+        CLOSED_KIND => ListingClosed::try_from(cbor).ok().map(|c| c.listing_id),
+        CONSUMED_KIND => StockConsumed::try_from(cbor).ok().map(|c| c.listing_id),
+        _ => None,
     }
-    if let Ok(update) = from_canonical_bytes::<ListingUpdated>(payload_bytes) {
-        return Some(update.listing_id);
-    }
-    if let Ok(close) = from_canonical_bytes::<ListingClosed>(payload_bytes) {
-        return Some(close.listing_id);
-    }
-    if let Ok(consumed) = from_canonical_bytes::<StockConsumed>(payload_bytes) {
-        return Some(consumed.listing_id);
-    }
-    None
 }
 
 /// Finds a listing's creation record without caring about its later history.
 fn find_created(log: &AppendLog, listing_id: &ListingId) -> Result<Option<Listing>> {
     for entry in log.iter_from(1) {
         let entry = entry?;
-        let Ok(listing) = from_canonical_bytes::<Listing>(&entry.payload.bytes) else {
+        let Ok(Some(listing)) =
+            from_canonical_bytes_if_kind::<Listing>(&entry.payload.bytes, LISTING_KIND)
+        else {
             continue;
         };
         if listing.id == *listing_id
@@ -908,6 +971,52 @@ pub fn compute_all(
     now: i64,
 ) -> Result<BTreeMap<ListingId, ListingState>> {
     Ok(scan(log, Scope::All, station)?
+        .into_iter()
+        .filter_map(|(id, records)| state_of(&records, now).map(|state| (id, state)))
+        .collect())
+}
+
+/// Like [`scan`] with [`Scope::All`], but selects each record type by
+/// **trial decoding** rather than kind dispatch — the pre-dispatch path, folding
+/// through the same `fold_*` helpers. Kept only as the oracle for the
+/// `compute_all_dispatch_equivalence` test.
+#[doc(hidden)]
+fn scan_all_reference(
+    log: &AppendLog,
+    station: &PublicKey,
+) -> Result<BTreeMap<ListingId, ListingRecords>> {
+    use rrn_crypto::serialize::from_canonical_bytes;
+    let scope = Scope::All;
+    let mut found: BTreeMap<ListingId, ListingRecords> = BTreeMap::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let signer = Address::from_public_key(entry.payload.signer);
+        let bytes = &entry.payload.bytes;
+        if let Ok(listing) = from_canonical_bytes::<Listing>(bytes) {
+            fold_created(&mut found, &scope, listing, &signer);
+        } else if let Ok(update) = from_canonical_bytes::<ListingUpdated>(bytes) {
+            fold_updated(&mut found, update, &signer);
+        } else if let Ok(consumed) = from_canonical_bytes::<StockConsumed>(bytes) {
+            fold_consumed(&mut found, consumed, &signer, station);
+        } else if let Ok(close) = from_canonical_bytes::<ListingClosed>(bytes) {
+            fold_closed(&mut found, close, &signer, station);
+        }
+    }
+    Ok(found)
+}
+
+/// The trial-decode counterpart of [`compute_all`], kept only as the oracle for
+/// `tests/compute_all_dispatch_equivalence.rs`, which asserts it reproduces
+/// [`compute_all`] over generated listing lifecycles — so kind dispatch is proven
+/// to select the same record (or the same skip) as trial decoding. Not used in
+/// production.
+#[doc(hidden)]
+pub fn compute_all_reference(
+    log: &AppendLog,
+    station: &PublicKey,
+    now: i64,
+) -> Result<BTreeMap<ListingId, ListingState>> {
+    Ok(scan_all_reference(log, station)?
         .into_iter()
         .filter_map(|(id, records)| state_of(&records, now).map(|state| (id, state)))
         .collect())
@@ -1124,9 +1233,10 @@ mod tests {
         // reference something stable. Encoding one as a `listing.v1` record
         // would therefore mint a second listing — which is why nothing does,
         // and why an update is its own record kind.
-        let recomputed: Listing =
-            from_canonical_bytes(&rrn_crypto::serialize::to_canonical_bytes(patched.clone()))
-                .unwrap();
+        let recomputed: Listing = rrn_crypto::serialize::from_canonical_bytes(
+            &rrn_crypto::serialize::to_canonical_bytes(patched.clone()),
+        )
+        .unwrap();
         assert_ne!(recomputed.id, patched.id);
     }
 

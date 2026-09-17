@@ -36,12 +36,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use rrn_crypto::keypair::PublicKey;
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::{decode_kinded, KindedCbor};
 use rrn_identity::address::Address;
-use rrn_identity::vouch::Vouch;
+use rrn_identity::vouch::{Vouch, VOUCH_KIND_TAG};
 use rrn_ledger::escrow::{
     EquivocationBasis, EquivocationId, EquivocationRecord, EquivocationVerdictRecord,
-    VerdictDecision,
+    VerdictDecision, EQUIVOCATION_KIND, EQUIVOCATION_VERDICT_KIND,
 };
 use rrn_ledger::state::{CancelReason, LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionConfirmation;
@@ -234,12 +234,25 @@ impl ScoringContext {
 
         // One pass over the whole log: known vouchers/subjects (unbounded), plus
         // the prefix's vouches, equivocations and verdicts (bounded to `max_seq`).
+        // Each entry is parsed once and dispatched on its `kind` discriminator
+        // rather than trial-decoded against each candidate type (the vouch/
+        // equivocation/verdict trio); a malformed or unknown-kind entry is skipped,
+        // exactly as three failed trial decodes were.
         for entry in log.iter_from(1) {
             let entry = entry?;
             let signer = entry.payload.signer;
-            let bytes = &entry.payload.bytes;
+            let Ok(KindedCbor {
+                kind: Some(kind),
+                cbor,
+            }) = decode_kinded(&entry.payload.bytes)
+            else {
+                continue;
+            };
 
-            if let Ok(vouch) = from_canonical_bytes::<Vouch>(bytes) {
+            if kind == VOUCH_KIND_TAG {
+                let Ok(vouch) = Vouch::try_from(cbor) else {
+                    continue;
+                };
                 let voucher = Address::from_public_key(signer);
                 // Known addresses span the whole log, whatever the prefix bound.
                 known.insert(voucher);
@@ -264,7 +277,10 @@ impl ScoringContext {
                 continue;
             }
 
-            if let Ok(record) = from_canonical_bytes::<EquivocationRecord>(bytes) {
+            if kind == EQUIVOCATION_KIND {
+                let Ok(record) = EquivocationRecord::try_from(cbor) else {
+                    continue;
+                };
                 // The cert-overspend cap is read from the prefix's certificate;
                 // `verify_evidence` does not depend on the scoring instant, so the
                 // verdict of "does the evidence re-derive the conflict" is settled
@@ -288,7 +304,10 @@ impl ScoringContext {
                 continue;
             }
 
-            if let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(bytes) {
+            if kind == EQUIVOCATION_VERDICT_KIND {
+                let Ok(verdict) = EquivocationVerdictRecord::try_from(cbor) else {
+                    continue;
+                };
                 if verdict.decision == VerdictDecision::Overturn {
                     overturns.push(OverturnEntry {
                         equivocation_id: verdict.equivocation_id,

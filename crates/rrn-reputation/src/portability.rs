@@ -38,13 +38,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dcbor::prelude::*;
 use rrn_crypto::hash::{Hash, Hasher};
 use rrn_crypto::keypair::{Keypair, PublicKey};
-use rrn_crypto::serialize::from_canonical_bytes;
+use rrn_crypto::serialize::{decode_kinded, from_canonical_bytes_if_kind, KindedCbor};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
-use rrn_identity::vouch::Vouch;
-use rrn_ledger::settlement::SettlementRecord;
-use rrn_ledger::state::CancellationRecord;
-use rrn_ledger::transaction::{TransactionConfirmation, TransactionId, TransactionProposal};
+use rrn_identity::vouch::{Vouch, VOUCH_KIND_TAG};
+use rrn_ledger::settlement::{SettlementRecord, SETTLEMENT_KIND};
+use rrn_ledger::state::{CancellationRecord, CANCELLATION_KIND};
+use rrn_ledger::transaction::{
+    TransactionConfirmation, TransactionId, TransactionProposal, CONFIRMATION_KIND, PROPOSAL_KIND,
+};
 use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 use rrn_storage::migrations;
@@ -305,7 +307,11 @@ fn entries_concerning(
     let mut transactions: HashSet<TransactionId> = HashSet::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
-        if let Ok(proposal) = from_canonical_bytes::<TransactionProposal>(&entry.payload.bytes) {
+        // Only proposals name the parties; dispatch on kind so a non-proposal
+        // entry is skipped without trial-decoding it as a proposal first.
+        if let Ok(Some(proposal)) =
+            from_canonical_bytes_if_kind::<TransactionProposal>(&entry.payload.bytes, PROPOSAL_KIND)
+        {
             if proposal.sender == *address || proposal.receiver == *address {
                 transactions.insert(proposal.id);
             }
@@ -332,29 +338,40 @@ fn concerns(
     transactions: &HashSet<TransactionId>,
     station: &PublicKey,
 ) -> bool {
-    let bytes = &entry.payload.bytes;
-
-    if let Ok(proposal) = from_canonical_bytes::<TransactionProposal>(bytes) {
-        return transactions.contains(&proposal.id);
-    }
-    if let Ok(confirmation) = from_canonical_bytes::<TransactionConfirmation>(bytes) {
-        return transactions.contains(&confirmation.proposal_id);
-    }
-    if let Ok(settlement) = from_canonical_bytes::<SettlementRecord>(bytes) {
-        return entry.payload.signer == *station && transactions.contains(&settlement.proposal_id);
-    }
-    if let Ok(cancellation) = from_canonical_bytes::<CancellationRecord>(bytes) {
-        return entry.payload.signer == *station
-            && transactions.contains(&cancellation.proposal_id);
-    }
-    if let Ok(vouch) = from_canonical_bytes::<Vouch>(bytes) {
+    // Parse once and dispatch on the `kind` discriminator, instead of
+    // trial-decoding proposal → confirmation → settlement → cancellation → vouch
+    // in turn. A malformed or unrelated-kind entry does not belong in the bundle.
+    let Ok(KindedCbor {
+        kind: Some(kind),
+        cbor,
+    }) = decode_kinded(&entry.payload.bytes)
+    else {
+        return false;
+    };
+    match kind.as_str() {
+        PROPOSAL_KIND => TransactionProposal::try_from(cbor)
+            .map(|p| transactions.contains(&p.id))
+            .unwrap_or(false),
+        CONFIRMATION_KIND => TransactionConfirmation::try_from(cbor)
+            .map(|c| transactions.contains(&c.proposal_id))
+            .unwrap_or(false),
+        SETTLEMENT_KIND => SettlementRecord::try_from(cbor)
+            .map(|s| entry.payload.signer == *station && transactions.contains(&s.proposal_id))
+            .unwrap_or(false),
+        CANCELLATION_KIND => CancellationRecord::try_from(cbor)
+            .map(|c| entry.payload.signer == *station && transactions.contains(&c.proposal_id))
+            .unwrap_or(false),
         // Vouches in both directions: the ones the member signed feed its own
         // attestation accuracy, and the ones it received are what a receiving
         // station needs in order to judge how it was anchored (T1.5.8).
-        let voucher = Address::from_public_key(entry.payload.signer);
-        return vouch.subject == *address || voucher == *address;
+        VOUCH_KIND_TAG => Vouch::try_from(cbor)
+            .map(|v| {
+                let voucher = Address::from_public_key(entry.payload.signer);
+                v.subject == *address || voucher == *address
+            })
+            .unwrap_or(false),
+        _ => false,
     }
-    false
 }
 
 /// The Merkle root over the entries' content hashes, in order.

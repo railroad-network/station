@@ -42,7 +42,7 @@ use crate::transaction::TransactionId;
 use crate::{Error, Result};
 
 /// Discriminant string for a settlement record's canonical CBOR.
-pub(crate) const SETTLEMENT_KIND: &str = "rrn.tx.settlement";
+pub const SETTLEMENT_KIND: &str = "rrn.tx.settlement";
 
 /// The default Tier-1 settlement window: 24 hours. Lower value, shorter scrutiny
 /// (ADR-0011).
