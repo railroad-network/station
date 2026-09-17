@@ -284,8 +284,22 @@ fn extract_signature(map: &Map, key: &str) -> std::result::Result<Signature, dcb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::ProptestConfig;
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
+
+    /// Property-test case budget: `PROPTEST_CASES` if set (the deep lane sets
+    /// 1024), else `default_cases` — sized so the default run stays fast.
+    fn cases(default_cases: u32) -> ProptestConfig {
+        let cases = std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_cases);
+        ProptestConfig {
+            cases,
+            ..ProptestConfig::default()
+        }
+    }
 
     /// A stand-in for a carried application record (a proposal, vote, …), so the
     /// outbox layer can be exercised without depending on a ledger record type.
@@ -464,6 +478,12 @@ mod tests {
     }
 
     proptest::proptest! {
+        // Default run: 64 cases (each builds and validates a chain of up to 40
+        // signed entries), which keeps this well under a second with optimized
+        // dependencies. `cases` honors `PROPTEST_CASES`, so the deep lane
+        // (`scripts/test-deep.sh`) still runs the full 1024-case budget.
+        #![proptest_config(cases(64))]
+
         #[test]
         fn arbitrary_chains_validate_and_mutation_is_local(len in 0u64..40, victim in 0usize..40) {
             let device = Keypair::generate();

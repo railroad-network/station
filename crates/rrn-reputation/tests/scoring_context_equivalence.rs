@@ -713,8 +713,22 @@ fn bits_eq(want: f32, got: f32) -> bool {
     want.to_bits() == got.to_bits()
 }
 
+/// Property-test case budget: `PROPTEST_CASES` if set (the deep lane sets
+/// 1024), else `default_cases`. Unlike `ProptestConfig::with_cases`, this
+/// honors the env var, so the deep lane deepens this equivalence proof too.
+fn cases(default_cases: u32) -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_cases);
+    ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(cases(64))]
 
     /// For every generated log, prefix bound and scoring instant, the context's
     /// score, anchoring voucher and established set match the reference oracle

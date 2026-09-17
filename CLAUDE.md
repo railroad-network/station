@@ -150,6 +150,10 @@ cargo test --test lifecycle -p rrn-ledger
 scripts/test-timings.sh nextest
 scripts/test-timings.sh libtest -p rrn-crypto
 
+# deep property-test lane: every proptest at 1024 cases (PROPTEST_CASES
+# overrides the fast per-test defaults). Slow by design — release/schedule only.
+scripts/test-deep.sh
+
 # fuzz targets (nightly toolchain, own workspace under fuzz/)
 cargo +nightly fuzz run verify_signature
 
