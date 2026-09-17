@@ -41,8 +41,9 @@ use crate::escrow::CertId;
 
 /// Discriminant strings carried in the `kind` field of each record's canonical
 /// CBOR, so log replay can tell the record types apart unambiguously.
-pub(crate) const PROPOSAL_KIND: &str = "rrn.tx.proposal";
-pub(crate) const CONFIRMATION_KIND: &str = "rrn.tx.confirmation";
+pub const PROPOSAL_KIND: &str = "rrn.tx.proposal";
+/// Discriminant string carried in a [`TransactionConfirmation`]'s canonical CBOR.
+pub const CONFIRMATION_KIND: &str = "rrn.tx.confirmation";
 
 /// The content address of a transaction: the Blake3 hash of its proposal's
 /// canonical bytes.

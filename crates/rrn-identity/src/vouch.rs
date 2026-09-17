@@ -27,8 +27,10 @@ use crate::attestation::{Attestation, SignedAttestation};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VouchKind;
 
-/// The discriminant string a [`VouchKind`] encodes to.
-const VOUCH_KIND_TAG: &str = "vouch";
+/// The discriminant string a [`VouchKind`] encodes to — the top-level `kind` a
+/// vouch attestation carries in its canonical CBOR, so a reader replaying the log
+/// can dispatch on it (`rrn-reputation`) instead of trial-decoding every type.
+pub const VOUCH_KIND_TAG: &str = "vouch";
 
 /// The vouch-specific payload.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

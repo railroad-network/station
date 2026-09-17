@@ -1952,6 +1952,7 @@ name = "rrn-marketplace"
 version = "0.1.0"
 dependencies = [
  "dcbor",
+ "proptest",
  "rrn-crypto",
  "rrn-identity",
  "rrn-ledger",

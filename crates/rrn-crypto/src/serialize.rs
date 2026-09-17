@@ -96,6 +96,70 @@ where
     T::try_from(cbor).map_err(|e| SerializeError::WrongShape(e.to_string()))
 }
 
+/// A log payload parsed once: the canonical CBOR value and the top-level `kind`
+/// discriminator every signed record in this system carries (`None` when the
+/// value is not a map or has no string `kind` — an "unknown" record a reader
+/// skips).
+///
+/// A reader with several candidate record types can [`decode_kinded`] each entry
+/// once and dispatch on [`kind`](Self::kind) to the one matching
+/// `TryFrom<CBOR>`, instead of trial-decoding every type (each attempt re-runs
+/// the depth pre-scan and a full dCBOR parse only to fail on the type's own
+/// `kind` check). The parsed [`cbor`](Self::cbor) is handed to that one
+/// `TryFrom`, which consumes it.
+#[derive(Clone, Debug)]
+pub struct KindedCbor {
+    /// The record's top-level `kind` string, or `None` when the value is not a
+    /// map or carries no string `kind`.
+    pub kind: Option<String>,
+    /// The value, parsed once — to be moved into the matching `TryFrom<CBOR>`.
+    pub cbor: CBOR,
+}
+
+/// Parses canonical bytes once — with the identical guarantees of
+/// [`checked_from_data`] (depth-bounded, deterministic-CBOR-validated) — and
+/// reads the top-level `kind` discriminator, so a reader can dispatch to exactly
+/// one `TryFrom<CBOR>` rather than trial-decoding every candidate record type.
+///
+/// The returned [`KindedCbor::kind`] is `None` when the value is not a map or has
+/// no string `kind`; such a value is "unknown" and a dispatching reader skips it,
+/// exactly as trial-decoding every type would have failed on all of them. Errors
+/// ([`SerializeError::TooDeeplyNested`], [`SerializeError::NotCanonical`]) are the
+/// same a plain decode would raise, and a dispatching reader treats them as "skip
+/// this entry" the way a failed trial-decode did.
+pub fn decode_kinded(bytes: &[u8]) -> Result<KindedCbor, SerializeError> {
+    let cbor = checked_from_data(bytes)?;
+    let kind = cbor
+        .as_map()
+        .and_then(|map| map.get::<&str, String>("kind"));
+    Ok(KindedCbor { kind, cbor })
+}
+
+/// [`decode_kinded`] followed by `T::try_from` only when the record's `kind`
+/// equals `expected`.
+///
+/// Returns `Ok(None)` when the kind differs (or is absent) — the "this is not
+/// that record type" outcome trial-decoding expressed as an `Err(WrongShape)` —
+/// and `Err(SerializeError::WrongShape)` when the kind matches but the value does
+/// not fit `T`. The bytes are parsed once regardless of how many candidate types
+/// a reader checks.
+pub fn from_canonical_bytes_if_kind<T>(
+    bytes: &[u8],
+    expected: &str,
+) -> Result<Option<T>, SerializeError>
+where
+    T: TryFrom<CBOR>,
+    <T as TryFrom<CBOR>>::Error: core::fmt::Display,
+{
+    let KindedCbor { kind, cbor } = decode_kinded(bytes)?;
+    if kind.as_deref() != Some(expected) {
+        return Ok(None);
+    }
+    T::try_from(cbor)
+        .map(Some)
+        .map_err(|e| SerializeError::WrongShape(e.to_string()))
+}
+
 /// Reads one CBOR item header at `data[pos..]`, returning
 /// `(major_type_bits, argument_value, header_len)`, or `None` if the header is
 /// truncated or uses an additional-info value the deterministic decoder rejects
@@ -483,6 +547,108 @@ mod tests {
                 "unexpected depth rejection for {bytes:02x?}"
             );
         }
+    }
+
+    #[test]
+    fn decode_kinded_reads_a_string_kind_and_keeps_the_value() {
+        let mut m = Map::new();
+        m.insert("kind", "rrn.example.v1");
+        m.insert("a", 7u64);
+        let bytes = to_canonical_bytes(m);
+
+        let decoded = decode_kinded(&bytes).expect("decodes");
+        assert_eq!(decoded.kind.as_deref(), Some("rrn.example.v1"));
+        // The value survives for the caller to hand to a `TryFrom`.
+        assert!(decoded.cbor.as_map().is_some());
+    }
+
+    #[test]
+    fn decode_kinded_reports_no_kind_for_a_map_without_one_or_a_non_map() {
+        // A map with no `kind`.
+        let mut m = Map::new();
+        m.insert("a", 1u64);
+        assert_eq!(decode_kinded(&to_canonical_bytes(m)).unwrap().kind, None);
+
+        // A non-map value (an integer) — an "unknown" record a reader skips.
+        assert_eq!(decode_kinded(&to_canonical_bytes(9u64)).unwrap().kind, None);
+    }
+
+    #[test]
+    fn decode_kinded_treats_a_non_string_kind_as_absent() {
+        // `kind` present but an integer, not text: `get::<String>` yields `None`,
+        // so it reads as unknown — matching a `TryFrom` that would fail to extract
+        // a string `kind`.
+        let mut m = Map::new();
+        m.insert("kind", 3u64);
+        assert_eq!(decode_kinded(&to_canonical_bytes(m)).unwrap().kind, None);
+    }
+
+    #[test]
+    fn decode_kinded_enforces_the_depth_bound_and_canonical_form() {
+        assert_eq!(
+            decode_kinded(&nested_arrays(MAX_CBOR_DEPTH + 1)).unwrap_err(),
+            SerializeError::TooDeeplyNested {
+                max: MAX_CBOR_DEPTH
+            }
+        );
+        // 0x1817 is the integer 23 in non-shortest form — rejected, not decoded.
+        assert!(matches!(
+            decode_kinded(&[0x18, 0x17]).unwrap_err(),
+            SerializeError::NotCanonical(_)
+        ));
+    }
+
+    #[test]
+    fn from_canonical_bytes_if_kind_matches_returns_none_and_errs_by_case() {
+        // `Ab` carries no `kind`, so build a map that both has a matching `kind`
+        // and the shape `Ab` expects.
+        let mut ok = Map::new();
+        ok.insert("kind", "ab");
+        ok.insert("a", 5u64);
+        ok.insert("b", "hi");
+        let ok_bytes = to_canonical_bytes(ok);
+
+        // A struct that only accepts its map when `kind == "ab"`.
+        #[derive(Debug, PartialEq)]
+        struct Kinded {
+            a: u64,
+        }
+        impl TryFrom<CBOR> for Kinded {
+            type Error = dcbor::Error;
+            fn try_from(cbor: CBOR) -> Result<Self, Self::Error> {
+                match cbor.into_case() {
+                    CBORCase::Map(map) => {
+                        if map.extract::<&str, String>("kind")? != "ab" {
+                            return Err(dcbor::Error::WrongType);
+                        }
+                        Ok(Kinded {
+                            a: map.extract::<&str, u64>("a")?,
+                        })
+                    }
+                    _ => Err(dcbor::Error::WrongType),
+                }
+            }
+        }
+
+        // Kind matches, shape fits.
+        assert_eq!(
+            from_canonical_bytes_if_kind::<Kinded>(&ok_bytes, "ab").unwrap(),
+            Some(Kinded { a: 5 })
+        );
+        // Kind differs → `Ok(None)`, the trial-decode "not this type" outcome.
+        assert_eq!(
+            from_canonical_bytes_if_kind::<Kinded>(&ok_bytes, "other").unwrap(),
+            None
+        );
+
+        // Kind matches but the shape is wrong (`a` missing) → `WrongShape`.
+        let mut wrong = Map::new();
+        wrong.insert("kind", "ab");
+        wrong.insert("b", "hi");
+        assert!(matches!(
+            from_canonical_bytes_if_kind::<Kinded>(&to_canonical_bytes(wrong), "ab").unwrap_err(),
+            SerializeError::WrongShape(_)
+        ));
     }
 
     #[test]

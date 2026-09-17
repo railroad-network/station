@@ -31,13 +31,71 @@ use rrn_ledger::settlement::SettlementRecord;
 use rrn_ledger::state::{CancelReason, CancellationRecord};
 use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
 use rrn_storage::db::Database;
-use rrn_storage::log::AppendLog;
+use rrn_storage::log::{AppendLog, StoredPayload};
 use rrn_storage::migrations;
+
+use dcbor::prelude::Map;
+use rrn_crypto::serialize::to_canonical_bytes;
 
 use rrn_reputation::context::ScoringContext;
 
 fn addr(kp: &Keypair) -> Address {
     Address::from_public_key(kp.public_key())
+}
+
+/// Appends a raw payload the scanner must skip: a map carrying a `kind` the
+/// reputation scan dispatches (`vouch` / equivocation / verdict) but the wrong
+/// shape, a map with an unrelated `kind`, or non-canonical / non-map bytes. Both
+/// the dispatching context and the trial-decoding reference must ignore it, so it
+/// perturbs neither — the point is that they agree it is nothing.
+fn append_garbage(db: &Database, signer: &Keypair, which: usize) {
+    let bytes = match which % 7 {
+        // A verdict-kind map with none of a verdict's fields.
+        5 => {
+            let mut m = Map::new();
+            m.insert("kind", "rrn.credit.equivocation_verdict");
+            m.insert("junk", 1u64);
+            to_canonical_bytes(m)
+        }
+        // A map with no `kind` key, and a map whose `kind` is a non-string.
+        6 => {
+            let mut m = Map::new();
+            m.insert("no_kind_here", 1u64);
+            to_canonical_bytes(m)
+        }
+        // A `vouch`-kind map with none of a vouch's fields.
+        0 => {
+            let mut m = Map::new();
+            m.insert("kind", "vouch");
+            m.insert("junk", 1u64);
+            to_canonical_bytes(m)
+        }
+        // An equivocation-kind map, wrong shape.
+        1 => {
+            let mut m = Map::new();
+            m.insert("kind", "rrn.credit.equivocation");
+            m.insert("junk", 1u64);
+            to_canonical_bytes(m)
+        }
+        // An unrelated (ledger-proposal) kind the scan ignores anyway.
+        2 => {
+            let mut m = Map::new();
+            m.insert("kind", "rrn.tx.proposal");
+            m.insert("junk", 1u64);
+            to_canonical_bytes(m)
+        }
+        // Non-canonical bytes (integer 23 in long form).
+        3 => vec![0x18, 0x17],
+        // A non-map value.
+        _ => to_canonical_bytes(9u64),
+    };
+    let signature = signer.sign(&bytes);
+    let stored = StoredPayload {
+        bytes,
+        signer: signer.public_key(),
+        signature,
+    };
+    AppendLog::new(db).append_raw(stored, 0).unwrap();
 }
 
 // --- log builders (the same well-formed chains the crate's unit tests use) ----
@@ -530,6 +588,11 @@ enum Action {
         recorded_at: i64,
         overturn_at: Option<i64>,
     },
+    /// A raw entry the scanner must skip (wrong-shape known kind, unrelated kind,
+    /// or malformed bytes) — see [`append_garbage`].
+    Garbage {
+        which: usize,
+    },
 }
 
 fn action_strategy(n: usize) -> impl Strategy<Value = Action> {
@@ -573,6 +636,7 @@ fn action_strategy(n: usize) -> impl Strategy<Value = Action> {
                     overturn_at,
                 }
             ),
+        (0usize..7).prop_map(|which| Action::Garbage { which }),
     ]
 }
 
@@ -635,6 +699,7 @@ fn build_log(db: &Database, members: &[Keypair], station: &Keypair, plan: &[Acti
                     append_overturn(db, station, id, *oat);
                 }
             }
+            Action::Garbage { which } => append_garbage(db, station, *which),
         }
     }
     AppendLog::new(db)

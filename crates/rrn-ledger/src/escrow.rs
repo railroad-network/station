@@ -416,7 +416,7 @@ pub enum CertificateStatus {
 }
 
 /// The derived state of one certificate in a [`LedgerSnapshot`](crate::state::LedgerSnapshot).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CertificateState {
     /// The station-signed certificate itself.
     pub certificate: SignedHeadroomCertificate,
@@ -465,10 +465,10 @@ pub fn spend_admissible_until(cert: &HeadroomCertificate, config: &CreditConfig)
 // never entered the log — this record is the only place it is preserved.
 
 /// Discriminant string carried in an [`EquivocationRecord`]'s canonical CBOR.
-pub(crate) const EQUIVOCATION_KIND: &str = "rrn.credit.equivocation";
+pub const EQUIVOCATION_KIND: &str = "rrn.credit.equivocation";
 /// Discriminant string carried in an [`EquivocationVerdictRecord`]'s canonical
 /// CBOR.
-pub(crate) const EQUIVOCATION_VERDICT_KIND: &str = "rrn.credit.equivocation_verdict";
+pub const EQUIVOCATION_VERDICT_KIND: &str = "rrn.credit.equivocation_verdict";
 
 /// Maximum evidence items in one record — a front-door DoS bound (ADR-0021 §5).
 pub const MAX_EVIDENCE_ITEMS: usize = 16;
