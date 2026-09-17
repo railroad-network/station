@@ -64,6 +64,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "dtn_pushes",
         sql: include_str!("../migrations/0008_dtn_pushes.sql"),
     },
+    Migration {
+        version: 9,
+        name: "wallet_meta",
+        sql: include_str!("../migrations/0009_wallet_meta.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -167,6 +172,7 @@ mod tests {
             "seen_outbox_entries",
             "seen_outbox_heads",
             "transactions",
+            "wallet_meta",
         ]
         .iter()
         .map(|s| s.to_string())

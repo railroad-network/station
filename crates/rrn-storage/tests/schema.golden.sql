@@ -13,6 +13,7 @@ CREATE TABLE reputation_snapshots ( address BLOB PRIMARY KEY, last_computed_at I
 CREATE TABLE seen_outbox_entries ( author BLOB NOT NULL, position INTEGER NOT NULL, entry_hash BLOB NOT NULL, envelope BLOB NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY (author, position) ) STRICT
 CREATE TABLE seen_outbox_heads ( author BLOB NOT NULL PRIMARY KEY, position INTEGER NOT NULL, entry_hash BLOB NOT NULL, updated_at INTEGER NOT NULL ) STRICT
 CREATE TABLE transactions ( id BLOB PRIMARY KEY, sender BLOB NOT NULL, receiver BLOB NOT NULL, amount_centicommons INTEGER NOT NULL, state TEXT NOT NULL, nonce INTEGER NOT NULL, proposed_at INTEGER NOT NULL, settled_at INTEGER ) STRICT
+CREATE TABLE wallet_meta ( key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL ) STRICT
 CREATE INDEX dtn_pushes_pending ON dtn_pushes (delivered_at, abandoned_at)
 CREATE INDEX idx_attestations_signer ON attestations (signer)
 CREATE INDEX idx_log_entries_content_hash ON log_entries (content_hash)

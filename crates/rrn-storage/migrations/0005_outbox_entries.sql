@@ -2,9 +2,10 @@
 --
 -- Durable, chain-checked persistence for a device's *own* outbox: the
 -- append-only, hash-chained run of signed records it has authored but not yet
--- had admitted by the station. The CLI wallet (T2.5.2) and, via FFI, the mobile
--- wallet (T2.4.2) write here; the station reuses these shapes in a separate
--- table to track *seen* remote chains (T2.2.3).
+-- had admitted by the station. The CLI wallet (`rrn wallet`, ADR-0028) writes
+-- here; the mobile app persists envelope bytes itself and does not use this
+-- table; the station reuses these shapes in a separate table to track *seen*
+-- remote chains (ADR-0020 §3).
 --
 -- Layering: `rrn-storage` sits below `rrn-identity`/`rrn-protocol`, so it cannot
 -- parse an `OutboxEntry`. Rows therefore hold **opaque, already-validated**

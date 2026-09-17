@@ -196,6 +196,37 @@ impl<'a> DtnStore<'a> {
             .transpose()
     }
 
+    /// The author's highest *seen* position and that entry's hash, regardless of
+    /// gaps below it — the counterpart to [`head`](Self::head), which stops at
+    /// the first gap.
+    ///
+    /// A restored wallet re-anchors on this, not on the contiguous head: chaining
+    /// onto anything below a gap-ahead entry would let a later append re-use a
+    /// position the station already saw a different entry at — a self-fork
+    /// (ADR-0028 §7). Reads directly from `seen_outbox_entries`.
+    pub fn highest_seen(&self, author: &[u8; 32]) -> Result<Option<SeenHead>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT position, entry_hash FROM seen_outbox_entries \
+                 WHERE author = ?1 ORDER BY position DESC LIMIT 1",
+                [author.as_slice()],
+                |row| {
+                    let position: i64 = row.get(0)?;
+                    let entry_hash: Vec<u8> = row.get(1)?;
+                    Ok((position, entry_hash))
+                },
+            )
+            .optional()?
+            .map(|(position, entry_hash)| {
+                Ok(SeenHead {
+                    position: position as u64,
+                    entry_hash: to_hash("seen_outbox_entries.entry_hash", entry_hash)?,
+                })
+            })
+            .transpose()
+    }
+
     /// Persists outbox-fork evidence for `(author, position)`. Idempotent: a
     /// second detection of the same fork leaves the first row intact.
     #[allow(clippy::too_many_arguments)]
@@ -853,6 +884,33 @@ mod tests {
                 entry_hash: h(2)
             })
         );
+    }
+
+    #[test]
+    fn highest_seen_reports_above_a_gap_while_head_stays_below() {
+        let db = store_db();
+        let mut s = DtnStore::new(&db);
+        let author = h(2);
+
+        assert_eq!(s.highest_seen(&author).unwrap(), None);
+
+        // Positions 0 and 2 seen (gap at 1): contiguous head is 0, highest is 2.
+        s.note_entry(&author, 0, &h(0), b"e0", 1).unwrap();
+        s.note_entry(&author, 2, &h(2), b"e2", 2).unwrap();
+        assert_eq!(s.head(&author).unwrap().unwrap().position, 0);
+        assert_eq!(
+            s.highest_seen(&author).unwrap(),
+            Some(SeenHead {
+                position: 2,
+                entry_hash: h(2)
+            })
+        );
+
+        // A leading gap (only position 5 seen) still has a highest, but no head.
+        let other = h(3);
+        s.note_entry(&other, 5, &h(5), b"e5", 3).unwrap();
+        assert_eq!(s.head(&other).unwrap(), None);
+        assert_eq!(s.highest_seen(&other).unwrap().unwrap().position, 5);
     }
 
     #[test]

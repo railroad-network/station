@@ -184,6 +184,53 @@ impl<'a> OutboxStore<'a> {
         Ok(())
     }
 
+    /// Writes a synthetic *restore anchor* at `(position, entry_hash)` for an
+    /// author whose chain is empty locally.
+    ///
+    /// A member restoring a backed-up wallet needs the next [`append`](Self::append)
+    /// to chain onto the station's highest-seen position, but the intervening
+    /// entries are gone. This inserts a single stand-in row at the station's
+    /// head so `append` — which enforces `position == head + 1` and
+    /// `prev_hash == head.entry_hash` — links correctly, without weakening those
+    /// checks (ADR-0028 §7). The anchor carries no real record: `prev_hash` and
+    /// `record_hash` are zeros, `record_kind` is `"anchor"`, `envelope` is empty,
+    /// and it is stored already-acked ([`AckOutcome::Known`]) so it is never
+    /// `pending()` and is never assembled into a bundle. [`prune_acked`](Self::prune_acked)
+    /// keeps it as the head that anchors the next append.
+    ///
+    /// Refuses with [`Error::ChainMismatch`] if any row already exists for
+    /// `author` — a restore never runs over an existing chain.
+    pub fn anchor(
+        &mut self,
+        author: &[u8; 32],
+        position: u64,
+        entry_hash: &[u8; 32],
+        now: i64,
+    ) -> Result<()> {
+        if self.head(author)?.is_some() {
+            return Err(Error::ChainMismatch);
+        }
+        self.db.conn().execute(
+            "INSERT INTO outbox_entries \
+             (author, position, entry_hash, prev_hash, record_hash, record_kind, \
+              envelope, authored_at, acked_seq, acked_outcome, refusal_reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL)",
+            rusqlite::params![
+                author.as_slice(),
+                position as i64,
+                entry_hash.as_slice(),
+                [0u8; 32].as_slice(),
+                [0u8; 32].as_slice(),
+                "anchor",
+                &[] as &[u8],
+                now,
+                AckOutcome::Known.as_str(),
+            ],
+        )?;
+        tracing::debug!(position, "wrote restore anchor to outbox");
+        Ok(())
+    }
+
     /// The author's current head (highest-position entry), if the chain is
     /// non-empty.
     pub fn head(&self, author: &[u8; 32]) -> Result<Option<OutboxRow>> {
@@ -963,6 +1010,71 @@ mod tests {
         }
         assert_eq!(store.prune_acked(&c.author).unwrap(), 0);
         assert_eq!(store.all_rows(&c.author).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn anchor_lets_next_append_chain_and_is_never_pending() {
+        let db = fresh_db();
+        let mut store = OutboxStore::new(&db);
+        let c = Chain::new(0);
+
+        // Anchor a restored chain at the station's highest-seen position.
+        let anchor_hash = c.entry_hash_at(6);
+        store
+            .anchor(&c.author, 6, &anchor_hash, 1_700_000_000)
+            .unwrap();
+
+        // The anchor is the head, but it is not pending and carries no bundle.
+        let head = store.head(&c.author).unwrap().unwrap();
+        assert_eq!(head.position, 6);
+        assert_eq!(head.entry_hash, anchor_hash);
+        assert_eq!(head.record_kind, "anchor");
+        assert_eq!(head.acked_outcome, Some(AckOutcome::Known));
+        assert!(store.pending(&c.author, None).unwrap().is_empty());
+
+        // With nothing appended yet the anchor is all there is: prune keeps it as
+        // the head that anchors the next append.
+        assert_eq!(store.prune_acked(&c.author).unwrap(), 0);
+        assert_eq!(store.head(&c.author).unwrap().unwrap().position, 6);
+
+        // The next append chains onto the anchor at position 7.
+        store
+            .append(NewOutboxEntry {
+                author: c.author,
+                position: 7,
+                entry_hash: c.entry_hash_at(7),
+                prev_hash: anchor_hash,
+                record_hash: c.record_hash_at(7),
+                record_kind: "rrn.test.record",
+                envelope: b"e7",
+                authored_at: 1_700_000_007,
+            })
+            .unwrap();
+        assert_eq!(store.head(&c.author).unwrap().unwrap().position, 7);
+
+        // Once a real record sits above it, the anchor is a spent acked row below
+        // the first pending position and prunes away like any other.
+        assert_eq!(store.prune_acked(&c.author).unwrap(), 1);
+        let positions: Vec<u64> = store
+            .all_rows(&c.author)
+            .unwrap()
+            .iter()
+            .map(|r| r.position)
+            .collect();
+        assert_eq!(positions, vec![7]);
+    }
+
+    #[test]
+    fn anchor_refuses_a_non_empty_chain() {
+        let db = fresh_db();
+        let mut store = OutboxStore::new(&db);
+        let mut c = Chain::new(0);
+        c.push(&mut store).unwrap();
+
+        let err = store
+            .anchor(&c.author, 5, &c.entry_hash_at(5), 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::ChainMismatch), "{err:?}");
     }
 
     #[test]

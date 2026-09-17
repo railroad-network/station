@@ -23,6 +23,7 @@ pub mod migrations;
 pub mod outbox;
 pub mod replay;
 pub mod reputation_snapshot;
+pub mod wallet_meta;
 
 /// Errors from the storage layer.
 #[derive(thiserror::Error, Debug)]
