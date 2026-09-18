@@ -735,6 +735,91 @@ or leaks the key).
   above). Constant-time table-free multiplication is noted as a possible future
   hardening if the deployment model ever admits a co-resident attacker.
 
+### `rrn-identity::recovery::ceremony` — the reconstruction ceremony on member devices
+
+The *arming* half above splits a key into a circle of holders. The
+**reconstruction ceremony** is the reverse ritual: the party rebuilding an
+identity mints an ephemeral recovery keypair, publishes a request, gathers each
+holder's raw share re-sealed to that ephemeral key, and interpolates the key
+(`ceremony`, ADR-0016). It runs on whoever holds the identity being recovered —
+the station rebuilding its own key, or a **member rebuilding their own key on a
+new phone or laptop** (`RecoverySession`, and `rrn wallet recover`). The member
+half is the same ceremony with the requester moved to a member device: the key
+is reconstructed there and never reaches the station (ADR-0006).
+
+**Assets:** the ephemeral recovery secret (opens the responses); the raw shares
+in transit as sealed responses; the reconstructed secret key in memory on the
+requester's device before it is re-sealed under a new passphrase.
+
+#### Spoofing — a forged requester
+
+- *Threat (RRN-A-001):* nothing in the wire format proves the requester is the
+  identity's true owner. An attacker who can reach `K` holders can run the
+  ceremony against *them* — showing a request for a victim's address — and, if
+  the holders contribute, reconstruct the victim's key. Two holders shown two
+  *different* ceremonies (the attacker's and a real one) have no built-in way to
+  notice.
+- *Mitigation:* every request carries a **ceremony fingerprint** —
+  `blake3("rrn.recovery.fingerprint" ‖ ephemeral pubkey)`, rendered
+  `xxxxx-xxxxx` (`ceremony::fingerprint`). Every requester prints it (`rrn wallet
+  recover`, `station recovery restore`) and every holder's confirm screen shows
+  it. The **normative procedure** is: a holder contributes a share *only* after
+  confirming, in person or over a channel they already trust, that the person is
+  who they claim and is really recovering their own key, and after reading the
+  fingerprint aloud with them — two holders comparing the same code detect a
+  split ceremony. A recovery request is exactly as trustworthy as the person
+  presenting it; the fingerprint makes a mismatch *detectable*, it is not itself
+  an authenticator.
+- *Residual risk (accepted):* an attacker who convinces `K` holders in person —
+  impersonating the owner well enough that they skip the out-of-band check — can
+  still reconstruct the key. That is the social-recovery trust model, bounded by
+  `K` and the holders' diligence. RRN-A-001 recommendation #3 (an `M`-of-`N`
+  co-acknowledgement before release, or an announced delay logged to the
+  community) would raise this bar further and needs its own ADR; it is out of
+  scope here.
+
+#### Replay / confidentiality — responses across ceremonies
+
+- *Threat:* an attacker captures a holder's sealed response and replays it into a
+  different ceremony, or opens it to recover the raw share.
+- *Mitigation:* a response is sealed to the ceremony's *ephemeral* recovery key
+  (a fresh keypair per `RecoverySession`), so only that session's secret opens
+  it; a response from another ceremony cannot be opened and is rejected
+  (`RecoveryError::Corrupt`, tested). The ephemeral secret lives only in memory
+  for the life of one ceremony and is zeroized on drop, so a captured set of
+  responses without it reveals nothing. Responses are deduplicated by shard
+  index, so a replayed or double-scanned response cannot masquerade as extra
+  distinct shares.
+
+#### Correctness — a below-threshold reconstruction
+
+- *Threat:* the recovering device does not know `K` (the recovery configuration
+  died with the lost device), so it might accept an under-threshold set and hand
+  back a *wrong* key, which the owner would then try to use as their identity.
+- *Mitigation:* `RecoverySession::reconstruct` interpolates over the shares on
+  hand and re-derives the address; fewer than `K` (or mixed) shares reconstruct a
+  *different* key whose address does not match the target, which is reported as
+  `NeedMoreResponses` — never returned as success (tested at the crate, FFI, and
+  CLI layers). A recovered wallet is treated as *restored*: it refuses to sign
+  until one `sync` re-anchors it, so a botched recovery cannot self-equivocate on
+  first submission (ADR-0028 §7; a fork at a seen position is equivocation,
+  ADR-0021 §5 / ADR-0020 §2). A share carrying the forbidden index `0` is rejected
+  at `add_response` so it cannot make interpolation singular.
+- *Residual risk (denial of service):* the recovery public key is in the request,
+  so anyone who sees it can seal *garbage* to it and produce a response that opens
+  (`add_response` cannot tell forged data from a genuine share — only that it was
+  sealed to this ceremony). Such a share cannot leak the key (the address check
+  fails it closed), but it *poisons* the set: reconstruction then reports "need
+  more" until the poison is removed, and a forged share scanned at a genuine
+  holder's index shadows that holder (first response wins). The same happens
+  innocently when a member re-armed (`RecoveryPackage::refresh`) and mixes shares
+  from the old and new circle — both carry the identity's address and open, but
+  lie on different polynomials. This is a nuisance, not a compromise, and the
+  same trust surface as someone showing a bogus request QR; the remedy is to start
+  a fresh ceremony (a new ephemeral key) and re-gather from one circle. A
+  `clear`/`remove` affordance or leave-one-out reconstruction would soften it and
+  is noted as a possible future improvement.
+
 ### `rrn-ledger`
 
 The mutual-credit transaction engine: the signed [`transaction`] records, the

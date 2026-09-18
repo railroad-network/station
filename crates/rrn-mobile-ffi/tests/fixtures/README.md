@@ -56,3 +56,25 @@ RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test it cross_platform_dtn_certs
 cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_dtn_certs.json \
    ../mobile/__tests__/fixtures/cross_platform_dtn_certs.json
 ```
+
+## `recovery_fingerprint.json` — recovery ceremony fingerprint (ADR-0016)
+
+Locks the human-comparable **ceremony fingerprint** (`xxxxx-xxxxx`) the app
+displays when rebuilding a lost key, and every holder confirms out-of-band before
+contributing a share. Each vector is a fixed ephemeral recovery public key and
+the fingerprint it must render to; `rrn_identity::recovery::ceremony::fingerprint`
+(the first ten hex chars of `blake3("rrn.recovery.fingerprint" ‖ recovery pubkey)`)
+is the source of truth, reached on mobile through `parse_recovery_request` and
+`RecoverySession.fingerprint()`. If the two platforms rendered different codes,
+the out-of-band check would be worthless, so the mobile repo asserts its displayed
+code against this table.
+
+Generated and verified by
+[`tests/it/recovery_ceremony.rs`](../it/recovery_ceremony.rs). Reproducible
+bit-for-bit (blake3 seeds). Regenerate:
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-mobile-ffi --test it recovery_ceremony
+cp crates/rrn-mobile-ffi/tests/fixtures/recovery_fingerprint.json \
+   ../mobile/__tests__/fixtures/recovery_fingerprint.json
+```

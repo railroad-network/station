@@ -147,6 +147,66 @@ explicit, deliberate act.
   a `station recovery refresh` is a small later addition, not required for the
   first cut.
 
+## Clarification (2026-09-17) — the same ceremony runs on a member device for the member's own key
+
+Context says "What does not yet exist anywhere is the *reconstruction* ceremony —
+gathering `K` trustees' decrypted shards and rebuilding — on either the station or
+the phone", and Decision builds the station half (`station recovery restore`). As
+built, that ceremony is a sealed transport rather than the sketched raw-shard
+hand-back: the requester mints an ephemeral recovery keypair and publishes an
+`rrnrecover-req:` request; each holder (the ADR's trustee) re-seals their raw
+share to that key as an `rrnrecover-resp:` response; the requester opens the
+responses and interpolates (`rrn-identity::recovery::ceremony`). This clarifies
+that the **member half is the same ceremony**, with the requester moved to the
+member's own device. It changes neither the decision nor the Status, and adds no
+wire format.
+
+A member who lost their device rebuilds their key on a new one — a laptop (`rrn
+wallet recover`) or a phone (`RecoverySession` over the mobile FFI; the phone
+screen ships in the mobile repo) — from the circle that armed it on their old
+phone (arming remains the mobile flow; the CLI wallet recovers a key but does not
+yet arm one). The device mints the ephemeral recovery keypair, publishes the same
+`rrnrecover-req:` request (the CLI through the single encoder
+`rrn_station::recovery::encode_request`; the FFI returns the same canonical-CBOR
+request bytes for the app to prefix), opens the holders' `rrnrecover-resp:`
+responses, and interpolates the key locally. Two properties are load-bearing:
+
+- **The member's key never touches the station.** ADR-0006 makes the member
+  device the key holder; a station-run ceremony targeting a member would hand the
+  station that member's secret key, which ADR-0006 forbids. Reconstruction runs on
+  the recovering member's own device; the station is not contacted (`--station`
+  only pins its address for the later `sync`) and learns nothing. The station half
+  is unchanged in behaviour — `begin_restore`/`finish_restore` are now a thin
+  wrapper over the same `RecoverySession` — and still rebuilds only the station's
+  *own* key.
+- **A recovered wallet is a restored wallet.** The requester does not know the
+  original threshold `K` (it died with the lost device), so reconstruction is "try
+  with what you have": too few or wrong shares interpolate to a *different* key,
+  whose address does not match the target; that is reported as needing more
+  responses, never returned as success. ADR-0028 §7 names a socially recovered key
+  as exactly the case that "would restart at position 0 and self-equivocate on its
+  first submission" — a fork at a seen position is equivocation (ADR-0021 §5,
+  ADR-0020 §2). So `rrn wallet recover` writes the wallet with chain state
+  `unknown` and refuses to sign until one `sync` re-anchors it. The FFI hands the
+  app only a `WalletContents` handle; the same re-anchor-before-signing rule binds
+  the mobile app, which owns its outbox store, before its first submission.
+  Because the recovery key is public, a bystander (or a mixed re-armed circle) can
+  add a share that opens but does not belong; it never yields a key (the address
+  check fails it closed) but can *stall* the ceremony, whose remedy is a fresh
+  request — see the threat model's ceremony residual.
+
+Holder confirmation is procedural. Each request carries a **ceremony
+fingerprint** — the first ten hex characters of `blake3("rrn.recovery.fingerprint"
+‖ recovery pubkey)`, rendered `xxxxx-xxxxx` — printed by every requester (`rrn
+wallet recover`, `station recovery restore`) and shown on every holder's confirm
+screen (`RecoveryRequestInfo.fingerprint`), so two holders can detect a split
+ceremony (RRN-A-001 recommendation #2). It binds the ephemeral key, not the target
+address: it identifies a ceremony, not an identity, and is not an authenticator. A
+recovery request is exactly as trustworthy as the person presenting it; the
+fingerprint makes a mismatch *detectable*, not impossible. Co-acknowledgement or
+an announced delay (RRN-A-001 recommendation #3) remains a future hardening that
+needs its own ADR.
+
 ## Alternatives Considered
 
 - **Encrypt the archive under the passphrase only.** Simplest, and rejected as

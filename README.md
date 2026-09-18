@@ -107,10 +107,6 @@ Out of scope so far — deferred to later Phase 1+ work — and **not** implemen
 - **No higher oracle tiers.** Tier 3 (physical evidence) and Tier 4
   (cross-community/governance) are absent; Tier-3-requiring transactions are
   blocked rather than silently downgraded.
-- **No at-rest encryption of the database** (the wallet key and backup
-  archives are encrypted; the live database is not), no memory locking, and no
-  defense against a compromised host OS.
-- **No radio/LoRa or mesh transport.** Runs over loopback/local network only.
 - **No production binaries or crates.io release.** Source-only, on purpose.
 
 See [`docs/threat-model.md`](docs/threat-model.md) for the full, STRIDE-organized

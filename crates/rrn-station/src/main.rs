@@ -642,11 +642,13 @@ fn cmd_recovery_restore(
     use std::io::BufRead;
 
     let dir = ops_dir(data_dir)?;
-    let (session, request_qr) = rrn_station::recovery::begin_restore(&dir, from_backup)?;
+    let (mut session, request_qr) = rrn_station::recovery::begin_restore(&dir, from_backup)?;
     eprintln!("Recovering station {}", session.target());
     eprintln!("\nHave each holder scan this request in their wallet's \"help recover\" flow:\n");
     println!("{}", rrn_station::recovery::render_qr(&request_qr));
     eprintln!("(or send them this line: {request_qr})\n");
+    println!("Ceremony fingerprint: {}", session.fingerprint());
+    eprintln!("Every holder must see this exact code on their screen before responding.\n");
     eprintln!(
         "Paste each holder's response line below as it comes in. Press Enter on an empty line \
          when you have enough:"
@@ -675,8 +677,14 @@ fn cmd_recovery_restore(
     }
 
     let new_passphrase = read_new_passphrase()?;
-    let address =
-        rrn_station::recovery::finish_restore(&session, &responses, &new_passphrase, &dir, force)?;
+    let address = rrn_station::recovery::finish_restore(
+        &mut session,
+        &responses,
+        &new_passphrase,
+        &dir,
+        force,
+        now_secs(),
+    )?;
     println!("{address}");
     eprintln!("Recovered station {address}. Start it with `station run` using the new passphrase.");
     Ok(())
@@ -694,6 +702,16 @@ fn read_new_passphrase() -> Result<String> {
         anyhow::bail!("passphrases did not match");
     }
     Ok(first)
+}
+
+/// Wall-clock Unix seconds, read at the CLI edge for the recovered wallet's
+/// cosmetic `created_at` (the library takes it as an injected parameter).
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Default archive path for `station backup`: a timestamped file in the cwd.
