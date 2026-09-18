@@ -43,6 +43,7 @@ use rrn_crypto::signed::SignedPayload;
 use rrn_governance::proposal::ProposalId;
 use rrn_governance::vote::{Vote, VoteChoice};
 use rrn_identity::address::Address;
+use rrn_identity::recovery::ceremony::RecoverySession;
 use rrn_identity::vouch::create_vouch;
 use rrn_identity::wallet::WalletContents;
 use rrn_ledger::dispute::DisputeRecord;
@@ -139,6 +140,25 @@ pub enum WalletCmd {
         /// The restored wallet refuses signing until one `sync` re-anchors it.
         #[arg(long)]
         restore: Option<PathBuf>,
+    },
+    /// Rebuild a lost key from your recovery circle, into a fresh wallet home.
+    ///
+    /// Runs the reconstruction ceremony on *this* device: prints a request QR and
+    /// a fingerprint for your holders to confirm, gathers their responses, and
+    /// rebuilds your key locally — nothing touches the station (ADR-0006). The
+    /// recovered wallet is treated as restored: it refuses signing until one
+    /// `sync` re-anchors it (ADR-0028).
+    Recover {
+        /// The station's `rrn1…` address to pin (as for `init`).
+        #[arg(long)]
+        station: String,
+        /// The `rrn1…` address being recovered. Prompted for if omitted (read it
+        /// off your old credential card or a friend's contact list).
+        #[arg(long)]
+        address: Option<String>,
+        /// Overwrite an existing wallet home.
+        #[arg(long)]
+        force: bool,
     },
     /// Pair with the station over the sealed channel; prints the SAS for the
     /// operator to confirm.
@@ -304,6 +324,16 @@ pub async fn cmd_wallet(
     if let WalletCmd::Init { station, restore } = &cmd {
         return cmd_init(fmt, &home, station, restore.as_deref());
     }
+    // `recover` likewise runs against a fresh home and never opens an existing
+    // wallet — it *creates* one from the recovery ceremony.
+    if let WalletCmd::Recover {
+        station,
+        address,
+        force,
+    } = &cmd
+    {
+        return cmd_recover(fmt, &home, station, address.as_deref(), *force);
+    }
 
     // Pre-unlock guard: refuse a station's data dir or a non-member wallet home
     // before any passphrase is read (ADR-0028 §3.1).
@@ -313,6 +343,7 @@ pub async fn cmd_wallet(
 
     match cmd {
         WalletCmd::Init { .. } => unreachable!("handled above"),
+        WalletCmd::Recover { .. } => unreachable!("handled above"),
         WalletCmd::Pair { url } => wallet.cmd_pair(fmt, &url).await,
         WalletCmd::Sync { no_receipts } => wallet.cmd_sync(fmt, no_receipts).await,
         WalletCmd::Status => wallet.cmd_status(fmt),
@@ -506,21 +537,179 @@ fn cmd_init(fmt: Format, home: &Path, station: &str, restore: Option<&Path>) -> 
     // The local metadata database, co-located with the outbox.
     let db = Database::open(&home.join("wallet.db")).context("create wallet.db")?;
     migrations::run(&db).context("apply wallet migrations")?;
-    {
-        let mut m = WalletMeta::new(&db);
-        m.set(K_ROLE, "member")?;
-        m.set(K_SCHEMA, SCHEMA)?;
-        m.set(K_ADDRESS, &address)?;
-        m.set(K_STATION_ADDRESS, &station_addr.to_string())?;
-        m.set(K_PAIRED, "no")?;
-        m.set(K_TRANSPORT_NONCE, "0")?;
-        m.set(K_NONCE_CURSOR, "0")?;
-        m.set(K_CHAIN_STATE, chain_state)?;
-    }
+    write_initial_meta(&db, &address, &station_addr, chain_state)?;
 
     crate::emit(
         fmt,
         &json!({ "address": address, "chain_state": chain_state }),
+        || Ok(address.clone()),
+    )
+}
+
+/// Writes the initial local metadata for a freshly created (or recovered) member
+/// wallet: a fresh, unpaired, un-synced chain pinned to `station_addr`. Shared by
+/// `init` and `recover` so the two cannot drift.
+fn write_initial_meta(
+    db: &Database,
+    address: &str,
+    station_addr: &Address,
+    chain_state: &str,
+) -> Result<()> {
+    let mut m = WalletMeta::new(db);
+    m.set(K_ROLE, "member")?;
+    m.set(K_SCHEMA, SCHEMA)?;
+    m.set(K_ADDRESS, address)?;
+    m.set(K_STATION_ADDRESS, &station_addr.to_string())?;
+    m.set(K_PAIRED, "no")?;
+    m.set(K_TRANSPORT_NONCE, "0")?;
+    m.set(K_NONCE_CURSOR, "0")?;
+    m.set(K_CHAIN_STATE, chain_state)?;
+    Ok(())
+}
+
+/// `rrn wallet recover` — rebuild a lost key from the member's recovery circle.
+///
+/// The reconstruction ceremony (ADR-0016) runs entirely on this device: an
+/// ephemeral recovery keypair is minted here, the request QR and fingerprint are
+/// shown here, holders' responses are opened here, and the key is interpolated
+/// and immediately sealed under a new passphrase here. The station is never
+/// involved and learns nothing (ADR-0006). A recovered wallet is a restored
+/// wallet: chain state `unknown`, signing refused until one `sync` (ADR-0028 §7).
+fn cmd_recover(
+    fmt: Format,
+    home: &Path,
+    station: &str,
+    address: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let station_addr: Address = station
+        .parse()
+        .map_err(|_| anyhow!("invalid station address {station:?} (expected rrn1…)"))?;
+
+    // The identity being recovered: from --address, else prompted (read off the
+    // old credential card). Validated as a well-formed rrn1… address.
+    let target: Address = match address {
+        Some(a) => a
+            .parse()
+            .map_err(|_| anyhow!("invalid address {a:?} (expected rrn1…)"))?,
+        None => {
+            let entered =
+                rpassword::prompt_password("address to recover (rrn1…): ").or_else(|_| {
+                    // Not secret; fall back to a visible prompt if no tty for rpassword.
+                    use std::io::Write;
+                    print!("address to recover (rrn1…): ");
+                    std::io::stdout().flush().ok();
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s).map(|_| s)
+                })?;
+            entered
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("that is not a valid rrn1… address"))?
+        }
+    };
+
+    // Refuse a non-empty home unless --force (mirrors `init`, which never
+    // overwrites; recover adds the escape hatch for a half-set-up device).
+    if !force {
+        for name in [
+            MEMBER_WALLET_FILE,
+            "wallet.db",
+            DB_FILE,
+            CONFIG_FILE,
+            WALLET_FILE,
+            SOCKET_FILE,
+        ] {
+            if home.join(name).exists() {
+                bail!(
+                    "{} is not empty (found {name}); choose a fresh --home or pass --force",
+                    home.display()
+                );
+            }
+        }
+    }
+
+    // Run the ceremony: publish the request, show the fingerprint, gather
+    // responses from stdin. Nothing is written to disk until the key rebuilds.
+    let mut session = RecoverySession::begin(target);
+    let request_line = rrn_station::recovery::encode_request(&session.request());
+    // All human guidance goes to stderr; stdout carries only the final result
+    // (the JSON/text object), so `rrn --format json wallet recover` stays
+    // machine-parseable.
+    eprintln!("Recovering {target}");
+    eprintln!("\nHave each holder scan this request in their wallet's \"help recover\" flow:\n");
+    eprintln!("{}", rrn_station::recovery::render_qr(&request_line));
+    eprintln!("or paste this line to each holder:");
+    eprintln!("{request_line}\n");
+    eprintln!("Ceremony fingerprint: {}", session.fingerprint());
+    eprintln!("Every holder must see this exact code on their screen before responding.\n");
+    eprintln!(
+        "Paste each holder's response line below as it comes in. Press Enter on an empty line \
+         when you have enough:"
+    );
+
+    {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line.context("read response")?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if !trimmed.starts_with(rrn_station::recovery::RESPONSE_PREFIX) {
+                eprintln!(
+                    "  (ignored — not an {} line)",
+                    rrn_station::recovery::RESPONSE_PREFIX
+                );
+                continue;
+            }
+            let bytes = match rrn_station::recovery::decode_response_line(trimmed) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("  (ignored — {e})");
+                    continue;
+                }
+            };
+            match session.add_response(&bytes) {
+                Ok(n) => eprintln!("  collected {n} response(s)"),
+                Err(e) => eprintln!("  (ignored — {e})"),
+            }
+        }
+    }
+
+    // Try to rebuild. Below the threshold (or with wrong shares) this reports
+    // NeedMoreResponses and writes nothing.
+    let mut contents = match session.reconstruct(now()) {
+        Ok(c) => c,
+        Err(e) => bail!(
+            "could not rebuild the key ({e}); gather responses from more holders and try again"
+        ),
+    };
+    if contents.address != target {
+        // Defensive: reconstruct already verifies this, but never write a wallet
+        // whose address is not the one we set out to recover.
+        bail!("reconstructed a different identity — aborting");
+    }
+    contents.metadata.insert(K_ROLE.into(), "member".into());
+    contents.metadata.insert(K_SCHEMA.into(), SCHEMA.into());
+
+    // Now persist: prompt for a NEW passphrase and write the wallet home.
+    std::fs::create_dir_all(home).context("create wallet home")?;
+    set_dir_private(home);
+    let passphrase = read_passphrase(true)?;
+    let address = contents.address.to_string();
+    contents
+        .save_to_file(&home.join(MEMBER_WALLET_FILE), &passphrase)
+        .context("write member.rrnwallet")?;
+    let db = Database::open(&home.join("wallet.db")).context("create wallet.db")?;
+    migrations::run(&db).context("apply wallet migrations")?;
+    write_initial_meta(&db, &address, &station_addr, "unknown")?;
+
+    eprintln!("Recovered {address}. Run `rrn wallet sync` before signing.");
+    crate::emit(
+        fmt,
+        &json!({ "address": address, "chain_state": "unknown" }),
         || Ok(address.clone()),
     )
 }

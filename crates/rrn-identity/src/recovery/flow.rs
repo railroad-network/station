@@ -99,6 +99,13 @@ pub enum RecoveryError {
     /// different identity.
     #[error("reconstructed address does not match the recovery package")]
     AddressMismatch,
+    /// Too few (or wrong) responses gathered so far to rebuild the key: the
+    /// requester-side ceremony ([`super::ceremony::RecoverySession`]) reports
+    /// this rather than a wrong key when the shards on hand do not interpolate
+    /// to the target — the requester does not know `K`, so "gather more" is the
+    /// only honest answer.
+    #[error("not enough matching responses yet to reconstruct")]
+    NeedMoreResponses,
     /// A filesystem error reading or writing the package.
     #[error("recovery package io error: {0}")]
     Io(#[from] std::io::Error),
@@ -268,6 +275,19 @@ pub fn reconstruct_wallet_for_address(
     decrypted_shards: &[RawShard],
     expected: &Address,
 ) -> Result<WalletContents, RecoveryError> {
+    reconstruct_wallet_for_address_at(decrypted_shards, expected, now_secs())
+}
+
+/// [`reconstruct_wallet_for_address`] with the recovered wallet's `created_at`
+/// supplied by the caller rather than read from the system clock — the
+/// injected-clock form the requester-side ceremony uses so a member device (or a
+/// test) sets the timestamp deterministically. The reconstructed identity is the
+/// same whatever `now` is; only the cosmetic `created_at` differs.
+pub fn reconstruct_wallet_for_address_at(
+    decrypted_shards: &[RawShard],
+    expected: &Address,
+    now: i64,
+) -> Result<WalletContents, RecoveryError> {
     let mut secret = reconstruct_secret(decrypted_shards)?;
     let secret_key = SecretKey::from_bytes(secret);
     secret.zeroize();
@@ -279,7 +299,7 @@ pub fn reconstruct_wallet_for_address(
     Ok(WalletContents {
         secret_key,
         address,
-        created_at: now_secs(),
+        created_at: now,
         metadata: BTreeMap::new(),
     })
 }

@@ -31,7 +31,7 @@ pub use payload::{canonical_bytes, PayloadError};
 mod recovery;
 pub use recovery::{
     parse_recovery_request, parse_shard_payload, respond_to_recovery, RecoveryError,
-    RecoveryPackage, RecoveryRequestInfo, ShardInfo,
+    RecoveryPackage, RecoveryRequestInfo, RecoverySession, ShardInfo,
 };
 
 mod envelope;

@@ -1,0 +1,16 @@
+{
+  "vectors": [
+    {
+      "recovery_pubkey_hex": "8063ddeabce8ac10e97e5488548f69121a3d2cbc732b2feea38aa7d2d1ef9c93",
+      "fingerprint": "3dffd-e60ea"
+    },
+    {
+      "recovery_pubkey_hex": "7bdf95d042dc4914b5d4066952800659e99f95b3fba3c83cffd0ada931bade92",
+      "fingerprint": "9138c-c208d"
+    },
+    {
+      "recovery_pubkey_hex": "78de4b916e69aa6ab6fb8580c4f0b8112b9c9eca9c2e1cc0baf47e404129afa3",
+      "fingerprint": "0d429-7a763"
+    }
+  ]
+}

@@ -283,13 +283,52 @@ enum RecoveryError {
     "Encryption",
     "Corrupt",
     "AddressMismatch",
+    "NeedMoreResponses",
     "Internal",
 };
 
 // Non-secret description of a recovery request, for a holder's confirm screen
-// (via `parse_recovery_request`). Names the identity being recovered.
+// (via `parse_recovery_request`). Names the identity being recovered and the
+// ceremony `fingerprint` (xxxxx-xxxxx) the holder confirms against the
+// requester's screen out-of-band before contributing a share (ADR-0016).
 dictionary RecoveryRequestInfo {
     string target_address;
+    string fingerprint;
+};
+
+// The requester side of the reconstruction ceremony, run on the device
+// rebuilding its OWN identity (a new phone recovering a lost key). It mints the
+// ephemeral recovery keypair, publishes the request, gathers holder responses,
+// and reconstructs the wallet — all in Rust. The ephemeral secret and the
+// rebuilt key never cross the boundary; only the finished WalletContents handle
+// does, exactly like `create_new`. The station is never involved (ADR-0006).
+interface RecoverySession {
+    // Begins a ceremony to recover `target_address`. `InvalidHolderAddress` if
+    // the address is malformed.
+    [Throws=RecoveryError]
+    constructor(string target_address);
+
+    // The request bytes to render as a `rrnrecover-req:<base64>` QR.
+    bytes request_payload();
+
+    // The ceremony fingerprint (xxxxx-xxxxx) to show in large type; every holder
+    // must see this exact code.
+    string fingerprint();
+
+    // Opens a scanned holder response and adds it, returning the count gathered
+    // so far. `Corrupt` if the response is not for this ceremony; a duplicate
+    // scan is ignored (the count does not advance).
+    [Throws=RecoveryError]
+    u32 add_response(bytes response_payload);
+
+    // How many distinct responses have been gathered.
+    u32 responses();
+
+    // Attempts reconstruction from the responses gathered so far.
+    // `NeedMoreResponses` when they do not yet rebuild the target (scan another
+    // holder and retry); a wrong key is never returned.
+    [Throws=RecoveryError]
+    WalletContents reconstruct();
 };
 
 // Non-secret metadata read off a distributable shard payload by the holder's

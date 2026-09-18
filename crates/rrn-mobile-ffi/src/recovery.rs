@@ -9,17 +9,22 @@
 //!
 //! # What does not cross the boundary
 //!
-//! The wallet secret is never exposed: [`RecoveryPackage::create`] takes an
-//! opaque [`WalletContents`] handle, splits and seals entirely inside Rust, and
-//! only the per-holder *sealed* shard payloads leave. `parse_shard_payload`
-//! reads metadata only — it cannot and does not decrypt a shard (that needs the
-//! holder's secret key, and only happens during reconstruction, which this
-//! surface does not expose).
+//! No secret ever crosses. [`RecoveryPackage::create`] takes an opaque
+//! [`WalletContents`] handle, splits and seals entirely inside Rust, and only
+//! the per-holder *sealed* shard payloads leave. `parse_shard_payload` reads
+//! metadata only. [`RecoverySession`] — the requester side, run on the device
+//! rebuilding its *own* identity — keeps the ephemeral recovery secret and the
+//! reconstructed key inside Rust: it hands back only the finished
+//! [`WalletContents`] handle, exactly like [`WalletContents::create_new`]. A
+//! member's key is reconstructed on the member's own device and never reaches
+//! the station (ADR-0006).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rrn_identity::address::Address;
-use rrn_identity::recovery::ceremony::{self, RecoveryRequest};
+use rrn_identity::recovery::ceremony::{
+    self, RecoveryRequest, RecoverySession as CoreRecoverySession,
+};
 use rrn_identity::recovery::flow::{
     parse_shard_payload as core_parse_shard_payload, RecoveryError as CoreRecoveryError,
     RecoveryPackage as CoreRecoveryPackage,
@@ -58,6 +63,10 @@ pub enum RecoveryError {
     /// A held shard is for a different identity than a recovery request targets.
     #[error("shard is for a different identity")]
     AddressMismatch,
+    /// Too few (or wrong) responses gathered so far to rebuild the key — the
+    /// recovering device should scan another holder's response and try again.
+    #[error("not enough matching responses yet")]
+    NeedMoreResponses,
     /// An unexpected error from the recovery core (not reachable on this
     /// surface; present so the conversion is total).
     #[error("internal recovery error")]
@@ -74,7 +83,11 @@ impl From<CoreRecoveryError> for RecoveryError {
             CoreRecoveryError::ShardIndexOutOfRange => RecoveryError::ShardIndexOutOfRange,
             // A holder can hold a shard for the wrong identity; surface that.
             CoreRecoveryError::AddressMismatch => RecoveryError::AddressMismatch,
-            // Reconstruction and file I/O do not happen on this FFI surface.
+            // The requester-side session reports "gather more" for a set that
+            // does not yet rebuild the target.
+            CoreRecoveryError::NeedMoreResponses => RecoveryError::NeedMoreResponses,
+            // File I/O does not happen on this FFI surface; a bare Reconstruct
+            // error only reaches here outside the session path.
             CoreRecoveryError::Reconstruct(_) | CoreRecoveryError::Io(_) => RecoveryError::Internal,
         }
     }
@@ -205,6 +218,7 @@ pub fn parse_recovery_request(
     let request = RecoveryRequest::from_bytes(&request_payload)?;
     Ok(RecoveryRequestInfo {
         target_address: request.target_address.to_string(),
+        fingerprint: ceremony::fingerprint(&request),
     })
 }
 
@@ -212,6 +226,96 @@ pub fn parse_recovery_request(
 pub struct RecoveryRequestInfo {
     /// The `rrn1…` address of the identity being recovered.
     pub target_address: String,
+    /// The ceremony fingerprint (`xxxxx-xxxxx`) the holder confirms out-of-band
+    /// against the requester's screen before contributing a share (ADR-0016).
+    pub fingerprint: String,
+}
+
+/// The requester side of the reconstruction ceremony, on the device rebuilding
+/// its *own* identity (a new phone). It holds the ephemeral recovery secret in
+/// Rust, gathers holder responses, and reconstructs the wallet — the secret and
+/// the rebuilt key never cross the FFI boundary; only the finished
+/// [`WalletContents`] handle does, exactly like [`WalletContents::create_new`].
+///
+/// The `Mutex` gives the uniffi `&self` methods the interior mutability
+/// `add_response` needs; contention is impossible in practice (the UI drives one
+/// session on one thread), so the lock is only ever briefly held.
+pub struct RecoverySession {
+    inner: Mutex<CoreRecoverySession>,
+}
+
+impl RecoverySession {
+    /// Begins a ceremony to recover `target_address`, minting a fresh ephemeral
+    /// recovery keypair. `InvalidHolderAddress` if the address is malformed
+    /// (reused as the generic "bad address" error on this surface).
+    pub fn new(target_address: String) -> Result<Self, RecoveryError> {
+        let target: Address = target_address
+            .parse()
+            .map_err(|_| RecoveryError::InvalidHolderAddress)?;
+        Ok(Self {
+            inner: Mutex::new(CoreRecoverySession::begin(target)),
+        })
+    }
+
+    /// The request bytes to render as a `rrnrecover-req:<base64>` QR.
+    pub fn request_payload(&self) -> Vec<u8> {
+        self.inner
+            .lock()
+            .expect("recovery session lock")
+            .request()
+            .to_bytes()
+    }
+
+    /// The ceremony fingerprint (`xxxxx-xxxxx`) to display in large type so every
+    /// holder can confirm they are helping the same recovery.
+    pub fn fingerprint(&self) -> String {
+        self.inner
+            .lock()
+            .expect("recovery session lock")
+            .fingerprint()
+    }
+
+    /// Opens a scanned holder response and adds it to the set, returning the
+    /// count gathered so far. `Corrupt` if the response is not for this ceremony;
+    /// duplicate scans are ignored (the count does not advance).
+    pub fn add_response(&self, response_payload: Vec<u8>) -> Result<u32, RecoveryError> {
+        let count = self
+            .inner
+            .lock()
+            .expect("recovery session lock")
+            .add_response(&response_payload)?;
+        Ok(count as u32)
+    }
+
+    /// How many distinct responses have been gathered.
+    pub fn responses(&self) -> u32 {
+        self.inner
+            .lock()
+            .expect("recovery session lock")
+            .responses() as u32
+    }
+
+    /// Attempts to reconstruct the wallet from the responses gathered so far.
+    /// `NeedMoreResponses` when the shares on hand do not rebuild the target —
+    /// scan another holder and retry; a wrong key is never returned.
+    pub fn reconstruct(&self) -> Result<Arc<WalletContents>, RecoveryError> {
+        let contents = self
+            .inner
+            .lock()
+            .expect("recovery session lock")
+            .reconstruct(now_secs())?;
+        Ok(Arc::new(WalletContents { inner: contents }))
+    }
+}
+
+/// Wall-clock Unix seconds for the recovered wallet's cosmetic `created_at`,
+/// read at the FFI edge (the core takes it as an injected parameter).
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

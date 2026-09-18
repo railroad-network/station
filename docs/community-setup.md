@@ -527,12 +527,27 @@ immediately — the old archives still answer only to the old key wrapping.
 | Station machine dies | `station restore <archive>` on a new machine | 4.1 backups |
 | Passphrase lost, machine fine | `station recovery restore` (re-keys in place) | 4.2 recovery |
 | Machine dies **and** passphrase lost | `station recovery restore --from-backup <archive>` | both |
-| A member loses their phone | The member's own social recovery (shards held by friends) | each member, in-app |
-| A member's phone is stolen | `station unpair <addr>` + the member recovers on a new phone | — |
+| A member loses their phone | The member rebuilds their key from their circle: **Recover an existing identity** in the app, or `rrn wallet recover` on a laptop | each member, in-app |
+| A member's phone is stolen | `station unpair <addr>` **first**, then the member recovers on a new phone and re-pairs | — |
 
 The first three rows protect the *community*. The last two protect a
 *member* — which is why nudging everyone through in-app social recovery
 setup (Part 2.2) is steward work too.
+
+**Recovering a member.** A member who lost their phone rebuilds their key on a new
+device with the same social-recovery circle that armed it — the reconstruction
+runs entirely on the member's device and never touches the station (their key is
+theirs alone). On a new phone: **Welcome → Recover an existing identity → From my
+recovery circle**, then scan at least the threshold number of holder responses.
+On a laptop: `rrn wallet recover --station rrn1<station> --address rrn1<theirs>`,
+which prints a request QR and a **ceremony fingerprint** for the holders to
+confirm, then reads their pasted responses. Either way the recovered wallet is
+treated as restored — it refuses to sign until one `rrn wallet sync` (or the
+app's first sync) re-anchors it. Order matters when a phone was **stolen** (the
+thief holds the same key until you act): `station unpair <addr>` first, *then* let
+the member recover and re-pair. Every holder must confirm the fingerprint out of
+band before contributing — a recovery request is exactly as trustworthy as the
+person showing it. See the member docs for the step-by-step.
 
 ### 4.4 Seizure resistance — the encrypted profile (optional, Linux)
 

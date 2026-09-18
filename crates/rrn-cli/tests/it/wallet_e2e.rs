@@ -18,6 +18,8 @@ use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::Keypair;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
+use rrn_identity::recovery::ceremony::{self, RecoveryRequest};
+use rrn_identity::recovery::flow::RecoveryPackage;
 use rrn_identity::wallet::WalletContents;
 use rrn_ledger::transaction::{SignedProposal, TransactionProposal};
 use rrn_protocol::bundle::{Bundle, EntryEnvelope};
@@ -716,6 +718,277 @@ async fn paper_module_stays_keyless() {
         !src.contains("rrn_storage"),
         "paper.rs must not use rrn-storage"
     );
+}
+
+// --- recovery ceremony ------------------------------------------------------
+
+/// Drives `rrn wallet recover` end to end: spawns the process, captures the
+/// `rrnrecover-req:` request line it prints (on stderr), asks `responder` for the
+/// holder response lines to feed, writes them on stdin, and returns
+/// `(success, stdout, stderr)`. `responder` runs on the parsed request so the
+/// simulated holders seal to the process's own ephemeral key.
+fn run_recover(
+    home: &Path,
+    pass: &str,
+    station: &str,
+    address: &str,
+    force: bool,
+    responder: impl FnOnce(&RecoveryRequest) -> Vec<String>,
+) -> (bool, String, String) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut args = vec![
+        "--format",
+        "json",
+        "wallet",
+        "--home",
+        home.to_str().unwrap(),
+        "recover",
+        "--station",
+        station,
+        "--address",
+        address,
+    ];
+    if force {
+        args.push("--force");
+    }
+    let mut child = Command::new(RRN)
+        .args(&args)
+        .env("RRN_WALLET_PASSPHRASE", pass)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rrn wallet recover");
+
+    // Drain stdout on its own thread so the child never blocks writing the QR.
+    let mut stdout = child.stdout.take().unwrap();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut buf).ok();
+        buf
+    });
+
+    // Drain stderr fully on its own thread (so the child never blocks writing
+    // guidance), forwarding the first `rrnrecover-req:` line back over a channel.
+    let stderr = child.stderr.take().unwrap();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut sent = false;
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap_or_default();
+            if !sent {
+                if let Some(idx) = line.find(rrn_station::recovery::REQUEST_QR_PREFIX) {
+                    req_tx.send(line[idx..].to_string()).ok();
+                    sent = true;
+                }
+            }
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    });
+
+    // Wait for the request line (or the channel to close if the process bailed
+    // before printing one), then feed the holder responses on stdin.
+    let mut stdin = child.stdin.take().unwrap();
+    if let Ok(req_line) = req_rx.recv() {
+        let bytes = rrn_station::recovery::decode_request_line(&req_line).unwrap();
+        let request = RecoveryRequest::from_bytes(&bytes).unwrap();
+        for resp in responder(&request) {
+            writeln!(stdin, "{resp}").unwrap();
+        }
+        writeln!(stdin).unwrap(); // blank line ends input
+        stdin.flush().ok();
+    }
+    drop(stdin); // EOF, in case the process never asked for input
+
+    let status = child.wait().expect("wait recover");
+    let stderr_buf = stderr_thread.join().unwrap();
+    let stdout = stdout_thread.join().unwrap();
+    (status.success(), stdout, stderr_buf)
+}
+
+/// The last JSON object printed on stdout (the emitted result), if any.
+fn last_json_line(stdout: &str) -> Option<serde_json::Value> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wallet_recover_from_circle() {
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // The lost identity, split 2-of-3 across three holders (driven through
+    // rrn-identity directly — the CLI wallet has no circle command).
+    let lost = WalletContents::create_new();
+    let lost_kp = Keypair::from_secret(lost.secret_key.clone());
+    let lost_addr = lost.address.to_string();
+
+    // Seed the station with one entry for this key (position 0) so a post-recovery
+    // sync finds a record to re-anchor onto — the no-self-fork rule keeps a
+    // never-seen key `unknown` forever (proven separately), which is not what we
+    // are testing here.
+    let now = now_secs();
+    let prop = SignedProposal::sign(
+        TransactionProposal::new(
+            lost.address,
+            h.station_addr.parse().unwrap(),
+            100,
+            None,
+            0,
+            now,
+            now + 100_000,
+        ),
+        &lost_kp,
+    );
+    let entry = OutboxEntry::wrapping(lost.address, 0, Hash::from_bytes([1u8; 32]), &prop, now);
+    let signed_entry = SignedPayload::sign(entry, &lost_kp);
+    let bundle = Bundle::new(vec![EntryEnvelope::from_signed(&signed_entry)], now).encode();
+    socket_call(
+        &h.client(),
+        "bundle_submit",
+        serde_json::json!({ "bundle_hex": hex(&bundle) }),
+    )
+    .await;
+
+    let holders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+    let holder_pubs: Vec<_> = holders.iter().map(|k| k.public_key()).collect();
+    let package = RecoveryPackage::create(&lost, &holder_pubs, 2).unwrap();
+    let payloads: Vec<Vec<u8>> = (0..3).map(|i| package.shard_payload(i).unwrap()).collect();
+
+    // Two responses (K=2) rebuild the key. The responder seals to the process's
+    // own ephemeral request.
+    let holders_for = holders;
+    let payloads_for = payloads.clone();
+    let home = dir.path().join("recovered");
+    let station = h.station_addr.clone();
+    let lost_for = lost_addr.clone();
+    let (ok, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_recover(&home, PASS, &station, &lost_for, false, |req| {
+            [0usize, 2]
+                .iter()
+                .map(|&i| {
+                    let resp = ceremony::build_response(
+                        &payloads_for[i],
+                        holders_for[i].secret_key(),
+                        req,
+                    )
+                    .unwrap();
+                    rrn_station::recovery::encode_response(&resp)
+                })
+                .collect()
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(ok, "recover failed: {stderr}");
+    let result = last_json_line(&stdout).expect("recover emits a JSON result");
+    assert_eq!(result["address"].as_str().unwrap(), lost_addr);
+    assert_eq!(result["chain_state"], "unknown");
+
+    // The home now holds the recovered identity, reported as restored/unanchored.
+    let home = dir.path().join("recovered");
+    let status = wjson(&home, &["status"]).await;
+    assert_eq!(status["address"].as_str().unwrap(), lost_addr);
+    assert_eq!(status["chain_state"], "unknown");
+
+    // Signing is refused until a sync re-anchors the recovered chain...
+    let stderr = wfail(&home, Some(PASS), &["pay", &h.station_addr, "1"]).await;
+    assert!(stderr.contains("re-anchor"), "got: {stderr}");
+
+    // ...and after pairing + sync (which re-anchors onto the seeded record), a
+    // pay admits at the next position.
+    pair_and_confirm(&h, &home, &lost_addr).await;
+    let synced = wjson(&home, &["sync"]).await;
+    assert_eq!(synced["chain_state"], "anchored");
+    assert!(synced["reanchored"].as_bool().unwrap());
+    wjson(&home, &["pay", &h.station_addr, "1.00"]).await;
+    let submitted = wjson(&home, &["submit"]).await;
+    assert_eq!(submitted["applied"].as_u64().unwrap(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wallet_recover_below_threshold_writes_nothing() {
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let lost = WalletContents::create_new();
+    let lost_addr = lost.address.to_string();
+    let holders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+    let holder_pubs: Vec<_> = holders.iter().map(|k| k.public_key()).collect();
+    let package = RecoveryPackage::create(&lost, &holder_pubs, 3).unwrap(); // K=3
+    let payloads: Vec<Vec<u8>> = (0..3).map(|i| package.shard_payload(i).unwrap()).collect();
+
+    // Only two responses for a 3-of-3 split.
+    let home = dir.path().join("recovered");
+    let home_check = home.clone();
+    let station = h.station_addr.clone();
+    let lost_for = lost_addr.clone();
+    let holders_for = holders;
+    let payloads_for = payloads;
+    let (ok, _stdout, _stderr) = tokio::task::spawn_blocking(move || {
+        run_recover(&home, PASS, &station, &lost_for, false, |req| {
+            [0usize, 1]
+                .iter()
+                .map(|&i| {
+                    let resp = ceremony::build_response(
+                        &payloads_for[i],
+                        holders_for[i].secret_key(),
+                        req,
+                    )
+                    .unwrap();
+                    rrn_station::recovery::encode_response(&resp)
+                })
+                .collect()
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(!ok, "recover below threshold must fail");
+    // No wallet was written.
+    assert!(
+        !home_check.join("member.rrnwallet").exists(),
+        "a failed recover must not write a wallet"
+    );
+    assert!(
+        !home_check.join("wallet.db").exists(),
+        "a failed recover must not create the db"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wallet_recover_refuses_existing_home_without_force() {
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    // A fully initialised home already exists.
+    let (home, _member) = init_wallet(dir.path(), "existing", &h.station_addr).await;
+
+    let target = Address::from_public_key(Keypair::generate().public_key()).to_string();
+    let home_for = home.clone();
+    let station = h.station_addr.clone();
+    let (ok, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        // No request will ever be printed — the home check bails first — so the
+        // responder is never called.
+        run_recover(&home_for, PASS, &station, &target, false, |_req| Vec::new())
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !ok,
+        "recover into a non-empty home must refuse without --force"
+    );
+    assert!(stderr.contains("not empty"), "got: {stderr}");
+    h.shutdown().await;
 }
 
 // --- helpers that reach into the station's on-disk state --------------------

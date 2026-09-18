@@ -20,10 +20,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 
-use rrn_crypto::keypair::Keypair;
 use rrn_identity::address::Address;
-use rrn_identity::recovery::ceremony::{self, RecoveryRequest};
-use rrn_identity::recovery::flow::{reconstruct_wallet_for_address, RecoveryPackage};
+use rrn_identity::recovery::ceremony::{RecoveryRequest, RecoverySession};
+use rrn_identity::recovery::flow::RecoveryPackage;
 use rrn_identity::wallet::WalletContents;
 
 use crate::station::WALLET_FILE;
@@ -49,6 +48,40 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(s.trim())
         .context("not valid base64")
+}
+
+/// Encodes a recovery request as the `rrnrecover-req:<base64>` line holders scan
+/// (or paste). The single encoder for the request line, so the station and the
+/// member CLI (`rrn wallet recover`) produce identical bytes.
+pub fn encode_request(request: &RecoveryRequest) -> String {
+    format!("{REQUEST_QR_PREFIX}{}", b64_encode(&request.to_bytes()))
+}
+
+/// Strips the `rrnrecover-req:` prefix from a request line and base64-decodes it
+/// to the request bytes. The counterpart to [`encode_request`].
+pub fn decode_request_line(line: &str) -> Result<Vec<u8>> {
+    let body = line
+        .trim()
+        .strip_prefix(REQUEST_QR_PREFIX)
+        .with_context(|| format!("not an {REQUEST_QR_PREFIX} line"))?;
+    b64_decode(body)
+}
+
+/// Encodes a holder's sealed response bytes as the `rrnrecover-resp:<base64>`
+/// line the requester pastes back. The counterpart to [`decode_response_line`].
+pub fn encode_response(response: &[u8]) -> String {
+    format!("{RESPONSE_PREFIX}{}", b64_encode(response))
+}
+
+/// Strips the `rrnrecover-resp:` prefix from a holder's response line and
+/// base64-decodes it to the sealed response bytes. `Err` if the line is not a
+/// response line or not valid base64.
+pub fn decode_response_line(line: &str) -> Result<Vec<u8>> {
+    let body = line
+        .trim()
+        .strip_prefix(RESPONSE_PREFIX)
+        .with_context(|| format!("not an {RESPONSE_PREFIX} line"))?;
+    b64_decode(body)
 }
 
 /// One holder's distributable shard: their address and the `rrnrecovery:` string
@@ -190,15 +223,20 @@ fn load_package(data_dir: &Path) -> Result<RecoveryPackage> {
 /// reopen. Held in memory for the life of one `station recovery restore` run and
 /// discarded after — a captured set of responses is useless without it.
 pub struct RestoreSession {
-    recovery: Keypair,
-    target: Address,
+    inner: RecoverySession,
     from_backup: Option<PathBuf>,
 }
 
 impl RestoreSession {
     /// The identity this ceremony reconstructs.
     pub fn target(&self) -> &Address {
-        &self.target
+        self.inner.target()
+    }
+
+    /// The ceremony fingerprint holders confirm out-of-band, so two holders can
+    /// notice they were shown different ceremonies (ADR-0016).
+    pub fn fingerprint(&self) -> String {
+        self.inner.fingerprint()
     }
 }
 
@@ -216,16 +254,11 @@ pub fn begin_restore(
             .context("read the station identity from the backup archive")?,
         None => load_package(data_dir)?.recovery_metadata.original_address,
     };
-    let recovery = Keypair::generate();
-    let request = RecoveryRequest {
-        recovery_pubkey: recovery.public_key(),
-        target_address: target,
-    };
-    let qr = format!("{REQUEST_QR_PREFIX}{}", b64_encode(&request.to_bytes()));
+    let inner = RecoverySession::begin(target);
+    let qr = encode_request(&inner.request());
     Ok((
         RestoreSession {
-            recovery,
-            target,
+            inner,
             from_backup: from_backup.map(Path::to_path_buf),
         },
         qr,
@@ -238,25 +271,26 @@ pub fn begin_restore(
 /// and rewrites the station under `new_passphrase` — in place, or by reopening
 /// the backup archive with the recovered key. Returns the restored address.
 pub fn finish_restore(
-    session: &RestoreSession,
+    session: &mut RestoreSession,
     responses: &[String],
     new_passphrase: &str,
     data_dir: &Path,
     force: bool,
+    now: i64,
 ) -> Result<Address> {
-    let mut shards = Vec::with_capacity(responses.len());
     for resp in responses {
         let body = resp
             .trim()
             .strip_prefix(RESPONSE_PREFIX)
             .with_context(|| format!("a response is not an {RESPONSE_PREFIX} string"))?;
         let bytes = b64_decode(body)?;
-        let shard = ceremony::open_response(&bytes, session.recovery.secret_key())
+        session
+            .inner
+            .add_response(&bytes)
             .context("open a holder response (wrong ceremony, or corrupt)")?;
-        shards.push(shard);
     }
 
-    let wallet = reconstruct_wallet_for_address(&shards, &session.target).context(
+    let wallet = session.inner.reconstruct(now).context(
         "reconstruct the key — gather responses from more holders (need the threshold), \
          or a response did not belong to this recovery",
     )?;
@@ -303,6 +337,10 @@ pub fn render_qr(text: &str) -> String {
 mod tests {
     use super::*;
     use rrn_crypto::keypair::Keypair;
+    use rrn_identity::recovery::ceremony::{self, RecoveryRequest};
+
+    /// A fixed clock for the recovered wallet's cosmetic `created_at`.
+    const NOW: i64 = 1_700_000_000;
 
     fn seed_wallet(dir: &Path, passphrase: &str) {
         WalletContents::create_new()
@@ -449,13 +487,13 @@ mod tests {
         ];
         let (dir, station_addr, shards) = arm("old-pass", &holders);
 
-        let (session, req_qr) = begin_restore(dir.path(), None).unwrap();
+        let (mut session, req_qr) = begin_restore(dir.path(), None).unwrap();
         assert_eq!(session.target(), &station_addr);
 
         // Two of the three holders respond.
         let responses = holder_responses(&req_qr, &shards, &[(0, &holders[0]), (2, &holders[2])]);
         let recovered =
-            finish_restore(&session, &responses, "new-pass", dir.path(), false).unwrap();
+            finish_restore(&mut session, &responses, "new-pass", dir.path(), false, NOW).unwrap();
         assert_eq!(recovered, station_addr);
 
         // The wallet now opens under the NEW passphrase, not the old.
@@ -478,12 +516,19 @@ mod tests {
 
         // Total loss: recover into a fresh, empty directory from the archive.
         let dest = tempfile::tempdir().unwrap();
-        let (session, req_qr) = begin_restore(dest.path(), Some(&archive)).unwrap();
+        let (mut session, req_qr) = begin_restore(dest.path(), Some(&archive)).unwrap();
         assert_eq!(session.target(), &station_addr);
 
         let responses = holder_responses(&req_qr, &shards, &[(0, &holders[0]), (1, &holders[1])]);
-        let recovered =
-            finish_restore(&session, &responses, "new-pass", dest.path(), false).unwrap();
+        let recovered = finish_restore(
+            &mut session,
+            &responses,
+            "new-pass",
+            dest.path(),
+            false,
+            NOW,
+        )
+        .unwrap();
         assert_eq!(recovered, station_addr);
 
         // Ledger restored and wallet readable under the new passphrase.
@@ -499,9 +544,32 @@ mod tests {
             Keypair::generate(),
         ];
         let (dir, _addr, shards) = arm("old-pass", &holders);
-        let (session, req_qr) = begin_restore(dir.path(), None).unwrap();
+        let (mut session, req_qr) = begin_restore(dir.path(), None).unwrap();
         // Only one response for a 2-of-3 split.
         let responses = holder_responses(&req_qr, &shards, &[(0, &holders[0])]);
-        assert!(finish_restore(&session, &responses, "new-pass", dir.path(), false).is_err());
+        assert!(
+            finish_restore(&mut session, &responses, "new-pass", dir.path(), false, NOW).is_err()
+        );
+    }
+
+    #[test]
+    fn restore_session_exposes_a_matching_fingerprint() {
+        let holders = [Keypair::generate(), Keypair::generate()];
+        let (dir, _addr, _shards) = arm("old-pass", &holders);
+        let (session, req_qr) = begin_restore(dir.path(), None).unwrap();
+
+        // The fingerprint the console prints is the one holders can recompute
+        // from the request QR they scan.
+        let req_bytes = b64_decode(req_qr.strip_prefix(REQUEST_QR_PREFIX).unwrap()).unwrap();
+        let request = RecoveryRequest::from_bytes(&req_bytes).unwrap();
+        let fp = session.fingerprint();
+        assert_eq!(fp, rrn_identity::recovery::ceremony::fingerprint(&request));
+
+        // `xxxxx-xxxxx` of lowercase hex.
+        let bytes = fp.as_bytes();
+        assert_eq!(bytes.len(), 11);
+        assert_eq!(bytes[5], b'-');
+        assert!(bytes[..5].iter().all(|b| b.is_ascii_hexdigit()));
+        assert!(bytes[6..].iter().all(|b| b.is_ascii_hexdigit()));
     }
 }
