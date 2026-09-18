@@ -991,6 +991,30 @@ async fn wallet_recover_refuses_existing_home_without_force() {
     h.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wallet_recover_refuses_a_station_dir_even_with_force() {
+    // --force overrides the member-file guard, but NOT the station-data-dir
+    // refusal: recovering into a live station's dir must fail before any ceremony.
+    let h = Harness::start(false).await;
+    let station_dir = h.station_data_dir();
+    let target = Address::from_public_key(Keypair::generate().public_key()).to_string();
+    let station = h.station_addr.clone();
+    let (ok, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        run_recover(&station_dir, PASS, &station, &target, true, |_req| {
+            Vec::new()
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !ok,
+        "recover into a station data dir must refuse even with --force"
+    );
+    assert!(stderr.contains("station data directory"), "got: {stderr}");
+    h.shutdown().await;
+}
+
 // --- helpers that reach into the station's on-disk state --------------------
 
 impl Harness {

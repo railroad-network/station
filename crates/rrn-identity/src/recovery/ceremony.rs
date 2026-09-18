@@ -213,7 +213,9 @@ impl RecoverySession {
         Self {
             recovery: Keypair::generate(),
             target,
-            shards: Vec::new(),
+            // Pre-size to the split cap so growth never reallocates and frees an
+            // un-zeroized buffer holding a share (defence in depth).
+            shards: Vec::with_capacity(super::shamir::MAX_SHARES as usize),
         }
     }
 
@@ -241,11 +243,25 @@ impl RecoverySession {
     /// number now held.
     ///
     /// Responses are deduplicated by shard index: a holder who answers twice, or
-    /// a duplicate scan, does not inflate the count or make interpolation
-    /// singular. A response sealed to a *different* ceremony's key cannot be
-    /// opened and is rejected as [`RecoveryError::Corrupt`].
+    /// a duplicate scan, does not inflate the count. A response sealed to a
+    /// *different* ceremony's key cannot be opened and is rejected as
+    /// [`RecoveryError::Corrupt`]; a share carrying the forbidden index `0` (which
+    /// is the secret itself, never a legitimate share) is likewise rejected as
+    /// `Corrupt` so it cannot make later interpolation singular.
+    ///
+    /// It cannot, however, distinguish a *genuine* share from garbage sealed to
+    /// the (public) recovery key by someone who saw the request: such a response
+    /// opens fine and is accepted, and — because a wrong share reconstructs a
+    /// *different* key — only makes [`reconstruct`](Self::reconstruct) fail
+    /// closed, never leak a key. If a ceremony is poisoned this way (or mixes
+    /// shares from two different circles after a re-arm), the remedy is to start a
+    /// fresh ceremony (a new [`begin`](Self::begin), hence a new ephemeral key)
+    /// and re-gather. See the threat model.
     pub fn add_response(&mut self, response: &[u8]) -> Result<usize, RecoveryError> {
         let shard = open_response(response, self.recovery.secret_key())?;
+        if shard.index.0 == 0 {
+            return Err(RecoveryError::Corrupt("response carries index 0".into()));
+        }
         if !self.shards.iter().any(|s| s.index == shard.index) {
             self.shards.push(shard);
         }
@@ -497,38 +513,98 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn session_never_returns_a_wrong_key_from_mixed_ceremonies() {
-        // Three responses, but one comes from a shard for a *different* identity
-        // (built against this session so it opens): the shares lie on different
-        // polynomials, so interpolation yields a wrong key — reported as needing
-        // more, never as a successful (bogus) reconstruction.
-        let wallet = WalletContents::create_new();
-        let (holders, payloads) = armed(&wallet, 3, 3);
+    /// Seals `plaintext` (`index ‖ 32 data bytes`) to `session`'s own recovery
+    /// key, so `add_response` will open it — the shape a party who saw the public
+    /// request could forge.
+    fn forge_response(session: &RecoverySession, index: u8, data: [u8; 32]) -> Vec<u8> {
+        let mut plaintext = [0u8; RAW_SHARD_LEN];
+        plaintext[0] = index;
+        plaintext[1..].copy_from_slice(&data);
+        sealed::seal(
+            &session.request().recovery_pubkey,
+            &plaintext,
+            RESPONSE_SEAL_CONTEXT,
+        )
+        .unwrap()
+        .to_bytes()
+    }
 
-        let stranger = WalletContents::create_new();
-        let (s_holders, s_payloads) = armed(&stranger, 3, 3);
+    #[test]
+    fn session_never_returns_a_wrong_key_from_mixed_circles() {
+        // The *same* identity split across two independent circles (as after a
+        // re-arm). Both circles' shards carry this identity's address, so
+        // `build_response` accepts either against this ceremony — but they lie on
+        // different polynomials, so mixing them interpolates to a *different* key.
+        // The address check catches it: NeedMoreResponses, never a bogus success.
+        let wallet = WalletContents::create_new();
+        let (holders_a, payloads_a) = armed(&wallet, 3, 2);
+        let (holders_b, payloads_b) = armed(&wallet, 3, 2);
 
         let mut session = RecoverySession::begin(wallet.address);
         let request = session.request();
-        // Two good responses for the target...
-        for i in [0usize, 1] {
-            let resp = build_response(&payloads[i], holders[i].secret_key(), &request).unwrap();
-            session.add_response(&resp).unwrap();
-        }
-        // ...and one for the stranger. `build_response` refuses a shard whose
-        // address does not match the request target, so a stranger shard cannot
-        // even be turned into a response for this ceremony.
-        assert!(matches!(
-            build_response(&s_payloads[2], s_holders[2].secret_key(), &request),
-            Err(RecoveryError::AddressMismatch)
-        ));
-        // With only the two good shares of a 3-of-3, reconstruction still needs
-        // more — and never yields a wrong key.
+        let a0 = build_response(&payloads_a[0], holders_a[0].secret_key(), &request).unwrap();
+        let b1 = build_response(&payloads_b[1], holders_b[1].secret_key(), &request).unwrap();
+        session.add_response(&a0).unwrap();
+        session.add_response(&b1).unwrap(); // distinct indices (1 and 2), both open
+        assert_eq!(session.responses(), 2);
         assert!(matches!(
             session.reconstruct(0),
             Err(RecoveryError::NeedMoreResponses)
         ));
+
+        // Two shares from the *same* circle then rebuild the key (control).
+        let mut good = RecoverySession::begin(wallet.address);
+        let req2 = good.request();
+        for i in [0usize, 1] {
+            let r = build_response(&payloads_a[i], holders_a[i].secret_key(), &req2).unwrap();
+            good.add_response(&r).unwrap();
+        }
+        assert_eq!(good.reconstruct(0).unwrap().address, wallet.address);
+    }
+
+    #[test]
+    fn session_accepts_a_forged_response_but_never_keys_it() {
+        // A party who saw the public request can seal garbage to the recovery key;
+        // it opens, so it is accepted — but a wrong share only makes reconstruction
+        // fail closed (a different key whose address will not match), never leak a
+        // key. Two genuine shares of a 2-of-3 plus one forged share => the forged
+        // share poisons the interpolation and reconstruction reports needing more.
+        let wallet = WalletContents::create_new();
+        let (holders, payloads) = armed(&wallet, 3, 2);
+        let mut session = RecoverySession::begin(wallet.address);
+        let request = session.request();
+        for i in [0usize, 1] {
+            let r = build_response(&payloads[i], holders[i].secret_key(), &request).unwrap();
+            session.add_response(&r).unwrap();
+        }
+        // A forged share at an unused, non-zero index.
+        let forged = forge_response(&session, 9, [0xAB; 32]);
+        assert_eq!(session.add_response(&forged).unwrap(), 3);
+        assert!(
+            matches!(
+                session.reconstruct(0),
+                Err(RecoveryError::NeedMoreResponses)
+            ),
+            "a forged share must never yield a (wrong) key"
+        );
+    }
+
+    #[test]
+    fn session_rejects_a_forbidden_zero_index_response() {
+        // A share at index 0 is the secret itself and can never be a legitimate
+        // share; a forged one is rejected at add time so it cannot make later
+        // interpolation singular (a permanent poison).
+        let wallet = WalletContents::create_new();
+        let session = {
+            let mut s = RecoverySession::begin(wallet.address);
+            let forged = forge_response(&s, 0, [0x11; 32]);
+            assert!(matches!(
+                s.add_response(&forged),
+                Err(RecoveryError::Corrupt(_))
+            ));
+            s
+        };
+        assert_eq!(session.responses(), 0);
     }
 
     #[test]
@@ -568,25 +644,29 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_session_zeroizes_gathered_shares() {
-        // Mirror the shamir zeroize-on-drop idiom: after add_response the shard
-        // data lives in the session; dropping it wipes that data.
+    fn session_zeroize_path_wipes_gathered_shares() {
+        // The load-bearing zeroize guarantees (SecretKey `ZeroizeOnDrop`, RawShard
+        // `Drop`) are unit-tested in their own modules; here we verify the session
+        // opts in by exercising the same wipe its `Drop` runs — the gathered share
+        // data is zeroed. (We assert on the live value before deallocation; reading
+        // freed memory would be UB.)
         let wallet = WalletContents::create_new();
         let (holders, payloads) = armed(&wallet, 3, 2);
         let mut session = RecoverySession::begin(wallet.address);
         let request = session.request();
         let resp = build_response(&payloads[0], holders[0].secret_key(), &request).unwrap();
         session.add_response(&resp).unwrap();
+        assert_ne!(
+            session.shards[0].data, [0u8; 32],
+            "a real share is non-zero"
+        );
 
-        // Snapshot the raw pointer/length of the shard buffer, drop, and confirm
-        // the session no longer holds the plaintext. We cannot read freed memory
-        // safely, so assert the observable contract instead: Drop runs and clears
-        // the vector's contents before deallocation via `zeroize`.
-        let before: [u8; 32] = session.shards[0].data;
-        assert_ne!(before, [0u8; 32], "a real share is non-zero");
-        drop(session);
-        // (Zeroization is a best-effort defence-in-depth; the SecretKey/RawShard
-        // Drop impls are the load-bearing guarantee and are unit-tested in their
-        // own modules. This test documents that RecoverySession opts in.)
+        for shard in &mut session.shards {
+            shard.zeroize();
+        }
+        assert_eq!(
+            session.shards[0].data, [0u8; 32],
+            "the session's wipe zeroes the share data"
+        );
     }
 }

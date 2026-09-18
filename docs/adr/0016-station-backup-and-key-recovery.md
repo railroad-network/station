@@ -190,6 +190,10 @@ responses, and interpolates the key locally. Two properties are load-bearing:
   `unknown` and refuses to sign until one `sync` re-anchors it. The FFI hands the
   app only a `WalletContents` handle; the same re-anchor-before-signing rule binds
   the mobile app, which owns its outbox store, before its first submission.
+  Because the recovery key is public, a bystander (or a mixed re-armed circle) can
+  add a share that opens but does not belong; it never yields a key (the address
+  check fails it closed) but can *stall* the ceremony, whose remedy is a fresh
+  request — see the threat model's ceremony residual.
 
 Holder confirmation is procedural. Each request carries a **ceremony
 fingerprint** — the first ten hex characters of `blake3("rrn.recovery.fingerprint"

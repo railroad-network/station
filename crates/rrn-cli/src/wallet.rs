@@ -593,15 +593,15 @@ fn cmd_recover(
             .parse()
             .map_err(|_| anyhow!("invalid address {a:?} (expected rrn1…)"))?,
         None => {
-            let entered =
-                rpassword::prompt_password("address to recover (rrn1…): ").or_else(|_| {
-                    // Not secret; fall back to a visible prompt if no tty for rpassword.
-                    use std::io::Write;
-                    print!("address to recover (rrn1…): ");
-                    std::io::stdout().flush().ok();
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s).map(|_| s)
-                })?;
+            // The address is not a secret — prompt it visibly (bech32m's checksum
+            // catches a typo).
+            use std::io::Write;
+            eprint!("address to recover (rrn1…): ");
+            std::io::stderr().flush().ok();
+            let mut entered = String::new();
+            std::io::stdin()
+                .read_line(&mut entered)
+                .context("read address")?;
             entered
                 .trim()
                 .parse()
@@ -609,17 +609,22 @@ fn cmd_recover(
         }
     };
 
-    // Refuse a non-empty home unless --force (mirrors `init`, which never
+    // A station's data dir is never a valid wallet home — refuse it
+    // unconditionally, exactly as `init` does; `--force` does not override this
+    // (ADR-0028 §3.1).
+    for name in [DB_FILE, CONFIG_FILE, WALLET_FILE, SOCKET_FILE] {
+        if home.join(name).exists() {
+            bail!(
+                "{} looks like a station data directory (found {name}); the member wallet home \
+                 must be its own directory",
+                home.display()
+            );
+        }
+    }
+    // Refuse an existing member wallet unless --force (mirrors `init`, which never
     // overwrites; recover adds the escape hatch for a half-set-up device).
     if !force {
-        for name in [
-            MEMBER_WALLET_FILE,
-            "wallet.db",
-            DB_FILE,
-            CONFIG_FILE,
-            WALLET_FILE,
-            SOCKET_FILE,
-        ] {
+        for name in [MEMBER_WALLET_FILE, "wallet.db"] {
             if home.join(name).exists() {
                 bail!(
                     "{} is not empty (found {name}); choose a fresh --home or pass --force",
@@ -697,6 +702,13 @@ fn cmd_recover(
     // Now persist: prompt for a NEW passphrase and write the wallet home.
     std::fs::create_dir_all(home).context("create wallet home")?;
     set_dir_private(home);
+    // Under --force, clear any prior member wallet + db first so no stale outbox
+    // rows, cursors, or a stale paired URL from a previous identity survive into
+    // the recovered one (the db is recreated fresh below).
+    if force {
+        let _ = std::fs::remove_file(home.join(MEMBER_WALLET_FILE));
+        let _ = std::fs::remove_file(home.join("wallet.db"));
+    }
     let passphrase = read_passphrase(true)?;
     let address = contents.address.to_string();
     contents

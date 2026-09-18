@@ -802,9 +802,23 @@ requester's device before it is re-sealed under a new passphrase.
   `NeedMoreResponses` — never returned as success (tested at the crate, FFI, and
   CLI layers). A recovered wallet is treated as *restored*: it refuses to sign
   until one `sync` re-anchors it, so a botched recovery cannot self-equivocate on
-  first submission (ADR-0028 §7, ADR-0021 §5).
-- *Residual risk:* none beyond the forged-requester case above; a correct set of
-  `K` genuine shares is required, and anything less fails closed.
+  first submission (ADR-0028 §7; a fork at a seen position is equivocation,
+  ADR-0021 §5 / ADR-0020 §2). A share carrying the forbidden index `0` is rejected
+  at `add_response` so it cannot make interpolation singular.
+- *Residual risk (denial of service):* the recovery public key is in the request,
+  so anyone who sees it can seal *garbage* to it and produce a response that opens
+  (`add_response` cannot tell forged data from a genuine share — only that it was
+  sealed to this ceremony). Such a share cannot leak the key (the address check
+  fails it closed), but it *poisons* the set: reconstruction then reports "need
+  more" until the poison is removed, and a forged share scanned at a genuine
+  holder's index shadows that holder (first response wins). The same happens
+  innocently when a member re-armed (`RecoveryPackage::refresh`) and mixes shares
+  from the old and new circle — both carry the identity's address and open, but
+  lie on different polynomials. This is a nuisance, not a compromise, and the
+  same trust surface as someone showing a bogus request QR; the remedy is to start
+  a fresh ceremony (a new ephemeral key) and re-gather from one circle. A
+  `clear`/`remove` affordance or leave-one-out reconstruction would soften it and
+  is noted as a possible future improvement.
 
 ### `rrn-ledger`
 
