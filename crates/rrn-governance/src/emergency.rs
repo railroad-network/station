@@ -74,6 +74,17 @@ pub const EMERGENCY_WINDOW_FLOOR_SECS: i64 = 24 * 3600;
 /// charter may raise this, never lower it (ADR-0023 §2).
 pub const EMERGENCY_DECLARATION_PCT_FLOOR: u8 = 67;
 
+/// Hard floor on the emergency measure *approval* bar: two-thirds of the decisive
+/// votes, the same two-thirds the declaration needs (ADR-0023 §3; the measure bar
+/// is "raised, never lowered"). Like the declaration floor a `u8` percent cannot
+/// spell 2/3, so the floor value 67 is read as an exact two-thirds
+/// (`yes × 3 ≥ 2 × decisive`) and only a charter that *raises* the bar above the
+/// floor is applied as a literal `pct` — see [`emergency_measure_approved`] and
+/// `tally::count_against`. Aligning this floor with the declaration floor closes the
+/// asymmetry whereby a co-present two-thirds that could *declare* an emergency
+/// could not *pass* its measure over a single dissent (2 yes / 1 no = 66.67%).
+pub const EMERGENCY_THRESHOLD_PCT_FLOOR: u8 = 67;
+
 /// Hard floor on the emergency measure quorum: a majority of the pinned electorate,
 /// so the fast lane does not let a handful bind everyone (ADR-0023 §3).
 pub const EMERGENCY_QUORUM_PCT_FLOOR: u8 = 50;
@@ -621,6 +632,31 @@ pub fn declaration_threshold(n: usize, pct: u8) -> usize {
     // A declaration always needs at least its author's own signature; N >= 1
     // whenever the author is eligible, so the threshold is >= 1 in every reachable
     // case and no `.max(1)` is needed (an unreachable N=0 yields 0, like genesis).
+}
+
+/// Whether an emergency measure with `yes` of `decisive` (yes + no) votes clears
+/// its approval bar, in integer arithmetic (no floats).
+///
+/// The counterpart of [`declaration_threshold`] for the *measure* rather than the
+/// *declaration*, and it resolves the same `u8`-cannot-spell-2/3 problem the same
+/// way: at the floor the bar is an exact **two-thirds of the decisive votes**
+/// (`yes × 3 ≥ 2 × decisive`), so a co-present two-thirds that can *declare* an
+/// emergency can also *pass* its measure over a lone dissent (2 yes / 1 no now
+/// carries, where a literal `≥ 67 %` read it as 66.67 % and failed). A charter that
+/// *raises* the bar above [`EMERGENCY_THRESHOLD_PCT_FLOOR`] is applied literally
+/// (`yes × 100 ≥ pct × decisive`), which is never below two-thirds and is monotone
+/// in `pct`; pass the floored [`crate::charter::GovernanceStructure::effective_emergency_threshold_pct`]
+/// so a charter can never lower the bar (ADR-0023 §3). No votes decisive → not
+/// approved, matching the ordinary tally.
+pub fn emergency_measure_approved(yes: u32, decisive: u32, pct: u8) -> bool {
+    if decisive == 0 {
+        return false;
+    }
+    if pct <= EMERGENCY_THRESHOLD_PCT_FLOOR {
+        u64::from(yes) * 3 >= 2 * u64::from(decisive)
+    } else {
+        u64::from(yes) * 100 >= u64::from(pct) * u64::from(decisive)
+    }
 }
 
 /// An emergency that took force, as re-derived from the log — one entry per

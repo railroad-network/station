@@ -76,7 +76,10 @@ pub struct GovernanceStructure {
     /// Days between a non-emergency statute passing and taking effect.
     pub implementation_delay_days: u8,
     /// Approval share required for an emergency proposal (a higher bar; takes
-    /// effect immediately).
+    /// effect immediately). Clamped up to
+    /// [`crate::emergency::EMERGENCY_THRESHOLD_PCT_FLOOR`] on use, and the floor
+    /// value is read as an exact two-thirds of the decisive votes — the same
+    /// two-thirds the declaration needs — not a literal 67 % (ADR-0023 §3).
     pub emergency_threshold_pct: u8,
     /// Seconds an `Emergency`-kind proposal deliberates/votes **while an emergency
     /// declaration is in force** — the compressed decision window (ADR-0023 §3a).
@@ -144,6 +147,17 @@ impl GovernanceStructure {
     pub fn effective_emergency_quorum_pct(&self) -> u8 {
         self.emergency_quorum_pct
             .max(crate::emergency::EMERGENCY_QUORUM_PCT_FLOOR)
+    }
+
+    /// The emergency measure *approval* bar, floored to
+    /// [`crate::emergency::EMERGENCY_THRESHOLD_PCT_FLOOR`] (ADR-0023 §3) — a charter
+    /// may raise the emergency bar, never lower it. The floor value is applied as an
+    /// exact two-thirds, not a literal 67 %, by
+    /// [`crate::emergency::emergency_measure_approved`], which this feeds; a raised
+    /// value is applied literally.
+    pub fn effective_emergency_threshold_pct(&self) -> u8 {
+        self.emergency_threshold_pct
+            .max(crate::emergency::EMERGENCY_THRESHOLD_PCT_FLOOR)
     }
 
     /// The consecutive-renewal cap, capped at
