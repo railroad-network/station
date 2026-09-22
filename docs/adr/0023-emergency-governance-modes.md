@@ -1008,3 +1008,52 @@ the second is implemented (option A) with its reading recorded here.*
   emergencies needs two sequential supermajorities. Overlaps are rare and bounded by
   expiry, but the maintainer should confirm this ordering is acceptable or ask for
   lapses to resolve against a named activation.
+
+- **2026-09-22 — the 2026-09-09 declaration-threshold reading is ratified, and the
+  measure *approval* bar is aligned to the same exact two-thirds (implemented; one
+  behavioral change).** The maintainer accepts that the emergency two-thirds is an exact
+  `ceil(2N/3)` at its floor, not a literal `ceil(N × 67/100)`. The rationale stands with
+  one word tightened: author-plus-one at N=3 grants no *power* ADR-0015 grace does not
+  already grant — three founders already govern outright during grace, so the compressed
+  path grants only **speed** on a measure they could pass anyway, whereas a holdout veto
+  (the `ceil(2.01) = 3` unanimity reading) would defeat §2's own co-present-supermajority
+  partition rationale. Three points ride with the ratification:
+  - **The measure approval bar is now an exact two-thirds at its floor too — a behavioral
+    change, not a no-op reading.** §3 raises the *measure* approval bar
+    (`emergency_threshold_pct`, default 67), but the tally applied it as a literal percent,
+    so at three decisive votes 2 yes / 1 no read as 66.67 % and **failed** — the same
+    co-present two-thirds that could *declare* the emergency (author + one) could not
+    *pass* its measure over a lone dissent. The bar now floors at
+    `EMERGENCY_THRESHOLD_PCT_FLOOR` (67) via `effective_emergency_threshold_pct`, and at
+    that floor is read as an exact two-thirds of the decisive votes
+    (`yes × 3 ≥ 2 × decisive`, `emergency::emergency_measure_approved`), mirroring the
+    declaration bar; a charter-**raised** bar is still applied as a literal `pct`. The one
+    observable delta: a 2-yes / 1-no emergency measure at three decisive votes now
+    **carries** where it previously failed. This *lowers* nothing below two-thirds and
+    leaves the ordinary statute / amendment bars untouched. The reading is **kind-wide** —
+    the tally keys the exact-two-thirds bar on the `Emergency` proposal kind, not on
+    whether a declaration is in force — so it also governs an `Emergency` measure raised
+    with *no* active declaration (the un-declared path §1 describes as keeping "its
+    Phase-1 behaviour exactly … [a] 67 % bar"): that bar is now the same exact two-thirds.
+    Reading 67 as two-thirds on the declared path and literally on the un-declared path
+    would be a fresh asymmetry, so the field's meaning is deliberately uniform; §1's "67 %
+    bar" is thus an N-not-a-multiple-of-3 statement, exactly as this note makes it for §3.
+    It is recorded here rather than as a rewrite of §1/§3's decision text because ADRs are
+    append-only; it is nonetheless a change in observable tally outcome, not merely a
+    corrected reading.
+  - **`67` is the only value read as an exact rational — for both the declaration and the
+    measure bar.** A `u8` percent cannot spell 66.67, so exactly the floor value 67 means
+    two-thirds; any charter that *raises* a bar above 67 is applied literally
+    (`ceil(N × pct/100)` for the declaration, `yes × 100 ≥ pct × decisive` for the
+    measure), which at electorates/decisive-counts that are multiples of 3 demands
+    strictly more than two-thirds — a bar nudged to 68 needs `ceil(0.68 N)`, i.e.
+    two-thirds plus a growing margin (`+1` up to N = 75, `+2` by N = 150), so at three
+    decisive votes it reads 2-of-3 as failing again. This is monotone and never below
+    two-thirds, but a charter author raising an emergency bar should know 67 is the
+    canonical exact-two-thirds value; anything above is a literal percent.
+  - **§2's "one member … cannot compress anything" is an N ≥ 3 statement.** Only an
+    *empty* founder list is rejected, so a 1- or 2-founder community exists, and there the
+    declaration bar `ceil(2N/3)` is 1 (a sole founder declares alone) or 2 (both must).
+    Those are the same members ADR-0015 grace already lets govern outright, so this grants
+    no new power, but the sentence is literally false at N ∈ {1, 2}; read it as "at N ≥ 3 a
+    bare majority cannot compress."

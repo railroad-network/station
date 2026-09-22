@@ -1018,6 +1018,155 @@ fn the_raised_emergency_quorum_binds_where_the_statute_quorum_would_pass() {
     assert_eq!(ts.outcome, Some(ProposalOutcome::Passed));
 }
 
+/// End-to-end through `tally`: the exact-two-thirds measure bar carries a
+/// compressed-path emergency measure over a lone dissent. Three founders turn out
+/// (quorum met) and vote 2 yes / 1 no — exactly two-thirds of the decisive votes,
+/// so the measure **passes** on this branch, where the old literal 67 % read it as
+/// 66.67 % and failed. Pins the whole wiring `tally` → `thresholds`
+/// (floored `effective_emergency_threshold_pct`) → `emergency_measure_approved`,
+/// which the pure-arithmetic tests cannot (ADR-0023 §3).
+#[test]
+fn a_two_thirds_emergency_measure_carries_over_a_lone_dissent() {
+    let (db, founders, st) = three_founder_community();
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
+        .unwrap()
+        .unwrap();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let at = t0 + 10;
+    let em = propose_emergency(&db, &st, &charter, &founders[0], at + 3600, at);
+    cosign_prop(&db, &founders[1], &em, at);
+    cosign_prop(&db, &founders[2], &em, at);
+    vote_prop(&db, &founders[0], &em, VoteChoice::Yes, at + 1);
+    vote_prop(&db, &founders[1], &em, VoteChoice::Yes, at + 1);
+    vote_prop(&db, &founders[2], &em, VoteChoice::No, at + 1);
+    let t = tally(
+        &db,
+        &em.proposal_id,
+        em.voting_ends_at + 1,
+        &station().public_key(),
+    )
+    .unwrap();
+    assert_eq!(t.eligible_voters, 3);
+    assert!(
+        t.quorum_met,
+        "3 of 3 turn out, clearing the 50% emergency quorum"
+    );
+    assert!(
+        t.approval_met,
+        "2 of 3 is exactly two-thirds at the floor bar"
+    );
+    assert_eq!(t.outcome, Some(ProposalOutcome::Passed));
+}
+
+/// A charter that stored a sub-floor `emergency_threshold_pct` cannot lower the
+/// measure bar: the floor (67 → exact two-thirds) binds through `thresholds`, so a
+/// 1-yes / 2-no measure **fails** even though a literal 10 % bar would pass it
+/// (`1/3 = 33 % ≥ 10 %`). The companion to `a_hostile_sub_floor_charter_...` for the
+/// approval bar (ADR-0023 §3, "raised, never lowered").
+#[test]
+fn a_sub_floor_emergency_threshold_cannot_lower_the_measure_bar() {
+    let db = fresh_db();
+    let founders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+    let gov = GovernanceStructure {
+        emergency_threshold_pct: 10, // below the 67% floor
+        ..GovernanceStructure::default()
+    };
+    publish_charter_with(&db, &founders, gov);
+    let st = station();
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
+        .unwrap()
+        .unwrap();
+    let t0 = 1_000_000;
+    activate(&db, &st, &founders, t0);
+    let at = t0 + 10;
+    let em = propose_emergency(&db, &st, &charter, &founders[0], at + 3600, at);
+    cosign_prop(&db, &founders[1], &em, at);
+    cosign_prop(&db, &founders[2], &em, at);
+    vote_prop(&db, &founders[0], &em, VoteChoice::Yes, at + 1);
+    vote_prop(&db, &founders[1], &em, VoteChoice::No, at + 1);
+    vote_prop(&db, &founders[2], &em, VoteChoice::No, at + 1);
+    let t = tally(
+        &db,
+        &em.proposal_id,
+        em.voting_ends_at + 1,
+        &station().public_key(),
+    )
+    .unwrap();
+    assert!(t.quorum_met, "3 of 3 turn out");
+    assert!(
+        !t.approval_met,
+        "1 of 3 is below two-thirds; the floor bar must not read the stored 10%"
+    );
+    assert_eq!(t.outcome, Some(ProposalOutcome::Failed));
+}
+
+/// The exact-two-thirds reading is confined to emergency measures: an ordinary
+/// `Statute` under a charter whose `statute_approval_pct` is 67 keeps the **literal**
+/// percent, so 2 yes / 1 no reads as 66.67 % and **fails** — proof the alignment did
+/// not leak into the ordinary bars.
+#[test]
+fn the_ordinary_statute_bar_stays_a_literal_percent() {
+    let db = fresh_db();
+    let founders: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+    let gov = GovernanceStructure {
+        statute_approval_pct: 67,
+        ..GovernanceStructure::default()
+    };
+    publish_charter_with(&db, &founders, gov);
+    let st = station();
+    let charter = rrn_governance::tally::effective_charter(&db, &station().public_key())
+        .unwrap()
+        .unwrap();
+    let at = 1_000_000;
+    let p = Proposal::new(
+        addr(&founders[0]),
+        "Ordinary rule".into(),
+        "b".into(),
+        ProposalKind::Statute,
+        at,
+    )
+    .unwrap();
+    let id = p.proposal_id;
+    let mut log = AppendLog::new(&db);
+    append_proposal(
+        &mut log,
+        SignedPayload::sign(p, &founders[0]),
+        &db,
+        &st,
+        &charter,
+        at,
+    )
+    .unwrap();
+    let statute = rrn_governance::proposal::proposal_records(
+        &AppendLog::new(&db),
+        &id,
+        &db,
+        &station().public_key(),
+    )
+    .unwrap()
+    .proposal
+    .unwrap();
+    cosign_prop(&db, &founders[1], &statute, at);
+    cosign_prop(&db, &founders[2], &statute, at);
+    vote_prop(&db, &founders[0], &statute, VoteChoice::Yes, at + 1);
+    vote_prop(&db, &founders[1], &statute, VoteChoice::Yes, at + 1);
+    vote_prop(&db, &founders[2], &statute, VoteChoice::No, at + 1);
+    let t = tally(
+        &db,
+        &statute.proposal_id,
+        statute.voting_ends_at + 1,
+        &station().public_key(),
+    )
+    .unwrap();
+    assert!(t.quorum_met, "3 of 3 clears the statute quorum");
+    assert!(
+        !t.approval_met,
+        "2 of 3 = 66.67% < a literal 67% statute bar — ordinary bars are not exact two-thirds"
+    );
+    assert_eq!(t.outcome, Some(ProposalOutcome::Failed));
+}
+
 // --- §4 the renewal count cap (isolated from the duration cap) ---------------
 
 #[test]
@@ -1371,8 +1520,9 @@ mod reputation {
 // --- Pure chain/threshold logic (proptest) ----------------------------------
 
 proptest::proptest! {
-    /// The declaration threshold is monotone in N, never below two-thirds, and — for
-    /// N >= 5 — a strict majority, so a bare majority can never compress (§2).
+    /// The declaration threshold is monotone in N, never below two-thirds, and
+    /// exactly `ceil(2N/3)`, so a bare majority can never compress (§2). `ceil(2N/3)`
+    /// exceeds `N/2` for every N >= 1, so the bar is always a strict majority too.
     #[test]
     fn declaration_threshold_is_a_monotone_two_thirds_bar(n in 1usize..500) {
         let t = emergency::declaration_threshold(n, 67);
@@ -1381,6 +1531,8 @@ proptest::proptest! {
         // Two-thirds is tight: below the true ceil(2N/3) is impossible, and it does
         // not overshoot by a whole unit.
         proptest::prop_assert!((t - 1) * 3 < n * 2);
+        // Always a strict majority (ceil(2N/3) > N/2 for all N >= 1).
+        proptest::prop_assert!(t * 2 > n);
         // Monotone in N.
         let t_next = emergency::declaration_threshold(n + 1, 67);
         proptest::prop_assert!(t_next >= t);
@@ -1388,6 +1540,66 @@ proptest::proptest! {
         let t_raised = emergency::declaration_threshold(n, 80);
         proptest::prop_assert!(t_raised >= t);
     }
+
+    /// The emergency *measure* approval bar mirrors the declaration bar: at the floor
+    /// it is an exact two-thirds of the decisive votes (`yes × 3 >= 2 × decisive`),
+    /// and a charter-raised bar is never easier to clear (ADR-0023 §3).
+    #[test]
+    fn emergency_measure_approval_is_an_exact_two_thirds_bar(
+        decisive in 1u32..500,
+        yes_frac in 0u32..=1000,
+    ) {
+        let yes = (u64::from(decisive) * u64::from(yes_frac) / 1000) as u32;
+        let approved = emergency::emergency_measure_approved(yes, decisive, 67);
+        // Exact two-thirds of the decisive votes, no float slack.
+        proptest::prop_assert_eq!(approved, u64::from(yes) * 3 >= 2 * u64::from(decisive));
+        // Raising the bar is never *easier*: anything a raised bar approves, the
+        // floor two-thirds approves too.
+        let approved_raised = emergency::emergency_measure_approved(yes, decisive, 80);
+        proptest::prop_assert!(!approved_raised || approved);
+    }
+}
+
+/// The concrete asymmetry ADR-0023 §3's clarification closes: at three decisive
+/// votes a lone dissent (2 yes / 1 no) now *carries* an emergency measure at the
+/// floor bar, where a literal 67 % read it as 66.67 % and failed — the same
+/// co-present two-thirds that can *declare* the emergency (author + one) can now
+/// *pass* its measure. A charter that raises the bar above the floor restores the
+/// literal percent, and 2 of 3 fails again.
+#[test]
+fn a_lone_dissent_no_longer_defeats_a_two_thirds_emergency_measure() {
+    use rrn_governance::emergency::emergency_measure_approved;
+    // Floor bar (67 → exact two-thirds).
+    assert!(
+        emergency_measure_approved(2, 3, 67),
+        "2 of 3 decisive must carry at the floor"
+    );
+    assert!(
+        !emergency_measure_approved(1, 3, 67),
+        "1 of 3 must not carry"
+    );
+    assert!(emergency_measure_approved(3, 3, 67), "unanimity carries");
+    assert!(
+        emergency_measure_approved(2, 2, 67),
+        "unanimity at N=2 carries"
+    );
+    assert!(
+        !emergency_measure_approved(1, 2, 67),
+        "a tie does not carry"
+    );
+    assert!(
+        !emergency_measure_approved(0, 0, 67),
+        "no decisive votes never carries"
+    );
+    // A charter-raised bar is applied literally: 2 of 3 = 66.67 % < 68 % fails again.
+    assert!(
+        !emergency_measure_approved(2, 3, 68),
+        "a raised bar reads 2 of 3 as 66.67 %"
+    );
+    assert!(
+        emergency_measure_approved(2, 3, 67),
+        "the floor still carries it"
+    );
 }
 
 // --- Replica determinism against forged/gossiped attestations ---------------

@@ -239,8 +239,16 @@ fn count_against(
     // Integer comparisons, no floats: participation/eligible ≥ quorum_pct/100 and
     // yes/decisive ≥ approval_pct/100, cross-multiplied.
     let quorum_met = u64::from(participation) * 100 >= u64::from(quorum_pct) * u64::from(eligible);
-    let approval_met =
-        decisive > 0 && u64::from(yes) * 100 >= u64::from(approval_pct) * u64::from(decisive);
+    // An emergency measure's approval bar is an *exact* two-thirds at its floor (a
+    // `u8` percent cannot spell 2/3), matching the declaration bar so the same
+    // co-present two-thirds can both declare and carry a measure over a lone dissent
+    // (ADR-0023 §3). `approval_pct` here is already floored by `thresholds`. Every
+    // other proposal kind keeps the literal cross-multiplied percent.
+    let approval_met = if proposal.kind.is_emergency() {
+        crate::emergency::emergency_measure_approved(yes, decisive, approval_pct)
+    } else {
+        decisive > 0 && u64::from(yes) * 100 >= u64::from(approval_pct) * u64::from(decisive)
+    };
 
     let settled = if quorum_met && approval_met {
         ProposalOutcome::Passed
@@ -286,7 +294,11 @@ fn thresholds(kind: &ProposalKind, charter: &Charter, under_emergency: bool) -> 
             } else {
                 gs.statute_quorum_pct
             };
-            (quorum, gs.emergency_threshold_pct)
+            // The approval bar is floored to two-thirds and, at that floor, read as
+            // an *exact* two-thirds of the decisive votes by `count_against` (via
+            // `emergency_measure_approved`) — never a literal 67 % (ADR-0023 §3,
+            // aligned with the declaration bar).
+            (quorum, gs.effective_emergency_threshold_pct())
         }
     }
 }
