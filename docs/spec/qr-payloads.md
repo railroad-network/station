@@ -1,7 +1,7 @@
 # QR Payload Formats
 
-**Status:** current · **Tasks:** T1.4.2 (M1.4 Vouching Flow); §§5–7 added by
-T2.5.1 (M2.5 paper fallback, ADR-0020)
+**Status:** current · §§1–4 date from the vouching flow (Phase 1); §§5–7 were
+added with the paper fallback (ADR-0020, ADR-0021)
 
 This document locks the formats of the QR codes the Railroad Network apps render
 and scan, so they stay stable and interoperable across the mobile app and the

@@ -1,15 +1,14 @@
 # SMS Carrier Format
 
-**Status:** current · **Task:** T2.7.1 (M2.7 SMS interface, Overview §10.3 "No
-internet — SMS") · **Depends on:** the `rrnp:` chunk grammar (T2.5.1,
-[`qr-payloads.md`](qr-payloads.md) §5) and DTN bundle ingest (ADR-0020,
+**Status:** current · Overview §10.3 "No internet — SMS" · **Depends on:** the
+`rrnp:` chunk grammar ([`qr-payloads.md`](qr-payloads.md) §5) and DTN bundle ingest (ADR-0020,
 [`dtn-bundles.md`](dtn-bundles.md))
 
 This document locks how signed payloads travel over SMS, so the mobile app (which
 composes the texts) and the station (which decodes and ingests them) stay
-interoperable. It describes what ships **today** in T2.7.1: the wire codec, the
-sender registry, and the station relay. The physical modem/gateway that carries the
-texts is **T2.7.2**; the mobile app's SMS-composition UI is the mobile repo. Both
+interoperable. It describes what ships **today**: the wire codec, the sender
+registry, and the station relay. The physical modem/gateway that carries the
+texts is **not built** (a human-gated hardware follow-up); the mobile app's SMS-composition UI is the mobile repo. Both
 consume the format defined here.
 
 ## 1. What SMS is, in one line

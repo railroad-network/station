@@ -41,6 +41,13 @@ not optional homework for later — do it the same day you found the community.
 - **Android only, sideloaded.** There is no app-store distribution. Members
   install a signed APK you give them (see the mobile repo's
   [`SIDELOAD.md`](https://github.com/railroad-network/mobile/blob/main/SIDELOAD.md)).
+- **The phone app is online-only for signing.** A payment, confirmation, vote,
+  or dispute from the app needs the station reachable; the app refuses and the
+  member retries later. The offline outbox, headroom certificates, and paper
+  export that Part 6 describes ship today in the **command-line wallet**
+  (`rrn wallet`, §2.4), not yet as screens in the app. Wherever this runbook
+  says a member "signs offline", read it as a laptop member or the paper path
+  until the app catches up.
 
 ## What you need
 
@@ -326,10 +333,13 @@ rrn wallet pair  --url 192.168.4.1:7500                 # shows an 8-char SAS
 **Confirm the pair as in §2.3:** compare the SAS the wallet prints with what
 `station pair-mobile` lists, then `station pair-mobile <their-rrn1-address>`.
 The member then runs `rrn wallet sync` to pull their nonce, balance, and any
-receipts. To pay offline they `rrn wallet pay …` and `rrn wallet export qr`
-(or `--format bundle`); a courier carries the sheets to you, you `rrn paper
-ingest` them, and the member applies the returned receipts with `rrn wallet
-receipts apply`. Online, `rrn wallet submit` does the whole round trip.
+receipts. To pay offline they `rrn wallet pay …` and `rrn wallet export qr
+--out <dir>` (or `rrn wallet export bundle --out <dir>` for a raw bundle a
+radio can carry); a courier carries the sheets to you, you `rrn paper ingest`
+them, and the member applies the returned receipts with `rrn wallet receipts
+apply`. Online, `rrn wallet submit` does the whole round trip. A member who
+loses the laptop rebuilds their key from their recovery circle with
+`rrn wallet recover` (§4.3).
 
 **Two things the member must understand.** First, **back up the whole wallet
 home directory** (`~/.railroad/wallet` by default), not just the key file — the
@@ -750,11 +760,15 @@ phone is on the right Wi‑Fi is what's worth investigating.
 
 ### Paper fallback — when there is no network at all
 
-When a member's phone cannot reach the station by any means — no Wi‑Fi, no mesh,
-no radio — a payment can still travel on **paper**. The member confirms (or
-spends) offline on their phone, which produces QR codes; those get printed or
-photographed, physically carried to the station, scanned back to text, and
-ingested. The station's delivery receipt makes the return trip the same way.
+When a member cannot reach the station by any means — no Wi‑Fi, no mesh, no
+radio — a payment can still travel on **paper**. The member confirms (or spends)
+offline, which produces QR codes; those get printed or photographed, physically
+carried to the station, scanned back to text, and ingested. The station's
+delivery receipt makes the return trip the same way. Today the member side of
+this is the **command-line wallet** (`rrn wallet pay` / `confirm` then
+`rrn wallet export qr`, §2.4); the phone app cannot yet sign offline or export
+an outbox, so a phone member's paper path is to sign on a laptop or wait for
+the network.
 
 What you need: a printer (any monochrome laser is plenty) and any commodity
 **QR scanner app** or webcam tool. The `rrn` CLI does **not** read camera images
@@ -872,11 +886,19 @@ phones you already have; nothing here needs federation.*
 
 The design principle to hold onto: **the station is the only thing that writes
 the ledger** (ADR-0020). When members cannot reach it, they do not stop — they
-keep signing on their phones, and their signed records travel to the station
-later over whatever still works: another member's phone, a radio, a text
-message, or a printed sheet. Nothing *settles* until the record arrives, and
-every settlement window is served in full from arrival (ADR-0022). Offline mode
-is normal mode, running late.
+keep signing on their own devices, and their signed records travel to the
+station later over whatever still works: a courier, a radio, a text message, or
+a printed sheet. Nothing *settles* until the record arrives, and every
+settlement window is served in full from arrival (ADR-0022). Offline mode is
+normal mode, running late.
+
+> **What "their own devices" means today.** The command-line wallet (§2.4)
+> signs offline into a durable outbox, holds headroom certificates, and exports
+> to paper or a bundle. The **phone app does not yet**: it needs the station
+> reachable to send, confirm, vote, or contest, and it cannot request or accept
+> a certificate. The Rust core behind the app already has these functions; the
+> screens are not written. Plan the drill in 6.6 around laptops and paper for
+> offline trade, and treat every "on their phone" below as the design target.
 
 ### 6.1 The "before the storm" ritual — headroom certificates
 
@@ -901,8 +923,10 @@ certificate has 10 Commons less to spend online until it expires or they return
 it. So the ritual is: reserve before a market day, a storm warning, a trip up
 the valley; return what you did not use when you are back.
 
-Members do this from their phones. The station's own wallet can do it from the
-console (the same rules apply to the steward):
+Members with the command-line wallet do this with `rrn wallet cert request`
+(and print it with `rrn paper cert`); the phone app cannot request or accept a
+certificate yet. The station's own wallet can do it from the console (the same
+rules apply to the steward):
 
 ```sh
 rrn cert request 10          # reserve a 10-Common certificate (Commons, not centicommons)
@@ -910,10 +934,12 @@ rrn cert list                # what is outstanding, with caps and expiries
 rrn paper cert --cert-id <hex> --out cards/   # print it as a wallet card (Part 5)
 ```
 
-What a receiver checks offline, on their phone, before handing over goods: the
-certificate is station-signed, it belongs to the payer, the payment fits the
-remaining cap, and it has not expired. The phone also shows the payer's earlier
-spends against that certificate — but only the ones the payer *presents*. A
+What a receiver checks offline, before handing over goods: the certificate is
+station-signed, it belongs to the payer, the payment fits the remaining cap, and
+it has not expired (the `rrnspend:` voucher the payer's wallet writes with
+`--voucher-out` carries what is needed; `rrn paper show` verifies it). The
+receiver also sees the payer's earlier spends against that certificate — but
+only the ones the payer *presents*. A
 payer can hide earlier spends; the cap still bounds what the community can lose
 per certificate, and the double-spend is refused and recorded as **provable
 equivocation** when the records reach the station: the member's standing drops
@@ -932,8 +958,8 @@ delay, or duplicate what they carry; they cannot forge or alter it.
 The three kinds of thing a courier carries:
 
 - **A bundle**: one or more members' signed records, going *to* the station.
-  On a phone, this is the app's outbox exported for carriage; on paper it is a
-  printed sheet.
+  From a laptop member this is `rrn wallet export bundle` (raw, for a radio or
+  a USB stick) or `rrn wallet export qr` (a printed sheet).
 - **Delivery receipts**: the station's signed answer, going *back* to each
   author, saying per record whether it was admitted, was already known, or was
   refused and why. A member whose phone has not seen a receipt simply re-sends;
@@ -952,8 +978,8 @@ rrn paper ingest --in scanned.txt --out carryback/
 rrn paper export-receipts --author rrn1… --out receipts/
 ```
 
-A courier phone paired with the station submits its carried bundles itself when
-it comes into Wi-Fi range; you do not need to do anything at the console.
+A laptop member who reaches the station's Wi-Fi again submits their own outbox
+with `rrn wallet submit`; you do not need to do anything at the console.
 
 Rules of thumb for members: **a receipt is proof; the absence of a receipt is
 not proof of anything.** Keep re-sending until the receipt comes back. Two
@@ -1079,10 +1105,10 @@ members; four hours. Take a `station backup` first.
 | T−1 day | Prepare | Every member who will pay reserves a certificate (6.1). Steward prints credential cards for anyone who wants one. Facilitator briefs the adversary. |
 | 0:00 | Normal | Fifteen minutes of ordinary trade on Wi-Fi. Steward notes `rrn balance` for a few members and the log length (`rrn history`). |
 | 0:15 | **Cut** | Turn off the Wi-Fi access point. Phones can no longer reach the station. Announce it. |
-| 0:15–2:15 | Outage | Trade continues *offline*: certificate-backed payments accepted on phones, plain payments signed and queued, a vouch or two, a governance vote if one is open. Couriers carry bundles to the steward on foot; the steward ingests and hands back receipt sheets. The slow courier holds one bundle back deliberately. One member's phone "dies" (turn it off) after signing. If you have radios, push at least one bundle over LoRa. |
+| 0:15–2:15 | Outage | Trade continues *offline* on the devices that can: laptop members sign certificate-backed and plain payments into their `rrn wallet` outbox and export them to paper or a bundle; phone members trade on paper through a laptop member or wait (the app cannot sign offline yet). Couriers carry bundles to the steward on foot; the steward ingests and hands back receipt sheets. The slow courier holds one bundle back deliberately. One member's laptop "dies" (close it) after signing and exporting. If you have radios, push at least one bundle over LoRa. |
 | 1:15 | **Emergency** (optional) | Declare a drill emergency (6.5) and co-sign it in person; pass one temporary measure through the compressed window. Watch the banner appear. |
 | 2:15 | Power loss (encrypted profile only) | Pull the station's power. Convene the holders and run `station unlock` — read the fingerprint aloud. Time it. |
-| 2:45 | **Reconnect** | Wi-Fi back on. Phones drain their queues; the slow courier finally delivers. |
+| 2:45 | **Reconnect** | Wi-Fi back on. Laptop members run `rrn wallet submit`; phones reconnect and catch up; the slow courier finally delivers. |
 | 3:00 | Reconcile | Steward reads every receipt outcome aloud: admitted / known / refused (and why). The adversary reveals what they tried. |
 | 3:30 | Settle & debrief | Wait out the settlement window if you shortened it for the drill (`[settlement]` uniform override), or read the pending list. Debrief. |
 
@@ -1114,6 +1140,10 @@ outcome. Afterwards verify with the steward:
 how to reserve a certificate; can the couriers find the steward; do the holders
 answer the phone; does the merchant trust an offline payment. Write down what
 surprised you and fix the people-side before the storm.
+
+The organizer-facing version of this guide is
+[Running an outage drill](https://railroad-network.github.io/organizers/outage-drill.html)
+on the docs site.
 
 ---
 

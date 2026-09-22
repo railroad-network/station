@@ -385,25 +385,25 @@ enum Command {
         /// The hex contract id.
         contract_id: String,
     },
-    /// Community governance: the Charter, proposals, voting, and statutes (M1.9).
+    /// Community governance: the Charter, proposals, voting, and statutes (ADR-0012).
     Governance {
         #[command(subcommand)]
         cmd: GovernanceCmd,
     },
     /// Disputes: contest a confirmed payment, respond, rule as a juror, resolve
-    /// (M1.10).
+    /// (ADR-0014).
     Dispute {
         #[command(subcommand)]
         cmd: DisputeCmd,
     },
     /// Offline spending certificates: reserve debt-floor headroom before a
-    /// partition, and list your outstanding certificates (M2.3, ADR-0021).
+    /// partition, and list your outstanding certificates (ADR-0021).
     Cert {
         #[command(subcommand)]
         cmd: CertCmd,
     },
     /// Paper fallback: export payloads to printable QR sheets and ingest scanned
-    /// QR text (M2.5, ADR-0020 §3 / ADR-0021 §4). The CLI consumes scanned QR
+    /// QR text (ADR-0020 §3 / ADR-0021 §4). The CLI consumes scanned QR
     /// *text* — one payload string per line, from any scanner app — it does not
     /// read camera images. A member exporting their *own* signed records prints
     /// them with `rrn wallet export` (ADR-0028); these tools are the courier's.
@@ -413,7 +413,7 @@ enum Command {
     },
     /// Delay-tolerant networking: originate an outbound bundle push to a peer over
     /// the Reticulum transport, inspect tracked pushes, and publish this station's
-    /// own reachability binding (M2.6, ADR-0013/0020).
+    /// own reachability binding (ADR-0013, ADR-0020).
     Dtn {
         #[command(subcommand)]
         cmd: DtnCmd,
