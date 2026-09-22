@@ -208,12 +208,12 @@ should weigh before calling the phase done:
    recovery is restore + outbox replay, or the holder ceremony.
 5. **Running-node seizure is not defended** (ADR-0024).
 6. **A read-replica cannot derive balances or governance under its own key.**
-   *The gossip front-door bypass is closed (T2.11.4, ADR-0020 §7 Clarification):*
+   *The gossip front-door bypass is closed (ADR-0020 §7 Clarification):*
    a station is a **writer** (owns the chain, never pulls, refuses to start with
    peers) or a **replica** (pulls a copy, admits nothing), so no gossiped record
    reaches the writer's chain ungated. The surviving residual is a replica's own
    derived views: station-signed records (ledger *and* governance) are
-   signer-pinned to the community station key on replay (T2.1.4, T2.11.3), and a
+   signer-pinned to the community station key on replay, and a
    replica's key differs from the writer's, so a replica sees no station-signed
    state (balances read zero; governance is genesis-only) — loud and tested,
    never silent. A replica is a faithful copy of the *chain* for audit/backup,
@@ -240,7 +240,7 @@ should weigh before calling the phase done:
   on "a root already exists", so an equal-version re-root — the reachable shape,
   since construction paths pin version 1 — is caught too. The gossip-front-door
   vector that could once have injected a charter around this guard is now closed
-  by the writer/replica split (T2.11.4, ADR-0020 §7): the writer never pulls, so
+  by the writer/replica split (ADR-0020 §7): the writer never pulls, so
   no gossiped charter reaches its chain.
 - **Declaration threshold is `ceil(2N/3)` in code** (`declaration_threshold`)
   where ADR-0023 §2's prose says `ceil(N × 67 / 100)`; the ADR's own worked

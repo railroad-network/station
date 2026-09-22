@@ -1248,6 +1248,19 @@ after multi-node sync ships means a wire-format break:
 > the red-team checklist (`security/phase-2-redteam.md`), and the criterion-by-
 > criterion exit statement are in **`docs/phase-2-exit-evidence.md`**.
 
+> **Updated 2026-09-22.** Two corrections to the note above. *LoRa*: the
+> station-side outbox export it was waiting on now exists (`rrn wallet export`,
+> ADR-0028), so a full propose → confirm → settle round-trip over radio is
+> provable in software; only the human field sign-off at real range remains.
+> *The mobile app*: the offline features of this phase (outbox, headroom
+> certificates, paper export, courier bundles) ship in the Rust core
+> (`rrn-mobile-ffi`) and in the `rrn wallet` command-line client, but the
+> Android app has **no screens for them yet** — it is online-only for signing.
+> "Members keep signing on their phones" describes the design and the
+> command-line wallet today, not the app. Member key recovery on a member's own
+> device (phone or laptop) shipped after the phase closed (ADR-0016
+> Clarification, 2026-09-17).
+
 **Testing methodology:** Deliberately take the community offline for 72-hour simulated
 outages with real economic activity. Does everything reconcile correctly on reconnect?
 Red team the physical security.

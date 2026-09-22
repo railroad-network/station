@@ -46,7 +46,7 @@ enum Command {
         #[command(subcommand)]
         cmd: PeersCmd,
     },
-    /// Confirm a mobile's pairing request (T1.3.3). With no address, lists the
+    /// Confirm a mobile's pairing request (ADR-0008). With no address, lists the
     /// pending requests and their confirmation codes; pass an address to
     /// confirm it after comparing the code with the mobile's screen in person.
     PairMobile {

@@ -16,23 +16,45 @@ client lives in the sibling repo `../mobile` (TypeScript UI over this workspace'
 `rrn-mobile-ffi` bindings, per ADR-0006/0007); cross-repo work (FFI surface, wire fixtures)
 touches both.
 
-## Current status: Phase 1 complete (M1.1–M1.11), pilot-ready
+## Current status: Phase 2 complete on simulation evidence; pilot and audit pending
 
-Phase 0 (crypto core, storage/log, identity, ledger, daemon+CLI) and all of Phase 1 —
-mobile transport, vouching, reputation, marketplace, oracle tiers 1–2, governance, dispute
-resolution, and M1.11 pilot readiness — have landed. What remains of Phase 1 is running the
-actual 90-day community pilot. The next build phase is **Phase 2 — Single-Community
-Resilience** (offline-first hardening, delay-tolerant sync, LoRa/SMS, paper fallback), which
-was resequenced *before* federation by ADR-0017.
+Phase 0 (crypto core, storage/log, identity, ledger, daemon+CLI), Phase 1 (mobile
+transport, vouching, reputation, marketplace, oracle tiers 1–2, governance, disputes,
+pilot readiness), and **Phase 2 — Single-Community Resilience** have all landed. Phase 2
+closed 2026-09-13 by the ADR-0017 criterion (`docs/phase-2-exit-evidence.md`): admission
+clock (ADR-0022), single-writer log + delay-tolerant submission (ADR-0020), headroom
+certificates + provable equivocation (ADR-0021/0025), paper fallback and the `rrn paper`
+courier tools, the `rrn wallet` self-custody CLI member wallet (ADR-0028), Reticulum/LoRa
+sidecar and transport (ADR-0013/0026), SMS codec + relay against a mock gateway,
+emergency governance (ADR-0023/0027), the encrypted at-rest profile (ADR-0024), the
+writer/replica role split, the 72-hour outage simulation, and — after the consolidation —
+member key recovery on member devices (ADR-0016 Clarification; mobile PR too).
+
+Still open, and the docs must say so:
+- the 90-day community pilot and the independent professional audit (the gates to real value);
+- two human-gated hardware follow-ups: the SMS modem gateway (not built) and the LoRa
+  field-acceptance sign-off at real range (radios bench-verified 2026-09-11);
+- **the phone app is online-only for signing** — the offline outbox, certificates, and
+  paper export exist in `rrn-mobile-ffi` and ship in `rrn wallet`, but the mobile app has
+  no screens for them. Do not describe the app as having an outbox.
+- Phase 3 (federation) is not started.
 
 **Phase numbering hazard (ADR-0017):** documents written before 2026-08-25 use the old
 numbering ("Phase 2" = federation). Now: Phase 2 = single-community resilience, Phase 3 =
 multi-community federation. ADRs 0001–0016 and the 2026-08 audit keep the old numbering as
-written; the threat model and design overview use the new one.
+written; the threat model, design overview, and docs site use the new one.
 
 An internal AI-assisted security review is done (`docs/security/audit-2026-08.md`, no
-High-severity findings); the independent professional audit is still pending. **Do not use
-with real value.**
+High-severity findings) and the Phase 2 surface has a red-team checklist
+(`docs/security/phase-2-redteam.md`); the independent professional audit is still
+pending. **Do not use with real value.**
+
+**The docs site.** The human-facing documentation is an mdBook in the sibling repo
+`../railroad-network.github.io`, live at https://railroad-network.github.io, split by
+audience (members / organizers / operators / reference). Its `rrn`/`station` command
+pages and ADR index are generated from this checkout by `scripts/gen-reference.sh` there;
+re-run it after a CLI help-string or ADR change. When the site and an ADR disagree, the
+ADR wins and the site has a bug. Keep the three repos' status claims consistent.
 
 ## Planning documents and work tickets
 
@@ -60,28 +82,30 @@ station/
 ├── Cargo.toml                  # workspace root, resolver = "2"
 ├── docs/
 │   ├── design/                 # design overview (canonical, updated in place with dated notes)
-│   ├── adr/                    # ADRs 0001–0018, MADR format — the locked-decision record
+│   ├── adr/                    # ADRs 0001–0028, MADR format — the locked-decision record
 │   ├── threat-model.md         # living STRIDE document, grown per milestone
-│   ├── security/               # audit reports
-│   ├── spec/                   # wire-format specs (QR payloads, ...)
-│   ├── community-setup.md      # operator runbook
-│   └── background-reliability.md
+│   ├── security/               # audit-2026-08.md, phase-2-redteam.md
+│   ├── spec/                   # wire formats: qr-payloads, dtn-bundles, sms-carrier, vmk-boot-ceremony
+│   ├── community-setup.md      # operator runbook (Parts 1–6 + command appendix)
+│   ├── background-reliability.md   # phones syncing when the app is closed, per vendor
+│   ├── lora-radio-bringup.md   # RNode LoRa radio from unflashed hardware to station traffic
+│   └── phase-2-exit-evidence.md    # the 72h simulation + the Phase 2 exit statement
 ├── crates/
 │   ├── rrn-crypto/             # ed25519, blake3, canonical CBOR, SignedPayload — audit boundary, no rrn-* deps
 │   ├── rrn-storage/            # SQLite, CRDTs (PN-Counter/OR-Set/LWW-Register), hash-chained signed log, replay
 │   ├── rrn-identity/           # wallet, addresses, vouching, sealed envelopes, Shamir recovery
-│   ├── rrn-ledger/             # tx state machine, settlement, tiers, credit (debt floor), disputes (records), contracts
-│   ├── rrn-reputation/         # ADR-0009 universal scoring, staking gates, sybil velocity, portability
-│   ├── rrn-governance/         # ADR-0012 charter, proposals, statutes, votes, tally
-│   ├── rrn-dispute/            # ADR-0014 sortition, panels, verdicts, escalation
+│   ├── rrn-ledger/             # tx state machine, settlement, tiers, credit (debt floor), escrow certs (ADR-0021), disputes (records), contracts
+│   ├── rrn-reputation/         # ADR-0009 universal scoring (single-replay ScoringContext), staking gates, sybil velocity, portability
+│   ├── rrn-governance/         # ADR-0012 charter, proposals, statutes, votes, tally; emergency mode (ADR-0023/0027)
+│   ├── rrn-dispute/            # ADR-0014 sortition, panels, verdicts, escalation; equivocation cases (ADR-0025)
 │   ├── rrn-marketplace/        # ADR-0010 listings, needs, inquiries, contracts, search
-│   ├── rrn-protocol/           # wire messages / transport seam (Reticulum backend per ADR-0013, Phase 2+)
-│   ├── rrn-mobile-ffi/         # uniffi bindings over rrn-crypto/rrn-identity for the mobile repo
-│   ├── rrn-station/            # `station` daemon: core, RPC, mobile server, gossip, backup/recovery
-│   └── rrn-cli/                # `rrn` CLI binary
+│   ├── rrn-protocol/           # ADR-0020 outbox chains, bundles, receipts, framing, airtime budget, paper codecs, net bindings
+│   ├── rrn-mobile-ffi/         # uniffi surface for the mobile repo: crypto/identity + DTN/bundles/certs + recovery ceremony
+│   ├── rrn-station/            # `station` daemon: core, RPC, mobile server, DTN loop, Reticulum sidecar, SMS relay, backup/recovery, at-rest encryption
+│   └── rrn-cli/                # `rrn` binary: operator console, `rrn paper` courier tools, `rrn wallet` member wallet (ADR-0028)
 ├── tests/                      # cross-crate integration tests
 ├── fuzz/                       # cargo-fuzz targets (own nightly workspace)
-└── scripts/                    # demo-phase-0.sh, install-hooks.sh
+└── scripts/                    # demos (phase-0, phase-2-{paper,wallet,outage}), drill-seizure-recovery, field-test-lora, test-{deep,timings}, target-hygiene, install-hooks
 ```
 
 Layered dependencies: `rrn-crypto` → `rrn-storage` → `rrn-identity` → `rrn-ledger` →
@@ -90,7 +114,7 @@ Layered dependencies: `rrn-crypto` → `rrn-storage` → `rrn-identity` → `rrn
 
 ## Locked technical decisions
 
-The authoritative record is `docs/adr/` (0001–0018, append-only). Don't deviate without a
+The authoritative record is `docs/adr/` (0001–0028, append-only). Don't deviate without a
 new ADR. Core library choices:
 
 | Concern | Choice |
@@ -121,8 +145,31 @@ Key protocol-level decisions (see the ADR for the full rule):
 - **Debt floor**: the engine refuses a debit committing its signer below −20 Commons
   (default; `[credit] debt_floor_centi`), counting settled balance plus pending signed
   debits (ADR-0018).
-- **Federation/collapse transport**: Reticulum as a supervised sidecar, strictly a dumb
-  carrier — never the identity, integrity, or encryption boundary (ADR-0013).
+- **Federation/collapse transport**: Reticulum as a supervised, version-pinned `rnsd`
+  sidecar driven through a Python LXMF adapter, strictly a dumb carrier — never the
+  identity, integrity, or encryption boundary (ADR-0013, ADR-0026).
+- **One log, one writer** (ADR-0020): resilience is delay-tolerant *submission* (outbox
+  chains → bundles → station-signed receipts), never a second writer or a CRDT merge of
+  logs. A station is a `writer` (never pulls) or a `replica` (pulls, never admits).
+- **Admission clock** (ADR-0022): the station's clock at admission and the log position are
+  the only inputs to any window, deadline, ordering, or electorate; party-asserted
+  timestamps are testimony. Governance and dispute electorates are position-bounded.
+- **Offline spending** (ADR-0021, ADR-0025): headroom certificates reserve debt-floor
+  headroom ahead of a partition; a certificate-backed spend skips the fresh floor check;
+  an overspend or a conflicting outbox entry is recorded as provable equivocation, zeroes
+  both reputation dimensions, and opens a distinct jury case kind.
+- **Emergency governance** (ADR-0023, ADR-0027): activates at the first crossing of
+  ceil(2N/3) electorate co-signatures, compresses only the emergency-proposal window (24h
+  floor), freezes both charter doors, pins the electorate, enforces measure expiry; a
+  part-signed declaration expires after 7 days.
+- **Encrypted at rest** (ADR-0024, Linux, opt-in): member-keyed LUKS2 container, VMK
+  Shamir-split via ADR-0016 machinery, wallet-free boot ceremony with a console fingerprint.
+- **Station-signer pinning**: station-signed governance attestations and ledger records
+  are pinned to the community station key on replay (skip, never halt). Consequence: a
+  replica's derived balances/governance views are empty by design.
+- **Member devices** (ADR-0006, ADR-0028): the phone and the `rrn wallet` CLI are the only
+  key holders; the station never custodies a member key. Member key recovery runs the
+  requester-side ceremony on the member's device (ADR-0016 Clarification).
 - The station signs settlement/cancellation records; charters chain amendments via
   `previous_hash` lineage (ADR-0005, ADR-0012).
 
@@ -159,8 +206,12 @@ scripts/test-deep.sh
 # fuzz targets (nightly toolchain, own workspace under fuzz/)
 cargo +nightly fuzz run verify_signature
 
-# end-to-end demo
-./scripts/demo-phase-0.sh
+# end-to-end demos (all real binaries; safe to re-run)
+./scripts/demo-phase-0.sh          # writer + replica converge
+./scripts/demo-phase-2-paper.sh    # offline confirm → QR sheets → ingest → receipt back
+./scripts/demo-phase-2-wallet.sh   # the rrn wallet laptop member, offline and online
+./scripts/demo-phase-2-outage.sh   # the 72-hour outage simulation, narrated
+./scripts/drill-seizure-recovery.sh --profile plaintext|encrypted
 ```
 
 Install nextest once with `cargo install cargo-nextest --locked`.
@@ -231,7 +282,11 @@ via a pre-commit hook (`git config core.hooksPath .githooks`, set up by
   references are legacy; do not add new ones.)
 - **Time**: Unix seconds as signed `i64` throughout. **Injected clocks** — ledger/settlement
   code takes `now: i64` as a parameter rather than reading the system clock, so tests
-  fast-forward without sleeping.
+  fast-forward without sleeping. Anything window-bearing reads the admission clock
+  (ADR-0022), never a timestamp inside a signed record.
+- **Docs honesty**: README/status claims in all three repos must match what ships. Two
+  recurring overstatements to avoid: the phone app having an offline outbox (it does not),
+  and SMS being switchable on (no modem gateway).
 
 ## The "station" terminology overload
 
@@ -248,7 +303,21 @@ via a pre-commit hook (`git config core.hooksPath .githooks`, set up by
 - **Vouch** — a signed attestation that a pubkey belongs to a real, known individual
   (`rrn-identity::vouch`); carries a reputation stake and feeds identity anchoring.
 - **Settlement window** — delay between confirmation and balance movement (Tier 1: 24h,
-  Tier 2: 48h; uniform override for demos/tests); doubles as the dispute window.
+  Tier 2: 48h; uniform override for demos/tests); doubles as the dispute window. Runs from
+  the confirmation's *admission* (ADR-0022).
+- **Outbox / bundle / receipt** — a member's chained signed records awaiting delivery; the
+  unsigned carriage envelope a courier/radio/paper carries; the station's signed per-record
+  answer (admitted / known / refused) (ADR-0020, `docs/spec/dtn-bundles.md`).
+- **Headroom certificate** — a station-signed reservation of debt-floor headroom requested
+  while connected, spent against offline; capped, time-limited, returnable (ADR-0021).
+- **Equivocation** — two conflicting commitments signed by one member (two spends on one
+  certificate, two entries at one outbox position); provable from the log, zeroes
+  reputation, opens a jury case (ADR-0025).
+- **Writer / replica** — the one station that owns and appends to a community's log, vs. a
+  read-only copy that pulls the chain and admits nothing (ADR-0020 §7).
+- **Courier** — anyone who physically carries bundles/receipts/sheets; needs no trust.
+- **VMK** — the Volume Master Key of the encrypted at-rest container, Shamir-split among
+  holders, never on disk; reconstructed by the boot ceremony (ADR-0024).
 - **Debt floor** — the lowest projected balance a member may sign themselves down to
   (ADR-0018); enforced at propose (sender-debit) and confirm (receiver-debit of a payment
   request) against settled balance plus pending signed debits.

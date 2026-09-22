@@ -1,6 +1,6 @@
 # DTN Wire Formats: Outbox Chains, Bundles, and Delivery Receipts
 
-**Status:** current · **Task:** T2.2.1 (M2.2 DTN core) · **ADR:** [0020](../adr/0020-single-writer-log-dtn-submission.md), [0022](../adr/0022-admission-clock-time-trust.md)
+**Status:** current · **ADR:** [0020](../adr/0020-single-writer-log-dtn-submission.md), [0022](../adr/0022-admission-clock-time-trust.md)
 
 This document locks the wire layer of ADR-0020's **delay-tolerant submission**:
 the tamper-evident structures by which a member's signed records travel
@@ -234,7 +234,7 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
 
 ---
 
-## 7. Constrained-carrier transport (T2.6.2, ADR-0013/0026)
+## 7. Constrained-carrier transport (ADR-0013, ADR-0026)
 
 When bundles and receipts move over a *constrained* carrier — the Reticulum
 sidecar, and behind it LoRa at ~250 B/s — three things ride on top of the framing
