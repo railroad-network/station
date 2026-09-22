@@ -1060,10 +1060,15 @@ fn a_two_thirds_emergency_measure_carries_over_a_lone_dissent() {
 }
 
 /// A charter that stored a sub-floor `emergency_threshold_pct` cannot lower the
-/// measure bar: the floor (67 → exact two-thirds) binds through `thresholds`, so a
-/// 1-yes / 2-no measure **fails** even though a literal 10 % bar would pass it
-/// (`1/3 = 33 % ≥ 10 %`). The companion to `a_hostile_sub_floor_charter_...` for the
-/// approval bar (ADR-0023 §3, "raised, never lowered").
+/// measure bar: the floor (67 → exact two-thirds) binds, so a 1-yes / 2-no measure
+/// **fails** even though a literal 10 % bar would pass it (`1/3 = 33 % ≥ 10 %`). The
+/// stored 10 is floored twice over — `thresholds` raises it to 67 via
+/// `effective_emergency_threshold_pct`, and `emergency_measure_approved`'s own
+/// `pct <= FLOOR` branch would floor it regardless — so the two are belt-and-braces
+/// and this test would still pass if `thresholds` regressed to the raw field; what it
+/// pins is that a sub-floor charter value never reaches the tally as a live bar. The
+/// companion to `a_hostile_sub_floor_charter_...` for the approval bar (ADR-0023 §3,
+/// "raised, never lowered").
 #[test]
 fn a_sub_floor_emergency_threshold_cannot_lower_the_measure_bar() {
     let db = fresh_db();
@@ -1521,8 +1526,10 @@ mod reputation {
 
 proptest::proptest! {
     /// The declaration threshold is monotone in N, never below two-thirds, and
-    /// exactly `ceil(2N/3)`, so a bare majority can never compress (§2). `ceil(2N/3)`
-    /// exceeds `N/2` for every N >= 1, so the bar is always a strict majority too.
+    /// exactly `ceil(2N/3)` (§2). `ceil(2N/3)` exceeds `N/2` for every N >= 1, so the
+    /// bar is always a strict majority — though not always *more* than the smallest
+    /// majority (they coincide at N in {3, 4, 6}), so this pins "strict majority", not
+    /// "a bare majority can never reach it".
     #[test]
     fn declaration_threshold_is_a_monotone_two_thirds_bar(n in 1usize..500) {
         let t = emergency::declaration_threshold(n, 67);

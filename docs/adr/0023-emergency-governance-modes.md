@@ -1037,7 +1037,9 @@ the second is implemented (option A) with its reading recorded here.*
     Phase-1 behaviour exactly … [a] 67 % bar"): that bar is now the same exact two-thirds.
     Reading 67 as two-thirds on the declared path and literally on the un-declared path
     would be a fresh asymmetry, so the field's meaning is deliberately uniform; §1's "67 %
-    bar" is thus an N-not-a-multiple-of-3 statement, exactly as this note makes it for §3.
+    bar" thus reads as the same exact two-thirds, exactly as this note makes it for §3 (the
+    literal `⌈0.67·D⌉` and exact `⌈2D/3⌉` part only where the decisive count `D` is a
+    multiple of 3, plus a handful of counts above ~100 — none a pilot community reaches).
     It is recorded here rather than as a rewrite of §1/§3's decision text because ADRs are
     append-only; it is nonetheless a change in observable tally outcome, not merely a
     corrected reading.
@@ -1047,13 +1049,17 @@ the second is implemented (option A) with its reading recorded here.*
     (`ceil(N × pct/100)` for the declaration, `yes × 100 ≥ pct × decisive` for the
     measure), which at electorates/decisive-counts that are multiples of 3 demands
     strictly more than two-thirds — a bar nudged to 68 needs `ceil(0.68 N)`, i.e.
-    two-thirds plus a growing margin (`+1` up to N = 75, `+2` by N = 150), so at three
-    decisive votes it reads 2-of-3 as failing again. This is monotone and never below
+    two-thirds plus a growing margin (`+1` for N = 3…75, `+2` from N = 78, `+3` from
+    N = 153), so at three decisive votes it reads 2-of-3 as failing again. This is monotone and never below
     two-thirds, but a charter author raising an emergency bar should know 67 is the
     canonical exact-two-thirds value; anything above is a literal percent.
-  - **§2's "one member … cannot compress anything" is an N ≥ 3 statement.** Only an
-    *empty* founder list is rejected, so a 1- or 2-founder community exists, and there the
-    declaration bar `ceil(2N/3)` is 1 (a sole founder declares alone) or 2 (both must).
-    Those are the same members ADR-0015 grace already lets govern outright, so this grants
-    no new power, but the sentence is literally false at N ∈ {1, 2}; read it as "at N ≥ 3 a
-    bare majority cannot compress."
+  - **§2's "one member … cannot compress anything" holds for N ≥ 2, and is false only at
+    N = 1.** Only an *empty* founder list is rejected (`NoFounders`), so a 1- or 2-founder
+    community exists, and there the declaration bar `ceil(2N/3)` is 1 (a sole founder
+    declares alone) or 2 (both must). At every N ≥ 2 the bar is ≥ 2, so no lone member
+    compresses and §2's sentence is exact; it is literally false only at N = 1, where the
+    sole founder *is* the whole electorate. Those are the same members ADR-0015 grace
+    already lets govern outright, so this grants no new power. (§2 is a claim about a *lone*
+    member, not about a bare majority: the smallest majority `⌊N/2⌋+1` actually reaches the
+    two-thirds bar at N ∈ {3, 4, 6} — the author-plus-one at N = 3 is exactly such a case —
+    and only falls short of it at N = 5 and every N ≥ 7.)
