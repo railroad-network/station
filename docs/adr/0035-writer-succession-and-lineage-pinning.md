@@ -3,15 +3,15 @@
 ## Status
 
 Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
-review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
-eight; the changes are folded in — see the ratification note below)
+review; it returned accept-with-changes for the set of eight and the changes
+are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
-> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
-> reconciled across the eight-ADR set, then reviewed for ratification by an
-> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> **Ratification note (2026-09-23).** Drafted against the maintainer's scope
+> decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification at the
+> maintainer's delegation. The review's
 > findings folded into this ADR: activation eligibility and `N` are evaluated at the successor's own attested anchor instant, never at a re-stamped `created_at`; a profile that changes `successor` is held until the partner's operator confirms it out of band (seized-key redirect residual); dead-branch certificates and orphaned partner-side records are stated as residuals.
 > Implementation tickets are written against this ratified text.
 
