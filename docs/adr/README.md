@@ -74,14 +74,14 @@ scheme (ADR-0017 renumbered: Phase 2 is now single-community resilience).
 | [0026](0026-reticulum-sidecar-ratified.md) | The Reticulum sidecar is ratified: pinned `rnsd` 1.5, driven from the station, native Rust deferred | Accepted |
 | [0027](0027-emergency-declaration-activation-and-ttl.md) | Emergency declaration activation is a single first-crossing event, and a part-signed declaration expires | Accepted |
 | [0028](0028-non-mobile-member-wallet.md) | A self-custody CLI member wallet: the non-mobile member device, a sealed-channel client with an offline outbox | Accepted |
-| [0029](0029-federation-identity-profiles-and-carriage.md) | Federation identity, community profiles, and the federation carriage protocol | Proposed |
-| [0030](0030-treaties-ratification-depth-lifecycle.md) | Treaties: ratification, depth, lifecycle, and suspension | Proposed |
-| [0031](0031-cross-community-credit-treaty-accounts.md) | Cross-community credit: treaty accounts and the prepare/commit protocol | Proposed |
-| [0032](0032-recognition-portable-standing-cross-community-marketplace.md) | Recognition: portable standing across communities and the cross-community marketplace | Proposed |
-| [0033](0033-oracle-tiers-3-and-4.md) | Oracle Tiers 3 and 4: artifact evidence, witnesses, and cross-community validation | Proposed |
-| [0034](0034-community-tribunal-and-federation-arbitration.md) | The community tribunal and federation arbitration | Proposed |
-| [0035](0035-writer-succession-and-lineage-pinning.md) | Writer succession and lineage-aware signer pinning | Proposed |
-| [0036](0036-predictive-matching-v0.md) | Predictive matching, version 0 | Proposed |
+| [0029](0029-federation-identity-profiles-and-carriage.md) | Federation identity, community profiles, and the federation carriage protocol | Accepted |
+| [0030](0030-treaties-ratification-depth-lifecycle.md) | Treaties: ratification, depth, lifecycle, and suspension | Accepted |
+| [0031](0031-cross-community-credit-treaty-accounts.md) | Cross-community credit: treaty accounts and the prepare/commit protocol | Accepted |
+| [0032](0032-recognition-portable-standing-cross-community-marketplace.md) | Recognition: portable standing across communities and the cross-community marketplace | Accepted |
+| [0033](0033-oracle-tiers-3-and-4.md) | Oracle Tiers 3 and 4: artifact evidence, witnesses, and cross-community validation | Accepted |
+| [0034](0034-community-tribunal-and-federation-arbitration.md) | The community tribunal and federation arbitration | Accepted |
+| [0035](0035-writer-succession-and-lineage-pinning.md) | Writer succession and lineage-aware signer pinning | Accepted |
+| [0036](0036-predictive-matching-v0.md) | Predictive matching, version 0 | Accepted |
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here, and the docs site's

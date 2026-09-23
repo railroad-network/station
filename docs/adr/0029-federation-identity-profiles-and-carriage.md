@@ -2,16 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**. This ADR is the
-> substrate the rest of the Phase 3 set (ADR-0030 treaties, ADR-0031 credit,
-> ADR-0032 recognition, ADR-0033 oracle tiers, ADR-0034 tribunal and arbitration,
-> ADR-0035 succession, ADR-0036 matching) builds on; ratify it first.
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: the partner writer pin became a station-signed log record (`rrn.fed.partner_pin`) so partner lineages are replay-derived; checkpoint rollback is ordered by federation-outbox position, never by a partner-signed instant; profiles carry a monotone `profile_seq`; every writer-signed federation record carries `home_seq` for lineage pinning; partner-writer suppression is stated as a residual; the crate layering of `CommunityId`/`TreatyId`/`Treaty`/`WriterLineage` is fixed.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -115,7 +117,8 @@ pub struct CommunityId(pub Hash);
   is signed by the writer and names the `CommunityId`; a `rrn.fed.checkpoint`
   (§5) is signed by the same key over a chain whose genesis hash is that
   `CommunityId`. Anyone holding the chain can verify both; a partner that does
-  not hold the chain pins the key on first sight (§2). A hostile party can always
+  not hold the chain pins the key on first sight and records that pin on its
+  *own* log (§2, `rrn.fed.partner_pin`). A hostile party can always
   mint a *new* community (new genesis, new key); it cannot impersonate an
   existing one once its writer key is pinned.
 
@@ -138,7 +141,9 @@ A community describes itself with a writer-signed **`rrn.fed.profile`**:
 | `open_to_treaties` | bool | whether the community is receiving treaty proposals |
 | `active_treaties` | [`TreatyId`] | the treaties it holds Active (ADR-0030) |
 | `bindings` | [bytes] | zero or more signed `rrn.net.binding` / `rrn.net.sms_binding` envelopes for reaching the writer |
-| `issued_at` | i64 | the writer's clock at issue (testimony) |
+| `profile_seq` | u64 | writer-maintained, strictly increasing per profile issued; orders profiles from one writer |
+| `home_seq` | u64 | the issuer's own log seq at which this profile is appended (§3, the pinning input) |
+| `issued_at` | i64 | the writer's clock at issue (testimony, display only) |
 
 This is the overview's §8.3 profile with two corrections: `charter_hash` is the
 *current* hash and `community` the *genesis* hash, so a partner can walk the
@@ -153,37 +158,55 @@ signed bindings rather than bare addresses ("bind, do not collapse", ADR-0013).
   what this community said about itself can be checked against what it signed.
 - **Foreign profiles are a cache, never a log record.** Received profiles go in
   the station-local **`federation_directory`** table keyed by `community`:
-  `{ community, profile_envelope (the signed bytes), writer, issued_at,
-  first_seen_at, last_seen_at, pinned_writer }`. The latest `issued_at` for a
+  `{ community, profile_envelope (the signed bytes), writer, profile_seq,
+  issued_at, first_seen_at, last_seen_at }`. The highest `profile_seq` for a
   community wins; a lower one is ignored (not an error — carriers reorder).
-- **TOFU, then pin.** The first profile seen for a `CommunityId` pins its
-  `writer`; every later profile for that community must be signed by the pinned
-  key or it is refused and logged at `warn` with both keys. The pin changes only
-  through ADR-0035 succession evidence (a `rrn.gov.succession` record signed by
-  the key the pinned profile named as `successor`). This is the same
-  trust-on-first-use posture ADR-0012 takes toward a genesis charter and ADR-0008
-  toward a paired device, lifted to the community, with the same mitigation: a
-  human compares the `rrnc1…` short form out of band (a conductor's letter of
-  introduction, a radio call, a printed sheet) before ratifying a treaty.
+  `issued_at` is never consulted for that choice.
+- **TOFU, then pin — and the pin is a log record.** The first profile seen for a
+  `CommunityId` pins its `writer`, and the writer records that pin on **our own
+  log** as a station-signed **`rrn.fed.partner_pin`** `{ community: CommunityId,
+  writer: Address, profile_hash: Hash, pinned_at: i64 }`. Every later profile for
+  that community must be signed by the pinned key or it is refused and logged at
+  `warn` with both keys. The pin changes only through ADR-0035 succession
+  evidence: a `rrn.gov.succession` record signed by the key the pinned profile
+  named as `successor`, admitted to our log as a foreign record in the same
+  `LogBatch` as a fresh `partner_pin` naming the new writer at that `at_seq`
+  boundary. A profile that *changes* `successor` relative to the pinned one is
+  held unverified until our operator confirms it out of band (ADR-0035 §7). The
+  pin is on the log — not only in the directory — because replay of our log must
+  pin every foreign station-signed record we admitted (a partner's treaty
+  acceptance, prepare, commit, settlement, validation, verdict) to the partner
+  writer that held the pen at that position; a replica of this station, or this
+  station restored from an ADR-0016 backup with outbox replay, re-derives every
+  partner lineage from `partner_pin` and admitted succession records alone, never
+  from the directory cache. This is the same trust-on-first-use posture ADR-0012
+  takes toward a genesis charter and ADR-0008 toward a paired device, lifted to
+  the community, with the same mitigation: a human compares the `rrnc1…` short
+  form out of band (a conductor's letter of introduction, a radio call, a printed
+  sheet) before ratifying a treaty.
 - **The directory is the gossiped profile set. There is no server —
   (maintainer decision, 2026-09-23).** Every station forwards every profile it
   holds (its own and its cache) to every partner it exchanges bundles with, and
-  includes its own profile (payload kind `0x05`, §6) in Reticulum announces where
-  the sidecar is enabled. Forwarding rule: a station forwards a foreign profile
+  includes its own profile *hash* (with its `CommunityId` and `profile_seq`) in
+  Reticulum announces where the sidecar is enabled — the full signed profile
+  (payload kind `0x05`, §6) is fetched over the carriage path, so an announce
+  stays within LXMF app-data limits regardless of how many bindings the profile
+  carries. Forwarding rule: a station forwards a foreign profile
   only if it is newer than what the peer last acknowledged (the federation
   outbox is acked per record, so the station knows), and never more than one
   profile per community per bundle. A community is discoverable once *any*
   station it has ever exchanged bundles with has seen it. `rrn federation
   directory` lists the cache with provenance (who we received it from, when).
   The Phase 4 "designated directory" role is explicitly not built.
-- **Profile freshness is testimony.** `issued_at` orders profiles from one
-  writer; it is never compared to our clock for any decision other than display
-  ("last heard from 41 days ago").
+- **Profile freshness is structural, not testimony.** `profile_seq` orders
+  profiles from one writer; `issued_at` is never compared to our clock, or to
+  another profile's `issued_at`, for any decision other than display ("last
+  heard from 41 days ago").
 - **The charter lineage travels beside the profile.** A profile names the
   current `charter_hash`, but a partner holding neither our chain nor our
   charters cannot walk from the pinned genesis to it (ADR-0012, ADR-0030). So
   the writer also signs a **`rrn.fed.charter_lineage`** `{ community:
-  CommunityId, charters: [bytes], issued_at }` — `charters` being the canonical
+  CommunityId, charters: [bytes], home_seq, issued_at }` — `charters` being the canonical
   `Charter` payload bytes from genesis to current, in order — carried in the
   federation outbox whenever the profile's `charter_hash` changes and on every
   treaty acceptance, and cached in `federation_directory` next to the profile
@@ -219,10 +242,20 @@ What a federation outbox carries, and nothing else:
 | `rrn.fed.treaty_acceptance`, `_suspension`, `_resumption`, `_termination` | our writer | ADR-0030 |
 | `rrn.fed.prepare`, `_refuse`, `_commit`, `_abort`, `_settlement` | our writer | ADR-0031 |
 | `rrn.tx.proposal` with `receiver_community`, and the matching `rrn.tx.confirmation` / `rrn.tx.dispute` / `rrn.tx.dispute.response` | our members | ADR-0031 |
-| `rrn.fed.history_request`; marketplace `listing.v1`/`need_announced.v1`/`inquiry_*` records that cross | our writer / our members | ADR-0032 |
+| `rrn.fed.history_request`; marketplace `rrn.marketplace.listing.v1` / `need_announced.v1` / `inquiry_*.v1` records that cross | our writer / our members | ADR-0032 |
 | `rrn.oracle.artifact`, `rrn.oracle.witness`, `rrn.fed.validation` | our members / our writer | ADR-0033 |
 | `rrn.fed.arbitration_request`, `_opened`, `_ballot`, `_verdict` | our members / our writer | ADR-0034 |
-| `rrn.gov.succession` | our (new) writer | ADR-0035 |
+| `rrn.gov.succession` (position 0 of the new writer's fresh chain — the routing carve-out in §4) | our (new) writer | ADR-0035 |
+
+**Every writer-signed federation record carries `home_seq: u64`** — the issuer's
+own log seq at which it is appended. The writer knows that seq at signing time
+(it holds the single-writer lock and appends the record in the same `LogBatch`),
+so the value is exact, and it is what a receiver pins the record to (§4 step 3).
+The exceptions are `rrn.fed.checkpoint`, which is never on the issuer's log
+and carries `seq` of the tail it describes instead, and `rrn.fed.hello`, which
+is a handshake message and is never appended anywhere. Member-signed records that
+cross carry no `home_seq`; they are pinned through the outbox entry that carries
+them.
 
 Why reuse the outbox rather than define a "federation message":
 
@@ -231,12 +264,17 @@ Why reuse the outbox rather than define a "federation message":
   (a foreign proposal, a foreign inquiry) that is exactly the attestation the
   receiving writer needs — "this is a member of mine, in good standing under my
   rules, and I have admitted this record" — without a second signature wrapper.
-- **Suppression is a gap; equivocation is a fork.** A partner writer that drops
-  a record it owes us leaves a visible hole in a chain it signed; a partner
-  writer that shows two communities two different position-`n` entries has
-  produced an outbox fork, which the existing `DtnStore::record_fork` machinery
-  already persists as evidence. ADR-0030 turns partner forks into automatic
-  treaty suspension.
+- **Courier suppression is a gap; equivocation is a fork.** A *carrier* that
+  drops an entry leaves a visible hole in a chain the partner writer signed; a
+  partner writer that shows two communities two different position-`n` entries
+  has produced an outbox fork, which the existing `DtnStore::record_fork`
+  machinery already persists as evidence. ADR-0030 turns partner forks into
+  automatic treaty suspension. What the chain does **not** reveal is
+  suppression by the partner *writer itself* — a writer that never enqueues a
+  record it owes us (a refusal, a settlement, a member's appeal) leaves no gap,
+  because it assigns the positions. That is a residual: it is visible only to
+  that community's own members and replicas, who hold its log, and it is
+  bounded by the treaty limit and the injured side's power to suspend.
 - **Idempotent, already.** Ingest is idempotent by content hash and presentation
   hash (ADR-0020 §3); re-carried federation bundles yield `known`, never a second
   admission, on any carrier, in any order.
@@ -252,16 +290,31 @@ than re-sent — and its profile if the partner has not acked the latest one.
 ### 4. Federation ingest: the partner-writer routing rule
 
 Federation bundles enter through the **existing** bundle ingest path
-(`Core::ingest_bundle` — RPC `bundle_submit`, mobile `POST /bundle`, transport
-DTN, paper). One new rule in the router:
+(`Core::ingest_bundle` — operator RPC and member-channel `bundle_submit`,
+transport DTN, paper). One new rule in the router, plus one carve-out:
 
 > If an outbox entry's `author` is a writer key known to this station — the
 > pinned writer of an Active or Proposed treaty (ADR-0030), or the pinned writer
 > of a `federation_directory` entry for the pre-treaty records (exactly
-> `rrn.fed.profile`, `rrn.fed.charter_lineage`, `rrn.fed.hello`, and
-> `rrn.fed.treaty_acceptance`; anything else from a pre-treaty writer is refused
+> `rrn.fed.profile`, `rrn.fed.charter_lineage`, `rrn.fed.hello`,
+> `rrn.fed.treaty_acceptance`, and the bundle's leading `rrn.fed.checkpoint`,
+> which is cache-only; anything else from a pre-treaty writer is refused
 > `fed-no-treaty`) — the entry is dispatched to **federation ingest** instead of
 > the member routing table.
+>
+> **Carve-out (succession).** An entry whose `author` is *not* a known writer
+> key, at position 0 of a fresh chain, carrying exactly one `rrn.gov.succession`
+> whose `previous_writer` equals the writer we have pinned for that community,
+> is dispatched to succession verification (ADR-0030 §6, ADR-0035 §7). Three
+> outcomes: the record verifies (`previous_writer`, `at_hash`, co-sign evidence)
+> **and** `new_writer` equals the pinned profile's `successor` → accepted, a
+> fresh `partner_pin` is appended, and the new key's per-partner chain continues
+> from that entry; the record verifies but `new_writer` is **not** the pinned
+> `successor` → the treaty moves to `Suspended("writer-unverified")` (ADR-0030
+> §6.2) pending out-of-band confirmation; the record does not verify, or the
+> entry has any other shape → refused `fed-writer-unpinned` and nothing is
+> suspended. Any other unknown author is refused `fed-writer-unpinned` outright —
+> a stranger cannot grief a treaty.
 
 Federation ingest, per entry in bundle order:
 
@@ -271,13 +324,17 @@ Federation ingest, per entry in bundle order:
    / `outbox_forks` tables (gap policy: route, do not advance the head; fork
    policy: persist evidence, refuse the later entry `outbox-fork`, and raise the
    ADR-0030 suspension).
-3. **Pin check.** The partner writer key must equal `writer_at(seq)` of the
-   partner-side `WriterLineage` we hold for that community (ADR-0035 §5): its
-   root is the pinned profile writer, extended by the `rrn.gov.succession`
-   records that partner has carried to us, with `at_seq` boundaries on the
-   partner's own seq space — so "the pin" is lineage-aware from the first
-   implementation, never a single frozen key. Mismatch → `refused /
-   fed-writer-unpinned`.
+3. **Pin check.** The partner writer key must equal `writer_at(home_seq)` of
+   the partner-side `WriterLineage` we hold for that community (ADR-0035 §5),
+   where `home_seq` is the carried record's own field (§3) — for a member-signed
+   record, the `home_seq` of the writer-signed record it accompanies in the same
+   bundle (a foreign proposal rides with its `prepare`), else the bundle's
+   leading checkpoint `seq`. The lineage's root is our `rrn.fed.partner_pin` for
+   that community and it is extended by the foreign `rrn.gov.succession` records
+   we have admitted, with `at_seq` boundaries on the partner's own seq space —
+   both on our log, so replay re-derives the same lineage and the same
+   verdict; "the pin" is lineage-aware from the first implementation, never a
+   single frozen key. Mismatch → `refused / fed-writer-unpinned`.
 4. Dispatch by the carried record's `kind` to the federation routing table
    (owned by `rrn-federation`, extended by ADR-0030–0035): profiles update the
    cache; checkpoints go to `federation_checkpoints`; treaty, credit, oracle,
@@ -311,7 +368,7 @@ Federation ingest, per entry in bundle order:
    | `fed-standing-stale` | held recognized standing is past its TTL | ADR-0032 |
    | `fed-members-only` | a `community_member_only` listing approached from outside | ADR-0032 |
    | `artifact-required`, `artifact-limit`, `artifact-unavailable` | Tier 3/4 artifact rules | ADR-0033 |
-   | `validator-required`, `validator-not-neutral` | Tier 4 validator rules | ADR-0033 |
+   | `validator-required`, `validator-not-neutral`, `validation-quorum` | Tier 4 validator rules (fewer than two agreeing member attestations) | ADR-0033 |
    | `tribunal-cannot-seat`, `tier-below-tribunal`, `reasoning-too-short`, `case-kind-unsupported` | tribunal rules | ADR-0034 |
    | `forum-not-neutral`, `forum-not-in-treaty`, `forum-busy` | arbitration rules | ADR-0034 |
 
@@ -319,35 +376,47 @@ What is **not** on our log: foreign profiles, foreign charter lineages, partner
 checkpoints, foreign listings and needs, foreign standing, our own checkpoints,
 and our federation outbox rows. Each is a station-local cache or evidence store, documented as such
 (PROCESS convention: "the log is the source of truth; everything else is a cache
-or local metadata"). What **is** on our log: every foreign record we *admit* —
-because from admission on it binds one of our members or one of our positions,
-and replay must re-derive that binding.
+or local metadata"). What **is** on our log: our `rrn.fed.partner_pin` records
+and the foreign `rrn.gov.succession` records that move a pin, and every other
+foreign record we *admit* — because from admission on it binds one of our
+members or one of our positions, and replay must re-derive that binding and
+the writer key it was pinned to.
 
 ### 5. Checkpoints and provable rollback
 
 A writer-signed **`rrn.fed.checkpoint`** `{ community: CommunityId, seq: u64,
-content_hash: Hash, issued_at: i64 }` commits the issuer to its own log tail. It
+content_hash: Hash, issued_at: i64 }` commits the issuer to its own log tail
+(`issued_at` is display only). It
 is **not** appended to the issuer's own log (it would be self-referential and
 would move the tail it describes); it rides as the first entry of every
 federation bundle the issuer sends — a position-consuming federation outbox
 entry like any other carried record (§3), so each bundle's checkpoint is a fresh
 signed statement, not a re-sent one — and is stored by each receiver in
-`federation_checkpoints { community, seq, content_hash, issued_at, received_at,
-envelope }`, all of them, never overwritten.
+`federation_checkpoints { community, outbox_position, seq, content_hash,
+issued_at, received_at, envelope }`, all of them, never overwritten.
 
 Two checkpoints from one writer are **provable rollback or fork** when either
 
 - they carry the same `seq` and different `content_hash`, or
-- the later-`issued_at` checkpoint carries a *lower* `seq` than an earlier one.
+- within one partner's federation-outbox chain, the checkpoint at the **higher
+  outbox `position`** carries a *lower* `seq` than one at a lower position.
 
-Both are self-contained proofs (two signed statements by one key that cannot both
+The second rule is deliberately **structural**: the order of two checkpoints is
+the order the partner writer gave them in its own signed chain, never the order
+of their `issued_at` instants — a partner whose clock stepped backwards (ADR-0022
+§6's own honest scenario) must not read as a rollback, and a partner cannot
+escape the rule by writing a convenient timestamp. Both rules are
+self-contained proofs (two signed statements by one key that cannot both
 describe one append-only chain). The receiver persists the pair as evidence and
 raises an ADR-0030 automatic suspension (`partner-rollback`). This is the
 cross-community answer to the threat model's open "log fork / rollback" item: a
 community cannot prove its own honesty, but every partner accumulates
 commitments it cannot later retract, and a conductor carrying a bundle carries
-the commitment with it. Checkpoints are also what a **replica** of a partner
-could later be checked against; that audit tool is a follow-up, not this ADR.
+the commitment with it. Checkpoints are not forwarded to third communities (they
+are not in the §3 forwarded set), so a proof forms only where two of one
+writer's checkpoints meet at one receiver. Checkpoints are also what a
+**replica** of a partner could later be checked against; that audit tool is a
+follow-up, not this ADR.
 
 A receiver never *verifies* a checkpoint against the partner's chain (it does
 not hold it); it verifies the signature and the consistency of the set. That is
@@ -427,8 +496,8 @@ ADR-0022 deferred cross-station time trust. The rule for Phase 3:
 > is testimony: displayed, and used by the *partner's* own accounting, never an
 > input to ours. Where two logs must agree on one outcome, one of them is
 > **authoritative** for that outcome and the other **mirrors** it: the paying
-> side for a cross-community payment (ADR-0031), the side that opened a case for
-> a dispute, the forum for an arbitration (ADR-0034), the successor for a
+> side for a cross-community payment (ADR-0031), the home (paying) log for a
+> dispute on it (ADR-0031 §11), the forum for an arbitration (ADR-0034), the successor for a
 > succession (ADR-0035). The mirroring side runs its own windows from *its*
 > admission of the authoritative side's record.
 
@@ -448,13 +517,31 @@ rrn-crypto → rrn-storage → rrn-identity → rrn-ledger
   → rrn-federation → rrn-station / rrn-cli
 ```
 
-It owns: `CommunityId` and its bech32m form; the profile, checkpoint, and hello
-records and their fixtures; the `federation_directory`, `federation_checkpoints`,
-`federation_outbox` stores (migrations in `rrn-storage::migrations`, tables
-documented as station-local); federation outbox assembly and the federation
-routing table; and, per the later ADRs, treaties, cross-community credit state,
-recognition verification, and arbitration records. It depends on `rrn-protocol`
-for `OutboxEntry`/`Bundle`/`DeliveryReceipt` and on `rrn-dispute` for sortition.
+Type placement follows the layering, because the identifiers are needed below
+the crate that owns the protocol:
+
+- **`CommunityId` and `TreatyId`** are newtypes over `Hash` defined in
+  **`rrn-storage`** (with the `rrnc` bech32m form), so that `rrn-ledger`
+  (`receiver_community`, `validator_community`, the treaty-position balance
+  space), `rrn-governance` (`ProposalKind::Treaty`), and `rrn-marketplace`
+  (`MatchingSource`) can name them without depending on `rrn-federation`. They
+  do **not** go in `rrn-crypto`, the audit boundary.
+- **The `Treaty` payload struct and `ProposalKind::Treaty`** live in
+  `rrn-governance` (a treaty is a proposal payload); `rrn-federation` owns the
+  treaty *state machine* and every `rrn.fed.*` record.
+- **`WriterLineage` and the `rrn.gov.succession` record type** live in
+  `rrn-storage::lineage` (lineage is a log-structural concern every reader
+  pins through); `rrn-governance` re-exports the record and owns designation
+  and activation (ADR-0035).
+
+`rrn-federation` then owns: the profile, charter-lineage, checkpoint, hello, and
+`partner_pin` records and their fixtures; the `federation_directory`,
+`federation_checkpoints`, `federation_outbox` stores (migrations in
+`rrn-storage::migrations`, tables documented as station-local); federation
+outbox assembly and the federation routing table; and, per the later ADRs, the
+treaty state machine, cross-community credit state, recognition verification,
+and arbitration records. It depends on `rrn-protocol` for
+`OutboxEntry`/`Bundle`/`DeliveryReceipt` and on `rrn-dispute` for sortition.
 `rrn-marketplace` gains **no** dependency on it (ADR-0036 reads federation caches
 through a trait). `rrn-crypto` is untouched.
 
@@ -500,6 +587,11 @@ through a trait). `rrn-crypto` is untouched.
   procedural (a treaty runs at the charter-amendment bar over 30 days, ADR-0030
   — ample time to notice). An eclipse that feeds a community a fabricated
   partner from the start is the residual, stated in the threat model.
+- **A partner writer can withhold, and the chain will not show it.** Courier
+  suppression is a gap (§3); a partner writer that never enqueues what it owes
+  us is not. The injured side's remedies are the treaty limit (bounding the
+  loss), suspension (ADR-0030), and that community's own members, who can see
+  on their log what their writer did not send.
 - **Metadata leaks widen.** Which communities trade with which, how often, and
   what categories they list are visible to every carrier and every partner's
   partner (profile forwarding). Content is community-public by design; the
@@ -509,8 +601,10 @@ through a trait). `rrn-crypto` is untouched.
 - **`VOUCH_COMMUNITY` retirement touches the wallet and tests.** A one-time
   cleanup; vouch bytes and fixtures are unchanged because the value is a string
   field.
-- **Follow-up work created:** the `rrn-federation` crate scaffold; migrations
-  for the three stores; router extension and refusal slugs; peer-port federation
+- **Follow-up work created:** the `rrn-federation` crate scaffold; the
+  `CommunityId`/`TreatyId` newtypes and `WriterLineage` in `rrn-storage`;
+  migrations for the three stores; the `partner_pin` record and its fixture;
+  router extension, the succession carve-out, and refusal slugs; peer-port federation
   methods; PROPAGATED delivery and the stamps decision; `PayloadKind`/`PaperKind`
   extensions with fixtures; `rrn federation` CLI family (`directory`, `profile`,
   `export`, `import`, `checkpoints`); mobile handoff for rendering `rrnc1…`
@@ -527,9 +621,18 @@ a new `rrn-federation` heading, plus additions to `rrn-station`):
   residual: withholding.
 - *Profile spoofing before pin* — the TOFU window; mitigation as above.
 - *Checkpoint equivocation* — a partner showing different checkpoints to
-  different peers; mitigation: any two conflicting checkpoints are a
-  self-contained proof once they meet (a partner's partner forwards them);
-  residual: they may never meet.
+  different peers; mitigation: any two conflicting checkpoints from one writer
+  are a self-contained proof once they meet at one receiver (two bundles to the
+  same partner, or a conductor carrying both), ordered by outbox position, never
+  by `issued_at`; residual: checkpoints are not forwarded, so a partner that is
+  consistent toward each peer separately is caught only by that peer.
+- *Partner-writer suppression* — a writer that never enqueues a record it owes
+  us leaves no gap; residual, bounded by the treaty limit and the injured side's
+  suspension; visible only to that community's own members.
+- *Directory-cache dependence* — a replica or restored station must re-derive
+  every partner lineage from `rrn.fed.partner_pin` and admitted succession
+  records on its own log; a test that drops the directory and replays must
+  reproduce every foreign-record pin verdict.
 - *Announce and forwarding budget on constrained links* — profile forwarding
   competes with money on a LoRa channel; mitigation: profiles are `Bulk`
   priority (§7.3 of the DTN spec) and at most one per community per bundle.

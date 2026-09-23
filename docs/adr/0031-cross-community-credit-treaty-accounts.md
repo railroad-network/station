@@ -2,19 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**. It depends on
-> [ADR-0029](0029-federation-identity-profiles-and-carriage.md) (community identity,
-> the federation outbox, checkpoints) and
-> [ADR-0030](0030-treaties-ratification-depth-lifecycle.md) (the `Treaty`
-> payload, `TreatyId`, treaty state), and hands off to
-> [ADR-0033](0033-oracle-tiers-3-and-4.md) (Tiers 3/4) and
-> [ADR-0034](0034-community-tribunal-and-federation-arbitration.md) (arbitration).
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: the receiver appends its import settlement only on admission of the home's terminal export settlement (never on a window from the commit — the reviewer showed the earlier text could create Commons across a courier link); a late home outcome after the receiver's provisional commit is honored unconditionally; the Tier 1–2 final-commit instant is stated; `rrn.fed.settlement` is recorded as an ADR-0009 trade-reliability input; the receiver-side dispute-window residual is stated.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -161,7 +160,8 @@ content id, signature, and fixture are byte-unchanged. The mobile and
 **Home member** is a defined term from here on: an address is a home member
 of a community when it is **anchored** on that community's log — it has an
 admitted vouch by an established member (ADR-0009 identity anchoring,
-`is_anchored_bounded` at the relevant log position) — or it is a genesis
+`is_anchored_bounded(at_time = the proposal's admission instant on the judging
+log, max_seq = that admission's seq, station = writer_at(seq))`) — or it is a genesis
 founder of that community's charter. An unanchored address may transact
 domestically today, but it may not cross the boundary in either role: the
 sender must be a home member of the home community, the receiver a home
@@ -196,8 +196,18 @@ Three rules fix which station does what:
 All are writer-signed (the issuing station's writer key) canonical dCBOR,
 carried in the issuer's federation outbox to the partner (ADR-0029), admitted
 by the partner as foreign records through federation ingest, and pinned on
-replay to the partner's writer key at that log position (lineage-aware
-pinning, ADR-0035). Optional fields are omitted when absent.
+replay to `writer_at(home_seq)` on the partner-side lineage — the lineage the
+admitting log itself records through its `rrn.fed.partner_pin` records and the
+admitted foreign `rrn.gov.succession` records that precede the pinned record
+(ADR-0029 §4, ADR-0035 §5), never the directory cache. Optional fields are
+omitted when absent.
+
+Every writer-signed record in this section carries **`home_seq: u64`** — the
+issuer's own log seq at which the record is appended. The issuer knows it at
+signing (it holds the single-writer lock and appends the record in the same
+`LogBatch` as the admission that triggers it), and the partner uses it as the
+position at which to pin the signer (ADR-0029 §4). It is a structural
+coordinate, not a timestamp.
 
 `rrn.fed.prepare` — signed by the **home** writer at proposal admission.
 
@@ -209,6 +219,7 @@ pinning, ADR-0035). Optional fields are omitted when absent.
 | `receiver_community` | `CommunityId` | the receiver's community (= the proposal's field) |
 | `amount_centi` | `i64` (> 0) | restated from the proposal |
 | `expires_at` | `i64` | home admission instant + `treaty.prepare_ttl_secs`, station-attested (ADR-0022) |
+| `home_seq` | `u64` | the issuer's log seq of this record (ADR-0029 §4) |
 | `prepared_at` | `i64` | home admission instant |
 
 `rrn.fed.refuse` — signed by the **receiver** writer when it will not admit a
@@ -218,7 +229,8 @@ carried proposal.
 |---|---|---|
 | `tx_id` | `TransactionId` | |
 | `treaty_id` | `TreatyId` | |
-| `reason` | string slug | from the registry in §13 |
+| `reason` | string slug | from the ADR-0029 §4 registry (§13 lists the subset this ADR issues) |
+| `home_seq` | `u64` | the issuer's log seq of this record (ADR-0029 §4) |
 | `refused_at` | `i64` | receiver admission instant |
 
 `rrn.fed.commit` — signed by **each** writer in turn.
@@ -228,6 +240,7 @@ carried proposal.
 | `tx_id` | `TransactionId` | |
 | `treaty_id` | `TreatyId` | |
 | `community` | `CommunityId` | which side is committing |
+| `home_seq` | `u64` | the issuer's log seq of this record (ADR-0029 §4) |
 | `committed_at` | `i64` | that side's admission instant |
 
 The receiver's commit is **provisional** — it means "the confirmation is
@@ -240,6 +253,7 @@ admitted on my log and my rules passed." The home's commit is **final** (§5).
 | `tx_id` | `TransactionId` | |
 | `treaty_id` | `TreatyId` | |
 | `reason` | `"expired" \| "refused" \| "cancelled" \| "dispute-upheld" \| "witness-quorum" \| "artifact-required" \| "approval-not-met" \| "validation-failed"` | the last four are ADR-0033's conditions, one abort reason per unmet condition |
+| `home_seq` | `u64` | the issuer's log seq of this record (ADR-0029 §4) |
 | `aborted_at` | `i64` | home admission instant |
 
 `rrn.fed.settlement` — signed by the writer of **each** log, one per log.
@@ -252,6 +266,7 @@ admitted on my log and my rules passed." The home's commit is **final** (§5).
 | `counterparty_community` | `CommunityId` | the other side |
 | `amount_centi` | `i64` (> 0) | |
 | `direction` | `"export" \| "import"` | `export` on the home log (member −, position +); `import` on the receiver log (member +, position −) |
+| `home_seq` | `u64` | the issuer's log seq of this record (ADR-0029 §4) |
 | `settled_at` | `i64` | this log's admission instant |
 
 `rrn.fed.settlement` is a **new kind**, not a reuse of `rrn.tx.settlement`:
@@ -266,13 +281,17 @@ Every cross-community transaction has exactly one **outcome authority**: the
 sender's home log. The receiver's log never reaches a terminal state the home
 log has not reached first:
 
-- The receiver **settles only after the home's final `commit` is on the
-  receiver's log** (§9). Until then B's credit is `Confirmed`-pending, exactly
-  like a domestic confirmation inside its settlement window.
+- The receiver **settles only on admission of the home's terminal
+  `rrn.fed.settlement{export}`** (§9), never on a window of its own. Until
+  then B's credit is `Confirmed`-pending, exactly like a domestic confirmation
+  inside its settlement window.
 - The receiver **cancels only on the home's `abort`**, or on its own `refuse`
   (which the home turns into an `abort`).
 - The receiver's own `commit` is a promise the home may rely on ("B confirmed
-  and I checked my rules"), not a decision.
+  and I checked my rules"), not a decision — and it binds the receiver: once
+  issued, whatever home outcome follows (`settlement{export}` or `abort`) is
+  honored unconditionally, even if the receiver's local exposure accounting
+  has moved on in the meantime (§10).
 
 This asymmetry is what makes the protocol *convergent* without a coordinator.
 Two logs, each with one writer, cannot both decide; if both could, a partition
@@ -385,8 +404,11 @@ recognition (ADR-0032) gives receivers verifiable foreign evidence.
 - **The floor tier is unchanged**: `tier_floor(|amount_centi|)` at both
   stations, computed identically from the same signed amount (ADR-0011). A
   listing or party may still opt *up* via `oracle_tier`.
-- **Tier 1**: bilateral confirmation plus each side's settlement window. No
-  new rule.
+- **Tier 1**: bilateral confirmation plus the home settlement window. No
+  new rule. For Tier 1 and Tier 2 the home's **final `commit` is appended in
+  the same `LogBatch` as the admission of the receiver-carried confirmation**
+  — that admission is the instant every home window claim below is measured
+  from.
 - **Tier 2**: the confirmer's reputation stake (ADR-0011) is a derived
   eligibility gate evaluated where the confirmer's standing lives — B's
   **home station Y**, at admission of B's confirmation
@@ -403,53 +425,57 @@ recognition (ADR-0032) gives receivers verifiable foreign evidence.
   "approval-not-met" | "validation-failed"}`, one reason per condition. This
   ADR only reserves those abort reasons; the window they run under is §9.
 
-### 9. Every window on its own admission clock; the receiver settles only after the home's final commit
+### 9. Every window on its own admission clock; the receiver settles only on the home's terminal settlement
 
 This is the ADR-0022 extension the maintainer chose (each side its own
 admission clock; the partner's station-signed instants are testimony):
 
 - **Home settlement window** runs from the home's admission of B's
   confirmation (carried back in Y's federation outbox), for
-  `treaty.settlement_window_secs` on the home's clock. During it the home
-  transaction is `Confirmed` (or `Disputed`), exactly as a domestic one. At
-  the window's end, if not disputed-and-upheld, the home appends
-  `rrn.fed.settlement{direction: export}` and the final `commit` has already
-  been carried; the settlement is carried too.
-- **Receiver settlement window** runs from the receiver's admission of the
-  **home's final `commit`**, for the same `settlement_window_secs` on the
-  receiver's clock. B's balance moves only when that window ends and the
-  receiver appends `rrn.fed.settlement{direction: import}`. If the home's
-  export settlement has already arrived by then, nothing changes; the
-  receiver's window is a bound, not a coordination.
+  `treaty.settlement_window_secs` on the home's clock; for Tier 1–2 the
+  final `commit` is appended in that same `LogBatch` (§8). During the window
+  the home transaction is `Confirmed` (or `Disputed`), exactly as a domestic
+  one. At the window's end, if no dispute is live and none was upheld (§11),
+  the home appends `rrn.fed.settlement{direction: export}` — the
+  **terminal** record — and carries it to the receiver.
+- **Receiver settlement has no window.** The receiver appends
+  `rrn.fed.settlement{direction: import}` **on admission of the home's
+  `settlement{export}`**, in the same `LogBatch`, and at no other moment.
+  B's balance moves when, and only when, the home's terminal record is on
+  the receiver's log. The receiver may *display* an estimate ("expected after
+  the other community's window, about N days") computed from its own
+  admission of the home's final commit; that estimate is never a trigger.
 - The `prepare.expires_at`, `prepared_at`, `committed_at`, and `settled_at`
   values a partner signs are **testimony** on our log: displayed, stored,
   and used to reason about the partner's accounting, never fed to our window
   arithmetic. A partner whose clock is wrong stretches or compresses only
   its own members' waits.
-
 - **Tier 3 and 4 windows.** For a cross-community Tier 3/4 transaction the
   home window is `max(treaty.settlement_window_secs, tier window)` on the
   home clock, where the tier window is `tier3_window_seconds` or the
-  charter-derived Tier-4 window of ADR-0033. The receiver mirrors as usual:
-  its window starts at its admission of the home's final commit and runs
-  for the same length.
+  charter-derived Tier-4 window of ADR-0033. The receiver still settles only
+  on the home's terminal settlement.
 
-A consequence worth stating: **B waits at least two settlement windows plus
-carriage** (home window, then receiver window). At the default 48 h Tier-2
-window that is four days plus courier time. Honest latency (ADR-0020
-Consequences) — the system never pretends a cross-community transfer settled
-before both logs could agree it did.
+A consequence worth stating: **B waits the home window plus two carriages**
+(B's confirmation Y→X, then the home's settlement X→Y). At the default 48 h
+Tier-2 window that is two days plus courier time each way. Honest latency
+(ADR-0020 Consequences) — the system never pretends a cross-community
+transfer settled before the authoritative log said it did.
 
-Why the receiver waits for the *final commit* rather than mirroring the home
-settlement directly: the final commit is the earliest record after which the
-home can no longer abort for any reason but a dispute (§11), and a dispute
-opened at home suspends the home's settlement but never the *commit*. Keying
-the receiver's window on the commit lets a courier deliver one record instead
-of two, keeps the receiver's clock independent, and — because the home
-settles first in wall time whenever windows are equal — means an
-upheld-dispute abort arriving late at the receiver always finds B still
-unsettled or already settled *after* the home settled, never a receiver that
-paid out what the home then clawed back.
+Why the receiver keys on the *terminal settlement* and not on the final
+commit: after its final commit the home can still abort — an upheld dispute
+(a 14-day window), a tribunal (21 days, ADR-0034), or federation arbitration
+(up to `arbitration_wait_secs`, 45 days) — and the arrival of that abort at
+the receiver is carriage-dependent. Had the receiver run its own window from
+the commit, a weekly courier could deliver the commit, let the receiver's
+window close and credit B, and only then deliver the dispute record and the
+abort: A never debited, B credited, `position_X = 0`, `position_Y = −amount`
+— the Common would have stopped being zero-sum across the federation with no
+rule to reconcile it. Keying on the terminal record makes the receiver's
+move a pure mirror of the home's: a dispute at home *delays* B (the home
+issues no settlement while it is live) but can never *reverse* B. The
+saving the commit-based rule offered — one carried record instead of two —
+is about a hundred bytes and is not worth a hole in conservation.
 
 ### 10. Expiry and abort: divergence is temporary and never silent
 
@@ -509,10 +535,11 @@ Partner stalls (no records for a long time):
      exposure would hang forever — so Y ALSO drops a prepare from its
      pending set once its own clock passes Y's OWN admission instant of
      the carried prepare + prepare_ttl_secs + treaty.settlement_window_secs
-     (a local release, not a decision: if the home's commit later arrives,
-     the receiver's import check re-runs at that admission and may refuse
-     late with `fed-position-limit`, which the home records as a receiver
-     refusal and the arbitration path can examine).
+     (a local release, not a decision, and it affects only NEW prepare
+     admissions: once Y has issued its provisional commit for a transaction,
+     any home outcome that later arrives — a `settlement{export}` or an
+     `abort` — is honored unconditionally, and the import settles even if
+     the released exposure now overshoots the limit).
 ```
 
 The last point releases exposure on the receiver's clock alone — anchored
@@ -520,7 +547,14 @@ on the receiver's admission of the prepare, never on the home-attested
 `prepared_at`/`expires_at`, which stay testimony (§9) — and it acts only to
 *stop counting* exposure against itself, never to move a balance or to
 override the home. Its purpose is that a treaty partner who vanishes cannot
-permanently freeze our import headroom.
+permanently freeze our import headroom. The price is a **bounded, transient
+overshoot**: if the home's terminal settlement arrives after the release, the
+import settles and `|position| + pending` may exceed `credit_limit_centi` by
+at most the released amount until trade in the other direction discharges
+it. The overshoot is visible in `status`, admits no *new* prepare while it
+lasts, and is a stated residual — the alternative, refusing late and leaving
+B unpaid after Y promised, would break §5's promise and have no
+reconciliation rule at all.
 
 ### 11. Disputes
 
@@ -528,12 +562,21 @@ permanently freeze our import headroom.
   settlement window, through the existing `raise_dispute` door (ADR-0014).
   A dispute raised by B on Y is carried to X and admitted there as a foreign
   record opening (or joining) the home dispute; a dispute raised by A on X is
-  carried to Y and admitted to Y's log as a foreign record, so the freeze
-  mirrors (ADR-0029 puts every admitted foreign record on the log, never in
-  a cache). The **home** window is the one that freezes
-  settlement; the receiver's window has not started (it starts at the final
-  commit) or, if it has, the receiver holds its import settlement while a
-  home dispute is live (the carried dispute record suspends it).
+  carried to Y and admitted to Y's log as a foreign record (ADR-0029 puts
+  every admitted foreign record on the log, never in a cache). The **home**
+  window is the one that freezes settlement; the receiver has no window of
+  its own — it settles only on the home's terminal settlement (§9), which
+  the home does not issue while a dispute is live — so the carried dispute
+  record on the receiver's log is informational (it explains B's wait) and
+  never a trigger.
+- **B's effective dispute window is shorter than the home's.** B's dispute
+  must reach the *home* inside the home window, which is measured from the
+  home's admission of B's confirmation; B therefore has `W − (Y→X carriage)`,
+  which on a courier link can be zero. This is a stated residual. Treaty
+  authors should set `settlement_window_secs` to at least twice the expected
+  carriage latency between the two communities, and the wallet and app show
+  B the home deadline as best known. B is protected in the other direction
+  regardless: nothing settles at Y before the home has decided.
 - Layer 2 jury sortition on the home draws from the home's pool only —
   foreign members are never jurors. An **upheld** ruling at home appends
   `abort{reason: "dispute-upheld"}` plus the domestic `cancellation{DisputeUpheld}`;
@@ -570,16 +613,29 @@ From either log alone, replay recomputes:
   `Proposed → Confirmed → Settled | Cancelled | Disputed` on the home log with
   the same `TransactionState` machine as today (the prepare is an attestation
   beside the proposal, not a new state), and on the receiver log a mirrored
-  state that additionally records "home commit admitted" and "home abort
-  admitted" as the two transitions that unlock settlement or force
-  cancellation.
+  state that additionally records "home commit admitted" (a display state),
+  "home settlement admitted" (the transition that settles) and "home abort
+  admitted" (the transition that cancels).
 
 Foreign-signed records (the partner's prepares, commits, aborts, settlements,
 refusals; foreign members' proposals and confirmations) are pinned on replay
-to the partner's writer key **at that log position** via ADR-0035's lineage,
-and skipped — never halting replay — when the signer does not match. A
-replica of X derives the same positions X does, because it pins with the
-same lineage.
+to `writer_at(home_seq)` on the partner-side lineage, and skipped — never
+halting replay — when the signer does not match. That lineage is itself
+derived from **this log**: its root is the station-signed
+`rrn.fed.partner_pin` record our writer appended when it first pinned the
+partner's profile, and it advances only through the admitted foreign
+`rrn.gov.succession` records (each paired with a fresh `partner_pin`) that
+precede the record being pinned (ADR-0029 §4, ADR-0035 §5). Nothing about a
+partner's identity is read from the directory cache on replay. A replica of
+X, or an X restored from an ADR-0016 backup plus outbox replay, derives the
+same positions X does, because the lineage it pins with is on the log it
+copied.
+
+**ADR-0009 input revision.** `rrn.fed.settlement` scores for `member`
+exactly as `rrn.tx.settlement` does today — one settled trade in the
+trade-reliability dimension, at `settled_at` on this log — and nothing else
+in the locked formula changes. Recorded here so that every implementation,
+and every portable history a partner verifies (ADR-0032), agrees on it.
 
 ### 13. Refusal slugs
 
@@ -628,20 +684,20 @@ treaties end to end rather than redefine them.
   (§6). The worst case from a hostile or broken partner is *stuck* credit —
   a position that cannot be discharged because trade in the other direction
   never comes — never *lost* credit at the member level, because B is only
-  ever credited after X's final commit and A is only ever debited after X's
-  own window.
-- **Latency doubles for the receiver** (§9). Members will notice; the
-  wallet and app must render "awaiting the other community" states clearly.
-  This is the honest cost of two clocks and no coordinator.
+  ever credited by mirroring X's terminal settlement and A is only ever
+  debited by that same terminal settlement at X.
+- **The receiver waits on the home plus two carriages** (§9). Members will
+  notice; the wallet and app must render "awaiting the other community"
+  states clearly. This is the honest cost of one authority and no coordinator.
 - **Positions can strand.** When a treaty is suspended or terminated
   (ADR-0030), its position freezes; Phase 3 has no netting or settlement-
   in-goods mechanism to discharge it. This is recorded as a residual, not
   papered over: the overview's "settlement required: physical goods/services
   delivery" is a social process outside the ledger until a later ADR.
-- **Two new front-door parameters per treaty** (`prepare_ttl_secs`,
-  `settlement_window_secs`) join the station's `[settlement]` config as
-  per-treaty overrides, decided in the treaty text (ADR-0030) rather than by
-  either operator alone.
+- **Two window parameters per treaty** (`prepare_ttl_secs`,
+  `settlement_window_secs`) are **treaty text** (ADR-0030), not station
+  `[settlement]` config: neither operator can change them alone, and the
+  engine reads them from the Active treaty at admission.
 - **Additive changes to shipped shapes.** `TransactionProposal` gains an
   optional field (bytes unchanged when absent); `CancelReason` gains five
   variants across the set — `FedAborted` (introduced here) and
@@ -668,15 +724,20 @@ treaties end to end rather than redefine them.
   - *Prepare replay* — re-carrying an old prepare to re-open exposure:
     mitigated by content-address dedup (`admission_of`) and by `tx_id`
     binding; a prepare for a `Cancelled`/`Settled` tx is `fed-stale-prepare`.
-  - *Partner refuses to settle* — Y takes X's export settlement and never
-    imports (B unpaid) or never carries B's confirmation: bounded by the home
-    expiry (nothing moves at X without a confirmation) and, after the home
-    settled, visible as a position discrepancy both logs can show; remedy is
-    ADR-0030 suspension and ADR-0034 arbitration, not ledger reversal.
-  - *Stalled commits* — the home's final commit never reaches the receiver:
-    B waits; nothing is lost; the receiver's local exposure release (§10)
-    stops the hang from freezing import headroom; the courier/DTN retry
-    machinery (ADR-0020 §3, `dtn_pushes`) re-sends idempotently.
+  - *Partner refuses to settle* — Y never admits X's export settlement (so
+    never imports; B unpaid) or never carries B's confirmation: bounded by
+    the home expiry (nothing moves at X without a confirmation) and, after
+    the home settled, visible as a position discrepancy both logs can show;
+    remedy is ADR-0030 suspension and ADR-0034 arbitration, not ledger
+    reversal. A Y that admits the export settlement *must* import in the
+    same `LogBatch` — a Y that does not is a partner-honesty matter its own
+    members and replicas can see.
+  - *Stalled terminal records* — the home's settlement or abort never
+    reaches the receiver: B waits; nothing is lost; the receiver's local
+    exposure release (§10) stops the hang from freezing import headroom, and
+    a late arrival is honored unconditionally (bounded overshoot, §10); the
+    courier/DTN retry machinery (ADR-0020 §3, `dtn_pushes`) re-sends
+    idempotently.
   - *Limit races* — two proposals admitted on the two logs simultaneously
     each passing its own check: cannot exceed the limit on either log
     because each check counts its own pending set; the transient sum across
@@ -735,12 +796,13 @@ treaties end to end rather than redefine them.
   admission clock; partner instants as testimony (the Phase 3 question its
   Alternatives deferred)
 - [ADR-0029](0029-federation-identity-profiles-and-carriage.md) — `CommunityId`,
-  the federation outbox, checkpoints, federation ingest
+  the federation outbox, checkpoints, federation ingest, `home_seq`, and the
+  `rrn.fed.partner_pin` record the partner-side lineage is rooted in
 - [ADR-0030](0030-treaties-ratification-depth-lifecycle.md) — `Treaty`,
   `TreatyId`, `credit_limit_centi`, `prepare_ttl_secs`,
   `settlement_window_secs`, suspension and position freeze
-- [ADR-0033](0033-oracle-tiers-3-and-4.md) — Tier 3/4 conditions on the
-  home's final commit
+- [ADR-0033](0033-oracle-tiers-3-and-4.md) — Tier 3/4 conditions the home
+  must meet before its final commit and terminal settlement
 - [ADR-0034](0034-community-tribunal-and-federation-arbitration.md) —
   the neutral forum and verdict enactment
 - [ADR-0035](0035-writer-succession-and-lineage-pinning.md) — lineage-aware

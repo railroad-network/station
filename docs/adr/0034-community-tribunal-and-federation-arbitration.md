@@ -2,17 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**. This ADR uses the
-> shared federation vocabulary of [ADR-0029](0029-federation-identity-profiles-and-carriage.md)
-> (`CommunityId`, federation outbox, partner writer key, lineage-aware pinning)
-> and the treaty model of [ADR-0030](0030-treaties-ratification-depth-lifecycle.md)
-> (`forum`, Recognition depth). It is ratified together with them or not at all.
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: a station-signed `rrn.dispute.tribunal_opened` anchor pins the tribunal's pool, weights, reserved seat and window; the home checks only its own treaty with the forum; the `dispute_anchor` change is gated by position as a migration; §10/§11 follow the corrected ADR-0031 settlement order and the suppression residual.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -112,10 +113,10 @@ A tribunal is convened by a member-signed **`rrn.dispute.tribunal_request`**:
 |---|---|---|
 | `case` | `CaseRef { kind: "tx" \| "equivocation" \| "tribunal", id: Hash }` | what is being judged — a disputed transaction (`kind = "tx"`, `id = tx_id`) or, for an appeal, the Layer-2 ruling's transaction |
 | `requester` | Address | a party to the case (sender or receiver), or — for an appeal — the party contesting the ruling |
-| `basis` | `"tier3"` \| `"appeal"` | first instance at Tier ≥ 3, or an appeal of a Layer-2 verdict (§5) |
+| `basis` | `"first-instance"` \| `"appeal"` | first instance at Tier ≥ 3 (Tier 3 or Tier 4), or an appeal of a Layer-2 verdict (§5) |
 | `requested_at` | i64 | testimony (ADR-0022 §3) |
 
-The front door admits a `tier3` request only while the named transaction is
+The front door admits a `first-instance` request only while the named transaction is
 `Disputed` (an ADR-0014 §1 `DisputeRecord` exists and its window is open) and
 its effective tier is ≥ 3; an `appeal` request only while a terminal Layer-2
 ruling exists for a Tier ≥ 3 transaction and ADR-0014's appeal window
@@ -125,6 +126,19 @@ same `CaseRef` is `known`, never a second case — the case is **keyed by
 keys equivocation cases by identity. The `"tribunal"` `CaseRef` kind exists
 for the Layer-4 appeal-own-community basis (§11), where the case *is* a
 tribunal verdict.
+
+Atomically with the request (`LogBatch`), the station appends a
+station-signed **`rrn.dispute.tribunal_opened { request_hash: Hash, seq: u64,
+opened_at: i64 }`** — the attested pin for the case, mirroring
+`rrn.fed.arbitration_opened` (§7) and ADR-0027's single-attested-pin
+discipline. `seq` is the request's admission seq; `opened_at` is the
+station's admission clock at that seq. Every input below that needs a
+position reads `seq`, and every input that needs an instant reads
+`opened_at` — never the request's `created_at`, which a replica re-stamps
+(ADR-0022 §1) and which would otherwise let two copies of one log seat two
+different panels. Replay validates the pin as it validates any station
+attestation: a `tribunal_opened` not immediately following its request is
+skipped, and a case with no validated pin seats nothing.
 
 Opening a Tier-3 dispute (`raise_dispute` on a Tier ≥ 3 transaction) does
 **not** seat a Layer-2 jury. Tier ≥ 3 disputes go to the tribunal directly:
@@ -140,28 +154,36 @@ ask for a ruling.
 — established members (composite ≥ `BAND_MEMBER_MIN`), or the ADR-0015 grace
 electorate, **minus both parties, minus direct vouchers of either party** —
 computed with the position-bounded readers (`eligible_pool_excluding`,
-`vouchers_of_until`, `established_members_asof`) at the **admission seq of the
-tribunal request**. Nothing admitted after that position can change the pool
-(ADR-0022 §5).
+`vouchers_of_until`, `established_members_asof`) at the **`(seq, opened_at)`
+pin of the case's `tribunal_opened` record** (§1) — position-bounded at `seq`,
+decay-evaluated at `opened_at`. Nothing admitted after that position can change
+the pool (ADR-0022 §5).
 
 - **Six seats by the draw.** `draw_sequence(pool, seed)` with
-  `seed = blake3("rrn.dispute.tribunal" ‖ canonical(CaseRef) ‖ request_seq_be ‖
-  dispute_anchor)`, where `request_seq_be` is the request's admission seq as
+  `seed = blake3("rrn.dispute.tribunal" ‖ canonical(CaseRef) ‖ seq_be ‖
+  dispute_anchor)`, where `seq_be` is the `tribunal_opened` pin's `seq` as
   8 big-endian bytes and `dispute_anchor` is the community's `CommunityId`
   (ADR-0029 §1). `Core::dispute_anchor()` — empty since ADR-0014 with the
   comment "a stable per-community anchor drops in here when federation
-  arrives" — now returns the genesis charter hash for **every** draw (jury,
-  equivocation, tribunal), so two communities running the same code never
-  produce the same panel for the same case id. This is the one change to a
-  Layer-2 input, and it is a strict improvement in the already-ratified
-  direction. A station with no published genesis charter has no
-  `CommunityId`: its anchor stays empty, exactly as today, and such a station
-  cannot federate (ADR-0032). The first six addresses the sequence yields, in order, are seats
-  1–6; the sequence continues to supply no-show replacements (§4).
+  arrives" — returns the genesis charter hash for every draw (jury,
+  equivocation, tribunal) **whose anchoring record is admitted at or after
+  the log's first own `rrn.fed.profile` record** (ADR-0029 §2); a case
+  anchored before that position keeps the empty anchor it was drawn with.
+  This gate is the migration: concluded Layer-2 and equivocation cases on an
+  existing log re-derive the panel they were actually seated with, and their
+  recorded verdicts still match their jurors on replay; only cases opened
+  after the community publishes its profile use the new anchor, so two
+  communities running the same code never produce the same panel for the
+  same case id. This is the one change to a Layer-2 input, and it is a
+  strict improvement in the already-ratified direction. A station with no
+  published genesis charter has no `CommunityId`: its anchor stays empty,
+  exactly as today, and such a station cannot federate (ADR-0032). The first
+  six addresses the sequence yields, in order, are seats 1–6; the sequence
+  continues to supply no-show replacements (§4).
 - **The seventh seat is reserved.** Seat 7 is the eligible member with the
-  **highest raw composite standing** at the request's admission seq
-  (`ScoringContext::score_raw` at the request's admission instant, over the
-  prefix) who was *not* drawn into seats 1–6. Ties break by ascending address
+  **highest raw composite standing** at the pin
+  (`ScoringContext::score_raw` at `opened_at`, over the prefix ending at
+  `seq`) who was *not* drawn into seats 1–6. Ties break by ascending address
   bytes. This is the overview's "at least one elected official" without an
   election: the community's most-established member sits by right of
   standing, which is the only rank the system computes and which cannot be
@@ -174,7 +196,7 @@ tribunal request**. Nothing admitted after that position can change the pool
   fewer than 7, the tribunal **cannot seat** and the request is refused at the
   front door with slug `tribunal-cannot-seat`. A community that cannot seat
   seven has no tribunal; its Tier ≥ 3 disputes fall back to the **Layer-2
-  jury** (a `tier3` request refused for this reason is followed by an
+  jury** (a `first-instance` request refused for this reason is followed by an
   ordinary jury draw on the same `DisputeRecord`, so the freeze is still
   adjudicated). A tribunal is a large-community instrument; the fallback
   keeps small communities' Tier-3 trade adjudicable rather than frozen.
@@ -214,14 +236,13 @@ refused (`already-voted`), never a change of vote.
   seq of the fourth concurring ballot (`ruling_reached_at`, the same
   primitive).
 - **Windows, on this station's admission clock.** The tribunal runs inside
-  its own **`tribunal_window_secs`, default 21 days**, from the request's
-  admission — replacing, for this case, ADR-0014's 14-day dispute-resolution
+  its own **`tribunal_window_secs`, default 21 days**, from the pin's
+  `opened_at` — replacing, for this case, ADR-0014's 14-day dispute-resolution
   window (the `DisputeRecord`'s freeze is extended to the tribunal window's
   end; the station's sweep reads the longer of the two for a transaction with
   a seated tribunal). Each juror has a **response deadline of 5 days**
-  (`tribunal_juror_response_secs`) from their seating position's admission
-  instant (the request's for the initial seven; the no-show's deadline
-  instant for a replacement).
+  (`tribunal_juror_response_secs`) from their seating instant (`opened_at`
+  for the initial seven; the no-show's deadline instant for a replacement).
 - **No-shows are redrawn around.** A drawn juror past their deadline with no
   ballot is replaced by the next address in the draw sequence not already
   seated or recused; the reserved-seat member is replaced by the next
@@ -270,8 +291,11 @@ under ADR-0035's lineage rule.
   dispute opens.
 - **Appeal.** For a transaction of effective tier **≥ 3** that a Layer-2
   jury nonetheless ruled on (only reachable through the §2 cannot-seat
-  fallback), a party may appeal the jury ruling to the tribunal within the
-  appeal window. The tribunal's ruling replaces the jury's. For Tier 1–2,
+  fallback, and then only if the eligible pool has grown since the
+  first-instance refusal — the same pool and recusals at a later position
+  will usually fail to seat again, so this is a near-dead path kept for
+  completeness), a party may appeal the jury ruling to the tribunal within
+  the appeal window. The tribunal's ruling replaces the jury's. For Tier 1–2,
   **nothing changes**: the ADR-0014 §5 electorate appeal (`EscalationReason::Appeal`)
   and `CannotSeat` escalation remain the only paths; a `tribunal_request` on
   a Tier ≤ 2 transaction is refused (`tier-below-tribunal`). Small disputes do
@@ -294,8 +318,10 @@ the partner as part of the ADR-0031 outcome (an `uphold` becomes the home's
 `rrn.fed.abort { reason: "dispute-upheld" }`), and the partner mirrors — it
 never runs its own tribunal on a transaction whose home is elsewhere.
 
-**Precedent** is a **cache table** `precedents` in `rrn-storage`, rebuilt by
-replay from tribunal (and arbitration, §10) verdicts and their ballots: one
+**Precedent** is a **cache table** `precedents` (migration in `rrn-storage`;
+the builder that decodes the dispute kinds lives in `rrn-dispute`, since
+storage decodes no application kind), rebuilt by replay from tribunal (and
+arbitration, §10) verdicts and their ballots: one
 row per verdict with `case`, `outcome`, the transaction's `category` (from
 its listing, when any) and effective tier, `decided_at`, and the concurring
 ballots' reasoning. It is served read-only by an RPC `dispute_precedents`
@@ -331,27 +357,36 @@ equal the `forum` field of the Active treaty between `home` and
 `counterparty_community` (ADR-0030); the home front door refuses a request
 naming any other community (`forum-not-in-treaty`). For an own-community
 appeal, `forum` may be the `forum` of *any* Active Recognition treaty the
-home holds (§11). In both cases the home refuses the request unless, at the
-request's admission position on the home log, the forum holds an **Active
-treaty of Recognition depth with each of the two communities involved**
-(`forum-not-neutral`) — a forum that trades with only one side is not
-neutral, and a Trade-depth treaty carries no reputation recognition, so the
-forum could not even read the parties' standing. If the treaty names no
-forum, or the named forum fails the neutrality test at that position, the
-request is refused and **there is no Layer 4 for that case**: it stays at
-the layer that heard it, and the status quo of that layer's outcome holds.
+home holds (§11). The home judges only what its own log holds: it refuses
+the request unless, at the request's admission position on the home log,
+the forum holds an **Active treaty of Recognition depth with the home**
+(`forum-not-neutral`) — a Trade-depth treaty carries no reputation
+recognition, so such a forum could not even read the parties' standing. The
+forum's relationship with the *counterparty's* community is not on the home
+log (the cached partner profile's `active_treaties` is testimony), so the
+home applies at most a non-authoritative pre-check against that cache and
+never refuses on it; the **forum** judges forum↔counterparty neutrality on
+its own log (below). If the treaty names no forum, or the named forum fails
+either side's test at its position, the request is refused and **there is
+no Layer 4 for that case**: it stays at the layer that heard it, and the
+status quo of that layer's outcome holds.
 Arbitration is an instrument communities choose to have when they sign a
 treaty; the protocol does not conjure a forum.
 
 The forum, on ingesting the request as a foreign record (carried in the home
 writer's outbox, signer pinned per ADR-0029 §4), re-checks neutrality
-**at its own admission position** against its own treaty state, and refuses
-(`refused/forum-not-neutral` in the delivery receipt) if it disagrees — the
-forum's log is authoritative for whether the forum sits. It admits the
+**at its own admission position** against its own treaty state — it must
+hold an **Active Recognition treaty with each of the two communities
+involved** — and refuses (`refused/forum-not-neutral` in the delivery
+receipt) if it does not; the forum's log is authoritative for whether the
+forum sits. It admits the
 request and, atomically with it (`LogBatch`), appends a forum-writer-signed
 **`rrn.fed.arbitration_opened { request_hash: Hash, panel_seed_seq: u64,
-opened_at: i64 }`** — the attested pin that anchors the panel and the window.
-`panel_seed_seq` is the request's admission seq on the forum log.
+opened_at: i64, home_seq: u64 }`** — the attested pin that anchors the panel
+and the window. `panel_seed_seq` is the request's admission seq on the forum
+log; `home_seq` is the opened record's own seq on the forum log (ADR-0029 §4:
+every writer-signed federation record carries the seq at which its issuer
+appends it, so a receiving station can pin it to `writer_at(home_seq)`).
 
 ### 8. The panel is the forum's own three-member jury, seated by ADR-0014 sortition on the forum's log
 
@@ -386,7 +421,8 @@ redrawn from the sequence.
 
 **`rrn.fed.arbitration_verdict`** — forum-writer-signed on ruling or lapse:
 `{ request_hash: Hash, outcome: "uphold" | "reject" | "lapsed", ballots:
-[Hash], decided_at: i64 }`. As with §4, replay validates the verdict against
+[Hash], decided_at: i64, home_seq: u64 }` (`home_seq` per ADR-0029 §4). As
+with §4, replay validates the verdict against
 its ballots and skips a verdict its ballots do not support. The forum
 appends it to its own log and carries it — with the ballots — in its
 federation outbox to **both** homes.
@@ -406,15 +442,21 @@ decides how long it will wait for one.
 
 ### 10. Enactment on each home: abort before settlement, record-only after, no clawback
 
-Each home admits the forum's verdict as a foreign record (pinned to the forum
-writer key from the directory / treaty, lineage-aware). Enactment on the
+Each home admits the forum's verdict as a foreign record, pinned to
+`writer_at(home_seq)` on the forum's partner-side `WriterLineage` — derived
+from this home's own `rrn.fed.partner_pin` record and the forum's admitted
+`rrn.gov.succession` records (ADR-0029 §4, ADR-0035 §5), never from the
+directory cache, so a replica or a restored station re-derives the same
+pin. Enactment on the
 transaction's **home** log (the paying side, ADR-0031):
 
 - **`uphold`, transaction not yet settled** — the home appends
   `rrn.fed.abort { reason: "dispute-upheld" }`, the transaction goes
   `Disputed → Cancelled(DisputeUpheld)`, and the abort is carried to the
-  counterparty's home, which mirrors (nothing moved on either side, because
-  the counterparty never settles before the home's final commit). The
+  counterparty's home, which mirrors (nothing moved on either side: the
+  counterparty appends its `rrn.fed.settlement{import}` only on admission of
+  the home's terminal `rrn.fed.settlement{export}`, ADR-0031 §9, which an
+  aborted transaction never produces). The
   confirmer's — and any witnesses' — attestations are recorded as proven
   wrong, as in §6.
 - **`uphold`, transaction already settled** (the verdict arrived after the
@@ -451,9 +493,12 @@ unfairly". Its scope in Phase 3 is deliberately narrow:
   which exist as records to appeal in Phase 3).
 - **Window:** requested within `appeal_window_seconds` (2 days) of the
   tribunal verdict's admission on the home log, in the home's clock; the
-  request must be admitted on the home log first (the home cannot suppress
-  it without leaving a gap in its federation outbox chain that the forum can
-  see, ADR-0020 §2).
+  request must be admitted on the home log first. A *courier* who drops the
+  carried request leaves a gap in the home's federation outbox chain that the
+  forum can see (ADR-0020 §2, ADR-0029 §3); the home *writer* itself, which
+  assigns those positions, can decline to admit or enqueue the request with
+  no gap at all — a residual visible only to the home's own members and
+  replicas, who see the request refused or absent on their log.
 - **Forum:** any community `F` that is the `forum` named in some Active
   Recognition treaty the home holds with a partner `P`, **and** that itself
   holds an Active Recognition treaty with the home; the request names which.
@@ -505,7 +550,7 @@ records, windows, and fail-open are §8–§9 unchanged.
 ### 13. Everything is position-bounded, and every derived view is a cache
 
 The tribunal's pool, reserved seat, and draw are functions of the log prefix
-at the request's admission seq; the forum's pool and draw are functions of
+at the `tribunal_opened` pin's `seq`, evaluated at its `opened_at`; the forum's pool and draw are functions of
 the forum's log prefix at `panel_seed_seq`; neutrality is judged at the
 request's admission position on each log that judges it. Nothing admitted
 later changes a seat, a threshold, or an eligibility (ADR-0022 §5). The
@@ -523,10 +568,12 @@ rebuilt by replay; the log records above are the only authority.
   (threat-model obligations) and a new cost: a seven-ballot tribunal can put ~28 KB of prose on
   the permanent log per case. Bounded, and only at Tier ≥ 3, where the
   transaction is worth ≥ 50 Commons; acceptable.
-- **`dispute_anchor()` becomes the `CommunityId`.** Every sortition seed in
-  the community changes from its Phase 1/2 value. Existing test vectors that
-  pin a panel for an empty anchor will need updating; there is no deployed
-  log with a live dispute to migrate.
+- **`dispute_anchor()` becomes the `CommunityId`, gated by position.** Only
+  cases anchored at or after the log's first own `rrn.fed.profile` use the
+  new anchor (§2); every earlier case, live or concluded, replays with the
+  empty anchor it was drawn with, so no existing log re-seats a historical
+  panel. Test vectors that pin a panel for an empty anchor stay valid for
+  pre-profile positions; new vectors cover the post-profile draw.
 - **Small communities get a fallback, not a tribunal.** Fewer than seven
   eligible after recusal means the Layer-2 jury hears Tier-3 disputes. Honest
   about scale; the tribunal appears as the community grows, with no
@@ -547,8 +594,9 @@ rebuilt by replay; the log records above are the only authority.
 - **Reputation now has a second proven-wrong input source** (witnesses,
   ADR-0033) and a second neutralization source (§11); both are locked-formula
   revisions in the ADR-0009 sense and are stated in ADR-0033 and here.
-- **New records.** Tribunal: `rrn.dispute.tribunal_request`, `tribunal_ballot`,
-  `tribunal_verdict`, `tribunal_verdict_lifted`. Arbitration:
+- **New records.** Tribunal: `rrn.dispute.tribunal_request`, `tribunal_opened`
+  (station-signed pin), `tribunal_ballot`, `tribunal_verdict`,
+  `tribunal_verdict_lifted`. Arbitration:
   `rrn.fed.arbitration_request`, `arbitration_opened`, `arbitration_ballot`,
   `arbitration_verdict`. Each: distinct discriminator, dCBOR fixture, mobile
   handoff for the member-signed ones (`tribunal_request`, `tribunal_ballot`,
@@ -639,13 +687,18 @@ The `rrn-dispute` and new `rrn-federation` sections of
 - **Request spam / forum denial of service.** Mitigations: one request per
   `CaseRef`; requester must be a party; a live freeze or appeal window must
   exist; `arbitration_max_open_per_partner`. Residual: no per-member rate
-  limiting (standing residual), and a hostile partner can fill its quota with
-  frivolous cases against its own members' counterparties.
+  limiting (standing residual); a hostile partner can fill its quota with
+  frivolous cases against its own members' counterparties, and a griefer
+  *inside* one community can exhaust that community's own quota against
+  everyone, since the cap is per requesting community, not per member.
 - **Tribunal pool packing.** Mitigated by position-bounding at the request
   seq and by the reserved seat's standing rank (velocity-limited).
-- **Late or suppressed verdict carriage.** A home that never carries the
-  request, or a forum that never carries the verdict, leaves a visible gap in
-  its federation outbox chain (ADR-0020 §2 / ADR-0029); the injured side's
+- **Late or suppressed verdict carriage.** A courier that drops a carried
+  request or verdict leaves a visible gap in the issuing writer's federation
+  outbox chain (ADR-0020 §2 / ADR-0029 §3); a home writer that never
+  *enqueues* the request, or a forum writer that never enqueues its verdict,
+  leaves no gap — that suppression is visible only to that community's own
+  members and replicas (ADR-0029 §3 residual). Either way the injured side's
   home lapses on its own clock and the status quo holds. Residual: a
   suppressed request is delay, not loss.
 

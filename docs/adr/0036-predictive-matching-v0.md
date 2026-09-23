@@ -2,13 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**.
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: station-local period stamps, integer widening and the scoring instant are stated.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -60,7 +65,8 @@ through a `MatchingSource` trait the station implements:
 
 ```rust
 pub trait MatchingSource {
-    /// This community's identity (the genesis charter hash, ADR-0029).
+    /// This community's identity (the genesis charter hash, ADR-0029; the
+    /// `CommunityId` newtype lives in `rrn-storage`, below this crate).
     fn home(&self) -> CommunityId;
     /// Every listing the station holds, home and foreign, with provenance.
     fn listings(&self) -> Result<Vec<SourcedListing>>;
@@ -75,6 +81,8 @@ pub trait MatchingSource {
     /// Composite standing of a provider, if this station has one: from the
     /// home scorer for home members, from `foreign_standing` (ADR-0032) for
     /// foreign members. `None` when unknown.
+    /// Scored at the run's `computed_at` (§3) for home members; the cached
+    /// profile as verified for foreign members.
     fn composite_of(&self, provider: &Address, community: &CommunityId) -> Option<f32>;
     /// Settled transactions between two communities in a category over the
     /// trailing twelve months, from settlement records linked to a listing.
@@ -88,7 +96,9 @@ pub trait MatchingSource {
 `SourcedListing { listing: Listing, community: CommunityId, received_at: i64 }`
 and `SourcedNeed { need: Need, community: CommunityId, received_at: i64 }`.
 `received_at` is the **local admission time** for a home record (the log
-entry's `created_at`, ADR-0022) and the **local cache-receipt time** for a
+entry's `created_at`, ADR-0022 — station-local, re-stamped on a replica, so two
+stations may bucket the same record into adjacent periods; consistent with
+suggestions being never authoritative) and the **local cache-receipt time** for a
 foreign record (when this station accepted it from a federation bundle). No
 timestamp inside a signed record is read: `created_at` on a listing and
 `valid_until` on a need are testimony (ADR-0022 §3) and stay out of the
@@ -115,7 +125,9 @@ stays below `rrn-federation`, and the station wires the caches in.
   for the period in which they were received: history is what the projection
   is built from.
 
-All of this is `u64` arithmetic. The category set is the fixed `CATEGORIES`
+All of this is `u64` arithmetic (`capacity` is `Option<u32>` and
+`quantity_needed` is `u32` in the records; the aggregates widen). The category
+set is the fixed `CATEGORIES`
 list (eight values), so the aggregate table is small: communities × 8 ×
 months.
 
@@ -164,7 +176,7 @@ depth_weight(S, D) := 1.0 if S == D
 standing_factor(S, cat) :=
     let composites = for each distinct provider P of a contributing listing of
                      (S, cat) in the source periods of §3:
-                       composite_of(P, S).unwrap_or(1.0)
+                       composite_of(P, S).unwrap_or(1.0)   -- at computed_at
     mean(composites) / 5.0                      -- in (0, 1]
 
 history_factor(S, D, cat) :=

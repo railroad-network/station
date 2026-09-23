@@ -2,16 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**. Vocabulary, record
-> kinds, and invariants are shared with ADRs 0029–0036 and must not drift from
-> them; where this ADR names a record another ADR defines, that ADR's definition
-> governs.
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: the Tier-4 validator's read of witness standing joins the exhaustive use list; `foreign_standing` is keyed by `(subject, home)`; the `min_reputation` conversion and the `to_seq` pin are stated.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -109,7 +111,9 @@ counterpart of the community profile for a community.
 The request is a log record on the requester's log (so a replica can see what
 was asked for, and so the partner's federation outbox chain proves it was or was
 not answered) and is admitted on the home log as a foreign writer-signed record
-under ADR-0029's carriage rules. A home writer answers at most one export per
+under ADR-0029's carriage rules; like every writer-signed federation record it
+carries `home_seq` (the requester's own log seq of the record, ADR-0029 §4), which
+is what the home pins it against. A home writer answers at most one export per
 `(subject, requested_by)` per `history_refresh_min_secs` (default 1 day) so a
 partner cannot use requests as a replay-work amplifier; a repeat inside that
 bound is answered from the last export.
@@ -136,12 +140,18 @@ use only in tests. The rest of the check is unchanged: root signature, address
 match, strictly increasing `seq`, per-entry signature and content-hash
 re-verification, Merkle root, then `score` at `computed_at`.
 
-The expected lineage is the partner-side `WriterLineage` of ADR-0035 §5: the home
-community's writer key pinned from its profile and `rrn.fed.treaty_acceptance`,
-advanced by any `rrn.gov.succession` records the partner has carried and this
-station has accepted under ADR-0035 §7 (the `at_seq` boundaries fall in the home
-community's own seq space, which is the space `to_seq` lives in). A history
-signed by a key outside that lineage is forgery, not a stale key.
+The expected lineage is the partner-side `WriterLineage` of ADR-0035 §5, and it
+is **derived on replay from this station's own log**, never from the directory
+cache: its root is the `rrn.fed.partner_pin` record this station appended when it
+first pinned the home community's writer (ADR-0029 §2, §4), advanced by the
+foreign `rrn.gov.succession` records this station has admitted under ADR-0035 §7
+(each admitted in the same batch as a fresh `partner_pin`). The `at_seq`
+boundaries fall in the home community's own seq space, which is the space
+`to_seq` lives in, and **the pin is evaluated at `to_seq`, not at the lineage's
+current key**: a history the *old* writer exported before a succession and that
+arrives late is signed by `writer_at(to_seq)` and is valid. Only a history signed
+by a key outside the lineage at `to_seq` is forgery — an implementer who pins at
+the current key would wrongly reject every such late history.
 
 Anchoring inside the replay is the foreign community's own: the vouches in the
 history are the vouches the home log holds, so `is_anchored` evaluates them as
@@ -159,8 +169,9 @@ derived state (ADR-0020 discipline: caches are caches):
 
 ```
 foreign_standing (STRICT)
-  subject      BLOB  PRIMARY KEY   -- Address
+  subject      BLOB                -- Address
   home         BLOB                -- CommunityId
+  PRIMARY KEY (subject, home)      -- one key may be anchored in two communities
   profile      BLOB                -- canonical ReputationProfile (kind rrn.reputation.profile.v1)
   computed_at  INTEGER             -- the root's computed_at (home clock: testimony)
   verified_at  INTEGER             -- THIS station's clock when verified (admission-class)
@@ -172,7 +183,10 @@ extension, ADR-0029 §8): an entry older than `foreign_standing_ttl_secs`
 (default 30 days) is **stale**. A stale entry is still displayed, marked stale,
 but it satisfies no gate; a gate that needs fresh standing triggers a new
 `history_request` and refuses the current attempt with the typed slug
-`fed-standing-stale` so the member retries once the answer lands. `computed_at`
+`fed-standing-stale` so the member retries once the answer lands — for a
+cross-community *proposal* that means the payer signs a fresh proposal with a
+new nonce after the history round trip, a cost this ADR accepts over admitting
+against stale standing. `computed_at`
 is carried for display and to reproduce the exact profile; it is never compared
 to this station's clock. A replica rebuilds the cache from carried histories
 exactly as the writer does; nothing about it is authoritative.
@@ -190,6 +204,10 @@ else:
 - **Tier-4 validator choice** (ADR-0033): a station picking the neutral
   Recognition partner to validate a Tier-4 transaction may read the parties'
   recognized standing as one input.
+- **Tier-4 validation itself** (ADR-0033 §6(b)): the validator community's
+  attestors read each *witness's* recognized standing when they check a
+  cross-community Tier-4 transaction — a read of `foreign_standing` of the same
+  safety class as the marketplace gate, and no more.
 
 It is **never** an input to:
 
@@ -197,8 +215,9 @@ It is **never** an input to:
   declarations, succession activations);
 - any **jury, tribunal, or arbitration pool** of this community (ADR-0014,
   ADR-0025, ADR-0034) — a foreign member is not eligible to judge here, full stop
-  (a *recusal-only* read of `foreign_standing`, ADR-0034 §8, excludes a juror and
-  is not an eligibility input);
+  (a *recusal-only* read of `foreign_standing` — ADR-0034 §8 for arbitration
+  jurors, ADR-0033 §6(b) for validation attestors — excludes a person and is not
+  an eligibility input);
 - **any local member's score** — `ScoringContext` over this log reads this log
   only; a foreign history is never merged into it;
 - **Tier-2 stake evaluation** — the confirmer's stake is evaluated by the
@@ -253,7 +272,10 @@ foreign_needs (STRICT)      need_hash BLOB PK, home BLOB, seeker BLOB, record BL
                             category TEXT, valid_until INTEGER, received_at INTEGER
 ```
 
-`received_at` is this station's admission-class clock. A foreign listing's
+`received_at` is this station's admission-class clock. `min_reputation_centi` is
+derived from the listing's `Requirements.min_reputation: f32` as
+`round_half_up(min_reputation × 100)`, fixed here so the gate below is the same
+integer comparison on every station. A foreign listing's
 `expires_at` is honored as the *home's* statement of intent — the cache drops it
 when a `listing_closed` arrives or when its own sweep passes `expires_at` on
 this station's clock, whichever first — and a closed or expired foreign listing

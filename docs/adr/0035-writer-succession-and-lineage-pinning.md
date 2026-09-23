@@ -2,15 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**. The shared vocabulary
-> for the whole federation set (ADRs 0029–0036) — record kinds, field names,
-> crate placement, and the cross-cutting invariants — is used here verbatim.
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: activation eligibility and `N` are evaluated at the successor's own attested anchor instant, never at a re-stamped `created_at`; a profile that changes `successor` is held until the partner's operator confirms it out of band (seized-key redirect residual); dead-branch certificates and orphaned partner-side records are stated as residuals.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -133,7 +136,13 @@ twice:
   electorate) **pinned at `last_seq`** — the last position the writer admitted
   that the successor holds. Back-dated standing cannot pack the activation
   because nothing after `last_seq` exists on the successor's copy to score from
-  (ADR-0022 §5).
+  (ADR-0022 §5). The *instant* the scorer decays to is **not** the successor's
+  own `created_at` for entry `last_seq` — that value is a pulled copy's
+  re-stamp (ADR-0022 §1) and differs on every verifier. It is the signed
+  `admitted_at` of the successor's `rrn.gov.succession_activation_admitted`
+  anchor (below): eligibility and `N` are evaluated at the single attested pin
+  `(last_seq, admitted_at)`, ADR-0027 D1b's discipline, so the old writer's
+  database, a partner, and any later replica compute the same electorate.
 - **First crossing, and only it** (ADR-0027 D1). The activation takes effect at
   the first admitted activation record at which the count reaches the threshold.
   A repeat signer or an ineligible signer is refused at the door and is not a
@@ -197,8 +206,11 @@ chain beneath it:
    that designation was signed by `writer_at(at_seq)` (§5);
 2. the entries named in `activation_hashes` are admitted activations between
    `at_seq + 1` and this record, naming this `(successor, at_seq, at_hash)`, whose
-   distinct eligible signers at the `at_seq` pin number at least `ceil(2N/3)`,
-   with the first admitted one inside the TTL;
+   distinct eligible signers — judged at `(at_seq, admitted_at)` where
+   `admitted_at` is the signed instant of the triple's
+   `succession_activation_admitted` anchor, never at any entry's re-stamped
+   `created_at` — number at least `ceil(2N/3)`, with the first admitted one
+   inside the TTL;
 3. the chain's entry at `at_seq` has `content_hash == at_hash`;
 4. `previous_writer == writer_at(at_seq)`.
 
@@ -227,8 +239,11 @@ replica's peer connection, or the operator's `station demote` command — a
 its own entry at `at_seq` and whose checks (§3) pass against its own chain,
 stops admitting immediately, records the fact in `station status`, and on next
 start runs as a replica of `new_writer`. `station demote --successor <addr>` is
-the operator's explicit form of the same transition (for a planned hand-over,
-see Alternatives). A writer never *pulls* (ADR-0020 §7), so it learns of a
+the operator's explicit form of the same transition. For a *planned* hand-over
+the order is fixed: the live writer **demotes first** (stops admitting, so its
+tail freezes), and only then do members sign activations against that frozen
+`(last_seq, last_hash)`; signing against a still-moving tail would make every
+triple stale before its 7-day TTL (see Alternatives). A writer never *pulls* (ADR-0020 §7), so it learns of a
 succession only through bytes brought to it; a partitioned writer that nobody
 reaches keeps admitting into a dead branch until someone does. That branch is
 what the next rule handles.
@@ -254,17 +269,45 @@ there:
   same confirmation is the one that counts, and it runs its window in full from
   the successor's admission (ADR-0022) — later, never earlier.
 
-The economic exposure of a split is bounded the same way ADR-0020 bounds
-everything: each front door enforces the debt floor and the certificate caps in
-its own arrival order, and the union of records is one outbox chain per member,
-so the converged chain admits nothing a single writer would have refused.
+The economic exposure of a split is bounded the way ADR-0020 bounds
+everything — each front door enforces the debt floor and the certificate caps
+in its own arrival order, and the union of member records is one outbox chain
+per member — but the dead branch does leave **residuals that must be stated,
+not argued away**:
+
+- *Dead-branch headroom certificates are void.* A `HeadroomCertificate` the old
+  writer issued past `at_seq` never exists on the surviving chain, so a
+  cert-backed spend a receiver accepted offline on the strength of that
+  station signature (ADR-0021's whole point) is refused on re-delivery, and
+  that receiver is stranded. The loss is bounded by `cert_max_cap_centi` per
+  certificate and is a jury matter, not a ledger one.
+- *Partner-side records from the old key past `at_seq` are orphaned.* A
+  partner that admitted the old key's `prepare`/`commit`/`settlement` records
+  past `at_seq` holds records with no counterpart on the survivor; the
+  successor re-issues what its own chain supports (a prepare for a proposal it
+  re-admitted, a commit for a confirmation it re-admitted), and the partner's
+  position converges only once those arrive — until then the two positions
+  disagree, visibly, in `status`.
+- *Re-run settlements may now fail the floor.* A member who spent against a
+  settlement the old writer signed on the dead branch may find the successor's
+  re-run of that settlement lands after a debit that no longer fits.
+
+`station status` on the successor therefore shows a **post-succession warning
+window** — from `succeeded_at` until every designated partner has acknowledged
+the succession (§7) and no member outbox has re-delivered in the last
+`settlement_window_secs` — during which operators are told to expect these
+effects and members are told not to accept old-branch certificates.
 
 ### 5. Writer lineage: `writer_at(seq)` replaces the runtime key at every pinning boundary
 
-`rrn-storage` gains a `lineage` module with one type, **`WriterLineage`**,
-built from a **root key** and the ordered admitted `rrn.gov.succession` records,
-exposing `writer_at(seq) → PublicKey`: the root for `seq ≤ at_seq` of the first
-valid succession, its `new_writer` up to the next, and so on. Every station-signed reader that today
+`rrn-storage` gains a `lineage` module holding **`WriterLineage`** *and* the
+`rrn.gov.succession` record type itself (storage owns the log-structural
+record so the lineage can decode it without a governance dependency;
+`rrn-governance` re-exports the type and owns designation and activation).
+`WriterLineage` is built from a **root key** and the ordered admitted
+`rrn.gov.succession` records, exposing `writer_at(seq) → PublicKey`: the root
+for `seq ≤ at_seq` of the first valid succession, its `new_writer` up to the
+next, and so on. Every station-signed reader that today
 pins to the runtime station key — ledger settlement/cancellation/certificate/
 equivocation/verdict/contract-charge readers, governance window/implemented/
 emergency attestations, `ScoringContext`, dispute resolution — pins instead to
@@ -284,13 +327,24 @@ being true the day this lands, and the threat-model residual and the
 `offline_lifecycle` legible-fail test are retired with it.
 
 A **treaty partner** builds a partner-side `WriterLineage` for this community
-the same way, without holding the chain: its root is the writer key of the
-pinned profile (ADR-0029 §2), and its succession records are the carried
-`rrn.gov.succession` records it accepted under §7, with `at_seq` boundaries read
-on this community's seq space as carried in checkpoints and federation records.
-ADR-0029 §4 (federation ingest) and ADR-0032 §2 (history verification) pin
-foreign station-signed records to that lineage's `writer_at`, never to a single
-static key.
+the same way, without holding the chain — and derives it **from its own log on
+replay**, never from its directory cache: its root is the writer key in the
+partner's own station-signed `rrn.fed.partner_pin` record for this community
+(ADR-0029 §2, appended at first pin), and its succession records are the
+foreign `rrn.gov.succession` records the partner admitted to its own log under
+§7, each in the same `LogBatch` as a fresh `partner_pin` for the new key. The
+`at_seq` boundaries are read on this community's seq space, which every
+writer-signed federation record now carries as `home_seq` (ADR-0029 §4) and
+every checkpoint carries as `seq`; the partner pins a carried record to
+`writer_at(home_seq)`. A succession record reaches a partner only through the
+routing carve-out ADR-0030 defines in its lifecycle section (§6): it is the
+position-0 entry of a *fresh* per-partner federation outbox chain authored by
+the new key — the successor's federation outbox toward every partner restarts
+at position 0 under the new key, and the old key's chain simply ends. ADR-0029
+§4 (federation ingest) and ADR-0032 §2 (history verification) pin foreign
+station-signed records to that lineage's `writer_at`, never to a single static
+key; a replica or restored partner station re-derives every partner lineage
+from its own chain.
 
 ### 6. Devices re-pair with the successor — a human step
 
@@ -321,7 +375,9 @@ A partner station holds this community's last pinned profile (ADR-0029 §2),
 including `successor`. On receiving a `rrn.gov.succession` in a federation
 bundle it accepts the new writer key — re-pinning the directory entry and the
 treaty's expected writer — **iff** `new_writer` equals the `successor` of the
-pinned profile. Otherwise every treaty with that community moves to
+pinned profile. If the record verifies against the pinned lineage
+(`previous_writer`, `at_hash`, co-sign evidence) but `new_writer` is **not** that
+`successor`, every treaty with that community moves to
 `Suspended("writer-unverified")` — an evidence suspension in the ADR-0030
 lifecycle that is lifted **only** by the suspending partner's own
 `ProposalKind::TreatyResume` (statute bar), after its operator has confirmed the
@@ -329,6 +385,20 @@ change out of band; it never lifts automatically and never on this community's
 say-so. A partner cannot verify the electorate count behind an activation
 (it holds no copy of the chain), so it verifies the one fact it does hold: that
 the community named this key in advance.
+
+That fact is only as good as the profile that carries it, and the profile is
+signed by the *old* writer key — the key a seizure hands to the attacker. A
+seized key could sign a profile naming the attacker's own key as `successor`,
+push it, and then "succeed" in every partner's eyes with no member vote. So a
+profile that **changes `successor`** relative to the one the partner has
+pinned is **not applied on arrival**: the partner stores it as unverified and
+applies the new `successor` only after its operator confirms the change out of
+band (`rrn federation confirm-successor <community> <address>`, the same human
+posture as lifting `writer-unverified`). A profile that leaves `successor`
+unchanged updates freely. The residual is stated: a seized writer key can
+*attempt* to redirect partner pins, and until humans talk it can act as the
+community toward partners that have not yet confirmed — bounded by
+`credit_limit_centi` per treaty and by the confirmation step.
 
 ### 8. Encrypted profiles, backups, and a recovered old key
 
@@ -405,7 +475,9 @@ the community named this key in advance.
   outboxes, exposure bounded by per-door floors); orphaned records and the
   latency they incur; a restored old station starting as a writer of a dead
   branch (§8); a stolen replica key attempting to capture devices or partners
-  (§6, §7).
+  (§6, §7); a seized *writer* key redirecting partner pins through a forged
+  `successor` (§7, held for human confirmation); void dead-branch certificates
+  and orphaned partner-side records (§4).
 
 ## Alternatives Considered
 
@@ -417,7 +489,8 @@ the community named this key in advance.
   new key, then stops). Rejected as the *only* mechanism because it does not cover
   seizure or destruction, which are the cases that matter. It is retained as the
   degenerate case of this design: `station demote --successor` on a live writer,
-  after a designation, is a planned hand-over with the activation bar still met by
+  after a designation, freezes the tail first, and members then activate against
+  that frozen tail — a planned hand-over with the activation bar still met by
   members, not by the operator alone.
 - **Multiple co-equal writers with automatic election** (Raft-style leadership).
   Rejected by ADR-0020 for the ledger layer and not reopened: the design overview's
@@ -455,8 +528,11 @@ the community named this key in advance.
   — devices pin the station key at pairing; re-anchoring the outbox head
 - [ADR-0012](0012-charter-format-and-amendments.md), [ADR-0015](0015-electorate-bootstrap-grace.md)
   — the electorate the activation counts
+- [ADR-0021](0021-escrowed-offline-spending-certificates.md) — why a dead-branch
+  certificate strands its receiver (§4)
 - [ADR-0029](0029-federation-identity-profiles-and-carriage.md) — profiles carry
-  `successor`; partners pin the writer key
+  `successor`; partners pin the writer key on their own log (`rrn.fed.partner_pin`)
+  and read `home_seq` on carried records
 - [ADR-0030](0030-treaties-ratification-depth-lifecycle.md) — the
   `Suspended("writer-unverified")` treaty state
 - [ADR-0031](0031-cross-community-credit-treaty-accounts.md) — why a frozen home

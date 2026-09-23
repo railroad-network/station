@@ -2,16 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification before
-> any Phase 3 implementation ticket is written. Maintainer decisions it encodes are
-> marked **(maintainer decision, 2026-09-23)**. Part of the federation ADR set
-> (0029–0036); the shared vocabulary — `CommunityId`, `TreatyId`, "home", "foreign",
-> the federation outbox, payload-kind tags — is defined in
-> [ADR-0029](0029-federation-identity-profiles-and-carriage.md) and used here unchanged.
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: cross-community validation is attested by a quorum of the validator community's established members (`rrn.oracle.validation_attest`) rather than decided by one operator; the Tier ≥ 3 gate applies on every transition into `Settled`; suspended-treaty and equivocating-validator cases are stated.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -62,7 +64,9 @@ the absolute amount, and opt-up is still upward only (ADR-0011).
 member-signed evidence kinds (an artifact reference and a witness attestation), a
 settle-or-cancel rule evaluated by the settlement sweep at the end of a
 tier-specific window, and — for Tier 4 only — a governance approval proposal plus
-a station-signed validation from a neutral Recognition-depth treaty partner.
+a validation from a neutral Recognition-depth treaty partner, attested by at
+least two of that partner's established members and merely carried by its
+writer.
 Anything above Tier 4 stays refused. Artifacts are hash-anchored records whose
 bytes live off-log; witnesses are established members under a derived stake gate
 and party/voucher recusal; the windows read the admission clock; a transaction
@@ -103,8 +107,9 @@ otherwise); a transaction admits at most **8** artifact records
 admitted only while the transaction is `Proposed`, `Confirmed`, or `Disputed`.
 
 The bytes travel as DTN payload kind **`0x04` Artifact** (ADR-0029 §6) — the
-tag byte, then the raw blob — and over the member channel as a new `POST
-/artifact` route gated like `/bundle`. They are stored in **`artifact_blobs`**, a
+tag byte, then the raw blob — and over the member channel as a new
+`artifact_submit` method on the sealed `/rpc` channel, gated exactly like
+`bundle_submit` (there is no separate route). They are stored in **`artifact_blobs`**, a
 station-local content-addressed table (`blob_hash BLOB PK, media_type, size,
 bytes BLOB, first_seen_at INTEGER, last_referenced_at INTEGER`), documented as
 evidence storage, never a log record. Bounds: a blob is refused if it exceeds
@@ -139,8 +144,10 @@ A new member-signed kind in `rrn-ledger::oracle`:
 | `witnessed_at` | `i64` | testimony |
 
 Admission rules, all evaluated **as of the transaction proposal's admission
-position** (`*_asof` readers, ADR-0022 §5), so a witness cannot be manufactured
-after the fact:
+position and instant on the judging log** — `*_asof(at_time = the proposal's
+admission instant, max_seq = its seq, station = writer_at(seq))`, ADR-0022 §5 —
+so a witness cannot be manufactured after the fact and every replica derives the
+same answer:
 
 1. **Established.** The witness's anchored composite standing is ≥ `BAND_MEMBER_MIN`
    (2.0) at that position — the same bar the electorate and the jury pool use.
@@ -175,6 +182,13 @@ Tier 3, at window end (home station's admission clock):
   valid witness records       <  3   → Cancelled(WitnessQuorumNotMet)
   otherwise                           → Settled   (station-signed rrn.tx.settlement, unchanged shape)
 ```
+
+The gate is a property of the **transition**, not of the sweep that usually runs
+it: for a Tier ≥ 3 transaction it is evaluated on *every* path into `Settled`,
+including `Disputed → Settled` after a dispute lapses or is rejected (ADR-0014
+§6). A lapsed dispute never lets a Tier-3 transaction settle with fewer than
+three witnesses; if the requirements are unmet when the freeze lifts, the
+cancellation reason above applies at that transition.
 
 `CancelReason` gains **four** variants here — `ArtifactRequired`,
 `WitnessQuorumNotMet`, `ApprovalNotMet`, and `ValidationNotMet` (the last two for
@@ -232,33 +246,71 @@ at the proposal's admission position, hold an **Active Recognition-depth treaty*
 with the receiver's community too. It must not be the home of either party
 (`validator-not-neutral`). The home writer carries the proposal, its artifact and
 witness records, and the blobs it holds to the validator in the federation outbox
-(ADR-0029); the validator answers with a writer-signed record:
+(ADR-0029). The validator's answer is **a statement of its members, carried by
+its writer — never an operator's click.** A transfer of 500 Commons or more must
+not hinge on one person at one keyboard (the "administrator clicked a button"
+posture ADR-0030 §4 rejects for treaties), and a seized validator writer key
+(ADR-0024, ADR-0035) must not be able to manufacture a verdict on its own. So a
+verdict is built from a new member-signed kind in `rrn-ledger::oracle`:
+
+| `rrn.oracle.validation_attest` field | type | meaning |
+|---|---|---|
+| `tx_id` | `TransactionId` | the transaction examined |
+| `home_community` | `CommunityId` | where the transaction lives |
+| `attestor` | `Address` | the signer; must equal the envelope signer; an established member of the validator community at the attestation's admission position on the validator's log |
+| `checked` | `{ witness_history_roots: [Hash], artifact_blobs: [Hash] }` | the `HistoryRoot` hashes of the witness histories and the `blob_hash`es the attestor actually examined — the audit trail the validator community's own members can check |
+| `verdict` | `"valid"` \| `"invalid"` | the attestor's judgment |
+| `reason?` | `String` (≤ 280) | required when `invalid` |
+| `attested_at` | `i64` | testimony |
+
+Attestors are recused if they appear as vouchers in either party's recognized
+history (the ADR-0014 §2 collusion edge, applied across the boundary; there is
+no party-recusal to apply — the parties are foreign by construction). A
+validation attestation is admitted to the **validator's own log** first, under
+the validator writer's standing check; the writer then assembles the envelope:
 
 | `rrn.fed.validation` field | type | meaning |
 |---|---|---|
 | `tx_id` | `TransactionId` | the transaction validated |
 | `home_community` | `CommunityId` | where the transaction lives |
 | `validator` | `CommunityId` | the answering community (must equal the signer's pinned community) |
-| `verdict` | `"valid"` \| `"invalid"` | the validator's judgment |
+| `verdict` | `"valid"` \| `"invalid"` | the community's judgment |
+| `attestations` | `[bytes]` (≥ 2) | the canonical signed `rrn.oracle.validation_attest` records, each from a distinct attestor, each agreeing with `verdict` |
 | `reason?` | `String` (≤ 280) | required when `invalid` |
+| `home_seq` | `u64` | the validator's own log seq at which this record is appended (ADR-0029 §4: the pin input) |
 | `validated_at` | `i64` | testimony |
 
-What the validator station checks before its operator (or, later, its own
-tribunal) signs: the proposal's and confirmation's signatures against the
-parties' addresses; that every witness record verifies and that each witness's
-**recognized standing** — obtained through the ADR-0032 portable-history path
-from the witness's home writer, never taken from the home station's say-so —
-meets the established bar at the recorded position; that the artifact records
-verify and that it holds the blobs they name — a validator missing a blob does
-**not** guess: it sends the home writer one re-carriage request for the missing
+The home log admits the envelope as a foreign record under the ADR-0029 pinning
+rules — the writer signature pinned to `writer_at(home_seq)` on the validator's
+partner-side lineage — **and** re-verifies each embedded attestation's signature
+and distinctness; an envelope with fewer than two agreeing attestations, or one
+whose attestations disagree with its `verdict`, is refused `validation-quorum`.
+The writer is therefore a *carrier* of its members' judgment: it can withhold a
+verdict (a stated residual — a seized or hostile validator writer key delays,
+and delay cancels at the window; the remedy is naming a different validator on a
+fresh proposal), but it cannot invent one.
+
+What an attestor checks, on the validator station's evidence view: the
+proposal's and confirmation's signatures against the parties' addresses; that
+every witness record verifies and that each witness's **recognized standing** —
+obtained through the ADR-0032 portable-history path from the witness's home
+writer, never taken from the home station's say-so — meets the established bar
+at the recorded position; that the artifact records verify and that the station
+holds the blobs they name — a validator missing a blob does **not** guess: the
+station sends the home writer one re-carriage request for the missing
 `blob_hash` (slug `artifact-unavailable`, a request rather than a verdict) and
-answers `invalid` with reason `artifact-unavailable` only if the blob is still
-absent after `[oracle] artifact_recarriage_secs` (default **7 days**) on the
-validator's own clock; and its own independence per the neutrality rule. The verdict is the validator community's
-statement, signed by its writer key and admitted on the home log as a foreign
-record under the ADR-0029 pinning rules. One `valid` verdict suffices; an
-`invalid` verdict admitted before the window ends is terminal
-(`Cancelled(ValidationNotMet)` at the next sweep, without waiting).
+an attestor answers `invalid` with reason `artifact-unavailable` only if the
+blob is still absent after `[oracle] artifact_recarriage_secs` (default **7
+days**) on the validator's own clock; and the community's own independence per
+the neutrality rule. One `valid` envelope suffices; an `invalid` envelope
+admitted before the window ends is terminal (`Cancelled(ValidationNotMet)` at
+the next sweep, without waiting). Two contradictory envelopes from one validator
+are its equivocation against the treaty (ADR-0030): the **first admitted** is
+terminal and the later one is `known`, never a reversal. An envelope arriving
+while the home↔validator treaty is `Suspended` is refused under ADR-0030 §10 like
+any other record from a suspended partner, and the transaction then cancels
+`ValidationNotMet` at the window's end unless a fresh, admissible one lands
+first.
 
 **The Tier-4 window.** `W4` is computed **from the effective charter at the
 confirmation's admission**: `deliberation_window_days + implementation_delay_days`
@@ -279,12 +331,21 @@ Tier 4, at window end:
 The order is fixed so the recorded reason is deterministic; the first unmet
 requirement names the cancellation.
 
+One race is noted rather than solved: `W4` is read from the charter at the
+*confirmation's* admission, while the `TransactionApproval` proposal's own
+window is read from the charter at *its* admission (`window_for`). A charter
+amendment that lengthens the statute process between the two can make `W4`
+end before the approval can complete, cancelling `ApprovalNotMet` through no
+fault of the parties. The parties re-propose; a station may warn when the two
+readings differ.
+
 ### 7. Cross-community Tier 3 and 4
 
 A cross-community transaction (ADR-0031: `receiver_community` present) at Tier 3
 or 4 follows the ADR-0031 prepare/commit flow with the evidence rule layered on
 the **home** (paying) log, which is authoritative for the outcome; the receiver's
-log mirrors by admitting the home's commit or abort, and an unmet requirement
+log mirrors by admitting the home's **terminal** record — its
+`rrn.fed.settlement{export}` or its abort — and an unmet requirement
 surfaces as an `rrn.fed.abort` whose `reason` names it — `"artifact-required"`,
 `"witness-quorum"`, `"approval-not-met"`, or `"validation-failed"` (the ADR-0031
 §4 enum) — which the receiver mirrors as `Cancelled(FedAborted)`.
@@ -293,8 +354,12 @@ surfaces as an `rrn.fed.abort` whose `reason` names it — `"artifact-required"`
 runs, on the home clock, a window of `max(treaty.settlement_window_secs, tier
 window)` — the tier window being `W3` or the charter-derived `W4` of §4/§6 — so
 the treaty's own settlement term can lengthen but never shorten the evidence
-window. The receiver mirrors as ADR-0031 §9 describes: its window starts at its
-own admission of the home's final commit and never gates evidence.
+window. The receiver mirrors as ADR-0031 §9 describes: it appends its own
+`rrn.fed.settlement{import}` only on admission of the home's
+`rrn.fed.settlement{export}` — never on a window of its own run from the commit
+— so no evidence gate, dispute, or arbitration outcome on the home side can be
+outrun by the receiver's clock. Any window the receiver shows is a display
+estimate.
 
 Witnesses may be members of **either** party's community. Each witness record is
 admitted first by the witness's *home* writer, which applies §3's rules against
@@ -332,7 +397,11 @@ adds **one input and no constants**:
 > approval, validation, expiry, withdrawal) is neither — it is not scored.
 
 Weights, dimensions, decay, velocity, bands, and anchoring are untouched; the
-`ScoringContext` single-replay derivation extends to the new kind. This is the
+`ScoringContext` single-replay derivation extends to the new kind. A residual
+follows from "accurate on `Settled`": a friend circle can farm attestation
+*volume* by opting up micro-trades to Tier 3 and witnessing each other. ADR-0009's
+velocity limit (0.5 per dimension per week) bounds what that buys, exactly as it
+bounds confirmation-volume farming today; it is stated, not solved. This is the
 "fraud-finding mechanism" ADR-0009 said Phase 1 lacked, arriving where the
 overview put it: at Tier 3.
 
@@ -355,8 +424,10 @@ forum changes. A tribunal that upholds the dispute voids the transfer and, per
   station-local evidence store; a station can lose every blob and derive the
   identical ledger. The cost is that artifact evidence is best-effort for a
   replica or a distant validator — stated, not hidden.
-- **Two new member-signed kinds and one new station-signed kind**, each with a
-  discriminator, a dCBOR fixture, and a threat-model section; `CancelReason` gains
+- **Three new member-signed kinds (`rrn.oracle.artifact`, `rrn.oracle.witness`,
+  `rrn.oracle.validation_attest`) and one new station-signed kind
+  (`rrn.fed.validation`)**, each with a discriminator, a dCBOR fixture, and a
+  threat-model section; `CancelReason` gains
   four variants here (five across the set with ADR-0031's `FedAborted`; additive
   to a station-signed record, so replay of old logs is unaffected). `TransactionProposal` gains one additive optional field.
 - **Windows lengthen with the tier.** Seven days is the honest price of gathering
@@ -368,7 +439,8 @@ forum changes. A tribunal that upholds the dispute voids the transfer and, per
 - **Mobile and CLI surfaces.** The phone and `rrn wallet` gain "add evidence" and
   "witness this" signing paths (FFI: `artifact_record_sign`, `witness_sign`; blob
   upload over the member channel); the operator console gains
-  `rrn oracle validate` for a validator station. The mobile repo receives fixtures
+  `rrn oracle validate` (which shows the evidence view and collects the members'
+  attestations) for a validator station. The mobile repo receives fixtures
   and a handoff note.
 - **Threat-model obligations** (`rrn-ledger::oracle` section, same PR): witness
   collusion (three colluders must all be established and unrecused, and each stakes
@@ -378,9 +450,11 @@ forum changes. A tribunal that upholds the dispute voids the transfer and, per
   *misleading* artifact is a witness/tribunal question, not a crypto one); blob DoS
   (per-record size cap, per-transaction record cap, store cap, prune sweep,
   member-channel gate; residual: no per-member rate limit, as everywhere);
-  validator capture (neutrality rule, Recognition-only, treaty suspension as the
-  remedy; residual: a validator that answers `valid` carelessly is accountable only
-  through its treaty).
+  validator capture (neutrality rule, Recognition-only, a two-attestor member
+  quorum with an audit trail so no operator can sign a verdict alone, treaty
+  suspension as the remedy; residuals: a validator writer key can *withhold* a
+  verdict, and a validator community whose members attest carelessly is
+  accountable only through its treaty).
 
 ## Alternatives Considered
 
@@ -424,7 +498,8 @@ forum changes. A tribunal that upholds the dispute voids the transfer and, per
 - [ADR-0030](0030-treaties-ratification-depth-lifecycle.md) — Recognition depth, treaty state, partner
   accountability
 - [ADR-0031](0031-cross-community-credit-treaty-accounts.md) — the prepare/commit flow this rule
-  layers on; the `abort` reason enum (`artifact-required`, `witness-quorum`,
+  layers on, and §9's rule that the receiver settles only on the home's terminal
+  `settlement{export}`; the `abort` reason enum (`artifact-required`, `witness-quorum`,
   `approval-not-met`, `validation-failed`) and `CancelReason::FedAborted`
 - [ADR-0032](0032-recognition-portable-standing-cross-community-marketplace.md) — the
   portable-history path a validator uses to verify foreign witnesses

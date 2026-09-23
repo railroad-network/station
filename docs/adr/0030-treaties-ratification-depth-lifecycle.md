@@ -2,17 +2,18 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-09-23 (the maintainer delegated the ratification
+review to a Fable 5.1 reviewer, which returned ACCEPT-WITH-CHANGES for the set of
+eight; the changes are folded in — see the ratification note below)
 
 Date: 2026-09-23
 
-> **Human-review checkpoint.** Drafted by Fable 5.1 for maintainer ratification
-> before any Phase 3 implementation ticket is written. Maintainer decisions it
-> encodes are marked **(maintainer decision, 2026-09-23)**. It depends on
-> [ADR-0029](0029-federation-identity-profiles-and-carriage.md) for the vocabulary
-> (`CommunityId`, writer key, federation outbox, checkpoints, directory) and is
-> depended on by ADR-0031 (credit), ADR-0032 (recognition), ADR-0033 (Tier 4
-> validation), ADR-0034 (arbitration forum), and ADR-0035 (succession).
+> **Ratification note (2026-09-23).** Drafted by Fable 5.1 against the maintainer's
+> scope decisions of 2026-09-23 (marked **(maintainer decision, 2026-09-23)** below),
+> reconciled across the eight-ADR set, then reviewed for ratification by an
+> independent Fable 5.1 reviewer at the maintainer's delegation. The review's
+> findings folded into this ADR: a `PartnerAccepted` state for partner-first acceptance; the succession routing carve-out so a successor's first entry can be evaluated; the true convergence bound; the checkpoint-rollback row follows ADR-0029's structural rule.
+> Implementation tickets are written against this ratified text.
 
 ## Context
 
@@ -124,7 +125,7 @@ the overview §8.4 ladder and no more:
 
 | depth | grants |
 |---|---|
-| `trade` | cross-community payments up to `credit_limit_centi` (ADR-0031); `federation_visible` listings and needs visible across the boundary when `listing_visibility` is set (ADR-0032); transaction disputes at the forum (ADR-0034). No identity or standing crosses. |
+| `trade` | cross-community payments up to `credit_limit_centi` (ADR-0031); `federation_visible` listings and needs visible across the boundary when `listing_visibility` is set (ADR-0032); transaction disputes at the forum, if the treaty names one that is Recognition-partnered with both parties (ADR-0034 §7). No identity or standing crosses. |
 | `recognition` | everything in `trade`, plus: the partner's writer-signed portable reputation histories are verified and scored locally (ADR-0032); vouches inside such a history count as anchoring in that foreign replay; a Recognition partner may act as a Tier-4 validator (ADR-0033) and, when named as `forum`, as an arbitration venue (ADR-0034). |
 
 Alliance and Full Federation are **deferred to Phase 4**. Their content —
@@ -183,6 +184,7 @@ the writer appends to its own log a station-signed **`rrn.fed.treaty_acceptance`
 | `tally` | map | `{ yes: u32, no: u32, abstain: u32, electorate: u32 }` as computed by `tally::tally` at implementation |
 | `charter_hash` | Hash | the accepting community's *current* charter hash at acceptance — the lineage pin the partner holds (§7) |
 | `accepted_at` | i64 | the writer's admission clock at implementation |
+| `home_seq` | u64 | the issuer's own log seq at which this record is appended (known at signing under the single-writer lock; appended in the same `LogBatch`). Every writer-signed federation record carries it; the partner pins the record to `writer_at(home_seq)` on its partner-side lineage (ADR-0029 §4) |
 
 The acceptance is then carried to the partner in the federation outbox
 (ADR-0029 §3) and admitted there as a foreign record, pinned to the partner's
@@ -219,7 +221,22 @@ trust model is honest about where the trust lives.
 A treaty is **Active on a given log** when that log holds both parties'
 `rrn.fed.treaty_acceptance` records for the same `treaty_id`: its own (appended
 at implementation) and the partner's (admitted as a foreign record). The state
-is derived per log by replay; there is no activation record.
+is derived per log by replay; there is no activation record. On replay the
+partner's acceptance is pinned to the partner-side `WriterLineage` derived from
+this log's own station-signed `rrn.fed.partner_pin` records and the admitted
+foreign `rrn.gov.succession` records that precede it (ADR-0029 §4, ADR-0035 §5)
+— never from the directory cache, so a replica or a station restored from
+backup re-derives every Active treaty from its log alone.
+
+Our own acceptance is admitted only if our `CommunityId ∈ treaty.parties`; a
+proposal carrying a treaty we are not party to passes or fails as a vote but
+produces no acceptance.
+
+Order does not matter. Pre-treaty routing (ADR-0029 §4) admits the partner's
+acceptance whether or not ours exists yet, so the derived state before `Active`
+is one of two: **`Proposed`** — our acceptance only — or **`PartnerAccepted`** —
+the partner's only. Either becomes `Active` when the other acceptance is
+admitted.
 
 Consequences of "per log":
 
@@ -234,7 +251,7 @@ Consequences of "per log":
   the same log derives the same state at every position (ADR-0020).
 - Before a treaty is Active, the only foreign records a station admits from
   that partner are the ADR-0029 pre-treaty kinds (profile, charter lineage,
-  hello, this acceptance).
+  hello, this acceptance, and the cache-only leading checkpoint).
 
 ### 6. Lifecycle and state machine
 
@@ -242,10 +259,12 @@ The derived state of a treaty on a log:
 
 ```
                  own acceptance admitted
-   (none) ─────────────────────────────────► Proposed
-                                                │
-                       partner acceptance admitted
-                                                ▼
+   (none) ─────────────────────────────────► Proposed ──────────┐
+      │                                                          │ partner
+      │ partner acceptance admitted                              │ acceptance
+      └──────────────────────────────────► PartnerAccepted ──────┤ admitted /
+                                                                 │ own acceptance
+                                                                 ▼ admitted
                                              Active ◄────────────────────────┐
                                                 │                             │
       ┌─────────────────────────────────────────┼──────────────────┐          │
@@ -290,7 +309,7 @@ omitted; `evidence` carries the proof bytes; `reason` is one of:
 | reason | evidence | source |
 |---|---|---|
 | `"partner-fork"` | two valid partner federation-outbox entries at one position with different `entry_hash` | ADR-0029 §3 (outbox fork = writer equivocation), detected by the existing DTN fork tracking on ingest |
-| `"partner-rollback"` | two partner-signed checkpoints at one `seq` with different `content_hash`, or a later-`issued_at` checkpoint with a lower `seq` | ADR-0029 §5 `rrn.fed.checkpoint` |
+| `"partner-rollback"` | two partner-signed checkpoints at one `seq` with different `content_hash`, or — within the partner's federation-outbox chain — a checkpoint at a **higher outbox position** carrying a **lower `seq`** than an earlier one; the ordering is structural (outbox position), and the checkpoint's `issued_at` is display only, never compared | ADR-0029 §5 `rrn.fed.checkpoint` |
 | `"charter-reroot"` | a partner profile whose `charter_hash` has no `previous_hash` lineage back to the `charter_hash` in the partner's acceptance | §7 |
 | `"expired-checkpoint"` | `now − received_at > checkpoint_ttl_secs` (default 90 d), where `received_at` is **our** admission-clock instant of the last partner checkpoint we stored — the partner's `issued_at` is testimony and never enters this comparison (ADR-0029 §8) — while cross-community records are pending | ADR-0029 §5; a liveness guard so a dead partner's pending prepares do not hold the position open forever |
 | `"writer-unverified"` | a `rrn.gov.succession` record signed by a key that is not the `successor` named in the partner profile we have pinned (ADR-0035 §7); a *profile* from an unpinned key is silently refused per ADR-0029 §2 and suspends nothing | ADR-0029 §2 (TOFU-then-pin), ADR-0035 §7 |
@@ -307,6 +326,23 @@ ADR-0031 pending-exposure accounting cannot be pinned open by a partner that
 vanished. The second is proof of an *unverified* change of writer — a succession
 we cannot check against the pin — and it holds the treaty until a human has
 verified the new writer out of band. Both are lifted by rules of their own (§6.3).
+
+How a succession record reaches that check at all needs one carve-out in the
+ADR-0029 §4 routing rule, because a succession arrives in an outbox chain
+*authored by the new key*, which the rule would otherwise refuse
+`fed-writer-unpinned` before any succession logic runs. The carve-out: an outbox
+entry from an unknown `author`, at position 0 of a fresh chain, carrying exactly
+one `rrn.gov.succession` whose `previous_writer` equals the writer we have
+pinned for that community, is dispatched to succession verification (ADR-0029
+§4, ADR-0035 §7). If the record verifies
+(`previous_writer` and `at_hash` match our pinned lineage) *and* `new_writer`
+equals the pinned `successor`, the pin advances — a `rrn.fed.partner_pin` is
+appended with it — and the new key's per-partner chain continues from that
+position-0 entry. If it verifies but `new_writer` is **not** the pinned
+`successor`, that is the `"writer-unverified"` evidence above. If it does not
+verify, or comes from any other unpinned key, it is refused `fed-writer-unpinned`
+and **nothing is suspended**: a stranger with a fresh key cannot grief a treaty
+into `Suspended`.
 
 #### 6.3 Resumption rules
 
@@ -347,7 +383,9 @@ hash equals the pinned genesis `CommunityId`, every `previous_hash` links to
 the hash before it, and the last hash equals the profile's `charter_hash`.
 
 - **Lineage intact** (every link is a `version + 1` with `previous_hash` equal
-  to the prior hash): the treaty is unchanged. The pin advances to the new hash.
+  to the prior hash): the treaty is unchanged. The *working* pin — the hash held in the directory
+  cache beside the profile — advances to the new hash; the on-log pin stays the
+  acceptance's `charter_hash`, and the walk always starts from it.
   A community amending its own constitution under its own rules is "the same
   community evolving" (overview §8.3).
 - **No lineage** (a charter whose chain does not reach the pinned hash — a
@@ -418,11 +456,21 @@ appeal).
 log, that station admits no new `rrn.fed.prepare` for the treaty and refuses
 incoming prepares (slug `fed-treaty-inactive`). Cross-community transactions
 already past the home writer's final `rrn.fed.commit` continue to their
-settlement on both logs — the credit was committed under an Active treaty and
-un-committing it would be a clawback. Transactions still in `Proposed`/prepared
-state abort at home on their prepare expiry (`abort("expired")`) as they would
-have anyway. So the treaty position converges to a fixed number on both logs
-within `prepare_ttl_secs + settlement_window_secs` of the freeze.
+outcome on both logs — the credit was committed under an Active treaty and
+un-committing it would be a clawback. The counterparty settles its side only
+on admission of the home's terminal `rrn.fed.settlement{export}` (ADR-0031 §9),
+never on a window of its own run from the commit, so the two logs cannot land
+on different outcomes for one transaction. Transactions still in
+`Proposed`/prepared state abort at home on their prepare expiry
+(`abort("expired")`) as they would have anyway. So the treaty position
+converges to a fixed number on both logs, but only once every in-flight
+transaction has reached its terminal record at home and that record has been
+carried: the bound is `prepare_ttl_secs + settlement_window_secs` plus, for a
+disputed transaction, the dispute window (14 d), the tribunal window
+(`tribunal_window_secs`, 21 d) and the home's `arbitration_wait_secs` (45 d)
+(ADR-0034), plus carriage in each direction. A frozen treaty with an open
+arbitration can therefore take months to reach its final position; the
+position is never *wrong* in the meantime, only not yet final.
 
 **Nothing nets.** The overview says an expelled community's "credit balances
 [are] settled per treaty terms." Phase 3 defines no settlement-of-position
@@ -559,5 +607,3 @@ identity, and standing on their home log are untouched (overview §8.7,
 - Design overview §2.5.1 (right to appeal), §8.1–8.4 (federation as protocol,
   handshake, profile, treaty depths), §8.7 (sanctions; innocent members), §12
   Phase 3 / Phase 4 deliverables
-- Auto-memory `phase3-planning-decisions` — the maintainer decisions of
-  2026-09-23 this ADR encodes
