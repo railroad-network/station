@@ -34,7 +34,7 @@ jury revealed that an equivocation case is **not** "a dispute like any other":
 
 `JurorVerdict.proposal_id` is inside a signed, mobile-verified payload, so it
 cannot be re-typed without breaking a shipped wire format — which rules out
-generalizing ADR-0014's records in place. Per repo convention (CLAUDE.md), a
+generalizing ADR-0014's records in place. Per repository convention, a
 decision that deviates from a locked ADR gets its own ADR rather than an implicit
 change in code review; this is that ADR.
 

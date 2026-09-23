@@ -108,5 +108,5 @@ internally).
 - [ADR-0002](0002-canonical-serialization-dcbor.md) — why a signed address is
   raw CBOR bytes, not the bech32 text form
 - `docs/threat-model.md` — `rrn-identity` (Tampering: address typos / wrong-HRP)
-- `CLAUDE.md` — Locked technical decisions table (address format: bech32m, HRP
+- Repository conventions — locked technical decisions table (address format: bech32m, HRP
   `rrn`)

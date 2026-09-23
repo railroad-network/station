@@ -348,7 +348,7 @@ pub struct AdmissionTimes {
 /// A point-in-time view of every transaction, derived by replaying the log.
 ///
 /// Replay is the only way to learn a transaction's state: the log is the source
-/// of truth (CLAUDE.md), so [`Engine`](crate::engine::Engine) and
+/// of truth (repository convention), so [`Engine`](crate::engine::Engine) and
 /// [`Settler`](crate::settlement::Settler) both build a snapshot on demand
 /// rather than trusting a mutable cache. Phase 0 logs are small, so a full
 /// replay per operation is fine.
@@ -479,7 +479,7 @@ impl LedgerSnapshot {
     /// and lifts no penalty) and the genuine record still applies.
     fn apply(&mut self, entry: &LogEntry, station: &PublicKey) -> Result<()> {
         // Parse the entry once and dispatch on the `kind` discriminator every
-        // signed record carries (CLAUDE.md "Signed payloads"), instead of
+        // signed record carries (repository convention "Signed payloads"), instead of
         // trial-decoding each record type in turn — each of which would re-run
         // the depth pre-scan and a full dCBOR parse only to fail on its own
         // `kind` check. A malformed entry, or one with no string `kind`, is an

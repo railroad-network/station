@@ -6,7 +6,7 @@
 # first exec on macOS — a fresh binary execs in < 1 s from any other
 # directory, so the cause is that directory's accumulated size, not the
 # binaries. Keep target/ trimmed to keep local test runs fast. See the
-# "Local build hygiene" note in CLAUDE.md.
+# "Local build hygiene" note in the repository conventions.
 #
 #   scripts/target-hygiene.sh           report du + deps entry count
 #   scripts/target-hygiene.sh --sweep   also run `cargo sweep --time 14`
@@ -32,7 +32,7 @@ if [ -d "$TARGET/debug/deps" ]; then
   count="$(/bin/ls -fU "$TARGET/debug/deps" 2>/dev/null | grep -cv '^\.\{1,2\}$' || true)"
   echo "debug/deps entries: $count"
   if [ "${count:-0}" -gt 300000 ]; then
-    echo "  warning: debug/deps is large; a fresh test binary may stall on first exec (see CLAUDE.md 'Local build hygiene')."
+    echo "  warning: debug/deps is large; a fresh test binary may stall on first exec (see the repository's 'Local build hygiene' note)."
     echo "  run: scripts/target-hygiene.sh --sweep   (or: cargo clean)"
   fi
 fi
