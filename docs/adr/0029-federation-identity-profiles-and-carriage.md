@@ -61,7 +61,7 @@ The forces:
   expiry.
 - **The Reticulum decision left one hard requirement open.** ADR-0026 §7 made
   propagation-node store-and-forward (LXMF `PROPAGATED`) an explicit acceptance
-  criterion that T2.6.2 then deferred; the transport today does DIRECT delivery
+  criterion that the shipped transport then deferred; the transport today does DIRECT delivery
   only. ADR-0013's "conductor pattern as a protocol primitive" ROI rides on the
   propagated path.
 
@@ -374,13 +374,13 @@ carriers ship in Phase 3; a treaty partner may be reached over any subset.
    …]` configures outbound TCP partners; the writer/replica role rule of
    ADR-0020 §7 is untouched — a *writer* may dial federation peers, because a
    federation exchange never pulls a chain, it submits bundles.
-2. **Reticulum, direct delivery.** Unchanged from T2.6.2/T2.6.4: the partner
+2. **Reticulum, direct delivery.** Unchanged from the shipped transport and outbound originator: the partner
    writer's `rrn.net.binding` (carried in its profile) resolves to a destination
    and the `DtnLoop` pushes bundles and correlates receipts.
 3. **Reticulum, propagation nodes — a hard requirement.** LXMF `PROPAGATED`
    delivery, so a federation bundle survives with *neither* station online — the
-   store-and-forward ADR-0026 §7 named as an acceptance criterion and T2.6.2
-   deferred. The implementing ticket settles the LXMF-stamp stance (ADR-0026 §7)
+   store-and-forward ADR-0026 §7 named as an acceptance criterion and the
+   shipped transport deferred. The implementing ticket settles the LXMF-stamp stance (ADR-0026 §7)
    and whether a station may *be* a propagation node; this ADR requires only that
    a bundle sent while the partner is unreachable is delivered when it is.
 4. **Conductor carriage — paper and USB.** A bundle whose entries are a
