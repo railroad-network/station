@@ -151,3 +151,9 @@ Concretely:
 - `crates/rrn-ledger/src/settlement.rs` (`find_eligible`),
   `crates/rrn-ledger/src/engine.rs` (admission checks),
   `crates/rrn-storage/src/log.rs` (`created_at`)
+- **Phase 3 cross-reference (added 2026-09-23).** The "reconsider at Phase 3" note
+  under Alternatives is answered by ADR-0029 §Cross-community time: each community's
+  station judges every window by its *own* admission clock; a partner station's
+  signed instants are testimony, and where two logs must agree on an outcome the
+  home log is authoritative and the other mirrors it. No time beacon is introduced.
+  This decision is unchanged.

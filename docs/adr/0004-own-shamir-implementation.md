@@ -166,5 +166,5 @@ to be investigated, not papered over with "our convention differs."
 - `crates/rrn-identity/src/recovery/` — the implementation this ADR governs.
 - `docs/threat-model.md` — `rrn-identity::recovery` (own-implementation risk;
   GF(256) table-lookup cache-timing).
-- `CLAUDE.md` — Locked technical decisions table (Shamir: own implementation
+- Repository conventions — locked technical decisions table (Shamir: own implementation
   over GF(256), Rijndael polynomial).

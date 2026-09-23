@@ -121,7 +121,7 @@ types not exposing float fields, not by the encoder.
 - dCBOR specification (Blockchain Commons) and the `dcbor` crate
   (<https://crates.io/crates/dcbor>)
 - [ADR-0001](0001-rust-workspace-and-dual-license.md) — audit-boundary posture
-- `CLAUDE.md` — Locked technical decisions table (canonical serialization:
+- Repository conventions — locked technical decisions table (canonical serialization:
   `dcbor`, fallback `cbor4ii`)
 - `crates/rrn-crypto/src/serialize.rs` — the wrapper this ADR governs
 - `docs/threat-model.md` — `rrn-crypto` (tampering / encoding determinism)

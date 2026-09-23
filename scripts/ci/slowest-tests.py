@@ -17,7 +17,7 @@ The per-test time is nextest's own per-test duration (one process per test)
 in the JUnit path, and libtest's `exec_time` in the `--tsv` path; both are
 close to the time spent inside the test and neither is a full-run wall-clock,
 which on macOS is dominated by a per-binary first-exec stall (see the build
-hygiene note in CLAUDE.md). stdlib only (xml.etree); no third-party deps, so
+hygiene note in the repository conventions). stdlib only (xml.etree); no third-party deps, so
 it runs anywhere python3 does.
 """
 

@@ -98,4 +98,4 @@ obligations on communities that adopt, fork, or self-host the software.
   (external cryptographic audit before real users)
 - Repository Strategy document — "Phase 0 — One repo", "What does NOT get its
   own repo", and "Locked names"
-- `CLAUDE.md` — Locked technical decisions table
+- Repository conventions — locked technical decisions table

@@ -12,7 +12,7 @@ A mutual-credit transaction in Railroad Network has a lifecycle:
 `Proposed → Confirmed → Settled` (or `→ Cancelled`). The append-only,
 hash-chained log (`rrn-storage::log`) is the source of truth: every transition
 is recorded as a log entry, and a transaction's current state is *derived* by
-replaying those entries (CLAUDE.md, "The log is the source of truth").
+replaying those entries (repository convention: "The log is the source of truth").
 
 The log only accepts **signed** entries: `AppendLog::append` takes a
 `SignedPayload<T>` and verifies the signature before writing. That is
@@ -104,7 +104,7 @@ anonymous log mutations.
 
 ## References
 
-- CLAUDE.md — "The log is the source of truth"; ledger overview
+- Repository conventions — "The log is the source of truth"; ledger overview
 - [ADR-0002](0002-canonical-serialization-dcbor.md) — canonical CBOR, which the
   signed records use
 - `crates/rrn-ledger/src/settlement.rs`, `crates/rrn-ledger/src/engine.rs`

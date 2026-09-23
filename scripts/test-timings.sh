@@ -11,7 +11,7 @@
 #   scripts/test-timings.sh libtest [cargo test args…]
 #       The nextest-free path, for hosts where nextest's `--list` stalls
 #       (macOS with a huge target/debug/deps — see the "Local build hygiene"
-#       note in CLAUDE.md; inside a sandbox nextest can hang indefinitely).
+#       note in the repository conventions; inside a sandbox nextest can hang indefinitely).
 #       Enumerates the test executables with `cargo test --no-run`, then runs
 #       each with libtest's own `--report-time --format=json`.
 #       `RUSTC_BOOTSTRAP=1` only unlocks libtest's flag parser at run time — it
