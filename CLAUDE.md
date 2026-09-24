@@ -275,6 +275,13 @@ via a pre-commit hook (`git config core.hooksPath .githooks`, set up by
 - **No Claude session links**: never put a `claude.ai/code/session_...` link in a PR
   description, commit message, or any file. The "Generated with Claude Code" attribution
   line is fine; the session URL below it is not — omit it.
+- **No AI-model or agent names in the repo**: never name a specific model or assistant
+  (e.g. Claude, Fable, Opus, Sonnet) or `CLAUDE.md` in source, comments, doc-comments,
+  ADRs, or docs; describe the process neutrally instead ("an AI model", "AI-assisted
+  review", "the maintainer delegated the review"). The "Generated with Claude Code"
+  attribution line and the `Co-Authored-By` trailer are the only allowed mentions. One
+  deliberate exception: `docs/security/audit-2026-08.md` names the model on its
+  "**Performed by:**" line as provenance for that security document — leave it.
 - **No ticket numbers in code**: never write ticket identifiers (e.g. `T2.1.4`, `T1.9.7b`)
   into source, comments, doc-comments, commit messages, or PR descriptions. Tickets are
   ephemeral and gitignored; the code must stand on its own. Cite the durable record instead
