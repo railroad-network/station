@@ -33,7 +33,7 @@
 //! effective-composite ≥ Member-band set that authors, co-signs, and votes —
 //! plus, while the community is in bootstrap grace, its genesis founders
 //! (ADR-0015). It is pinned at the proposal's **open log position** — the seq at
-//! which the station admitted the proposal (ADR-0022 §5, T2.1.3) — not at a
+//! which the station admitted the proposal (ADR-0022 §5) — not at a
 //! wall-clock instant. Pinning to the open *position* is what makes a concluded
 //! outcome **stable and replica-deterministic**: nothing admitted after the
 //! proposal opened can join its electorate, so back-dated reputation evidence
@@ -81,7 +81,7 @@ pub struct VoteTally {
     /// Ballots explicitly abstaining — turnout, but not decisive.
     pub abstain_count: u32,
     /// Established members eligible to vote, pinned at the proposal's open log
-    /// position (T2.1.3).
+    /// position.
     pub eligible_voters: u32,
     /// Whether participation reached the Charter's quorum for this kind.
     pub quorum_met: bool,
@@ -228,7 +228,7 @@ fn count_against(
 
     // The electorate: established members, plus the genesis founders while the
     // community is in bootstrap grace (ADR-0015). Pinned at the proposal's *open*
-    // log position (T2.1.3), so it is replica-deterministic and cannot be packed
+    // log position, so it is replica-deterministic and cannot be packed
     // by standing manufactured — even with a back-dated timestamp — after the
     // proposal opens. A concluded quorum stays stable on replay.
     let eligible =
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn a_back_dated_member_admitted_after_open_does_not_join_the_electorate() {
-        // The concluded-tally back-dating regression (T2.1.3 acceptance): a member
+        // The concluded-tally back-dating regression: a member
         // established by evidence admitted *after* a proposal opens must not enter
         // that proposal's electorate, even when the evidence's own timestamps are
         // back-dated to on/before the open (legal under ADR-0022 §3). Before the
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn two_replicas_replaying_the_same_log_agree_on_outcome_and_electorate() {
-        // Acceptance 1 (T2.1.3): a replica that admits the whole chain *late* — every
+        // Replica agreement: a replica that admits the whole chain *late* — every
         // entry re-stamped with a `created_at` well past the voting close — must
         // reach the same window, outcome, and electorate as the station that
         // admitted them in real time. Before windows/eligibility were read from the

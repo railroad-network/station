@@ -1,8 +1,8 @@
-//! Cross-platform headroom-certificate wire fixtures (T2.3.1, ADR-0021).
+//! Cross-platform headroom-certificate wire fixtures (ADR-0021).
 //!
 //! One fully-populated, byte-stable vector for each of the three new signed
 //! record kinds — a member's certificate request, the station's headroom
-//! certificate, and a member's certificate return — so the mobile repo (T2.4.2)
+//! certificate, and a member's certificate return — so the mobile repo
 //! can verify it produces **byte-identical** canonical dCBOR and signatures
 //! (ADR-0002). Deterministic (blake3-derived seeds + RFC 8032 Ed25519),
 //! reproducible bit-for-bit.
@@ -167,10 +167,10 @@ fn build_fixture() -> Fixture {
     assert!(signed_spend.verify().is_ok());
 
     Fixture {
-        comment: "Cross-platform headroom-certificate wire fixtures for T2.3.1/T2.3.2 (ADR-0021). \
+        comment: "Cross-platform headroom-certificate wire fixtures (ADR-0021). \
             One fully-populated vector per signed record kind: member certificate request, station \
             headroom certificate, member certificate return, and a member-signed cert-backed \
-            spend (a TransactionProposal carrying the additive `cert_id` — T2.3.2). \
+            spend (a TransactionProposal carrying the additive `cert_id`). \
             `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); \
             `signature_hex` is the Ed25519 signature over those bytes. request_id/cert_id/\
             proposal_id are the Blake3 content addresses (omitted from the CBOR, recomputed on \

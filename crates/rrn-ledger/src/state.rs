@@ -328,7 +328,7 @@ impl TransactionState {
 /// (ADR-0022): the log positions and admission-clock readings of the entries
 /// that produced the current state. Local and unsigned — for display and for
 /// window arithmetic on the admitting station only, never signed content (see
-/// ADR-0022 §1). T2.1.2 re-anchors settlement and dispute windows onto these.
+/// ADR-0022 §1). Settlement and dispute windows are re-anchored onto these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdmissionTimes {
     /// Log seq of the admitting proposal entry.
@@ -371,8 +371,8 @@ pub struct LedgerSnapshot {
     /// request that a genuinely earlier entry admitted from the same member
     /// *and for the same cap* (consent is to a specific amount).
     cert_requests: BTreeMap<RequestId, (Address, i64)>,
-    /// Station-signed equivocation records by content address (ADR-0021 §5,
-    /// T2.3.3). A faithful view of what the log records; scoring re-verifies each
+    /// Station-signed equivocation records by content address (ADR-0021 §5).
+    /// A faithful view of what the log records; scoring re-verifies each
     /// with [`EquivocationRecord::verify_evidence`] before acting on it, so an
     /// unverified record here is not itself a consequence.
     equivocations: BTreeMap<EquivocationId, SignedEquivocationRecord>,
@@ -418,7 +418,7 @@ impl LedgerSnapshot {
     /// Replays the log prefix `[1, max_seq]` into a snapshot — the ledger state as
     /// it stood at that log *position*.
     ///
-    /// Used by position-bounded reputation scoring (T2.1.3): pinning an electorate
+    /// Used by position-bounded reputation scoring: pinning an electorate
     /// at a log position means every derived input — settlements, confirmations,
     /// disputes — must also stop at that position, so evidence admitted later
     /// cannot leak into a pinned score however old its self-asserted timestamp is.

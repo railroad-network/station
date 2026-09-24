@@ -18,7 +18,7 @@
 //!
 //! # `bundle_id` is a carriage identifier, not a content identifier
 //!
-//! [`Bundle::bundle_id`] identifies a *carriage unit* (for chunking in T2.2.5).
+//! [`Bundle::bundle_id`] identifies a *carriage unit* (for chunking).
 //! It is deliberately **not** stable under re-bundling: the same record carried
 //! in two different bundles has two different `bundle_id`s. Receipts therefore
 //! key on each record's [`crate::outbox::OutboxEntry::record_hash`], never on
@@ -188,7 +188,7 @@ impl Bundle {
     /// module docs; not stable under re-bundling).
     ///
     /// A caller that already holds the encoded bytes (e.g. the send path, or
-    /// T2.2.5 chunking) should hash them with [`Bundle::id_from_encoded`] rather
+    /// chunking) should hash them with [`Bundle::id_from_encoded`] rather
     /// than call this, which re-encodes.
     pub fn bundle_id(&self) -> Hash {
         Self::id_from_encoded(&self.encode())
@@ -211,7 +211,7 @@ impl Bundle {
     /// position is legal too — both sides of an outbox fork, or a byte-identical
     /// duplicate, may ride together — so only a strictly *decreasing* position
     /// for one author is refused. Signatures are **not** checked here; that is
-    /// ingest's job (T2.2.3).
+    /// ingest's job.
     ///
     /// This hand-parses rather than going through a blanket `TryFrom<CBOR>` so
     /// the count cap is enforced *before* the per-entry envelopes are decoded:
@@ -295,7 +295,7 @@ impl Bundle {
     /// to split the pair across bundles and would let one fork pair poison an
     /// otherwise-valid bundle. This decode-time check is structural hygiene over
     /// *claimed* authors — signatures are not checked here — not a security
-    /// boundary; ingest (T2.2.3) verifies signatures and answers a fork's losing
+    /// boundary; ingest verifies signatures and answers a fork's losing
     /// side per-record (`outbox-fork`, or `known` for a duplicate).
     fn check_same_author_order(&self) -> Result<()> {
         let mut last: HashMap<[u8; 32], u64> = HashMap::new();
@@ -486,7 +486,7 @@ mod tests {
         let device = Keypair::generate();
         // Two DISTINCT entries at position 0 (an outbox fork) carried together:
         // equal position is non-decreasing, so decode accepts it. This is signed
-        // equivocation evidence; ingest (T2.2.3) answers the losing side.
+        // equivocation evidence; ingest answers the losing side.
         let a = entry(&device, 0, zero_hash());
         let b = SignedPayload::sign(
             OutboxEntry::wrapping(

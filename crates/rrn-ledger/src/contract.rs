@@ -1,5 +1,5 @@
 //! The direct-debit charge that a recurring service contract executes each
-//! period (T1.7.7).
+//! period.
 //!
 //! A one-off payment is a sender-signed [`TransactionProposal`](crate::transaction::TransactionProposal)
 //! the receiver confirms and the settlement window closes. A subscription cannot
@@ -29,7 +29,7 @@
 //! form — so `rrn-ledger` stays free of a dependency on `rrn-marketplace`, which
 //! already depends on it (the reverse would cycle). The ledger cannot check that a
 //! charge is backed by a real, active, not-yet-charged contract period; the
-//! station does, at append time (T1.7.7 Part D). The ledger's job is only to make
+//! station does, at append time. The ledger's job is only to make
 //! the charge a balance change that re-derives identically everywhere.
 
 use dcbor::prelude::*;

@@ -1,4 +1,4 @@
-//! T2.10.1 — the 72-hour outage simulation harness (Phase-2 exit gate, part 1).
+//! The 72-hour outage simulation harness (Phase-2 exit gate, part 1).
 //!
 //! The exit criterion made executable (ADR-0017): a community of ~20 members and
 //! one station run through a **72-hour full connectivity loss** with realistic
@@ -11,7 +11,7 @@
 //! respected, and that adversarial inputs left nothing but refusals — all
 //! **deterministic** across seeds.
 //!
-//! It extends the T2.4.1 offline scaffolding (`offline_lifecycle.rs`): one real
+//! It extends the offline scaffolding (`offline_lifecycle.rs`): one real
 //! `station` daemon on an injected manual clock, driven over its Unix socket, with
 //! members' offline records arriving as DTN bundles (ADR-0020 §3). Simulated time
 //! (injected clocks end to end) keeps the 72 hours to seconds of wall-clock.
@@ -27,9 +27,9 @@
 //!   a live operator round-trip; a DTN cert request is refused `unroutable-kind`).
 //!   The behavioral requirement — cert-backed offline spends, an at-cap spend, and
 //!   a planted double-spend (equivocation) — is preserved with the operator as the
-//!   sole certificate holder (exactly the T2.4.1 model).
+//!   sole certificate holder (exactly the offline-lifecycle model).
 //! - **All amounts are Tier-1 (< 500 centi).** The Tier-2 confirmation gate
-//!   (T1.8.2) depends on the reputation electorate; keeping every amount Tier-1
+//!   depends on the reputation electorate; keeping every amount Tier-1
 //!   makes the harness a pure function of its seed and independent of the
 //!   reputation formula, so determinism (assertion 9) is exact. The near-floor and
 //!   double-spend mechanics do not need Tier-2 amounts.
@@ -47,10 +47,10 @@
 //!   any seed, which is assertion 9's property.
 //! - **Not exercised here (covered elsewhere or out of scope):** disputes
 //!   (rrn-dispute has its own suites), payment requests (the receiver-side floor
-//!   check, ADR-0018, is unit-tested in rrn-ledger), a governance vote (T2.8.2 is
-//!   unimplemented), and a real SMS leg (T2.7.1). The paper leg exercises the
+//!   check, ADR-0018, is unit-tested in rrn-ledger), a governance vote
+//!   (unimplemented), and a real SMS leg. The paper leg exercises the
 //!   `rrn_protocol::paper` codec in-process rather than the CLI's `payload.txt`
-//!   file round trip (T2.5.2 covers the file I/O).
+//!   file round trip (the paper CLI tools cover the file I/O).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -640,7 +640,7 @@ async fn run_and_assert(seed: u64) -> Hash {
     //    duplicate, NOT a fork. -----------------------------------------------
     outage_duplicated_carriage(&mut h).await;
 
-    // -- Paper leg: a payment round-tripped through the T2.5.2 paper codec. -----
+    // -- Paper leg: a payment round-tripped through the paper codec. -----
     outage_paper_leg(&mut h).await;
 
     // -- Mock-LoRa leg: a payment across a lossy, airtime-budgeted carrier via

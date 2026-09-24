@@ -1,6 +1,6 @@
 # Test fixtures
 
-## `cross_platform_dtn.json` — DTN wire parity (T2.2.1)
+## `cross_platform_dtn.json` — DTN wire parity
 
 Locks the canonical dCBOR and Ed25519 signatures of the three ADR-0020
 delay-tolerant-submission wire records, so the mobile repo can prove it produces
@@ -30,7 +30,7 @@ RRN_REGEN=1 cargo test -p rrn-protocol --test it cross_platform_dtn
 # mobile repo alongside the other cross_platform_* fixtures.
 ```
 
-## `paper/*.txt` — paper/QR text-encoding vectors (T2.5.1)
+## `paper/*.txt` — paper/QR text-encoding vectors
 
 Exact emitted QR strings (one per line) for the paper-fallback forms of
 `docs/spec/qr-payloads.md` §§5–7, so the mobile repo's paper parser can verify

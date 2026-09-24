@@ -156,7 +156,7 @@ surprise. **(ii)** `expires_at` is **enforced for every `Emergency`-kind
 measure** (kind-level: an expired measure has no effect in `enacted_statutes`),
 and only the *bound* above is compressed-path-specific. Today the field is
 entirely inert — serialized but read by nothing in `statute.rs`/`lifecycle.rs` —
-so enforcing it at all is new work T2.8.2 must do; making it fast without making
+so enforcing it at all is new work the implementation must do; making it fast without making
 it enforced would be the bug. And because enforcing it kind-wide now gives the
 *un*-declared Emergency kind — an "immediate effect at 67%, no exit runway"
 instrument with, today, no lifetime bound at all — a bound too: an Emergency
@@ -194,7 +194,7 @@ so they can be admitted one at a time as they arrive. Note a carriage caveat:
 **no `rrn.gov.*` kind is DTN-routable today** — `route_dtn_record` refuses
 governance kinds as `UnroutableKind`, so proposals, co-signs, and votes do not
 yet ride bundles at all. The partition argument below therefore rests on
-routing that T2.8.2 must *add* (extending the router's kind table and airtime
+routing that the implementation must *add* (extending the router's kind table and airtime
 classification); it is a required part of this work, not an existing capability,
 and the implementation sketch lists it.
 
@@ -289,7 +289,7 @@ Two rules this scope needs decided, because tallies depend on them:
   emergency lapses is counted exactly if it reached the station before that
   proposal's close, and ignored otherwise. The ballot's own `cast_at` is
   testimony, bounded only by the no-future-dating rule (ADR-0022 §4), never
-  arithmetic. (T2.8.2 lists this as a required-in-ADR case; it is here.)
+  arithmetic. (The implementation lists this as a required-in-ADR case; it is here.)
 - **The publication gate inside a compressed window.** A proposal must still be
   *published* (reach its co-sign publication threshold,
   `DEFAULT_COSIGN_THRESHOLD = 3` outside grace) before it can pass, and under
@@ -307,7 +307,7 @@ emergency lapses (its 30-day window keeps running; it simply cannot take effect
 inside the emergency). The freeze is defined on the **effective charter**, not on
 the amendment-proposal path alone: `effective_charter` also roots on the
 highest-version founder-authorized charter (`charter.rs`'s `founder_charter`
-selects it with no lineage or vote gate), so T2.8.2 must freeze *that* door too —
+selects it with no lineage or vote gate), so the implementation must freeze *that* door too —
 no higher-version founder charter takes effect during an emergency — rather than
 bolt the amendment path shut and leave the founder path open. (That path is
 latent today — the RPC pins version 1 and it is not DTN-routable — but the ADR
@@ -332,7 +332,7 @@ exists to close. Binding the electorate to a log *position* (ADR-0022 §5,
 "ordering is log order, full stop") closes it: nothing admitted after the
 activation co-signature can enter the pinned set, whatever timestamp it claims.
 This needs a position-bounded `established_members`/`grace_electorate` variant in
-`rrn-reputation` (today's helpers take a time `at`); T2.8.2 owes it.
+`rrn-reputation` (today's helpers take a time `at`); the implementation owes it.
 
 The parameter table, normal vs emergency, with floors:
 
@@ -432,7 +432,7 @@ that plainly rather than implying an hours-scale spend.
   chain is capped on *both*: at most `MAX_CONSECUTIVE_RENEWALS` renewals (recommend
   **2** — three activations) **and** at most `EMERGENCY_CHAIN_MAX_SECS` = **14
   days** of total active time across the proximity-derived chain (the running
-  total T2.8.2 accumulates as it admits each continuation). Whichever binds first
+  total the implementation accumulates as it admits each continuation). Whichever binds first
   ends the chain. Then a **fixed** cooldown: `EMERGENCY_COOLDOWN_SECS` = **14
   days**, a plain constant — not the earlier draft's "≥ Σ chain durations," which
   was circular (continuation is *defined* by proximity within the cooldown, so a
@@ -496,7 +496,7 @@ arrived first, whether the cooldown refused activation — is a *station-signed*
 record at a definite log position, so every replica, every read-replica, and a
 station re-bootstrapped by outbox replay (ADR-0020) all compute the identical
 answer, and *which window governed every admission is reconstructible for all
-time* (T2.8.2 invariant 1). An `Emergency` proposal's window is
+time* (implementation invariant 1). An `Emergency` proposal's window is
 `emergency_window_secs` iff `emergency_active_for(P)`; a proposal whose station
 admission falls one second past `scheduled_expiry` (or past an early lapse) runs
 the ordinary window.
@@ -546,14 +546,14 @@ review comments:
 - **No lowered bar.** Emergency changes *how long* you have to reach a threshold,
   never *how high* it is (§3).
 - **No general governance re-anchoring *in this ADR* — but it is owed, as
-  conformance, before T2.8.2.** This ADR decides only the emergency path's
+  conformance, before the emergency implementation.** This ADR decides only the emergency path's
   admission anchoring. Re-anchoring *ordinary* governance windows and eligibility
   is **not a new decision** — ADR-0022 already ruled the admission clock "the only
   clock that bears on windows, deadlines, ordering, and eligibility," so today's
   author-clock governance (`proposal.rs`, `vote.rs`) is a *conformance gap against
   an Accepted ADR*, not a design question. It therefore needs **no new ADR**, but
-  it does need its own ticket (**T2.1.3**, filed with this work), and that ticket
-  must land **before T2.8.2** — otherwise the crate carries two window regimes and
+  it does need its own dedicated change (filed alongside this work), and that change
+  must land **before the emergency work** — otherwise the crate carries two window regimes and
   two eligibility gates at once, doubling the derivation and its tests. That
   ticket also fixes a **live ordinary-path bug** this ADR's §3c analysis exposed:
   `tally.rs` pins the electorate at `voting_ends_at` by *time* (`grace_electorate(
@@ -561,7 +561,7 @@ review comments:
   earlier (legal under ADR-0022 §3) silently changes a *concluded* tally's
   denominator on replay — contradicting the "concluded quorum stays stable"
   guarantee. This ADR closes that hole for emergencies (position-bounded pin);
-  T2.1.3 closes it everywhere.
+  the admission-clock conformance work closes it everywhere.
 - **No machine-enforced scope — with one forward pre-commitment.** `reason`/`scope`
   are testimony and display; the machine does not verify that an `Emergency`
   measure is germane to the declared crisis (Alternatives explains why not, and
@@ -675,12 +675,12 @@ zero, only bounded. The bounds this ADR places on it:
   its long-inert `expires_at` becomes bounded and enforced.
 - **Governance must finally meet the admission clock — at least on this path.**
   Shipping a compressed window on the author's `created_at` would be unsafe
-  (Context), so T2.8.2 must anchor the emergency declaration, window, and expiry
+  (Context), so the implementation must anchor the emergency declaration, window, and expiry
   on admission time (ADR-0022). This surfaces the broader, pre-existing gap that
   ADR-0022 never re-anchored *ordinary* governance windows either; closing that
   generally is recommended follow-up, not decided here (Non-goals).
 - **A new capture surface must be threat-modeled.** `docs/threat-model.md` has no
-  emergency/coup section today; T2.8.2 must add one — assets: the integrity of the
+  emergency/coup section today; the implementation must add one — assets: the integrity of the
   compression gate, of the enforced measure-expiry, of the position-pinned
   electorate, and of the station-signed emergency boundary; threats: squatting the
   declaration lever, fast-path capture of the connected electorate, an
@@ -792,7 +792,7 @@ zero, only bounded. The bounds this ADR places on it:
   response (Consequences). The log makes review *possible*; a community may make it
   *mandatory* by statute.
 
-## Implementation sketch (for T2.8.2)
+## Implementation sketch
 
 **Crates touched:**
 
@@ -820,7 +820,7 @@ zero, only bounded. The bounds this ADR places on it:
   emergency state, mirroring the grace banner.
 - `rrn-cli` — declare / co-sign / lapse / status verbs and display.
 
-**Sequencing:** **T2.1.3** (admission-clock conformance for governance — Non-goals)
+**Sequencing:** the **admission-clock conformance for governance** (Non-goals)
 must land **before** this ticket, so the emergency path is not built atop
 author-clock windows. **New charter parameters** on `GovernanceStructure`:
 `emergency_window_secs`, `emergency_declaration_pct`, `emergency_quorum_pct`,
@@ -842,7 +842,7 @@ charter duration param). `tally.rs` applies `emergency_quorum_pct` (not
 and a committed fixture; plus the threat-model STRIDE section. **Two load-bearing
 preconditions, called out for the reviewer:** (i) the emergency boundary must be
 a **station-signed** fact, not a per-replica admission-clock computation, or two
-replicas disagree on which window governed a past vote (T2.8.2 invariant 1);
+replicas disagree on which window governed a past vote (implementation invariant 1);
 (ii) the emergency path must be **admission-anchored** (ADR-0022), because a
 compressed window on the author clock is trivially back-dated. Neither is
 optional.
@@ -876,7 +876,7 @@ optional.
 *Clarifications record a corrected reading of the decision above; they do not change
 it. Flagged for maintainer ratification alongside this ADR.*
 
-- **2026-09-09 (T2.8.2) — the declaration threshold is a true two-thirds,
+- **2026-09-09 — the declaration threshold is a true two-thirds,
   `ceil(2N/3)`.** §2 states the bar as `ceil(N × emergency_declaration_pct / 100)`
   with `pct = 67`, but its worked cases fix the *intent* at two-thirds: a 3-member
   grace electorate needs 2 ("author plus one") and a 20-member one 14 — which is
@@ -884,14 +884,14 @@ it. Flagged for maintainer ratification alongside this ADR.*
   *unanimity*, and generally two-thirds+1 wherever N is a multiple of 3, the very
   sizes where two-thirds is exact). A `u8` percent cannot spell 66.67, and the ADR's
   own precedent — `founder_threshold`'s `ceil(n × 3/4)` — is an exact rational, not a
-  percent. T2.8.2 therefore implements the floor value 67 as exactly `ceil(2N/3)`
+  percent. The implementation therefore sets the floor value 67 as exactly `ceil(2N/3)`
   and any charter-**raised** bar literally as `ceil(N × pct/100)` (never below
   two-thirds, monotone in N and `pct`). Author-plus-one for three founders grants
   nothing ADR-0015 grace does not already grant, whereas a holdout veto would defeat
   §2's own co-present-supermajority partition rationale. See
   `rrn_governance::emergency::declaration_threshold`.
 
-- **2026-09-09 (T2.8.2) — span boundary and genesis-resolved legitimacy parameters.**
+- **2026-09-09 — span boundary and genesis-resolved legitimacy parameters.**
   Two readings the implementation fixes: (i) §4's "ends when `activation_instant +
   duration_secs ≤ now`" and §5's `activation_instant < admission(P) ≤ scheduled_expiry`
   are reconciled in favour of §5 — a proposal is governed for admissions in the span
@@ -912,7 +912,7 @@ it. Flagged for maintainer ratification alongside this ADR.*
 **superseded by the accepted [ADR-0027](0027-emergency-declaration-activation-and-ttl.md)**;
 the second is implemented (option A) with its reading recorded here.*
 
-- **2026-09-10 (T2.8.2 review) — a declaration should activate only at its first
+- **2026-09-10 (implementation review) — a declaration should activate only at its first
   threshold-crossing position, and a part-signed declaration should expire; both need a
   station-signed anchor to stay replay-derivable. [Superseded by
   [ADR-0027](0027-emergency-declaration-activation-and-ttl.md) (Accepted 2026-09-10); not
@@ -976,7 +976,7 @@ the second is implemented (option A) with its reading recorded here.*
   did for the span. The maintainer's call is *whether* to add a TTL, *what* window, and
   *which* signed anchor it reads.
 
-- **2026-09-10 (T2.8.2 review) — competing lapse motions split the lift supermajority.
+- **2026-09-10 (implementation review) — competing lapse motions split the lift supermajority.
   [Resolved by option A, implemented; reading pending ratification.]** §4 says a lapse
   "carries the
   same co-sign supermajority as a declaration … reusing the `emergency_cosign` kind,

@@ -1,4 +1,4 @@
-//! The member-relative transaction view the mobile wallet renders (T1.3.4).
+//! The member-relative transaction view the mobile wallet renders.
 //!
 //! The log is append-only *events*; [`LedgerSnapshot`] already correlates them
 //! into one [`TransactionState`] per transaction (proposed → confirmed →
@@ -27,7 +27,7 @@ use crate::rpc::TransactionRow;
 /// The member's transactions, most recent first, capped at `limit` if given.
 ///
 /// `log`/`station` are used only to resolve the title of any marketplace payment
-/// (T1.7.6 Stage B), so history reads as what it bought. The lookup is memoised
+///, so history reads as what it bought. The lookup is memoised
 /// by [`ListingId`] and, when a limit is given, runs only on the rows kept — a
 /// member with many marketplace payments pays per-listing once, not per-row.
 pub fn member_transactions(

@@ -12,7 +12,7 @@ Phase 1 introduces a second piece of software beside the `station` daemon: a
 mobile client (the `mobile` repo, React Native + TypeScript). Before either
 implementation matures, we have to fix the relationship between the two, because
 that relationship decides where cryptographic identity lives — and every M1 task
-from M1.1 through M1.4 is shaped by the answer.
+from the early mobile milestones is shaped by the answer.
 
 The forces:
 
@@ -53,7 +53,7 @@ Concretely:
   relationship is exclusive. What is singular is the *key*: the member's mobile
   keypair is the one authority that signs on their behalf.
 - **Pairing is a one-time bond, not per-request authentication.** A mobile and a
-  station pair once (the pairing protocol is specified in M1.3.3); thereafter
+  station pair once (the pairing protocol is specified separately); thereafter
   the mobile authenticates individual requests with its own signature, rather
   than re-establishing trust on every call.
 
@@ -61,7 +61,7 @@ Concretely:
 
 - **Crypto runs on mobile.** Because the mobile signs, the Rust cryptographic
   core (`rrn-crypto`, `rrn-identity`) must execute *on the device*. This directly
-  constrains **M1.1**, which ships that Rust code to iOS and Android; the tool
+  constrains the **mobile FFI work**, which ships that Rust code to iOS and Android; the tool
   for doing so is decided in [ADR-0007](0007-rust-mobile-ffi-uniffi.md).
 - **The station never sees a secret key.** It receives only signed payloads. A
   seized or compromised station therefore cannot forge any member's signature —
@@ -69,7 +69,7 @@ Concretely:
   handled by the log's hash-chaining and by replication), but it cannot *become*
   a member. Station compromise is not identity compromise.
 - **The transport authenticates per request via the mobile's signature.** This
-  constrains **M1.3**: the mobile–station transport is not a trusted channel
+  constrains the **transport work**: the mobile–station transport is not a trusted channel
   where the station vouches for the caller; every request carries the mobile's
   signature and is verified against the paired identity.
 - **Offline signing works.** Signatures are produced locally, so the member can
@@ -102,5 +102,5 @@ Concretely:
   a lost key-holding device
 - [ADR-0007](0007-rust-mobile-ffi-uniffi.md) — the FFI tool that gets the Rust
   crypto onto mobile, built directly on this decision
-- M1.1 task spec — Rust crypto on mobile (constrained by this ADR)
-- M1.3 task spec — mobile–station transport and pairing (constrained by this ADR)
+- The mobile-crypto task spec — Rust crypto on mobile (constrained by this ADR)
+- The transport task spec — mobile–station transport and pairing (constrained by this ADR)

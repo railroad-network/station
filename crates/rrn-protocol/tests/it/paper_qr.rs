@@ -1,4 +1,4 @@
-//! Paper / QR text-encoding tests (T2.5.1): a proptest roundtrip over the
+//! Paper / QR text-encoding tests: a proptest roundtrip over the
 //! multi-part chunker/reassembler, and golden fixtures — one exact-string example
 //! per scheme prefix, committed under `tests/fixtures/paper/` so the mobile repo
 //! can verify its own parser against byte-identical vectors.
@@ -27,7 +27,7 @@ proptest! {
     /// Chunk a payload of 0..64 KiB, deliver the chunks shuffled and with a random
     /// subset duplicated, and get exactly the original payload back — or, for a
     /// payload past the 64-chunk capacity, a clean `TooManyChunks` refusal at
-    /// encode. Mirrors T2.2.5's framing roundtrip proptest.
+    /// encode. Mirrors the framing roundtrip proptest.
     #[test]
     fn chunks_reassemble_under_shuffle_and_duplication(
         payload in proptest::collection::vec(any::<u8>(), 0..(64 * 1024)),

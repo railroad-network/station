@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# demo-phase-2-paper.sh — the M2.5 paper-fallback loop, end to end, with real
+# demo-phase-2-paper.sh — the paper-fallback loop, end to end, with real
 # binaries.
 #
 # One `station` daemon (the operator) and one offline member (a *phone*, played
@@ -11,7 +11,7 @@
 # back to the phone. No network path between the phone and the station exists —
 # only paper.
 #
-# This is the human acceptance path for T2.5.2. macOS + Linux only; it does the
+# This is the human acceptance path for the paper CLI. macOS + Linux only; it does the
 # release build for you.
 
 set -euo pipefail

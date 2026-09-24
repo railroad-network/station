@@ -1,4 +1,4 @@
-//! The mobile↔station pairing handshake wire protocol (T1.3.3).
+//! The mobile↔station pairing handshake wire protocol.
 //!
 //! Pairing is the one-time, in-person bond that ADR-0008 makes the root of all
 //! later trust: it binds two static Ed25519 keys and nothing else. This module
@@ -15,7 +15,7 @@
 //! two implementations. Each layout is domain-separated by a version tag so a
 //! signature made for one purpose can never be valid for another. These are a
 //! deliberately simple fixed concatenation rather than the canonical-dCBOR
-//! envelope of T1.3.4: pairing is the bootstrap that *establishes* the keys the
+//! envelope of the authenticated channel: pairing is the bootstrap that *establishes* the keys the
 //! sealed request channel later relies on, and a fixed three-field layout is
 //! easier to get identical on two platforms than a dCBOR encoder.
 
@@ -32,7 +32,7 @@ const RESPONSE_TAG: &[u8] = b"rrn-pair-resp-v1";
 
 /// How far a request's `requested_at` may sit from the station's clock, in
 /// seconds. Bounds the window in which a captured request can be replayed, and
-/// matches the ±5-minute skew the authenticated channel (T1.3.4) will allow.
+/// matches the ±5-minute skew the authenticated channel will allow.
 pub const REQUESTED_AT_SKEW_SECS: i64 = 300;
 
 /// How long the station holds an accepted-but-unconfirmed pairing request before
@@ -43,7 +43,7 @@ pub const PENDING_TTL_SECS: i64 = 300;
 /// A pairing request the station has accepted (signature valid, timestamp
 /// fresh) and is holding until the operator confirms it or it expires. This is
 /// what `station pair-mobile` lists so the operator can read the [`sas`] aloud
-/// and compare it with the code on the mobile's screen (T1.3.3).
+/// and compare it with the code on the mobile's screen.
 ///
 /// [`sas`]: PendingPair::sas
 #[derive(Debug, Clone, PartialEq, Eq)]

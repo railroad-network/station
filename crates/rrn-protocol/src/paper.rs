@@ -1,4 +1,4 @@
-//! Paper / QR text encodings for DTN carriage over paper (T2.5.1, ADR-0020;
+//! Paper / QR text encodings for DTN carriage over paper (ADR-0020;
 //! Overview §10.3 Class 4 "paper fallback").
 //!
 //! When every electronic carrier is gone — no internet, no LoRa, no SMS — signed
@@ -6,7 +6,7 @@
 //! sheets, the station scans them back. This module is the text layer of that
 //! fallback: the string forms a QR code carries, and the codecs that split a
 //! payload across several QRs and reassemble it. It is pure codec — no image
-//! rendering, no PDF layout, no scanning (that is T2.5.2 for the CLI and the
+//! rendering, no PDF layout, no scanning (that lives in the CLI and the
 //! mobile repo for phones).
 //!
 //! # What travels, and how it is framed
@@ -84,10 +84,10 @@ pub const MAX_CHUNKS: usize = 64;
 /// header fields → ≤ 982 characters total (well under [`MAX_QR_TEXT_CHARS`] and
 /// the ≤ 1100 acceptance bound).
 ///
-/// **Divergence from the T2.5.1 sketch (noted per PROCESS.md rule 3):** the ticket
-/// text said "raw payload bytes split every 1000 bytes", but 1000 raw bytes
+/// **Divergence from the original design sketch:** the sketch
+/// said "raw payload bytes split every 1000 bytes", but 1000 raw bytes
 /// base64url-encode to 1334 characters, which exceeds both the ≤ 1000-byte per-QR
-/// budget (measured on the QR's byte-mode text) and the ticket's own "every
+/// budget (measured on the QR's byte-mode text) and the sketch's own "every
 /// emitted string ≤ 1100 chars" test. The behavioral requirements — a chunk fits a
 /// mid-size QR, and every emitted string ≤ 1100 chars — are preserved exactly; the
 /// slice size is sized to satisfy them.

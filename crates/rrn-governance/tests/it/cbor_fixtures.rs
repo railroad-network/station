@@ -1,11 +1,11 @@
-//! Canonical dCBOR fixtures for the governance record kinds (T2.1.3).
+//! Canonical dCBOR fixtures for the governance record kinds.
 //!
 //! Each governance signed record has a committed hex of its canonical bytes, so a
 //! second implementation (the mobile repo signs co-signatures and ballots; the
 //! station signs the window attestation) can prove it produces **byte-identical**
 //! encodings (ADR-0002). Covers `rrn.gov.proposal`, `rrn.gov.proposal_cosign`,
-//! `rrn.gov.vote`, and the T2.1.3 `rrn.gov.proposal_window` attestation. The
-//! proposal fixture also guards the T2.1.3 shape change: the window fields are
+//! `rrn.gov.vote`, and the `rrn.gov.proposal_window` attestation. The
+//! proposal fixture also guards the shape change: the window fields are
 //! **not** in the signed content.
 //!
 //! Deterministic (blake3-seeded keypairs). Regenerate with:
@@ -177,7 +177,7 @@ fn governance_records_match_committed_cbor_fixtures() {
 
 #[test]
 fn the_signed_proposal_excludes_the_window_fields() {
-    // The T2.1.3 guard: voting_ends_at/implementation_at are NOT in the signed
+    // The guard: voting_ends_at/implementation_at are NOT in the signed
     // content, so populating them does not change the canonical bytes (nor, hence,
     // the content-addressed proposal_id).
     let a = sample_proposal();

@@ -51,7 +51,7 @@ obligations on communities that adopt, fork, or self-host the software.
 - A workspace-wide lint can forbid `unsafe` outside `rrn-crypto`, giving
   auditors a single, explicit boundary to focus on.
 - One `Cargo.toml`/`Cargo.lock`, one CI pipeline, one issue tracker — low
-  coordination overhead while the project is small. `deny.toml` (T0.0.3)
+  coordination overhead while the project is small. `deny.toml`
   centrally governs the licenses and sources allowed for dependencies across
   every crate.
 - Rust has a steeper learning curve and slower compile times than some

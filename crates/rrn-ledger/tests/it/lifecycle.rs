@@ -1,4 +1,4 @@
-//! The end-to-end transaction lifecycle (T0.5.8), written as a narrative.
+//! The end-to-end transaction lifecycle, written as a narrative.
 //!
 //! Two identities, one transaction, the whole arc: Alice proposes, Bob confirms,
 //! the settlement window elapses, balances move, and the append-only log tells

@@ -6,7 +6,7 @@
 //! `merge` that is commutative, associative, and idempotent, so replicas that
 //! diverge and reconcile in any order converge to identical state.
 //!
-//! Submodules are added by T0.2.3–T0.2.5.
+//! Each CRDT lives in its own submodule below.
 
 pub mod lww_register;
 pub mod or_set;

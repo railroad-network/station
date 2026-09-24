@@ -1,6 +1,6 @@
 # Test fixtures
 
-## `cross_platform_canonical.json` — canonical-CBOR type model (T1.1.7)
+## `cross_platform_canonical.json` — canonical-CBOR type model
 
 Locks the mobile **tagged-value model** → canonical dCBOR mapping so the mobile
 `canonical_bytes` FFI and the station agree byte-for-byte across the whole dCBOR
@@ -28,7 +28,7 @@ cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_canonical.json \
 The `committed_fixture_is_in_sync` test fails if the committed JSON drifts from
 what the generator produces, so a stale fixture cannot pass CI unnoticed.
 
-## `cross_platform_dtn_certs.json` — DTN + certificate FFI (T2.4.2)
+## `cross_platform_dtn_certs.json` — DTN + certificate FFI
 
 Locks the wire bytes for every new envelope the mobile app encodes or decodes
 through the delay-tolerant-submission and escrowed-offline-spending FFI surface

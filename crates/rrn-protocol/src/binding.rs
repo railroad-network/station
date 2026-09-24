@@ -1,8 +1,8 @@
 //! Reachability bindings: an RRN identity ↔ a carrier handle.
 //!
 //! Two live here, one shape: [`TransportBinding`] (RRN identity ↔ Reticulum
-//! destination, T2.6.2/ADR-0013) and [`SmsBinding`] (RRN identity ↔ phone number,
-//! T2.7.1). Both are **self-signed** statements appended to the log — "you can
+//! destination, ADR-0013) and [`SmsBinding`] (RRN identity ↔ phone number).
+//! Both are **self-signed** statements appended to the log — "you can
 //! currently reach me here" — never authorization, reputation, or a key. The rest
 //! of these docs describe the Reticulum case; the SMS case is identical bar the
 //! handle it names.
@@ -183,7 +183,7 @@ pub fn validate(signed: &SignedBinding) -> Result<()> {
 pub const SMS_BINDING_KIND: &str = "rrn.net.sms_binding";
 
 /// A signed statement that an RRN identity is reachable by SMS at a phone number
-/// (T2.7.1, Overview §10.3 "No internet — SMS"). Self-signed, appended to the log,
+/// (Overview §10.3 "No internet — SMS"). Self-signed, appended to the log,
 /// same discipline as [`TransportBinding`]: the identity `rrn1…` is the durable
 /// root; the [`msisdn`](SmsBinding::msisdn) is a disposable reachability handle
 /// *under* it. A later binding for the same address supersedes an earlier one.

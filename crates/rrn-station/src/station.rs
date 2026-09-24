@@ -49,9 +49,9 @@ pub const DB_FILE: &str = "station.db";
 pub const SOCKET_FILE: &str = "station.sock";
 /// Config file name within the data dir.
 pub const CONFIG_FILE: &str = "config.toml";
-/// Paired-mobiles list file name within the data dir (T1.3.3).
+/// Paired-mobiles list file name within the data dir.
 pub const PAIRED_FILE: &str = "paired_mobiles.json";
-/// Marketplace full-text index directory within the data dir (T1.6.6).
+/// Marketplace full-text index directory within the data dir.
 ///
 /// A derived cache, not data: per ADR-0010 deleting this directory is a
 /// supported repair, and the core rebuilds it from the log at startup.
@@ -209,7 +209,7 @@ impl Station {
         let paired =
             paired::PairedMobiles::load(layout.state_dir()).context("load paired mobiles")?;
 
-        // The marketplace index (T1.6.6). Failing to open it must not keep the
+        // The marketplace index. Failing to open it must not keep the
         // station down — it is a cache the core rebuilds from the log anyway — so
         // fall back to an in-memory index, which costs this run's browse nothing
         // and simply does not survive a restart.
@@ -292,7 +292,7 @@ impl Station {
         };
 
         // Shared, in-memory connectivity snapshot for the `status` RPC's
-        // degradation-legibility block (T2.4.1): the gossip loop writes per-peer
+        // degradation-legibility block: the gossip loop writes per-peer
         // reachability, the mobile-bind path below records whether it bound, and
         // the status handler reads it. Purely derived — no signed/persisted state.
         let connectivity = Arc::new(gossip::ConnectivityState::new(
@@ -384,7 +384,7 @@ impl Station {
             }
         }
 
-        // Mobile-facing HTTP surface (ADR-0008 / T1.3.3+), on the port mDNS
+        // Mobile-facing HTTP surface (ADR-0008), on the port mDNS
         // advertises. Best-effort, matching the advertisement below: if the port
         // cannot be bound — most often another station already holds it on this
         // host — the station still serves peers and the CLI, and the warning
@@ -412,7 +412,7 @@ impl Station {
         }
 
         // Local-network advertisement, so a mobile can find this station
-        // without being told an IP address (T1.3.2).
+        // without being told an IP address.
         //
         // Best-effort by design: a station that cannot advertise — no
         // multicast-capable interface, a locked-down network, another daemon
@@ -439,7 +439,7 @@ impl Station {
             }
         }
 
-        // Airtime-budget sanity (T2.6.2): a frame must fit the framing header and
+        // Airtime-budget sanity: a frame must fit the framing header and
         // the burst bucket, and the rates must be finite and non-negative — else
         // the pacer would refuse every frame (silent starvation) or misbehave.
         if config.lora.adapter_script.is_some() {
@@ -468,7 +468,7 @@ impl Station {
             }
         }
 
-        // Supervised Reticulum sidecar (T2.6.1, ADR-0013). Off unless the
+        // Supervised Reticulum sidecar (ADR-0013). Off unless the
         // operator opts in; when on, it runs `rnsd` as an appliance-style managed
         // child. A carrier only — its failures degrade to "sidecar unavailable"
         // inside the supervisor and never keep the station down.
@@ -501,7 +501,7 @@ impl Station {
                 shutdown_rx.clone(),
             )));
 
-            // Reticulum DTN transport (T2.6.2, ADR-0026 §3): when an adapter
+            // Reticulum DTN transport (ADR-0026 §3): when an adapter
             // script is configured, spawn the supervised Python LXMF adapter and
             // run the DtnSyncer over it — receiving bundles, ingesting them, and
             // returning signed receipts, paced to the [lora] airtime budget. Only
@@ -548,9 +548,9 @@ impl Station {
             }
         }
 
-        // SMS carrier (T2.7.1): the wire codec, the [`crate::sms`] seam + relay
+        // SMS carrier: the wire codec, the [`crate::sms`] seam + relay
         // engine, and the [`sms_gateway_loop`] bridge all ship here — but the
-        // modem/HTTP-provider backend that drives them is T2.7.2. An enabled `[sms]`
+        // modem/HTTP-provider backend that drives them is not yet wired. An enabled `[sms]`
         // without that backend is therefore supervised-but-idle, mirroring
         // `[sidecar]` enabled without `[lora] adapter_script`; log the state so the
         // operator sees it rather than silence.
@@ -562,7 +562,7 @@ impl Station {
                 Some(msisdn) if rrn_protocol::binding::valid_msisdn(msisdn) => tracing::info!(
                     station_msisdn = msisdn,
                     allowed_senders = ?config.sms.allowed_senders,
-                    "SMS carrier enabled; awaiting a gateway backend (T2.7.2 wires the modem)"
+                    "SMS carrier enabled; awaiting a gateway backend (the modem gateway is not yet wired)"
                 ),
                 Some(bad) => anyhow::bail!(
                     "config: [sms] station_msisdn is not valid E.164 (got {bad:?}); \
@@ -570,7 +570,7 @@ impl Station {
                 ),
                 None => tracing::warn!(
                     "SMS carrier enabled but [sms] station_msisdn is unset; \
-                     set it before a gateway backend is wired (T2.7.2)"
+                     set it before a gateway backend is wired"
                 ),
             }
         }
@@ -590,35 +590,35 @@ impl Station {
                 shutdown_rx.clone(),
             )));
 
-            // Listing expiry sweep timer (T1.7.0).
+            // Listing expiry sweep timer.
             tasks.push(tokio::spawn(listing_expiry_timer(
                 Duration::from_secs(config.timers.listing_expiry_interval_secs.max(1)),
                 core.clone(),
                 shutdown_rx.clone(),
             )));
 
-            // Inquiry expiry sweep timer (T1.7.4).
+            // Inquiry expiry sweep timer.
             tasks.push(tokio::spawn(inquiry_expiry_timer(
                 Duration::from_secs(config.timers.inquiry_expiry_interval_secs.max(1)),
                 core.clone(),
                 shutdown_rx.clone(),
             )));
 
-            // Service-contract charge sweep timer (T1.7.7).
+            // Service-contract charge sweep timer.
             tasks.push(tokio::spawn(contract_charge_timer(
                 Duration::from_secs(config.timers.contract_charge_interval_secs.max(1)),
                 core.clone(),
                 shutdown_rx.clone(),
             )));
 
-            // Governance-enactment sweep timer (T1.9.7).
+            // Governance-enactment sweep timer.
             tasks.push(tokio::spawn(governance_implementation_timer(
                 Duration::from_secs(config.timers.governance_implementation_interval_secs.max(1)),
                 core.clone(),
                 shutdown_rx.clone(),
             )));
 
-            // Dispute-resolution sweep timer (T1.10.5).
+            // Dispute-resolution sweep timer.
             tasks.push(tokio::spawn(dispute_resolution_timer(
                 Duration::from_secs(config.timers.dispute_resolution_interval_secs.max(1)),
                 core.clone(),
@@ -640,7 +640,7 @@ impl Station {
             shutdown_rx.clone(),
         )));
 
-        // DTN receipt-delivery prune timer (T2.2.4) — local receipt-table
+        // DTN receipt-delivery prune timer — local receipt-table
         // maintenance, not a log append; harmless on a replica (which holds none)
         // and correct on a writer.
         tasks.push(tokio::spawn(dtn_prune_timer(
@@ -730,7 +730,7 @@ impl Station {
 
     /// Forces an immediate DTN receipt-delivery prune sweep; returns the number of
     /// rows removed. Lets a driver advance the clock past a receipt's retention and
-    /// see the row reclaimed without waiting on the timer (T2.2.4).
+    /// see the row reclaimed without waiting on the timer.
     pub async fn prune_receipts(&self) -> usize {
         self.core.prune_receipts().await
     }
@@ -748,7 +748,7 @@ impl Station {
     }
 }
 
-/// The SMS gateway bridge (T2.7.1): drives an [`crate::sms::SmsRelay`] over a real
+/// The SMS gateway bridge: drives an [`crate::sms::SmsRelay`] over a real
 /// [`crate::sms::SmsGateway`] the way [`run_dtn_syncer`] drives the Reticulum
 /// carrier. Each second it polls inbound texts, ingests each completed bundle
 /// through the core's front door, and queues the signed delivery receipt back over
@@ -762,8 +762,8 @@ impl Station {
 /// costs one indexed row read, not a full-log CBOR decode.
 ///
 /// The modem/HTTP-provider [`SmsGateway`](crate::sms::SmsGateway) this drives is
-/// T2.7.2 (`Station::open` does not spawn this loop until that backend exists);
-/// T2.7.1 exercises the bridge with [`crate::sms::MockSmsGateway`].
+/// not yet wired (`Station::open` does not spawn this loop until that backend
+/// exists); the bridge is exercised with [`crate::sms::MockSmsGateway`].
 pub async fn sms_gateway_loop<G: crate::sms::SmsGateway + 'static>(
     mut relay: crate::sms::SmsRelay<G>,
     paired_mode: bool,
@@ -826,7 +826,7 @@ pub async fn sms_gateway_loop<G: crate::sms::SmsGateway + 'static>(
     tracing::info!("SMS gateway loop stopped");
 }
 
-/// Manages the Reticulum DTN transport (T2.6.2): waits for the sidecar to be
+/// Manages the Reticulum DTN transport: waits for the sidecar to be
 /// `Running`, spawns the LXMF adapter, then each second pumps the paced sender
 /// onto the carrier and drains arrivals — ingesting each completed bundle through
 /// the core's front door and sending its signed receipt back. If the adapter dies
@@ -976,8 +976,7 @@ async fn sweep_timer(interval: Duration, core: CoreHandle, mut shutdown: watch::
     }
 }
 
-/// Periodically asks the core to close listings whose expiry has passed
-/// (T1.7.0).
+/// Periodically asks the core to close listings whose expiry has passed.
 ///
 /// Latency here is not a correctness problem — every reader already treats a
 /// past-expiry listing as off the market (ADR-0010), so this converts a
@@ -1006,8 +1005,7 @@ async fn listing_expiry_timer(
     }
 }
 
-/// Periodically asks the core to close inquiries gone quiet past the TTL
-/// (T1.7.4).
+/// Periodically asks the core to close inquiries gone quiet past the TTL.
 ///
 /// Like the listing sweep, this converts a derivation into a signed record
 /// rather than deciding anything: a party already treats a long-dormant thread
@@ -1036,8 +1034,7 @@ async fn inquiry_expiry_timer(
     }
 }
 
-/// Periodically asks the core to bill every service contract's due periods
-/// (T1.7.7).
+/// Periodically asks the core to bill every service contract's due periods.
 ///
 /// Unlike the settlement sweep, a charge here has no window to close and no party
 /// to confirm it — the buyer's contract signature pre-authorized it — so this is
@@ -1095,7 +1092,7 @@ async fn reputation_refresh_timer(
 }
 
 /// Periodically asks the core to enact passed proposals whose implementation delay
-/// has run (T1.9.7).
+/// has run.
 ///
 /// Like the contract charge sweep, this is the only thing that turns a decided
 /// proposal into a recorded fact — the community's vote authorized it, and the
@@ -1128,7 +1125,7 @@ async fn governance_implementation_timer(
 
 /// Periodically asks the core to resolve disputes: enact the outcome of any whose
 /// jury has reached a majority, and lapse (settle as confirmed) any whose window
-/// has closed unresolved (T1.10.5).
+/// has closed unresolved.
 ///
 /// Like the governance-enactment sweep, this is what turns a decided dispute into
 /// a recorded fact. A missed tick is caught up on the next — the sweep resolves
@@ -1159,7 +1156,7 @@ async fn dispute_resolution_timer(
 }
 
 /// Periodically prunes DTN receipt-delivery rows past their retention (ADR-0020
-/// §3, T2.2.4): confirmed receipts older than `[dtn] receipt_retention_secs`, and
+/// §3): confirmed receipts older than `[dtn] receipt_retention_secs`, and
 /// unconfirmed ones older than four times that. Pure housekeeping on a bounded
 /// queue — a missed tick is caught up on the next, since the sweep removes every
 /// row now past retention, not just the newest.

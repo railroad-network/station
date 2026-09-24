@@ -1,4 +1,4 @@
-//! Delay-tolerant submission for the mobile client (T2.4.2, ADR-0020).
+//! Delay-tolerant submission for the mobile client (ADR-0020).
 //!
 //! Thin marshalling over `rrn-protocol` so the React Native app can build and
 //! carry its own outbox chain, assemble and inspect bundles, and read the
@@ -17,7 +17,7 @@
 //! bytes (in the OS keychain / its own store) and feeds the last one back as
 //! `prev_entry`; this crate keeps no state and opens no database (ADR-0007), so
 //! the outbox is exposed as pure functions over caller-held bytes rather than a
-//! second copy of T2.2.2's on-station `OutboxStore`.
+//! second copy of the on-station `OutboxStore`.
 
 use std::sync::Arc;
 
@@ -212,7 +212,7 @@ pub struct BundleEntryInfo {
     pub valid: bool,
 }
 
-/// Display data for a parsed bundle, for a courier UI (T2.4.2). Carries no
+/// Display data for a parsed bundle, for a courier UI. Carries no
 /// secret and performs no admission — inspection only.
 pub struct BundleInfo {
     /// Number of entries carried.
@@ -281,7 +281,7 @@ pub struct ReceiptOutcome {
 }
 
 /// Parses a station delivery receipt, verifying the station signature, and
-/// returns one typed outcome per presented record (T2.4.2, ADR-0020 §3).
+/// returns one typed outcome per presented record (ADR-0020 §3).
 ///
 /// `expected_station_pubkey` is the 32-byte Ed25519 key of the member's paired
 /// station: the receipt must be signed by it and its `station` address must match

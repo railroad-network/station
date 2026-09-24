@@ -22,7 +22,7 @@
 //!   do not count in [`Deliberation`](crate::proposal::ProposalPhase::Deliberation));
 //! - the ballot is **admitted within the proposal's window** — admitted by the
 //!   attested `voting_ends_at`, judged on the admitting station's *admission*
-//!   clock, not the voter's `cast_at` (ADR-0022 / T2.1.3). This bound is enforced
+//!   clock, not the voter's `cast_at` (ADR-0022). This bound is enforced
 //!   on the **write path** ([`append_vote`]): the station takes a ballot only while
 //!   its own admission clock is still inside the window. Replay does **not**
 //!   re-apply the close — `created_at` is re-stamped per replica, so a wall-clock
@@ -37,7 +37,7 @@
 //!   > under any later replay.
 //! - the voter is in the **electorate pinned at the proposal's open log
 //!   position** — an established member (or grace founder) then, the same
-//!   frozen electorate that authors and co-signs (T2.1.3);
+//!   frozen electorate that authors and co-signs;
 //! - the voter has **not already voted** on this proposal.
 //!
 //! The electorate is pinned by open *position* and the window is anchored on the
@@ -52,14 +52,14 @@
 //! There is no replace-vote. The first ballot a member casts on a proposal is
 //! their ballot; a second is refused on the write path and ignored on replay
 //! ([`votes`] keeps the first). Vote *silence* is not abstain — a member who never
-//! casts simply did not participate, which bears on quorum (T1.9.6) but is not a
+//! casts simply did not participate, which bears on quorum but is not a
 //! choice. Abstain is an explicit third choice that does count toward quorum.
 //!
 //! # State is derived, never stored
 //!
 //! [`votes`] replays the log into the valid ballots for one proposal, and the
 //! append guard [`append_vote`] applies the identical rules on the write path, so
-//! authorization and replay cannot drift. The tally (T1.9.6) reduces [`votes`] to
+//! authorization and replay cannot drift. The tally reduces [`votes`] to
 //! an outcome; this module stops at the ballots.
 
 use std::collections::HashMap;
@@ -106,7 +106,7 @@ pub struct Vote {
     /// The choice cast.
     pub choice: VoteChoice,
     /// Unix seconds the ballot was cast — the voter's clock. **Testimony only**
-    /// (ADR-0022 / T2.1.3): the ballot's window membership runs on its admission,
+    /// (ADR-0022): the ballot's window membership runs on its admission,
     /// and the voter's standing is judged at the proposal's open log position;
     /// neither reads this.
     pub cast_at: i64,
@@ -168,7 +168,7 @@ pub fn votes(
         // A ballot is admitted *after* the proposal opens; an entry at or before the
         // open position is never a ballot on this proposal (only reachable via
         // gossip injection). Log *position* orders the log — not the re-stamped
-        // `created_at` — so this gate is replica-identical (ADR-0022 / T2.1.3).
+        // `created_at` — so this gate is replica-identical (ADR-0022).
         if entry.seq <= open_seq {
             continue;
         }
@@ -227,7 +227,7 @@ pub fn append_vote(
         return Err(VoteError::ProposalNotPublished(vote.proposal_id));
     }
     // The ballot will be admitted at the monotone-clamped `now`; the window is on
-    // that admission, not the voter's `cast_at` (ADR-0022 / T2.1.3).
+    // that admission, not the voter's `cast_at` (ADR-0022).
     let admitted_at = match log.tail()? {
         Some(t) => now.max(t.created_at),
         None => now,
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn a_vote_admitted_after_the_window_closes_is_rejected() {
-        // The window runs on *admission* (T2.1.3): a ballot admitted after the
+        // The window runs on *admission*: a ballot admitted after the
         // proposal's close is refused, whatever its `cast_at` claims.
         let db = fresh_db();
         let station = Keypair::generate();
@@ -778,7 +778,7 @@ mod tests {
     fn cast_at_is_testimony_the_window_runs_on_admission() {
         // A ballot with an out-of-range `cast_at` (before the proposal even
         // existed) is still counted when *admitted* inside the window: `cast_at`
-        // is testimony, never the gate (ADR-0022 / T2.1.3).
+        // is testimony, never the gate (ADR-0022).
         let db = fresh_db();
         let station = Keypair::generate();
         let (members, proposal) = published_statute(&db, &station, 0);

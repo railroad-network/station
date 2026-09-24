@@ -44,7 +44,7 @@ That predicate is unsatisfiable in a brand-new community, and not by accident:
   banner. Governance and disputes simply never got the equivalent.
 
 - **The gap has been papered over, not closed.** Every live exercise of
-  governance (M1.9) and disputes (M1.10) to date has required standing up a
+  governance and disputes to date has required standing up a
   *test-build* station that manufactured established members, because a
   stock binary cannot produce a functioning electorate from a fresh log. The
   Phase-1 exit criteria require a real 20-plus-member community to run for 90

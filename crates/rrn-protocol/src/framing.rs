@@ -223,7 +223,7 @@ impl ChunkHeader {
 /// The payload id carried in a data frame's header (blake3 of the payload), or
 /// `None` if `frame` is not a well-formed framing chunk (wrong magic/version, too
 /// short). Lets a caller group a carrier's frames by payload — and tell a data
-/// chunk from a non-framing control frame — without a full decode (T2.6.2's
+/// chunk from a non-framing control frame — without a full decode (the
 /// reliability layer).
 pub fn frame_payload_id(frame: &[u8]) -> Option<[u8; 32]> {
     ChunkHeader::decode(frame).ok().map(|h| h.payload_id)
@@ -232,7 +232,7 @@ pub fn frame_payload_id(frame: &[u8]) -> Option<[u8; 32]> {
 /// The `(payload_id, chunk_index)` a data frame carries in its header, or `None`
 /// if `frame` is not a well-formed framing chunk. Lets a sender key a
 /// per-chunk in-flight set (so a flood of request-missing does not enqueue the
-/// same chunk twice — T2.6.2).
+/// same chunk twice).
 pub fn frame_ids(frame: &[u8]) -> Option<([u8; 32], u16)> {
     ChunkHeader::decode(frame)
         .ok()
@@ -602,7 +602,7 @@ mod tests {
     use super::*;
 
     /// The exact 76-byte header layout, pinned. A wire change to any field's
-    /// offset or width breaks this — the mobile FFI (T2.4.2) decodes these bytes.
+    /// offset or width breaks this — the mobile FFI decodes these bytes.
     #[test]
     fn header_golden_bytes() {
         let header = ChunkHeader {

@@ -31,7 +31,7 @@ defensible choice — not to wave the rule away.
 Two facts drive the decision:
 
 1. **The project's posture is "audit the whole stack."** Per design overview
-   Section 13.5 and milestone M0.7, an external security audit covers
+   Section 13.5, an external security audit covers
    everything that touches key material, *including our dependencies*. There is
    no "trusted, unaudited" tier for code on the secret-key path. So the usual
    payoff of a third-party crate — "someone else's reviewed code you don't have
@@ -75,14 +75,14 @@ sharings, one per byte position, sharing the same set of `x` indices. A shard is
 - **Multiple well-documented reference implementations exist to validate
   against** — SLIP-0039 (Trezor), academic implementations, and Trezor's Python
   `shamir-mnemonic`. We can check our output byte-for-byte against independent
-  implementations (T0.4.5), which is *stronger* evidence of correctness than
+  implementations, which is *stronger* evidence of correctness than
   "many people use this crate."
 - **The risk surface is small and well-bounded.** The things that can go wrong
   are enumerable: finite-field arithmetic correctness, constant-time discipline
   on secret-dependent operations, and correct CSPRNG usage. Each is directly
   addressable with deliberate code and exhaustive tests (the full 256×256
   multiplication table is testable; the field laws are property-testable).
-- **An external audit (M0.7) covers this code regardless of provenance**, so we
+- **An external audit covers this code regardless of provenance**, so we
   capture the tailoring benefit without giving up review.
 
 ### Standards followed
@@ -95,7 +95,7 @@ sharings, one per byte position, sharing the same set of `x` indices. A shard is
   `shamir-mnemonic`. Using a non-standard field would be a code smell and would
   forfeit that cross-validation.
 
-### Cross-validation targets (consumed by T0.4.5)
+### Cross-validation targets
 
 The "did we roll our own correctly" test matches our output against at least two
 independent published implementations:
@@ -139,11 +139,11 @@ to be investigated, not papered over with "our convention differs."
 
 | Risk | Mitigation |
 |---|---|
-| Implementation bug in field arithmetic or interpolation | Exhaustive 256×256 multiplication test against an independent reference multiply; field-law property tests; round-trip and reference-vector validation (T0.4.5) |
+| Implementation bug in field arithmetic or interpolation | Exhaustive 256×256 multiplication test against an independent reference multiply; field-law property tests; round-trip and reference-vector validation |
 | Constant-time failure (secret-dependent branch) | Table-based multiplication with branchless (`subtle`) handling of the zero operand; no data-dependent branches in field ops; cache-timing channel acknowledged in the threat model |
 | CSPRNG misuse (predictable coefficients) | Coefficients drawn from a `CryptoRng` supplied by the caller; index `0` forbidden as a share (it *is* the secret); coefficients zeroized after evaluation |
 | Maintenance burden | Small LOC, no unused surface, single-file core |
-| Audit findings | Expected; addressed before Phase 0 closure (M0.7) |
+| Audit findings | Expected; addressed before Phase 0 closure |
 
 ## Alternatives Considered
 

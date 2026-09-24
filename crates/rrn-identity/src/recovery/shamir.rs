@@ -171,7 +171,7 @@ pub fn split_secret(
 /// `total` must satisfy `threshold <= total <= MAX_SHARES`.
 ///
 /// Exposed (rather than kept private) for two reasons: it is the seam the
-/// reference-vector tests inject known coefficients through (T0.4.5), and it is a
+/// reference-vector tests inject known coefficients through, and it is a
 /// legitimately useful *reproducible* split for callers who derive their own
 /// coefficients deterministically. Such callers carry the obligation
 /// [`split_secret`] otherwise discharges: the coefficients **must** be
@@ -297,7 +297,7 @@ mod tests {
         ChaCha20Rng::from_seed([seed; 32])
     }
 
-    // --- T0.4.3: split ------------------------------------------------------
+    // --- split --------------------------------------------------------------
 
     #[test]
     fn threshold_below_two_is_rejected() {
@@ -359,7 +359,7 @@ mod tests {
         }
     }
 
-    // --- T0.4.4: reconstruct ------------------------------------------------
+    // --- reconstruct --------------------------------------------------------
 
     /// All `k`-element subsets of `0..n` (index combinations), for the
     /// exhaustive subset test.

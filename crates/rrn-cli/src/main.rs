@@ -459,7 +459,7 @@ enum DtnCmd {
     },
 }
 
-/// The `rrn cert …` subcommands (T2.3.1).
+/// The `rrn cert …` subcommands.
 #[derive(Subcommand)]
 enum CertCmd {
     /// Reserve a headroom certificate for your own wallet, ahead of going
@@ -476,7 +476,7 @@ enum CertCmd {
     },
 }
 
-/// The `rrn dispute …` subcommands (T1.10.5).
+/// The `rrn dispute …` subcommands.
 #[derive(Subcommand)]
 enum DisputeCmd {
     /// List the disputes currently frozen, with their live jury tally.
@@ -541,7 +541,7 @@ enum DisputeCmd {
     },
 }
 
-/// The `rrn governance …` subcommands (T1.9.7b).
+/// The `rrn governance …` subcommands.
 #[derive(Subcommand)]
 enum GovernanceCmd {
     /// Publish the community's genesis Charter. With no `--founder-key`, the
@@ -1289,7 +1289,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// The `rrn cert …` command family (T2.3.1, ADR-0021).
+/// The `rrn cert …` command family (ADR-0021).
 async fn cmd_cert(client: &UnixClient, fmt: Format, cmd: CertCmd) -> Result<()> {
     match cmd {
         CertCmd::Request { cap } => {
@@ -1829,7 +1829,7 @@ fn i(v: &serde_json::Value, key: &str) -> Option<i64> {
     v.get(key).and_then(|x| x.as_i64())
 }
 
-// --- governance text rendering (T1.9.7b) ------------------------------------
+// --- governance text rendering ----------------------------------------------
 
 /// The effective Charter and its governing thresholds.
 fn render_pending_charter(v: &serde_json::Value) -> String {
@@ -1989,7 +1989,7 @@ fn render_statutes(statutes: &serde_json::Value) -> String {
         .join("\n")
 }
 
-// --- dispute text rendering (T1.10.5) ---------------------------------------
+// --- dispute text rendering -------------------------------------------------
 
 /// One dispute per line: id, resolution status, jury tally, grievance.
 fn render_disputes(disputes: &serde_json::Value, color: ColorMode) -> String {

@@ -144,7 +144,7 @@ impl Default for CreditConfig {
 /// up front so a later cert-backed spend can be admitted without a fresh floor
 /// check. The reservation releases when a spend against the certificate can no
 /// longer be admitted — past [`escrow::spend_admissible_until`](crate::escrow::spend_admissible_until),
-/// the *single shared boundary* T2.3.2's admission bound also uses — mirroring
+/// the *single shared boundary* the cert-backed-spend admission bound also uses — mirroring
 /// the proposal-expiry release discipline (ADR-0018 point 2). `config` supplies
 /// that boundary's grace and skew.
 pub fn committed_debits_centi(
@@ -185,7 +185,7 @@ pub fn committed_debits_centi(
     // Outstanding certificate reservations: the remaining cap of each of the
     // member's *live* certificates (unreturned and still admissible — the shared
     // escrow boundary). Past that boundary a certificate reserves nothing, so it
-    // is excluded by `live_certs_of`, exactly T2.3.2's admission bound and the
+    // is excluded by `live_certs_of`, exactly the cert-backed-spend admission bound and the
     // proposal-expiry release discipline (ADR-0021 §2, ADR-0018 point 2).
     for cert_state in snapshot.live_certs_of(party, now, config) {
         let cert = &cert_state.certificate.payload;
@@ -348,8 +348,8 @@ mod tests {
     fn a_certificates_reservation_releases_at_the_shared_escrow_boundary() {
         // The coupled-boundary invariant (ADR-0021 §2, acceptance): the release
         // condition in `committed_debits_centi` fires at exactly
-        // `escrow::spend_admissible_until`, the same instant T2.3.2's admission
-        // bound will use. Boundary-tested one second either side.
+        // `escrow::spend_admissible_until`, the same instant the cert-backed-spend
+        // admission bound will use. Boundary-tested one second either side.
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         let (station, alice) = (Keypair::generate(), Keypair::generate());

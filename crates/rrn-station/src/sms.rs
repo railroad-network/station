@@ -1,4 +1,4 @@
-//! SMS as a DTN carrier (T2.7.1, Overview §10.3 "No internet — SMS").
+//! SMS as a DTN carrier (Overview §10.3 "No internet — SMS").
 //!
 //! When a community has cellular text messaging but no data, a paired member's
 //! phone can still reach its station: the app encodes its outbox into SMS text
@@ -13,12 +13,12 @@
 //! ## What this module is, and is not
 //!
 //! - The **wire** (chunk grammar, budget) is [`rrn_protocol::paper`], generalized by
-//!   T2.7.1 with an SMS-sized budget ([`paper::sms_chunk_budget_bytes`]). The chunk
+//!   an SMS-sized budget ([`paper::sms_chunk_budget_bytes`]). The chunk
 //!   alphabet is GSM-7-safe (audited there), so no transcoding is needed.
 //! - The **seam** is [`SmsGateway`]: `send` one text, `poll_recv` inbound texts.
-//!   T2.7.1 ships only [`MockSmsGateway`] (a deterministic, fault-injecting
+//!   This ships only [`MockSmsGateway`] (a deterministic, fault-injecting
 //!   in-memory channel for tests); the real modem/gateway that drives a production
-//!   [`sms_gateway_loop`] is T2.7.2.
+//!   [`sms_gateway_loop`] is not yet wired.
 //! - The **engine** is [`SmsRelay`]: per-sender reassembly, the sender registry
 //!   ("paired"/"open"), a per-sender inbound rate cap, and a strict-priority
 //!   (money-first) outbound queue. It is clock-injected and pull-driven, mirroring
@@ -117,7 +117,7 @@ pub struct InboundSms {
 }
 
 /// The SMS transport seam: a carrier that sends and receives text messages. The
-/// real modem/HTTP-provider implementation is T2.7.2; T2.7.1 ships [`MockSmsGateway`].
+/// real modem/HTTP-provider implementation is not yet wired; this ships [`MockSmsGateway`].
 pub trait SmsGateway: Send + Sync {
     /// Sends one text message to `to`. An error is a backend fault the caller may
     /// retry; the reliability model (re-send until the receipt returns) tolerates a

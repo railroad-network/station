@@ -8,11 +8,11 @@ Date: 2026-07-23
 
 ## Context
 
-M1.4 gave the network its first reputation *input*: an in-person vouch, signed by
+The vouching work gave the network its first reputation *input*: an in-person vouch, signed by
 the voucher's mobile and appended to the log, carrying a reputation stake
 ([ADR references in `docs/threat-model.md`](../threat-model.md), "Vouching
 surface"). A vouch is only worth staking against if there is a reputation to
-stake. M1.5 builds the thing the stake is denominated in: a score, derived from
+stake. This work builds the thing the stake is denominated in: a score, derived from
 the log, that says how much the network should trust a member.
 
 This is the first protocol-level *scoring* system in the project, and it is
@@ -53,7 +53,7 @@ The forces:
   the five dimensions — community contribution and domain competence — have no
   data source in Phase 1. Community contribution is a Phase 2+ concept; domain
   competence is fed by marketplace transactions tagged with categories, which
-  arrive in M1.7. The formula has to name all five now (so it never changes
+  arrive later. The formula has to name all five now (so it never changes
   shape) while honestly producing nothing for the two that have no inputs.
 
 - **Sybil resistance is mostly this formula's job in Phase 1.** The heavier
@@ -64,7 +64,7 @@ The forces:
   is therefore not a tuning knob; it is the primary structural defense, and it
   belongs in the locked formula.
 
-The M1.5 task spec proposes concrete starter values for every weight and
+The reputation task spec proposes concrete starter values for every weight and
 threshold. This ADR adopts them and records *why* they are defensible, so that a
 future federation-governance proposal to change them argues against stated
 reasoning rather than against a wall of unexplained constants.
@@ -85,11 +85,11 @@ range).
 
 | Dimension | Weight | Phase-1 input |
 |---|---:|---|
-| Trade reliability | 0.30 | Count and recency of settled transactions, weighted by transaction tier (tiers arrive in M1.8; until then all tiers weight equally). Confirmed-and-settled is positive signal; cancelled-by-counterparty is neutral; disputed-against is negative (no disputes in Phase 1 — the slot is reserved). |
+| Trade reliability | 0.30 | Count and recency of settled transactions, weighted by transaction tier (tiers arrive later; until then all tiers weight equally). Confirmed-and-settled is positive signal; cancelled-by-counterparty is neutral; disputed-against is negative (no disputes in Phase 1 — the slot is reserved). |
 | Attestation accuracy | 0.25 | For every attestation this member signed (vouches, transaction confirmations), the ratio of accurate-to-total, where "inaccurate" means later proven wrong by a fraud finding. No fraud-finding mechanism exists in Phase 1, so every attestation counts as accurate and the dimension rewards attestation *volume* — see Consequences. |
-| Governance participation | 0.15 | Votes cast, proposals authored (quality-weighted by whether they passed), council service (M2+ placeholder). No governance mechanism ships in M1.5, so this reads 0 until M1.9. |
+| Governance participation | 0.15 | Votes cast, proposals authored (quality-weighted by whether they passed), council service (Phase 2+ placeholder). No governance mechanism ships yet, so this reads 0 until governance lands. |
 | Community contribution | 0.15 | Non-economic contributions. **Phase 1: always 0.0** — no data source until Phase 2+. Named now so the formula never changes shape. |
-| Domain competence | 0.15 | Per-category score, `BTreeMap<DomainTag, f32>`, fed by marketplace transactions tagged with a controlled category vocabulary (M1.6/M1.7). **Phase 1: empty map, contributes 0.0.** |
+| Domain competence | 0.15 | Per-category score, `BTreeMap<DomainTag, f32>`, fed by marketplace transactions tagged with a controlled category vocabulary. **Phase 1: empty map, contributes 0.0.** |
 
 The weights sum to 1.0 and are a deliberate ordering of what the network values:
 **demonstrated trade behavior first** (0.30 — Section 5.2 calls transaction
@@ -128,7 +128,7 @@ invariant across both.
 
 The accepted, visible cost: **the maximum composite reachable in Phase 1 is
 3.50**, because community contribution and domain competence (0.30 of the weight)
-are structurally 0.0. The two upper bands are therefore unreachable until M1.7+
+are structurally 0.0. The two upper bands are therefore unreachable until later phases
 supplies their inputs. This is honest rather than a defect: "Trusted" and
 "Senior" are supposed to require demonstrated domain competence and community
 contribution, and Phase 1 does not yet measure either. The UI must present the
@@ -173,7 +173,7 @@ decay does not disturb cross-station or cross-time determinism.
 important Sybil defense M1 has, and it is structural, not tunable. A refresh
 interval finer than weekly accumulates the gain over a trailing 7-day window;
 exceeding the cap is a *flag for human review*, never an automatic punishment
-(humans decide — see `sybil.rs`, T1.5.8).
+(humans decide — see `sybil.rs`).
 
 ### Identity anchoring
 
@@ -200,16 +200,16 @@ stops a lone fake identity, not a patient pair; the velocity cap and human revie
 are what bound that case in Phase 1, and detecting the pattern itself is the
 Phase 2 graph analysis.
 
-> **Amended 2026-07-27 (T1.5.8).** This threshold was originally 3.0, which
+> **Amended 2026-07-27.** This threshold was originally 3.0, which
 > Phase 1 could not reach: with governance participation, community contribution
 > and domain competence all structurally 0.0, the highest available composite is
 > `0.55 · 5.0 = 2.75`. Enforcing a 3.0 threshold would have held **every** member,
 > founding members included, at 1.0 in every dimension permanently — reputation
 > would have been a constant. The threshold is now tied to the Member-band floor
 > so that it keeps denoting "someone the community recognizes as established" as
-> M1.7 and M1.9 light up the remaining dimensions, instead of needing to be
+> later milestones light up the remaining dimensions, instead of needing to be
 > renumbered each time. Alternatives weighed and rejected: deferring anchoring
-> until M1.9 made 3.0 reachable (leaves the pilot with no anchoring at all);
+> until governance made 3.0 reachable (leaves the pilot with no anchoring at all);
 > exempting founding identities (two carve-outs instead of one, and all anchoring
 > would still funnel through the founders); and replacing the composite test with
 > a chain-of-trust walk from a genesis identity (strictly stronger — it is the one
@@ -224,13 +224,13 @@ velocity cap, and the 1.0 anchoring cap with its Member-band voucher threshold �
 is fixed at the federation-protocol level. A station operator cannot override any of them;
 there is no config surface for them by design. They change only through a
 federation-wide governance process (mechanism itself is a Phase 2 concern). This
-ADR is the source of truth; the `rrn-reputation` implementation (T1.5.2–T1.5.8)
+ADR is the source of truth; the `rrn-reputation` implementation
 follows it, and any divergence is a bug in the code, not a local policy choice.
 
 ## Consequences
 
 - **The formula is portable by construction.** Because the computation is total,
-  deterministic, and phase-invariant, `verify_history` (T1.5.7) on a receiving
+  deterministic, and phase-invariant, `verify_history` on a receiving
   station replays the exporter's log entries and must arrive at the same profile
   the exporter published, or reject the export. Reputation becomes a
   passport that cannot be forged by inflating it at home.
@@ -246,17 +246,17 @@ follows it, and any divergence is a bug in the code, not a local policy choice.
   dimension effectively rewards *making* attestations rather than making them
   *well*. This is a soft farming surface (cheap vouches inflate attestation
   accuracy), bounded for now by the velocity cap and identity anchoring, and
-  closed properly when M1.8+ adds fraud findings that can retroactively mark an
-  attestation wrong. It must be named in the threat model (T1.5.8).
+  closed properly when later work adds fraud findings that can retroactively mark an
+  attestation wrong. It must be named in the threat model.
 
-- **Three of five dimensions are dark in Phase 1** (governance until M1.9,
-  community contribution in Phase 2+, domain competence in M1.7). The code carries
+- **Three of five dimensions are dark in Phase 1** (governance until it ships,
+  community contribution in Phase 2+, domain competence later). The code carries
   all five so the shape never changes, but reviewers should expect the Phase-1
   composite to be driven almost entirely by trade reliability and attestation
   accuracy.
 
 - **Scoring is O(N) in log size per fresh computation.** Fine at Phase 1 scale
-  (hundreds of members, thousands of entries); the snapshot cache (T1.5.5) exists
+  (hundreds of members, thousands of entries); the snapshot cache exists
   so queries do not pay the replay cost every time, with the log remaining
   canonical and the snapshot a derived view.
 
@@ -275,9 +275,9 @@ follows it, and any divergence is a bug in the code, not a local policy choice.
 - **Renormalize the composite over active dimensions (divisor 0.70 in Phase 1).**
   Lets the full New→Senior range be reached immediately, which is friendlier.
   Rejected because it makes the same log score differently across phases: when
-  M1.7 activates domain competence the divisor changes and every member's
+  domain competence activates the divisor changes and every member's
   composite shifts with no behavior change, breaking portability and
-  determinism-across-time — the properties T1.5.7 depends on. We took the honest
+  determinism-across-time — the properties reputation portability depends on. We took the honest
   ceiling instead.
 
 - **Drop the two Phase-1-empty dimensions from the model until they have inputs.**
@@ -289,7 +289,7 @@ follows it, and any divergence is a bug in the code, not a local policy choice.
 - **Store reputation as an authoritative value rather than deriving it from the
   log.** Rejected: a stored score is a second source of truth that can drift from
   the log and cannot be re-verified by a receiving community. The profile is a
-  derived view; the log is canonical (Section 5.6). The snapshot table (T1.5.5)
+  derived view; the log is canonical (Section 5.6). The snapshot table
   is a cache, not an authority.
 
 - **Auto-penalize velocity violations.** Rejected per task spec: a burst of
@@ -310,5 +310,5 @@ follows it, and any divergence is a bug in the code, not a local policy choice.
 - [ADR-0002](0002-canonical-serialization-dcbor.md) — canonical dCBOR; the replay determinism this ADR depends on rests on it.
 - [ADR-0005](0005-station-signed-settlement.md) — settlement is the trade-reliability input source.
 - [ADR-0008](0008-mobile-station-transport.md) — the log entries scored here arrive as signed, sealed envelopes.
-- `docs/threat-model.md`, "Vouching surface (M1.4)" — vouches are a reputation input; the attestation-accuracy farming surface named above extends it.
-- M1.5 task spec (`Phase 1 Tasks/M1.5 Reputation Scoring.md`) — T1.5.1 through T1.5.8 implement this ADR.
+- `docs/threat-model.md`, "Vouching surface" — vouches are a reputation input; the attestation-accuracy farming surface named above extends it.
+- The reputation task spec implements this ADR.

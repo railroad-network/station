@@ -1,5 +1,5 @@
-//! Certificate-backed spends: admission against escrowed headroom (T2.3.2,
-//! ADR-0021 §3–§5).
+//! Certificate-backed spends: admission against escrowed headroom
+//! (ADR-0021 §3–§5).
 //!
 //! A cert-backed proposal draws against a headroom certificate whose full cap
 //! was reserved at issuance, so it is admitted **without a fresh debt-floor
@@ -291,8 +291,8 @@ fn expiry_boundary_is_the_shared_escrow_instant() {
         Err(Error::CertificateExpired)
     ));
 
-    // At exactly the boundary: admitted — the same instant T2.3.1's reservation
-    // release is coupled to.
+    // At exactly the boundary: admitted — the same instant the certificate's
+    // reservation release is coupled to.
     let at_bound = cert_proposal(&db, &station, &alice, &bob, 300, cert, bound);
     engine.submit_proposal(at_bound, bound).unwrap();
     assert_eq!(

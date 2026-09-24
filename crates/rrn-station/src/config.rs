@@ -9,7 +9,7 @@
 //! default to production-ish values when omitted, so the minimal file in the
 //! [module example](#example) is valid on its own.
 //!
-//! Note that *mobile* discovery is mDNS ([`crate::mdns`], T1.3.2) — that is a
+//! Note that *mobile* discovery is mDNS ([`crate::mdns`]) — that is a
 //! separate surface from peer gossip, and the two are not to be confused.
 //!
 //! A community's log has exactly one writer (ADR-0020 §1). The default
@@ -63,7 +63,7 @@ pub struct StationConfig {
     #[serde(default)]
     pub mobile: MobileConfig,
     /// Settlement tuning (optional; defaults to the per-tier windows —
-    /// Tier 1 = 24h, Tier 2 = 48h, T1.8.4).
+    /// Tier 1 = 24h, Tier 2 = 48h).
     #[serde(default)]
     pub settlement: SettlementSection,
     /// Credit tuning (optional; defaults to the protocol debt floor of
@@ -82,10 +82,10 @@ pub struct StationConfig {
     #[serde(default)]
     pub sidecar: SidecarSection,
     /// LoRa airtime budget for the Reticulum transport (optional; defaults to the
-    /// design's ~250 B/s raw at 1% duty, T2.6.2).
+    /// design's ~250 B/s raw at 1% duty).
     #[serde(default)]
     pub lora: LoraSection,
-    /// SMS carrier (optional; disabled by default, T2.7.1). A member's paired phone
+    /// SMS carrier (optional; disabled by default). A member's paired phone
     /// texts its outbox to the station's number; the station decodes, ingests, and
     /// texts receipts back.
     #[serde(default)]
@@ -186,14 +186,14 @@ impl Default for EncryptedSection {
     }
 }
 
-/// `[sms]` — SMS as a DTN carrier (T2.7.1, Overview §10.3 "No internet — SMS").
+/// `[sms]` — SMS as a DTN carrier (Overview §10.3 "No internet — SMS").
 ///
 /// SMS is a *carrier for signed payloads*, never custody: a paired phone encodes
 /// its outbox into GSM-7-safe text chunks and texts them to `station_msisdn`; the
 /// station reassembles, ingests through the same DTN front door the online path
 /// uses (ADR-0020 §3), and texts the signed receipt back. Off by default; and even
-/// when enabled, T2.7.1 ships no modem backend — the real gateway that this config
-/// drives is T2.7.2, so an enabled `[sms]` without that backend is supervised-but-
+/// when enabled, no modem backend ships — the real gateway that this config
+/// drives is not yet wired, so an enabled `[sms]` without that backend is supervised-but-
 /// idle (mirroring `[sidecar]` without `[lora] adapter_script`). See
 /// `docs/spec/sms-carrier.md`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,7 +202,7 @@ pub struct SmsSection {
     #[serde(default)]
     pub enabled: bool,
     /// The station's own phone number (E.164), the number members text. Required
-    /// when the modem backend runs (T2.7.2); optional here.
+    /// when the modem backend runs; optional here.
     #[serde(default)]
     pub station_msisdn: Option<String>,
     /// The most concatenated GSM-7 parts one SMS message (one chunk) may span.
@@ -256,13 +256,13 @@ impl SmsSection {
     }
 }
 
-/// `[lora]` — the airtime budget the Reticulum transport paces to (T2.6.2).
+/// `[lora]` — the airtime budget the Reticulum transport paces to.
 ///
 /// LoRa's honest ceiling is ~250 raw bytes/second, and regional duty-cycle rules
 /// cut *sustained* throughput far lower (design overview §10.3). The station paces
 /// to `sustained = raw_bytes_per_sec × duty_cycle_percent / 100`, prioritizing
 /// money over governance over bulk (`rrn_protocol::airtime`). Code takes numbers;
-/// the per-geography duty-cycle table is the T2.6.3 operator runbook's job.
+/// the per-geography duty-cycle table is the operator runbook's job.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoraSection {
     /// Raw carrier throughput in bytes/second before the duty cycle. Defaults to
@@ -284,7 +284,7 @@ pub struct LoraSection {
     pub frame_bytes: usize,
     /// Path to the Reticulum LXMF adapter script
     /// (`scripts/reticulum/lxmf_adapter.py`). When set **and** `[sidecar]` is
-    /// enabled, the station runs the DTN transport over Reticulum (T2.6.2);
+    /// enabled, the station runs the DTN transport over Reticulum;
     /// omitted → the sidecar is supervised but no DTN traffic flows over it yet.
     #[serde(default)]
     pub adapter_script: Option<String>,
@@ -488,7 +488,7 @@ pub struct MobileConfig {
     /// this must be reachable from the LAN, so it defaults to all interfaces
     /// rather than loopback.
     ///
-    /// T1.3.2 only *advertises* this port over mDNS; T1.3.4 binds it.
+    /// mDNS only *advertises* this port; the daemon binds it.
     #[serde(default = "default_mobile_listen")]
     pub listen: String,
     /// Overrides the name advertised over mDNS. When omitted — the normal case
@@ -502,7 +502,7 @@ pub struct MobileConfig {
     #[serde(default = "default_advertise")]
     pub advertise: bool,
     /// How long a `/subscribe` long-poll is held open before returning an empty
-    /// heartbeat (T1.3.5). The default matches the task's 30s; tests set it small
+    /// heartbeat. The default matches the task's 30s; tests set it small
     /// so the timeout path is fast.
     #[serde(default = "default_subscribe_hold_secs")]
     pub subscribe_hold_secs: u64,
@@ -642,13 +642,13 @@ impl Default for DtnSection {
 /// Reticulum only where an operator opts in — and, when on, is run as an
 /// appliance-style managed child (version-pinned, restarted with backoff, killed
 /// cleanly on shutdown). Its loss is a connectivity event, never a reason the
-/// daemon exits (T2.4.1 posture).
+/// daemon exits.
 ///
 /// The generated Reticulum config (in [`config_dir`](SidecarSection::config_dir))
 /// is templated from [`tcp_listen`](SidecarSection::tcp_listen) and
 /// [`tcp_peers`](SidecarSection::tcp_peers) only; the RNode/LoRa interface
-/// template lands in T2.6.3, and the `FrameTransport` impl over the sidecar in
-/// T2.6.2. This ticket (T2.6.1) delivers the supervisor and the integration
+/// template comes later, and the `FrameTransport` impl over the sidecar comes
+/// with the Reticulum transport. This delivers the supervisor and the integration
 /// spike, not the transport wiring.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SidecarSection {
@@ -745,14 +745,14 @@ pub struct TimersSection {
     /// Inquiry-expiry sweep interval in seconds (default: 3600 — hourly).
     ///
     /// Coarser than the listing sweep: an inquiry expires after seven days of no
-    /// activity (T1.7.4), so a few minutes of latency on writing that close down
+    /// activity, so a few minutes of latency on writing that close down
     /// changes nothing a party would notice.
     #[serde(default = "default_inquiry_expiry_interval")]
     pub inquiry_expiry_interval_secs: u64,
     /// Service-contract charge sweep interval in seconds (default: 300 — five
     /// minutes).
     ///
-    /// Each tick bills every period a live contract has due (T1.7.7). Latency here
+    /// Each tick bills every period a live contract has due. Latency here
     /// only delays *writing down* a charge the contract already authorized, and a
     /// re-swept period folds to nothing (the `(contract, period)` idempotency key),
     /// so a coarse cadence is safe; a test drives it directly through
@@ -761,8 +761,8 @@ pub struct TimersSection {
     pub contract_charge_interval_secs: u64,
     /// Governance-enactment sweep interval in seconds (default: 3600 — hourly).
     ///
-    /// Puts every passed proposal whose implementation delay has run into force
-    /// (T1.9.7). Coarse on purpose: the delay is measured in days, so an hour of
+    /// Puts every passed proposal whose implementation delay has run into force.
+    /// Coarse on purpose: the delay is measured in days, so an hour of
     /// latency writing the enactment down changes nothing a member would notice,
     /// and the sweep catches up every proposal due since the last tick.
     #[serde(default = "default_governance_implementation_interval")]
@@ -770,7 +770,7 @@ pub struct TimersSection {
     /// Dispute-resolution sweep interval in seconds (default: 3600 — hourly).
     ///
     /// Enacts a dispute whose jury has reached a majority, and lapses one whose
-    /// window has closed unresolved (T1.10.5). Coarse on purpose: the freeze window
+    /// window has closed unresolved. Coarse on purpose: the freeze window
     /// is measured in days, so an hour of latency writing the outcome down changes
     /// nothing a party would notice, and the sweep catches up every dispute due
     /// since the last tick. A test drives it directly through
@@ -779,8 +779,8 @@ pub struct TimersSection {
     pub dispute_resolution_interval_secs: u64,
     /// DTN receipt-delivery prune interval in seconds (default: 3600 — hourly).
     ///
-    /// Each tick removes delivery-tracking rows past their retention (ADR-0020 §3,
-    /// T2.2.4): confirmed receipts older than `[dtn] receipt_retention_secs`, and
+    /// Each tick removes delivery-tracking rows past their retention (ADR-0020 §3):
+    /// confirmed receipts older than `[dtn] receipt_retention_secs`, and
     /// unconfirmed ones older than four times that. Pure housekeeping on a queue,
     /// with days-to-weeks-long retentions, so a coarse cadence is ample; a test
     /// drives it directly through

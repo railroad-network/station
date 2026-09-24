@@ -1,5 +1,5 @@
 //! Station-role DTN state: seen remote chains, fork evidence, issued receipts
-//! (ADR-0020 §3-§4; T2.2.3).
+//! (ADR-0020 §3-§4).
 //!
 //! This is the *station's* view of delay-tolerant submission, the counterpart to
 //! [`crate::outbox`] (a *device's* own outbox). It persists three things the
@@ -11,7 +11,7 @@
 //!   filling the gap later does (ADR-0020 §2).
 //! - **Fork evidence** — when two validly-signed entries from one author claim
 //!   the same position with different content (an outbox fork / equivocation,
-//!   ADR-0021), both raw envelopes are kept verbatim for T2.3.3.
+//!   ADR-0021), both raw envelopes are kept verbatim as equivocation proof.
 //! - **Issued receipts** — keyed by a bundle's *presentation hash*, so
 //!   re-ingesting a byte-identical presentation returns the same receipt
 //!   verbatim (idempotency, ADR-0020 §3).
@@ -322,7 +322,7 @@ impl<'a> DtnStore<'a> {
         Ok(())
     }
 
-    // --- receipt delivery tracking (ADR-0020 §3; T2.2.4) -------------------
+    // --- receipt delivery tracking (ADR-0020 §3) ---------------------------
     //
     // The outbound counterpart of the ingest state above: once a receipt is
     // issued (`put_receipt`), one row per reported record is queued here so the
@@ -495,7 +495,7 @@ impl<'a> DtnStore<'a> {
     /// The number of delivery-receipt rows still pending confirmation
     /// (`confirmed_delivered = 0`) — receipts the station is holding to hand to a
     /// courier or whose delivery the author has not yet acked. A
-    /// degradation-legibility count for the `status` connectivity block (T2.4.1).
+    /// degradation-legibility count for the `status` connectivity block.
     /// Derived, not cached.
     pub fn pending_receipt_count(&self) -> Result<u64> {
         let n: i64 = self.db.conn().query_row(
@@ -962,7 +962,7 @@ mod tests {
         assert_eq!(s.receipt_for(&ph).unwrap(), Some(b"receipt-bytes".to_vec()));
     }
 
-    // --- receipt delivery tracking (T2.2.4) --------------------------------
+    // --- receipt delivery tracking -----------------------------------------
 
     /// Persists a receipt and queues a delivery row for `record_hash` by `author`
     /// against it, in one step (the receipt must exist first for the FK).

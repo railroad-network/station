@@ -1,4 +1,4 @@
-//! Canonical CBOR from a tagged-JSON payload value model (T1.1.7).
+//! Canonical CBOR from a tagged-JSON payload value model.
 //!
 //! Mobile signs *values*, and the signature must cover the same canonical dCBOR
 //! bytes the station would produce for the same logical value (ADR-0002). The

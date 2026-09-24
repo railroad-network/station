@@ -1,4 +1,4 @@
-//! Deriving a member's push events from the append-only log (T1.3.5).
+//! Deriving a member's push events from the append-only log.
 //!
 //! The mobile long-poll (`/subscribe`) needs to answer one question: *what has
 //! happened, relevant to this member, since the last thing it saw?* We answer it
@@ -8,7 +8,7 @@
 //! entry that survives a restart, so "events since you last looked" is just "log
 //! entries after your cursor that concern you". The mobile holds the cursor (a
 //! log seq) and sends it each subscribe; the station stays delivery-stateless.
-//! See ADR-0008 and the M1.3 exit criterion.
+//! See ADR-0008 and the mobile-transport exit criterion.
 //!
 //! **Directional relevance, not merely party-hood.** A member is not notified of
 //! their *own* action — the sender already knows they proposed. So:
@@ -34,9 +34,9 @@ use serde::Serialize;
 use crate::rpc::TransactionRow;
 use crate::transaction_view::row_for;
 
-/// The kind of a push event. The full set is the T1.3.5 wire contract so the
+/// The kind of a push event. The full set is the wire contract so the
 /// mobile router can handle a future type gracefully; only the first four have a
-/// live ledger source in M1.3 (the rest arrive with later milestones).
+/// live ledger source today (the rest arrive with later milestones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -49,20 +49,20 @@ pub enum EventKind {
     /// A proposal this member is party to was cancelled/expired (delivered to
     /// the counterparty of whoever caused it; to both on expiry).
     Cancellation,
-    /// Someone vouched for this member (delivered to the subject; T1.4.1).
+    /// Someone vouched for this member (delivered to the subject).
     VouchReceived,
-    /// M1.6/M1.7 — no live source yet.
+    /// The marketplace — no live source yet.
     ListingMatch,
-    /// M1.9 — no live source yet.
+    /// Governance — no live source yet.
     GovernanceProposal,
-    /// M1.9 — no live source yet.
+    /// Governance — no live source yet.
     VoteNeeded,
 }
 
 /// One push event: its id (the log seq), its kind, and the payload the wallet
 /// renders — a transaction row for the ledger kinds, a vouch row for a vouch.
 /// Exactly one of the two payload fields is present; the absent one is omitted
-/// from the wire so the T1.3.5 payment-event shape is unchanged.
+/// from the wire so the payment-event shape is unchanged.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     /// The event id — the log entry's seq. Monotonic; the mobile acks by sending
@@ -70,11 +70,11 @@ pub struct Event {
     pub id: u64,
     /// What happened.
     pub kind: EventKind,
-    /// The transaction, from `member`'s vantage point (T1.3.4 shape). Present
+    /// The transaction, from `member`'s vantage point. Present
     /// for the four ledger kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction: Option<TransactionRow>,
-    /// The vouch, for a `vouch_received` event (T1.4.1).
+    /// The vouch, for a `vouch_received` event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vouch: Option<VouchRow>,
 }

@@ -109,7 +109,7 @@ impl<'db> ReputationScorer<'db> {
     }
 
     /// The address's reputation as it stood at `at_time`, computed from only the
-    /// log prefix `[1, max_seq]` — the position-bounded profile T2.1.3 uses to pin
+    /// log prefix `[1, max_seq]` — the position-bounded profile used to pin
     /// a governance electorate at a window's log position.
     ///
     /// Both the evidence and the anchoring vouch are bounded to the prefix, so a
@@ -140,7 +140,7 @@ impl<'db> ReputationScorer<'db> {
     }
 
     /// Like [`score_raw_at`](Self::score_raw_at), but only evidence admitted within
-    /// the log prefix `[1, max_seq]` counts — the position-bounded form (T2.1.3).
+    /// the log prefix `[1, max_seq]` counts — the position-bounded form.
     /// Retained for the crate's tests; production builds a [`ScoringContext`]
     /// directly.
     #[cfg(test)]
@@ -330,7 +330,7 @@ mod tests {
         (a - b).abs() < 1e-6
     }
 
-    // --- equivocation (T2.3.3) ----------------------------------------------
+    // --- equivocation -------------------------------------------------------
 
     use rrn_ledger::escrow::{CertId, CertificateRequest, EvidenceItem, HeadroomCertificate};
 
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn only_a_station_signed_overturn_neutralizes_the_penalty() {
         // The overturn must be signed by the same key that signed the equivocation
-        // record (T2.3.4 step 8). Mallory self-signing an `Overturn` does not lift
+        // record (ADR-0025). Mallory self-signing an `Overturn` does not lift
         // her own penalty; the station's does.
         let db = fresh_db();
         let (mallory, station) = (Keypair::generate(), Keypair::generate());

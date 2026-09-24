@@ -1,4 +1,4 @@
--- Station-role DTN state (ADR-0020 §3-§4; T2.2.3).
+-- Station-role DTN state (ADR-0020 §3-§4).
 --
 -- These tables are the *station's* record of the delay-tolerant submission
 -- machinery — distinct from `outbox_entries` (0005), which is a *device's* own
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS seen_outbox_entries (
 
 -- Persisted outbox-fork evidence (ADR-0020 §2 / ADR-0021): two validly-signed
 -- entries by one author at the same position with different content. Both raw
--- envelopes are kept verbatim as the equivocation proof T2.3.3 consumes. One
+-- envelopes are kept verbatim as the equivocation proof. One
 -- row per (author, position) fork — the first conflicting pair detected.
 --   author       BLOB    32-byte pubkey of the equivocating author
 --   position     INTEGER the shared position

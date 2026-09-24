@@ -1,4 +1,4 @@
-//! `FrameTransport` over the supervised Reticulum LXMF adapter (T2.6.2, ADR-0026 §3).
+//! `FrameTransport` over the supervised Reticulum LXMF adapter (ADR-0026 §3).
 //!
 //! ADR-0026 ratified the sidecar and found the decisive constraint: **RNS exposes
 //! no language-neutral send/receive RPC**. The supported way to move an LXMF
@@ -15,7 +15,7 @@
 //! [`ReticulumTransport`], a [`FrameTransport`] that spawns the adapter, writes
 //! outbound frames to its stdin, and drains inbound frames a background reader
 //! thread collects from its stdout. The real end-to-end path (adapter ↔ `rnsd` ↔
-//! `rnsd` ↔ adapter) is exercised in the T2.6.1 spike lane, extended by T2.6.2.
+//! `rnsd` ↔ adapter) is exercised in the integration spike lane.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -99,7 +99,7 @@ pub struct AdapterConfig {
     /// The `rnsd` config dir the adapter attaches its shared instance to.
     pub config_dir: PathBuf,
     /// Where the adapter persists its LXMF identity (the reachability key — its
-    /// custody is T2.9.1's at-rest scope, ADR-0026 §7).
+    /// custody is the at-rest scope, ADR-0026 §7).
     pub identity_path: PathBuf,
     /// The largest carrier frame, in bytes — the [`TransportProfile::max_frame_bytes`].
     pub max_frame_bytes: usize,

@@ -1,4 +1,4 @@
-//! Authenticated request-channel acceptance (T1.3.4): a real station, the real
+//! Authenticated request-channel acceptance: a real station, the real
 //! HTTP `/rpc` endpoint, real sealing and signing.
 //!
 //! Drives a paired mobile's happy path — seal + sign a request, POST it, open
@@ -527,7 +527,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         "a relayed foreign proposal is refused"
     );
 
-    // --- T1.3.5: push events over /subscribe -------------------------------
+    // --- push events over /subscribe -------------------------------
     // The log now holds a proposal (seq 1) and its confirmation (seq 2).
 
     // (a) The sender subscribes from the start: it is told its proposal was
@@ -652,7 +652,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         "heartbeat advances the cursor"
     );
 
-    // --- T1.4.3: a paired mobile submits a vouch it signed -----------------
+    // --- a paired mobile submits a vouch it signed -----------------
     let params = vouch_params(&mobile, &receiver_addr, now);
     let req = sealed_request(
         &mobile,
@@ -689,7 +689,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     let reply = open_reply(&mobile, &station_pk, &body);
     assert!(reply.error.is_some(), "a relayed foreign vouch is refused");
 
-    // --- T1.4.1: the vouch reaches its subject over /subscribe -------------
+    // --- the vouch reaches its subject over /subscribe -------------
     // The subject (the receiver) subscribes from the start and finds a
     // vouch_received event carrying the vouch row — same content address the
     // submit returned, the voucher's address, and no transaction payload.
@@ -736,7 +736,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         "voucher not told of own vouch"
     );
 
-    // --- T1.4.4: vouch_counts are member-relative and truthful -------------
+    // --- vouch_counts are member-relative and truthful -------------
     // One vouch was appended (mobile → receiver). The voucher sees given=1,
     // received=0; the subject sees given=0, received=1. Each reads its OWN
     // counts (the member is the authenticated signer, not a param).
@@ -782,7 +782,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     assert_eq!(counts["given"], 0, "subject gave none");
     assert_eq!(counts["received"], 1, "subject received one vouch");
 
-    // --- T1.4.5: list_vouches returns the browser rows, split by direction --
+    // --- list_vouches returns the browser rows, split by direction --
     // The voucher lists one given row (naming both parties, same content
     // address the submit returned) and no received rows.
     let req = sealed_request(
@@ -848,7 +848,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     assert_eq!(lists["received"][0]["vouch_id"], vouch_id);
 
-    // --- T1.5.9: reputation is readable over the same sealed channel ---------
+    // --- reputation is readable over the same sealed channel ---------
     // The member's own standing: the full five-dimension breakdown, keyed to the
     // authenticated signer rather than a param, so a mobile cannot ask for
     // anyone else's dimensions.

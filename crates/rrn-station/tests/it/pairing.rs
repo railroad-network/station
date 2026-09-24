@@ -1,4 +1,4 @@
-//! Pairing acceptance (T1.3.3): a real station, the real HTTP `/pair` endpoint,
+//! Pairing acceptance: a real station, the real HTTP `/pair` endpoint,
 //! and the real operator Unix-socket commands.
 //!
 //! Drives the whole happy path end-to-end — a mobile POSTs a signed request, the

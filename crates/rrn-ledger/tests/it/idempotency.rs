@@ -1,4 +1,4 @@
-//! Replaying ledger operations is safe (T0.5.7).
+//! Replaying ledger operations is safe.
 //!
 //! "Idempotent" here does *not* mean "every operation can be called twice with
 //! no error." Some operations correctly *error* on a duplicate (resubmitting a

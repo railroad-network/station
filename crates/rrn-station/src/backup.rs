@@ -1,4 +1,4 @@
-//! Encrypted station backup and restore (ADR-0016 / T1.11.3).
+//! Encrypted station backup and restore (ADR-0016).
 //!
 //! A backup is a single encrypted archive of the irreplaceable contents of a
 //! station's data directory:
@@ -16,7 +16,7 @@
 //! The whole bundle is sealed in a [`DualWrapEnvelope`]: encrypted under a fresh
 //! random data-encryption key whose key is wrapped both under the passphrase and
 //! to the station's own public key. The passphrase path is used by
-//! [`restore_backup`] here; the public-key path is what the (T1.11.3 slice D)
+//! [`restore_backup`] here; the public-key path is what the
 //! recovery ceremony uses to open a backup after a lost passphrase. See
 //! [ADR-0016](../../../docs/adr/0016-station-backup-and-key-recovery.md).
 
@@ -192,7 +192,7 @@ pub fn restore_backup(
 }
 
 /// Restores an archive using the station's **secret key** rather than the
-/// passphrase — the recovery path (T1.11.3 slice D) taken after a lost
+/// passphrase — the recovery path taken after a lost
 /// passphrase, once the key has been reconstructed from a threshold of holders.
 ///
 /// Writes the ledger and the paired/config files, but **skips the stored wallet

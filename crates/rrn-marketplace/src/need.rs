@@ -255,7 +255,7 @@ fn is_obtainable(listing: &Listing) -> bool {
 /// nothing — not an error, simply no longer a question worth answering.
 ///
 /// Takes the index and the database rather than the database alone (as the task
-/// sketch had it), for the same reason the rest of M1.6 does: the tantivy half
+/// sketch had it), for the same reason the rest of the marketplace search does: the tantivy half
 /// of the index is not reachable from a `Database` handle.
 pub fn find_matches(
     index: &SearchIndex,

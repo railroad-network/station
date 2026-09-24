@@ -1,17 +1,17 @@
-//! Persistent record of which mobiles have paired with this station (T1.3.3).
+//! Persistent record of which mobiles have paired with this station.
 //!
 //! Pairing binds static public keys and nothing else (see
 //! [ADR-0008](../../../docs/adr/0008-mobile-station-transport.md)): there is no
 //! certificate to pin, expire, or rotate. A paired mobile is remembered by its
 //! bech32 identity address plus the moment it paired, and that list is the
 //! entire authorization story for the mobile-facing HTTP surface — an unpaired
-//! key's requests are rejected (T1.3.4). Either side may revoke: the operator
+//! key's requests are rejected. Either side may revoke: the operator
 //! via `station unpair <address>`, the mobile from its own Settings.
 //!
 //! The list is persisted to `<data_dir>/paired_mobiles.json` so it survives a
 //! station restart, mirroring the mobile, which persists the station's key
 //! across its own restarts. Together that is what makes a pairing outlast both
-//! processes, per the M1.3 exit criterion.
+//! processes, per the mobile-transport exit criterion.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub struct PairedMobile {
     /// Station-clock Unix seconds when this pairing was confirmed.
     pub paired_at: i64,
     /// The highest request nonce seen from this mobile on the authenticated
-    /// channel (T1.3.4). Monotonic per mobile: a request must carry a strictly
+    /// channel. Monotonic per mobile: a request must carry a strictly
     /// greater nonce or it is rejected as a replay. Starts at 0 (so the first
     /// request is nonce 1) and resets on a fresh pairing. `#[serde(default)]` so
     /// a `paired_mobiles.json` written before this field parses as 0.
@@ -113,7 +113,7 @@ impl PairedMobiles {
 
     /// Accepts request nonce `nonce` from `address` if it is strictly greater
     /// than the highest previously seen — the monotonic replay check for the
-    /// authenticated channel (T1.3.4). On success updates the stored high-water
+    /// authenticated channel. On success updates the stored high-water
     /// mark and returns `true`; returns `false` for an unpaired address or a
     /// stale/replayed nonce. Does **not** persist — call [`save`](Self::save)
     /// after a successful accept so the bump survives a restart.
@@ -134,7 +134,7 @@ impl PairedMobiles {
     }
 
     /// Whether `address` is currently paired — the authorization check the
-    /// request channel (T1.3.4) will gate on.
+    /// request channel will gate on.
     pub fn contains(&self, address: &str) -> bool {
         self.mobiles.contains_key(address)
     }

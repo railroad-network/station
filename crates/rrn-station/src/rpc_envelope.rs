@@ -1,6 +1,6 @@
-//! The authenticated request channel's envelope (T1.3.4, ADR-0008).
+//! The authenticated request channel's envelope (ADR-0008).
 //!
-//! After pairing (T1.3.3) establishes both static keys, every mobile request
+//! After pairing establishes both static keys, every mobile request
 //! travels as a **sealed, signed envelope** over plain HTTP. This module owns
 //! the *format* and the pure verification; [`Core`](crate::core) owns the state
 //! (the paired list, per-mobile nonces, the station keypair) and the dispatch.
@@ -273,7 +273,7 @@ pub fn frame_signed_response(response: &ResponseEnvelope, station: &Keypair) -> 
 /// Length of a public key in the signed-record framing.
 const PK_LEN: usize = 32;
 
-/// Frames a mobile-submitted **signed record** (the write path, T1.3.4):
+/// Frames a mobile-submitted **signed record** (the write path):
 /// `payload_len(u32 BE) ‖ payload(canonical dCBOR) ‖ signer(32) ‖ signature(64)`.
 ///
 /// This is how the mobile hands the station a whole [`SignedPayload`] — a signed

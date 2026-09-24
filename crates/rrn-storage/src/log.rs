@@ -211,7 +211,7 @@ impl<'a> AppendLog<'a> {
 
     /// Appends a pre-signed [`StoredPayload`] received from a peer, verbatim.
     ///
-    /// Replication (the gossip layer, M0.6) hands over the exact bytes another
+    /// Replication (the gossip layer) hands over the exact bytes another
     /// replica signed, not a typed `T` — so this path takes a [`StoredPayload`]
     /// and stores its `bytes` unchanged, rather than re-encoding through
     /// `Into<CBOR>` (which would only round-trip for types we can name). The
@@ -287,7 +287,7 @@ impl<'a> AppendLog<'a> {
     /// Admission metadata of the entry holding `content_hash`, if present:
     /// `(seq, created_at)`. `created_at` is this station's admission-clock
     /// reading for that entry (ADR-0022). Used by idempotent ingest, receipts,
-    /// and window re-anchoring (T2.1.2) to find when an entry was admitted here.
+    /// and window re-anchoring to find when an entry was admitted here.
     pub fn admission_of(&self, content_hash: &Hash) -> Result<Option<(u64, i64)>> {
         let row: Option<(i64, i64)> = self
             .db
@@ -317,7 +317,7 @@ impl<'a> AppendLog<'a> {
     /// same entries. That equivalence is what lets governance pin an electorate
     /// "as of a window instant" by **log position** (ADR-0022 §5, "ordering is
     /// log order") rather than by wall-clock time, closing the back-dated-evidence
-    /// vector (T2.1.3). The query is `MAX(seq) WHERE created_at <= t` so it stays
+    /// vector. The query is `MAX(seq) WHERE created_at <= t` so it stays
     /// correct even if monotonicity were ever to regress.
     pub fn last_seq_admitted_by(&self, t: i64) -> Result<u64> {
         let seq: Option<i64> = self.db.conn().query_row(

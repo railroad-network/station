@@ -1,4 +1,4 @@
-//! The end-to-end "lose your phone" scenario (T0.4.9), written as a story.
+//! The end-to-end "lose your phone" scenario, written as a story.
 //!
 //! Alice splits her identity key across five friends. She loses her phone — the
 //! wallet file is gone. Three of her friends decrypt their shards, and her wallet

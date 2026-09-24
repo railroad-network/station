@@ -1,6 +1,6 @@
 # Test fixtures
 
-## `cross_platform_sign.json` — mobile/station signing parity (T1.1.4)
+## `cross_platform_sign.json` — mobile/station signing parity
 
 Locks the Ed25519 signature for a set of `(seed, message)` pairs so the
 **mobile** client and the **station** produce byte-identical signatures and

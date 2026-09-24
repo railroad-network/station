@@ -1,6 +1,6 @@
 name: audit-prep
 
-# Gated, manually-triggered deep fuzzing pass for audit preparation (T0.7.3).
+# Gated, manually-triggered deep fuzzing pass for audit preparation.
 # Unlike the 60s-per-target smoke check in ci.yml (which gates every PR), this
 # runs each target for >=1 hour. It is NOT on push/PR — run it before handing a
 # tagged commit to the auditor, and triage any uploaded crash before submission.

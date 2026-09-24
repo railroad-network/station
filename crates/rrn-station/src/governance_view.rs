@@ -1,6 +1,6 @@
-//! Member- and operator-facing governance reads (T1.9.7b).
+//! Member- and operator-facing governance reads.
 //!
-//! M1.9 built the governance engine ([`rrn_governance`]) — the Charter, proposals,
+//! The governance engine ([`rrn_governance`]) — the Charter, proposals,
 //! voting, tallying, and enactment — but exposed none of it to a reader. This
 //! module is that read path: it turns the log-derived governance state into the
 //! flat, JSON-shaped views the `rrn governance` CLI prints and the mobile renders,
@@ -283,7 +283,7 @@ fn summarize(
     let records = proposal_records(log, &proposal.proposal_id, db, station)?;
     // The publish bar clamps down during bootstrap grace (ADR-0015 § 3), so a
     // small founder set is not shown as forever un-published. The electorate is
-    // pinned at the proposal's open log position (T2.1.3).
+    // pinned at the proposal's open log position.
     let threshold = effective_cosign_threshold(db, records.open_time, records.open_seq, station)?;
     let published = records.is_published(threshold);
     let phase = phase(&records, threshold, now)

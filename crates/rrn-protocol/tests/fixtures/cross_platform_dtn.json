@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-platform DTN wire fixtures for T2.2.1 (ADR-0020). One fully-populated vector per record: outbox entry, carriage bundle, station delivery receipt. `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); signed records also record the Ed25519 signature over those bytes. Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
+  "_comment": "Cross-platform DTN wire fixtures (ADR-0020). One fully-populated vector per record: outbox entry, carriage bundle, station delivery receipt. `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); signed records also record the Ed25519 signature over those bytes. Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
   "outbox_entry": {
     "device_seed": "564070c4715d864e408300d7c811f49f1a4faaacd9779f3f11801b0e880f5928",
     "author_pubkey": "78fc55e46e82b9dac58b3747a8b10a3116ddbc28a8599c5a6b0e89fb3154dffb",

@@ -136,14 +136,14 @@ pub enum Command {
         reply: oneshot::Sender<usize>,
     },
     /// Close every listing whose `expires_at` has passed with a station-signed
-    /// [`ListingClosed`]; reply with the number closed (T1.7.0).
+    /// [`ListingClosed`]; reply with the number closed.
     ExpireListings {
         /// Count of listings closed.
         reply: oneshot::Sender<usize>,
     },
     /// Close every inquiry gone quiet past [`INQUIRY_TTL_SECS`](rrn_marketplace::inquiry::INQUIRY_TTL_SECS)
     /// with a station-signed `InquiryClosed { Expired }`; reply with the number
-    /// closed (T1.7.4).
+    /// closed.
     ExpireInquiries {
         /// Count of inquiries closed.
         reply: oneshot::Sender<usize>,
@@ -151,25 +151,25 @@ pub enum Command {
     /// Charge every service contract's periods that have fallen due with a
     /// station-signed [`ContractCharge`], plus the early-termination penalty of a
     /// contract whose notice window has closed; reply with the number of charge
-    /// records appended (T1.7.7).
+    /// records appended.
     ChargeContracts {
         /// Count of charge records appended.
         reply: oneshot::Sender<usize>,
     },
     /// Put every passed proposal whose implementation delay has run into force with
-    /// a station-signed `ProposalImplemented`; reply with the number enacted (T1.9.7).
+    /// a station-signed `ProposalImplemented`; reply with the number enacted.
     EnactGovernance {
         /// Count of proposals enacted.
         reply: oneshot::Sender<usize>,
     },
     /// Resolve every disputed transaction whose jury has reached a majority, and
     /// lapse (settle as confirmed) any whose window has closed unresolved; reply
-    /// with the number of disputes given a terminal outcome (T1.10.5).
+    /// with the number of disputes given a terminal outcome.
     ResolveDisputes {
         /// Count of disputes resolved (upheld, rejected, or lapsed) this pass.
         reply: oneshot::Sender<usize>,
     },
-    /// Prune DTN receipt-delivery rows past their retention (ADR-0020 §3, T2.2.4);
+    /// Prune DTN receipt-delivery rows past their retention (ADR-0020 §3);
     /// reply with the number removed.
     PruneReceipts {
         /// Count of delivery rows pruned this pass.
@@ -202,7 +202,7 @@ pub enum Command {
         /// How many were newly appended (not already held).
         reply: oneshot::Sender<usize>,
     },
-    /// A mobile's pairing request (T1.3.3), from the mobile HTTP surface. The
+    /// A mobile's pairing request, from the mobile HTTP surface. The
     /// core verifies it, records it as pending for the operator to confirm, and
     /// replies with the station's signed response.
     PairRequest {
@@ -211,7 +211,7 @@ pub enum Command {
         /// The station's signed response, or why it was rejected.
         reply: oneshot::Sender<Result<PairResponse, PairError>>,
     },
-    /// A paired mobile's authenticated request (T1.3.4), from the mobile HTTP
+    /// A paired mobile's authenticated request, from the mobile HTTP
     /// surface. The bytes are the sealed envelope; the reply is the sealed
     /// response bytes, or the rejection reason for the edge to turn into a status.
     RpcRequest {
@@ -220,7 +220,7 @@ pub enum Command {
         /// The sealed response bytes, or why the request was rejected.
         reply: oneshot::Sender<Result<Vec<u8>, ChannelError>>,
     },
-    /// A paired mobile's `/subscribe` request (T1.3.5): authenticate, then return
+    /// A paired mobile's `/subscribe` request: authenticate, then return
     /// pending events sealed, or the context to long-poll on.
     Subscribe {
         /// The sealed subscribe envelope as it arrived on the wire.
@@ -228,8 +228,8 @@ pub enum Command {
         /// Pending events (sealed), or the long-poll context, or a rejection.
         reply: oneshot::Sender<Result<SubscribeOutcome, ChannelError>>,
     },
-    /// Re-poll events for an already-authenticated long-polling subscriber
-    /// (T1.3.5). `force` returns a sealed empty heartbeat when still empty.
+    /// Re-poll events for an already-authenticated long-polling subscriber.
+    /// `force` returns a sealed empty heartbeat when still empty.
     CollectEvents {
         /// The subscriber's address.
         member: Address,
@@ -244,7 +244,7 @@ pub enum Command {
         /// The sealed response, or `None` when there is still nothing.
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
-    /// Ingest a DTN bundle carried in over the Reticulum transport (T2.6.2), the
+    /// Ingest a DTN bundle carried in over the Reticulum transport, the
     /// same front door as `bundle_submit`; reply with the signed delivery-receipt
     /// bytes to send back, or `None` if the bundle was malformed.
     IngestBundle {
@@ -253,8 +253,7 @@ pub enum Command {
         /// The signed receipt bytes to return, or `None` on a malformed bundle.
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
-    /// The current SMS sender registry (bound MSISDNs), derived from the log
-    /// (T2.7.1).
+    /// The current SMS sender registry (bound MSISDNs), derived from the log.
     SmsBoundSenders {
         /// The set of MSISDNs currently bound to an identity.
         reply: oneshot::Sender<std::collections::HashSet<crate::sms::Msisdn>>,
@@ -296,7 +295,7 @@ pub enum Command {
     Shutdown,
 }
 
-/// The outcome of an authenticated `/subscribe` request (T1.3.5): either events
+/// The outcome of an authenticated `/subscribe` request: either events
 /// were already pending (sealed, return immediately) or the edge should park on
 /// the log-tail signal and re-poll with the carried context — no re-auth.
 pub enum SubscribeOutcome {
@@ -320,7 +319,7 @@ pub enum SubscribeOutcome {
 pub struct CoreHandle {
     tx: mpsc::Sender<Command>,
     /// Fires whenever the log tail advances — the wake signal a `/subscribe`
-    /// long-poll parks on (T1.3.5). Carries the current tail seq, but callers
+    /// long-poll parks on. Carries the current tail seq, but callers
     /// only use it as an edge trigger to re-poll for events.
     log_tail: watch::Receiver<u64>,
 }
@@ -411,7 +410,7 @@ impl CoreHandle {
     }
 
     /// Triggers the DTN receipt-delivery prune sweep; returns the number of rows
-    /// removed (T2.2.4).
+    /// removed.
     pub async fn prune_receipts(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::PruneReceipts { reply }).is_err() {
@@ -420,7 +419,7 @@ impl CoreHandle {
         rx.await.unwrap_or(0)
     }
 
-    /// Ingests a DTN bundle carried over the Reticulum transport (T2.6.2) and
+    /// Ingests a DTN bundle carried over the Reticulum transport and
     /// returns the signed delivery-receipt bytes to send back, or `None` if the
     /// bundle was malformed or the core stopped. Idempotent (ADR-0020 §3).
     pub async fn ingest_bundle_bytes(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
@@ -430,7 +429,7 @@ impl CoreHandle {
     }
 
     /// The current SMS sender registry: the set of MSISDNs currently bound to an
-    /// identity by a `rrn.net.sms_binding` record (T2.7.1), derived from the log.
+    /// identity by a `rrn.net.sms_binding` record, derived from the log.
     /// The SMS relay reads it to gate inbound in `"paired"` mode. An empty set on a
     /// stopped core (fail-closed: unknown senders are simply not "paired").
     pub async fn sms_bound_senders(&self) -> std::collections::HashSet<crate::sms::Msisdn> {
@@ -560,7 +559,7 @@ impl CoreHandle {
         rx.await.unwrap_or(Err(PairError::Unavailable))
     }
 
-    /// Submits a paired mobile's sealed request (T1.3.4); returns the sealed
+    /// Submits a paired mobile's sealed request; returns the sealed
     /// response bytes, or the rejection reason. [`ChannelError::Unavailable`]
     /// means the core is gone.
     pub async fn rpc_request(&self, sealed: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
@@ -571,7 +570,7 @@ impl CoreHandle {
         rx.await.unwrap_or(Err(ChannelError::Unavailable))
     }
 
-    /// Authenticates a paired mobile's `/subscribe` request (T1.3.5); returns
+    /// Authenticates a paired mobile's `/subscribe` request; returns
     /// pending events (sealed) or the long-poll context. [`ChannelError::Unavailable`]
     /// means the core is gone.
     pub async fn subscribe(&self, sealed: Vec<u8>) -> Result<SubscribeOutcome, ChannelError> {
@@ -612,7 +611,7 @@ impl CoreHandle {
     }
 
     /// A receiver that fires whenever the log tail advances — the wake signal a
-    /// `/subscribe` long-poll parks on (T1.3.5).
+    /// `/subscribe` long-poll parks on.
     pub fn log_tail_watch(&self) -> watch::Receiver<u64> {
         self.log_tail.clone()
     }
@@ -633,16 +632,16 @@ pub struct Core {
     credit: rrn_ledger::credit::CreditConfig,
     clock: Clock,
     /// Mobiles that have completed pairing — the authorization list for the
-    /// mobile HTTP surface (T1.3.3). Persisted across restarts.
+    /// mobile HTTP surface. Persisted across restarts.
     paired: PairedMobiles,
     /// Pairing requests accepted but not yet confirmed by the operator, keyed by
     /// mobile address. In-memory only: an unconfirmed request has no standing to
     /// survive a restart, and each entry expires after [`pairing::PENDING_TTL_SECS`].
     pending: BTreeMap<String, PendingPair>,
     /// Publishes the log tail after every append so a parked `/subscribe`
-    /// long-poll wakes and re-polls for events (T1.3.5).
+    /// long-poll wakes and re-polls for events.
     tail_tx: watch::Sender<u64>,
-    /// The marketplace's full-text index (T1.6.6), kept in step with the log as
+    /// The marketplace's full-text index, kept in step with the log as
     /// listing records are appended or replicated.
     ///
     /// A cache and nothing more: it is rebuilt from the log at startup and can
@@ -651,12 +650,12 @@ pub struct Core {
     /// ever.
     listings: SearchIndex,
     /// How long a *confirmed* DTN delivery receipt is retained before the prune
-    /// sweep removes it, in seconds (ADR-0020 §3, T2.2.4). Unconfirmed receipts
+    /// sweep removes it, in seconds (ADR-0020 §3). Unconfirmed receipts
     /// are kept `RETENTION_UNCONFIRMED_MULTIPLIER`× longer. Set from `[dtn]
     /// receipt_retention_secs`.
     dtn_receipt_retention_secs: i64,
-    /// Shared, in-memory connectivity snapshot the `status` RPC reports from
-    /// (T2.4.1): per-peer reachability and the mobile-listener state, written by
+    /// Shared, in-memory connectivity snapshot the `status` RPC reports from —
+    /// per-peer reachability and the mobile-listener state, written by
     /// the daemon's gossip loop and startup path. `None` for a bare test core with
     /// no daemon around it — `status` then reports the configured surface with no
     /// live reachability. Purely derived degradation-legibility state.
@@ -687,8 +686,8 @@ pub struct Core {
 /// uses (the test cores).
 const DEFAULT_RECEIPT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// The most distinct receipts one `receipts_fetch` returns (ADR-0020 §3,
-/// T2.2.4). A courier paging the queue sees `truncated: true` and fetches again;
+/// The most distinct receipts one `receipts_fetch` returns (ADR-0020 §3). A
+/// courier paging the queue sees `truncated: true` and fetches again;
 /// the author's own device confirms only what a page actually returned.
 const MAX_RECEIPTS_PER_FETCH: usize = 256;
 
@@ -749,7 +748,7 @@ impl Core {
 
     /// Attaches the shared [`ConnectivityState`](crate::gossip::ConnectivityState)
     /// the daemon's gossip loop writes, so the `status` RPC can report live peer
-    /// reachability and the mobile-listener state (T2.4.1). Builder-style; a core
+    /// reachability and the mobile-listener state. Builder-style; a core
     /// left unset reports the configured surface with no live reachability.
     pub fn with_connectivity(
         mut self,
@@ -989,7 +988,7 @@ impl Core {
             "vouch" => self.m_vouch(req),
             "backup_export" => self.m_backup_export(req),
             "recover_import" => self.m_recover_import(req),
-            // Operator-facing marketplace (T1.7.3). The reads answer with the
+            // Operator-facing marketplace. The reads answer with the
             // same views the mobile channel serves; the writes are signed by
             // this station's own wallet, as `propose` and `vouch` are.
             "marketplace_search" => self.m_marketplace_search(req),
@@ -1010,7 +1009,7 @@ impl Core {
             "marketplace_contracts" => self.m_marketplace_contracts(),
             "marketplace_contract_show" => self.m_marketplace_contract_show(req),
             "marketplace_contract_terminate" => self.m_marketplace_contract_terminate(req),
-            // Operator-facing governance (T1.9.7b). Reads answer with the same
+            // Operator-facing governance. Reads answer with the same
             // views the mobile channel serves; the writes are signed by this
             // station's own wallet, as `propose` and `vouch` are.
             "governance_charter" => self.m_governance_charter(),
@@ -1032,7 +1031,7 @@ impl Core {
             "governance_emergency_lapse" => self.m_governance_emergency_lapse(req),
             "governance_emergency_status" => self.m_governance_emergency_status(),
             "governance_emergency_report" => self.m_governance_emergency_report(),
-            // Operator-facing disputes (T1.10.5). Reads answer with the same
+            // Operator-facing disputes. Reads answer with the same
             // views the mobile channel serves; the writes are signed by this
             // station's own wallet, as `propose` and `vouch` are.
             "disputes" => self.m_disputes(),
@@ -1043,27 +1042,27 @@ impl Core {
             "dispute_resolve" => self.m_dispute_resolve(req),
             "dispute_escalate" => self.m_dispute_escalate(req),
             "dispute_escalation_vote" => self.m_dispute_escalation_vote(req),
-            // Operator-facing pairing management (T1.3.3), invoked by the
+            // Operator-facing pairing management, invoked by the
             // `station` binary over this same Unix socket.
             "pair_list_pending" => self.m_pair_list_pending(),
             "pair_confirm" => self.m_pair_confirm(req),
             "list_mobiles" => self.m_list_mobiles(),
             "unpair" => self.m_unpair(req),
-            // DTN bundle ingest (T2.2.3, ADR-0020): the operator/courier hands the
+            // DTN bundle ingest (ADR-0020): the operator/courier hands the
             // station a bundle over the Unix socket; the station admits each
             // carried record through the same engine front doors the live path
             // uses and answers with one signed delivery receipt.
             "bundle_submit" => self.m_bundle_submit(req),
-            // DTN receipt pickup (T2.2.4, ADR-0020 §3): a courier fetches pending
+            // DTN receipt pickup (ADR-0020 §3): a courier fetches pending
             // receipts to carry back (bumps fetched count, never confirms), and
             // the operator confirms delivery of its own-wallet records' receipts.
             "receipts_fetch" => self.m_receipts_fetch(req),
             "receipts_ack" => self.m_receipts_ack(req),
-            // Headroom certificates (T2.3.1, ADR-0021): reserve offline-spending
+            // Headroom certificates (ADR-0021): reserve offline-spending
             // headroom for the station wallet ahead of a partition, and list a
             // member's outstanding certificates. The request is signed by this
             // station's own wallet, as `propose`/`vouch` are; a member signing on
-            // a phone is T2.4.2's mobile FFI path.
+            // a phone is the mobile FFI path.
             "cert_request" => self.m_cert_request(req),
             "cert_list" => self.m_cert_list(req),
             "cert_export" => self.m_cert_export(req),
@@ -1083,7 +1082,7 @@ impl Core {
     }
 
     fn m_whoami(&self) -> Result<serde_json::Value, rpc::RpcError> {
-        // Bootstrap-grace status (T1.8.6, widened in T1.11.2/ADR-0015): while fewer
+        // Bootstrap-grace status (widened in ADR-0015): while fewer
         // than the threshold of members are established, the community runs under
         // grace across all three subsystems at once — any member may confirm a
         // Tier-2 payment, and the genesis founders stand in as the electorate for
@@ -1108,7 +1107,7 @@ impl Core {
         })
     }
 
-    /// `status` — a live, derived degradation-legibility snapshot (T2.4.1): the
+    /// `status` — a live, derived degradation-legibility snapshot: the
     /// identity fields `whoami` carries, plus a `connectivity` block reporting
     /// per-peer reachability (from the gossip loop's shared state), the mobile
     /// listener's advertised/bound state, and the pending outbox/receipt depths.
@@ -1226,7 +1225,7 @@ impl Core {
             now,
             now + PROPOSAL_TTL_SECS,
         );
-        // Honor a sender's opt-up to a higher oracle tier (T1.8.1). `with_tier`
+        // Honor a sender's opt-up to a higher oracle tier. `with_tier`
         // drops a request that is not a genuine lift, so a plain pay stays at its
         // amount-derived floor and its bytes are unchanged from before this field.
         if let Some(tier) = params.oracle_tier {
@@ -1250,7 +1249,7 @@ impl Core {
         let now = self.clock.now();
         let station = self.station_keypair();
 
-        // A Tier-2 transaction is confirmed by staking reputation on it (T1.8.2):
+        // A Tier-2 transaction is confirmed by staking reputation on it:
         // the confirmer must be an established member, or the community must still
         // be inside its bootstrap grace. Shared with the mobile and DTN paths via
         // `tier2_confirmation_gate`.
@@ -1297,7 +1296,7 @@ impl Core {
     }
 
     /// `transactions` — the member-relative, structured transaction view the
-    /// mobile wallet renders (T1.3.4). Correlates the log's events into one row
+    /// mobile wallet renders. Correlates the log's events into one row
     /// per transaction from the querying member's vantage point.
     fn m_transactions(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::TransactionsParams = parse_params(req)?;
@@ -1317,7 +1316,7 @@ impl Core {
         ok(&rpc::TransactionsResult { transactions })
     }
 
-    /// `next_nonce` — the nonce a member's next proposal must carry (T1.3.4). The
+    /// `next_nonce` — the nonce a member's next proposal must carry. The
     /// mobile reads this before it signs a proposal, since the nonce is signed
     /// and the ledger requires it to be exactly the next in sequence.
     fn m_next_nonce(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -1336,7 +1335,7 @@ impl Core {
     }
 
     /// `cert_request` — reserve a headroom certificate for the station wallet
-    /// (T2.3.1, ADR-0021). Signs a [`CertificateRequest`] with the station wallet
+    /// (ADR-0021). Signs a [`CertificateRequest`] with the station wallet
     /// (the operator's identity on this socket), issues it through the engine, and
     /// returns the certificate's terms.
     fn m_cert_request(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -1375,7 +1374,7 @@ impl Core {
         })
     }
 
-    /// `cert_list` — a member's outstanding headroom certificates (T2.3.1). A
+    /// `cert_list` — a member's outstanding headroom certificates. A
     /// derived read: outstanding certs with caps, expiries, and remaining
     /// allowance, in content-id order.
     fn m_cert_list(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -1412,7 +1411,7 @@ impl Core {
     }
 
     /// `cert_export` — the station-signed certificate for `cert_id` as portable
-    /// `{signer, sig, body}` envelope bytes, hex-encoded (T2.5.2). A read-only
+    /// `{signer, sig, body}` envelope bytes, hex-encoded. A read-only
     /// derive: the CLI's paper tools put this on a `rrncert:` wallet card so a
     /// certificate reserved online can back an offline spend. The envelope carries
     /// the station signature, and the bytes are public (a certificate reserves the
@@ -1652,7 +1651,7 @@ impl Core {
         ok(&rpc::VouchResult { vouch_id })
     }
 
-    // --- operator marketplace (T1.7.3) --------------------------------------
+    // --- operator marketplace --------------------------------------
 
     /// `marketplace_search` — browse, for the CLI. The same read the mobile gets.
     fn m_marketplace_search(&self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
@@ -1680,7 +1679,7 @@ impl Core {
     ///
     /// The station's wallet is the provider, which on the operator's socket is
     /// the operator themselves; a member publishing from a phone signs their own
-    /// listing instead (T1.7.2). `community` comes from this station rather than
+    /// listing instead. `community` comes from this station rather than
     /// the caller for the same reason `provider` does — both are facts about who
     /// is publishing, not choices the request gets to make.
     fn m_marketplace_create_listing(
@@ -1808,7 +1807,7 @@ impl Core {
     }
 
     /// `marketplace_edit_listing` — apply a provider patch to one of the station's
-    /// own listings (T1.7.2 Phase B). The listing's content id is fixed at
+    /// own listings. The listing's content id is fixed at
     /// publication; an update references it and changes only what a
     /// [`ListingPatch`](rrn_marketplace::lifecycle::ListingPatch) permits —
     /// pricing, description, availability, expiry. The current listing is read
@@ -1986,8 +1985,8 @@ impl Core {
     /// `marketplace_inquire` — open a station-signed inquiry against a listing.
     ///
     /// The station wallet is the buyer, which on the operator's socket is the
-    /// operator themselves (a member inquires from a phone with their own key,
-    /// T1.7.4). The listing's requirements are checked against the operator's own
+    /// operator themselves (a member inquires from a phone with their own key).
+    /// The listing's requirements are checked against the operator's own
     /// standing, so an operator below a listing's floor is refused just as a
     /// member would be.
     fn m_marketplace_inquire(
@@ -2142,7 +2141,7 @@ impl Core {
     }
 
     /// `marketplace_contract` — sign up to a recurring service, born from an
-    /// agreed inquiry (T1.7.7).
+    /// agreed inquiry.
     ///
     /// The station wallet is the buyer, which on the operator's socket is the
     /// operator themselves (a member signs their own contract from a phone in
@@ -2150,11 +2149,11 @@ impl Core {
     /// standing cadence and the price the two parties settled on — so the request
     /// chooses nothing but the free-form notes: everything binding was already
     /// agreed. [`append_service_contract`] re-checks all of it against the log.
-    /// `marketplace_settle_inquiry` — pay for an agreed inquiry (T1.7.6), the CLI
+    /// `marketplace_settle_inquiry` — pay for an agreed inquiry, the CLI
     /// counterpart of the mobile "Send payment" step. The station wallet must be
     /// the inquiry's buyer; the payment is a station-signed, listing-linked
     /// proposal at the granted price, which the provider then confirms through the
-    /// ordinary M0.5 flow. Idempotent: a payment already on the log for this
+    /// ordinary payment flow. Idempotent: a payment already on the log for this
     /// agreement is returned rather than duplicated.
     fn m_marketplace_settle_inquiry(
         &mut self,
@@ -2225,8 +2224,8 @@ impl Core {
             now + PROPOSAL_TTL_SECS,
         )
         .with_listing(listing_ref)
-        // Carry the listing's declared oracle tier onto the payment as an opt-up
-        // (T1.8.1): a Tier-2 listing (e.g. a low-value medical consult) lifts an
+        // Carry the listing's declared oracle tier onto the payment as an opt-up:
+        // a Tier-2 listing (e.g. a low-value medical consult) lifts an
         // otherwise Tier-1 amount up to Tier 2. `with_tier` drops the request when
         // it is not a genuine lift, so a Tier-1 listing or an amount already at
         // the listing's tier leaves the proposal at its amount-derived floor.
@@ -2433,8 +2432,8 @@ impl Core {
     // --- internal operations ------------------------------------------------
 
     /// Settles every transaction whose window has closed, and — for a settled
-    /// marketplace payment — attests the sale against its listing (T1.7.6 Stage
-    /// B): one settled, listing-linked payment consumes one unit of stock.
+    /// marketplace payment — attests the sale against its listing: one settled,
+    /// listing-linked payment consumes one unit of stock.
     fn do_sweep(&mut self) -> usize {
         let now = self.clock.now();
 
@@ -2527,7 +2526,7 @@ impl Core {
         }
     }
 
-    // --- marketplace index maintenance (T1.7.0) -----------------------------
+    // --- marketplace index maintenance -----------------------------
 
     /// Rebuilds the listing index from a full log replay.
     ///
@@ -2596,7 +2595,7 @@ impl Core {
     }
 
     /// Closes every listing whose expiry has passed, with a station-signed
-    /// [`ListingClosed`] (T1.6.5, ADR-0005's station-as-signer pattern).
+    /// [`ListingClosed`] (ADR-0005's station-as-signer pattern).
     ///
     /// `Expired` is a *derived* state, not a record: readers already treat it as
     /// off the market, so this sweep is not what makes an expired listing
@@ -2659,7 +2658,7 @@ impl Core {
     }
 
     /// Closes every inquiry gone quiet past the TTL with a station-signed
-    /// `InquiryClosed { Expired }` (T1.7.4), mirroring [`Self::do_expire_listings`].
+    /// `InquiryClosed { Expired }`, mirroring [`Self::do_expire_listings`].
     ///
     /// Inquiries are not indexed, so there is nothing to drop from a cache here —
     /// this only writes the terminal record a stale thread already reads as. A
@@ -2713,7 +2712,7 @@ impl Core {
 
     /// Executes every service contract's due periods as direct debits, and levies
     /// the early-termination penalty on a terminated contract once its notice
-    /// window has closed (T1.7.7 Part D).
+    /// window has closed.
     ///
     /// The buyer's one `ServiceContract` signature pre-authorized every period, so
     /// no party is present to sign the individual charges: the station appends a
@@ -2913,7 +2912,7 @@ impl Core {
         appended
     }
 
-    // --- governance (T1.9.7b) ----------------------------------------------
+    // --- governance ----------------------------------------------
 
     fn m_governance_charter(&self) -> Result<serde_json::Value, rpc::RpcError> {
         let station = self.wallet.address.public_key();
@@ -2954,7 +2953,7 @@ impl Core {
 
     /// `governance_init_charter` — create and publish the genesis Charter. With no
     /// founder keys the station wallet is the sole founder (the solo bootstrap);
-    /// otherwise the supplied secret keys are the founding set (T1.9.7b).
+    /// otherwise the supplied secret keys are the founding set.
     fn m_governance_init_charter(
         &mut self,
         req: &rpc::Request,
@@ -3524,7 +3523,7 @@ impl Core {
         })
     }
 
-    // --- disputes (T1.10.5) ------------------------------------------------
+    // --- disputes ------------------------------------------------
 
     /// The dispute-resolution parameters this station runs: the freeze window, a
     /// juror's response deadline, and the panel size. Fixed at the Phase-1 defaults
@@ -3798,7 +3797,7 @@ impl Core {
         })
     }
 
-    // --- governance mobile writes (T1.9.7b) --------------------------------
+    // --- governance mobile writes --------------------------------
 
     /// `governance_submit_proposal` — accept a mobile-signed governance
     /// [`Proposal`] and append it. The author signs it on the phone; the station
@@ -3821,7 +3820,7 @@ impl Core {
         let proposal_id = signed.payload.proposal_id.to_string();
         let now = self.clock.now();
         // The window attestation is computed against the effective Charter at
-        // admission (ADR-0022 / T2.1.3); without a published Charter there is no
+        // admission (ADR-0022); without a published Charter there is no
         // window to anchor, so governance is not yet operable.
         let station = self.station_keypair();
         let charter = effective_charter(&self.db, &station.public_key())
@@ -3907,7 +3906,7 @@ impl Core {
         Ok(serde_json::json!({ "ok": true }))
     }
 
-    // --- dispute mobile writes (T1.10.5) -----------------------------------
+    // --- dispute mobile writes -----------------------------------
 
     /// `submit_dispute` — accept a mobile-signed [`SignedDispute`] and raise it.
     /// The party signs it on the phone; the station validates and records, freezing
@@ -4072,7 +4071,7 @@ impl Core {
     }
 
     /// Puts every passed proposal whose implementation delay has run into force,
-    /// appending a station-signed enactment record for each (T1.9.7). Returns the
+    /// appending a station-signed enactment record for each. Returns the
     /// number enacted. Emergencies, whose delay is zero, are enacted the first
     /// sweep after their vote closes.
     fn do_enact_governance(&mut self) -> usize {
@@ -4088,8 +4087,8 @@ impl Core {
     }
 
     /// Resolves every disputed transaction whose jury has reached a majority, and
-    /// lapses (settles as confirmed) any whose window has closed with no ruling
-    /// (T1.10.5). Returns the number given a terminal outcome. A dispute still
+    /// lapses (settles as confirmed) any whose window has closed with no ruling.
+    /// Returns the number given a terminal outcome. A dispute still
     /// inside its window with no majority is left `Pending` and untouched; a failing
     /// resolution is logged and skipped so one bad dispute cannot stall the sweep.
     fn do_resolve_disputes(&mut self) -> usize {
@@ -4202,7 +4201,7 @@ impl Core {
     }
 
     /// `receipts_fetch` (operator / Unix socket): a **courier** picks up pending
-    /// delivery receipts to carry back to their authors (ADR-0020 §3, T2.2.4).
+    /// delivery receipts to carry back to their authors (ADR-0020 §3).
     ///
     /// This is deliberately the courier path: it bumps each returned receipt's
     /// `fetched_count` but never marks it confirmed — a courier is not the record's
@@ -4229,7 +4228,7 @@ impl Core {
     /// `receipts_ack` (operator / Unix socket): the operator confirms delivery of
     /// the receipts for records authored on this station's **own wallet** — the
     /// author-path counterpart to the courier `receipts_fetch`, so the retention
-    /// sweep may reclaim those rows (ADR-0020 §3, T2.2.4). Confirming an unknown or
+    /// sweep may reclaim those rows (ADR-0020 §3). Confirming an unknown or
     /// already-confirmed record hash is a no-op, not an error.
     fn m_receipts_ack(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::ReceiptsAckParams = parse_params(req)?;
@@ -4249,7 +4248,7 @@ impl Core {
 
     /// `receipts_fetch` (paired mobile / sealed channel): the **author** picks up
     /// the delivery receipts for their *own* records and, by doing so, confirms
-    /// delivery (ADR-0020 §3, T2.2.4).
+    /// delivery (ADR-0020 §3).
     ///
     /// Unlike the operator/courier [`m_receipts_fetch`](Self::m_receipts_fetch),
     /// this is strictly scoped to the authenticated identity: it ignores any
@@ -4351,8 +4350,8 @@ impl Core {
         }))
     }
 
-    /// Prunes DTN receipt-delivery rows past their retention (ADR-0020 §3,
-    /// T2.2.4); returns the number removed. Driven by the daemon's prune timer and
+    /// Prunes DTN receipt-delivery rows past their retention (ADR-0020 §3);
+    /// returns the number removed. Driven by the daemon's prune timer and
     /// directly by tests.
     fn do_prune_receipts(&self) -> usize {
         let now = self.clock.now();
@@ -4423,7 +4422,7 @@ impl Core {
 
         let mut outcomes = Vec::with_capacity(entries.len());
         // Delivery-tracking candidates (record_hash, author), queued after the
-        // receipt is signed (T2.2.4). Only entries that passed `outbox::validate`
+        // receipt is signed. Only entries that passed `outbox::validate`
         // are added: validation enforces `author == outer signer`, so their author
         // is cryptographically attested. A bad-signature entry's `author` field is
         // attacker-controlled — never enqueue a delivery row under it, or a courier
@@ -4558,8 +4557,8 @@ impl Core {
             dtn.put_receipt(&presentation_hash.to_bytes(), &receipt_bytes, now)
                 .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
             // Queue a delivery row per reported record with an *attested* author so
-            // the receipt can travel back by the same carriers (ADR-0020 §3,
-            // T2.2.4). `deliveries` holds only entries that passed validation (see
+            // the receipt can travel back by the same carriers (ADR-0020 §3).
+            // `deliveries` holds only entries that passed validation (see
             // its construction above), so a bad-signature entry's spoofable author
             // never gets a row. Must follow `put_receipt`: the row's foreign key
             // references the receipt just stored. Idempotent on `record_hash` — a
@@ -4613,7 +4612,7 @@ impl Core {
                 match from_canonical_bytes::<TransactionConfirmation>(bytes) {
                     Ok(payload) => {
                         // Enforce the same Tier-2 staking gate the live paths do
-                        // (T1.8.2) — a confirmation must clear it however it is
+                        // — a confirmation must clear it however it is
                         // carried, so DTN is not a bypass. Keyed on the record's
                         // own confirmer.
                         if self
@@ -4681,7 +4680,7 @@ impl Core {
             }
             // An SMS-reachability binding carries no engine semantics — it is a
             // self-signed statement appended verbatim so the station can derive its
-            // inbound SMS sender registry from the log (T2.7.1). Handled off to the
+            // inbound SMS sender registry from the log. Handled off to the
             // side and returned early; it never touches the ledger engine below.
             Some(KIND_SMS_BINDING) => return self.admit_sms_binding(bytes, signer, signature, now),
             // A Reticulum transport binding carries no engine semantics — a
@@ -4695,7 +4694,7 @@ impl Core {
             // Governance records ride DTN like any member record (ADR-0020): a
             // proposal, co-signature, or ballot authored offline is admitted on
             // arrival through the same append guards the live RPC uses, so windows
-            // and eligibility run on this admission (T2.1.3). They do not touch the
+            // and eligibility run on this admission. They do not touch the
             // ledger engine, so each returns its own disposition early.
             Some(KIND_GOV_PROPOSAL) => {
                 return self.admit_gov_proposal(bytes, signer, signature, now)
@@ -4769,7 +4768,7 @@ impl Core {
         }
     }
 
-    /// Admits a self-signed `rrn.net.sms_binding` record (T2.7.1): validate it is a
+    /// Admits a self-signed `rrn.net.sms_binding` record: validate it is a
     /// well-formed, self-signed binding (signer == the bound address, valid E.164),
     /// then append it to the log **verbatim** via
     /// [`append_raw`](AppendLog::append_raw). It carries no ledger semantics; the
@@ -5043,7 +5042,7 @@ impl Core {
     }
 
     /// Admits a DTN-carried governance [`Proposal`] through the same append guard
-    /// the RPC uses, anchoring its window on this admission (T2.1.3). Needs a
+    /// the RPC uses, anchoring its window on this admission. Needs a
     /// published Charter for the window attestation; without one governance is not
     /// yet operable, so the record is `unroutable-kind` rather than rejected.
     fn admit_gov_proposal(
@@ -5110,7 +5109,7 @@ impl Core {
     }
 
     /// Admits a DTN-carried [`Vote`] through the RPC's append guard; the ballot's
-    /// voting window runs on this admission (T2.1.3).
+    /// voting window runs on this admission.
     fn admit_gov_vote(
         &self,
         bytes: &[u8],
@@ -5238,7 +5237,7 @@ impl Core {
 
     /// Records a station-signed cert-overspend [`EquivocationRecord`] for a
     /// cert-backed spend the engine refused as `CertificateOverspent` **or**
-    /// `CertificateExpired` (ADR-0021 §5, T2.3.3) — unless one already stands for
+    /// `CertificateExpired` (ADR-0021 §5) — unless one already stands for
     /// that certificate. The spend is refused regardless; this only appends the
     /// proof, and only when `verify_evidence` confirms a genuine overspend (so a
     /// within-cap late spend records nothing).
@@ -5380,7 +5379,7 @@ impl Core {
         Ok(())
     }
 
-    /// The Tier-2 confirmation staking gate (T1.8.2), shared by every path that
+    /// The Tier-2 confirmation staking gate, shared by every path that
     /// admits a confirmation — the operator CLI (`m_confirm`), the mobile channel
     /// (`channel_submit_confirmation`), and DTN ingest (`route_dtn_record`) — so
     /// a Tier-2 confirmation clears the same reputation bar however it is carried
@@ -5451,7 +5450,7 @@ impl Core {
         self.station_keypair().public_key()
     }
 
-    // --- pairing (T1.3.3) ---------------------------------------------------
+    // --- pairing ---------------------------------------------------
 
     /// Verifies a mobile's pairing request, records it as pending for the
     /// operator to confirm, and returns the station's signed response.
@@ -5459,7 +5458,7 @@ impl Core {
     /// Accepting a request does **not** pair the mobile: it proves the mobile
     /// holds its key and lets both sides display the same confirmation code. The
     /// mobile is added to [`paired`](Self::paired) only when the operator runs
-    /// `station pair-mobile` after comparing that code in person (T1.3.3).
+    /// `station pair-mobile` after comparing that code in person.
     fn do_pair_request(&mut self, request: PairRequest) -> Result<PairResponse, PairError> {
         let verified = request.verify()?;
 
@@ -5495,7 +5494,7 @@ impl Core {
         })
     }
 
-    // --- authenticated request channel (T1.3.4) -----------------------------
+    // --- authenticated request channel -----------------------------
 
     /// Opens, authenticates, and dispatches a paired mobile's sealed request,
     /// returning the sealed response bytes.
@@ -5522,7 +5521,7 @@ impl Core {
     }
 
     /// Opens, verifies, and authorizes a sealed request envelope — the auth
-    /// preamble shared by `/rpc` and `/subscribe` (T1.3.4/T1.3.5). On success the
+    /// preamble shared by `/rpc` and `/subscribe`. On success the
     /// request's transport nonce is consumed and persisted, so a replay is
     /// rejected even if the caller never dispatches. Auth failures return a
     /// [`ChannelError`] the edge turns into a 4xx.
@@ -5565,7 +5564,7 @@ impl Core {
     }
 
     /// Authenticates a `/subscribe` request and either returns pending events
-    /// (sealed, ready) or the context to long-poll on (T1.3.5). The 30s wait
+    /// (sealed, ready) or the context to long-poll on. The 30s wait
     /// itself lives in the async edge, not here — the core must not block.
     fn do_subscribe(&mut self, sealed_bytes: Vec<u8>) -> Result<SubscribeOutcome, ChannelError> {
         let envelope = self.authenticate_envelope(&sealed_bytes)?;
@@ -5698,7 +5697,7 @@ impl Core {
             "submit_contract_termination" => self.channel_submit_contract_termination(envelope),
             "marketplace_contracts" => self.channel_marketplace_contracts(envelope),
             "marketplace_contract_show" => self.channel_marketplace_contract_show(envelope),
-            // Governance writes (T1.9.7b): each carries a mobile-signed record, and
+            // Governance writes: each carries a mobile-signed record, and
             // the signer must be the authenticated mobile. Reads fall through to the
             // shared, signer-less dispatch below.
             "governance_submit_proposal" => self.channel_governance_submit_proposal(envelope),
@@ -5707,17 +5706,17 @@ impl Core {
             "governance_submit_charter_signature" => {
                 self.channel_governance_submit_charter_signature(envelope)
             }
-            // Dispute writes (T1.10.5): each carries a mobile-signed record whose
+            // Dispute writes: each carries a mobile-signed record whose
             // signer must be the authenticated mobile. Reads fall through to the
             // shared, signer-less dispatch below.
-            // DTN bundle ingest (T2.2.3, ADR-0020). Unlike the other channel
+            // DTN bundle ingest (ADR-0020). Unlike the other channel
             // writes, the paired mobile here is a **courier**, not the author:
             // the carried records may be signed by *other* members, so this
             // deliberately does NOT bind the record signer to the authenticated
             // mobile. The pairing gate is the DoS/accountability boundary; per-
             // entry signatures are the integrity boundary (ADR-0020 §3).
             "bundle_submit" => self.channel_bundle_submit(envelope),
-            // DTN receipt pickup by the author (T2.2.4, ADR-0020 §3): scoped to the
+            // DTN receipt pickup by the author (ADR-0020 §3): scoped to the
             // authenticated identity, and confirms delivery of the returned rows —
             // the sealed-channel stand-in for the ticket's `GET /receipts`.
             "receipts_fetch" => self.channel_receipts_fetch(envelope),
@@ -5825,7 +5824,7 @@ impl Core {
         }
         let now = self.clock.now();
 
-        // A Tier-2 confirmation stakes reputation (T1.8.2): gate it on the
+        // A Tier-2 confirmation stakes reputation: gate it on the
         // **authenticated mobile** (`signed.signer`) — the confirmer must clear
         // the Member band, or the community must still be in bootstrap grace.
         // Shared with the operator and DTN paths via `tier2_confirmation_gate`.
@@ -5889,8 +5888,8 @@ impl Core {
         Ok(serde_json::json!({ "vouch_id": vouch_id }))
     }
 
-    /// `submit_listing` — accept a mobile-signed [`SignedListing`] and publish it
-    /// (T1.7.2). The member is the provider and signs the listing on the phone,
+    /// `submit_listing` — accept a mobile-signed [`SignedListing`] and publish it.
+    /// The member is the provider and signs the listing on the phone,
     /// exactly as they sign a vouch; the station verifies the signature, that the
     /// signer is this paired mobile, and that the listing names this station's
     /// community, then leaves signer-is-provider, self-validity, and
@@ -5947,7 +5946,7 @@ impl Core {
     }
 
     /// `submit_listing_close` — accept a mobile-signed [`SignedListingClose`] and
-    /// take the member's own listing off offer (T1.7.2). A provider may only sign
+    /// take the member's own listing off offer. A provider may only sign
     /// `ProviderClosed`; entitlement, existence, and not-already-closed are
     /// [`append_listing_closed`]'s to enforce.
     fn channel_submit_listing_close(
@@ -5984,7 +5983,7 @@ impl Core {
     }
 
     /// `submit_listing_update` — accept a mobile-signed [`SignedListingUpdate`]
-    /// and apply the provider's patch to their own listing (T1.7.2 Phase B). The
+    /// and apply the provider's patch to their own listing. The
     /// provider signs a [`ListingPatch`](rrn_marketplace::lifecycle::ListingPatch)
     /// on the phone; the station verifies the signature and that the signer is
     /// this paired mobile, then leaves signer-is-provider, listing-exists,
@@ -6027,7 +6026,7 @@ impl Core {
     }
 
     /// `marketplace_my_listings` — the authenticated mobile's own listings, in
-    /// whatever state, newest first (T1.7.2). The member is the signer, not a
+    /// whatever state, newest first. The member is the signer, not a
     /// param, so a mobile only ever reads its own; the operator's socket keeps its
     /// station-scoped variant ([`Self::m_marketplace_my_listings`]).
     fn channel_marketplace_my_listings(
@@ -6042,7 +6041,7 @@ impl Core {
         Ok(serde_json::json!({ "listings": listings }))
     }
 
-    /// `submit_inquiry` — open a mobile-signed inquiry against a listing (T1.7.4).
+    /// `submit_inquiry` — open a mobile-signed inquiry against a listing.
     ///
     /// The buyer signs the [`InquiryOpened`](rrn_marketplace::inquiry::InquiryOpened)
     /// on the phone, as they sign a listing or a vouch. The station verifies the
@@ -6117,7 +6116,7 @@ impl Core {
     }
 
     /// `submit_inquiry_message` — a mobile-signed message in an open inquiry the
-    /// member is a party to (T1.7.4).
+    /// member is a party to.
     fn channel_submit_inquiry_message(
         &mut self,
         envelope: &RequestEnvelope,
@@ -6152,7 +6151,7 @@ impl Core {
     }
 
     /// `submit_inquiry_close` — a mobile-signed close of an inquiry the member is
-    /// a party to: agreeing on a price, or declining their side (T1.7.4).
+    /// a party to: agreeing on a price, or declining their side.
     fn channel_submit_inquiry_close(
         &mut self,
         envelope: &RequestEnvelope,
@@ -6184,8 +6183,8 @@ impl Core {
         Ok(serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }))
     }
 
-    /// `inquiry_thread` — one inquiry's full thread, for the authenticated mobile
-    /// (T1.7.4). Only a party to the inquiry may read it.
+    /// `inquiry_thread` — one inquiry's full thread, for the authenticated mobile.
+    /// Only a party to the inquiry may read it.
     fn channel_inquiry_thread(
         &mut self,
         envelope: &RequestEnvelope,
@@ -6202,7 +6201,7 @@ impl Core {
     }
 
     /// `my_inquiries` — the authenticated mobile's own inquiries (as buyer or
-    /// provider), newest activity first (T1.7.4).
+    /// provider), newest activity first.
     fn channel_my_inquiries(
         &mut self,
         envelope: &RequestEnvelope,
@@ -6213,7 +6212,7 @@ impl Core {
     }
 
     /// `submit_contract` — a mobile-signed [`SignedServiceContract`](rrn_marketplace::contract::SignedServiceContract),
-    /// the buyer's recurring mandate born from an agreed inquiry (T1.7.7 Stage 2).
+    /// the buyer's recurring mandate born from an agreed inquiry.
     ///
     /// The phone snapshots the terms from the agreed inquiry thread and signs; the
     /// append re-checks every one of them — that the contract is born from an
@@ -6260,7 +6259,7 @@ impl Core {
 
     /// `submit_contract_termination` — a mobile-signed
     /// [`SignedContractTermination`](rrn_marketplace::contract::SignedContractTermination)
-    /// ending a contract the member is a party to (T1.7.7 Stage 2). Either party
+    /// ending a contract the member is a party to. Either party
     /// may; the notice window and any penalty are the charge sweep's to apply.
     fn channel_submit_contract_termination(
         &mut self,
@@ -6296,7 +6295,7 @@ impl Core {
     }
 
     /// `marketplace_contracts` — the authenticated mobile's own contracts (as
-    /// buyer or provider), newest first (T1.7.7 Stage 2).
+    /// buyer or provider), newest first.
     fn channel_marketplace_contracts(
         &mut self,
         envelope: &RequestEnvelope,
@@ -6307,7 +6306,7 @@ impl Core {
     }
 
     /// `marketplace_contract_show` — one contract the authenticated mobile is a
-    /// party to (T1.7.7 Stage 2). Only a party may read it.
+    /// party to. Only a party may read it.
     fn channel_marketplace_contract_show(
         &mut self,
         envelope: &RequestEnvelope,
@@ -6323,7 +6322,7 @@ impl Core {
             .map_err(|e| (e.code, e.message))
     }
 
-    /// `vouch_counts` — the authenticated mobile's own vouching tallies (T1.4.4):
+    /// `vouch_counts` — the authenticated mobile's own vouching tallies:
     /// how many vouches it has given (signed) and received (is the subject of).
     /// The member is the authenticated signer, not a param, so a mobile only ever
     /// reads its own counts. A live log scan (see [`vouch_view`]).
@@ -6338,7 +6337,7 @@ impl Core {
     }
 
     /// `list_vouches` — the authenticated mobile's own vouches for the vouching
-    /// browser (T1.4.5), split into `given` (it signed) and `received` (it is the
+    /// browser, split into `given` (it signed) and `received` (it is the
     /// subject of), newest first. The member is the authenticated signer, not a
     /// param, so a mobile only ever lists its own vouches. Optional `limit` /
     /// `offset` window each list (client-side search still sees the fetched set;
@@ -6362,7 +6361,7 @@ impl Core {
         serde_json::to_value(lists).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
     }
 
-    /// `reputation` — the authenticated mobile's own standing (T1.5.9): the five
+    /// `reputation` — the authenticated mobile's own standing: the five
     /// ADR-0009 dimensions, the composite, the band, and whether an anchoring
     /// vouch has lifted the newcomer cap. The member is the authenticated signer,
     /// not a param, so a mobile only ever reads its own full profile; other
@@ -6381,7 +6380,7 @@ impl Core {
     }
 
     /// `reputation_band` — the band for an arbitrary `address` param, which is
-    /// what a marketplace listing card shows about its lister (M1.7). Only the
+    /// what a marketplace listing card shows about its lister. Only the
     /// band and composite, never the dimension breakdown: what one member needs
     /// about another is whether to trade with them, not an audit of their
     /// history. An address with no history answers `New` rather than erroring.
@@ -6402,10 +6401,10 @@ impl Core {
         serde_json::to_value(view).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))
     }
 
-    /// `marketplace_search` — the browse read (T1.7.1). Every filter is
+    /// `marketplace_search` — the browse read. Every filter is
     /// optional; an empty `{}` returns the most relevant page of everything on
     /// offer. Results are ranked by text relevance times the provider's standing
-    /// (T1.6.6) and carry the provider's band inline, so a browse screen renders
+    /// and carry the provider's band inline, so a browse screen renders
     /// a page from one round trip (see [`marketplace_view`]).
     ///
     /// `limit` is clamped, not validated — a client asking for more than
@@ -6426,8 +6425,8 @@ impl Core {
             .map_err(|e| (e.code, e.message))
     }
 
-    /// `marketplace_listing` — one listing in full, by hex `listing_id`
-    /// (T1.7.1). Read from the log rather than the index, so a detail screen
+    /// `marketplace_listing` — one listing in full, by hex `listing_id`.
+    /// Read from the log rather than the index, so a detail screen
     /// cannot be the place a stale cache is taken as authoritative.
     fn channel_marketplace_listing(
         &mut self,
@@ -6446,8 +6445,8 @@ impl Core {
             .map_err(|e| (e.code, e.message))
     }
 
-    /// The browse read itself, shared by the mobile channel and the CLI socket
-    /// (T1.7.3). One query with one meaning however it arrived — the transports
+    /// The browse read itself, shared by the mobile channel and the CLI socket.
+    /// One query with one meaning however it arrived — the transports
     /// differ in who is asking, not in what browse is.
     fn run_marketplace_search(
         &self,
@@ -6589,7 +6588,7 @@ impl Core {
         ok(&serde_json::json!({ "inquiries": rows }))
     }
 
-    /// The contract-detail read (T1.7.7). `viewer` must be the contract's buyer or
+    /// The contract-detail read. `viewer` must be the contract's buyer or
     /// provider — a contract is private to its two parties, so a non-party gets
     /// the same "no such contract" a missing one would.
     fn run_contract_detail(
@@ -6616,7 +6615,7 @@ impl Core {
         }
     }
 
-    /// The my-contracts read (T1.7.7). Returns the contracts `viewer` is a party
+    /// The my-contracts read. Returns the contracts `viewer` is a party
     /// to, newest first, each with the count of periods the ledger has charged so
     /// the state and next-due date are current.
     fn run_my_contracts(&self, viewer: Address) -> Result<serde_json::Value, rpc::RpcError> {
@@ -6702,8 +6701,8 @@ impl Core {
         ok(&serde_json::json!({ "mobiles": mobiles }))
     }
 
-    /// `unpair` — revoke a mobile's pairing. Its next request will be rejected
-    /// (T1.3.4). Reports whether the address was actually paired.
+    /// `unpair` — revoke a mobile's pairing. Its next request will be rejected.
+    /// Reports whether the address was actually paired.
     fn m_unpair(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         #[derive(serde::Deserialize)]
         struct Params {
@@ -6719,7 +6718,7 @@ impl Core {
     }
 }
 
-// --- DTN bundle ingest helpers (T2.2.3) -------------------------------------
+// --- DTN bundle ingest helpers -------------------------------------
 
 /// Wire discriminators of the record kinds the station routes over DTN. These
 /// mirror the `pub(crate)` `*_KIND` constants in `rrn-ledger`
@@ -6739,7 +6738,7 @@ const KIND_CERT_RETURN: &str = "rrn.credit.cert_return";
 /// a store-and-forward bundle cannot carry. It is refused as `unroutable-kind`
 /// rather than falling through the catch-all, so the reason is deliberate.
 const KIND_CERT_REQUEST: &str = "rrn.credit.cert_request";
-/// A member-signed SMS-reachability binding (T2.7.1). Unlike the ledger records
+/// A member-signed SMS-reachability binding. Unlike the ledger records
 /// above it carries no engine semantics — it is a self-signed statement appended to
 /// the log verbatim, so the station can derive its inbound SMS sender registry from
 /// the log (a cache, never authoritative). Admitted via the normal DTN path so a
@@ -6750,7 +6749,7 @@ const KIND_SMS_BINDING: &str = rrn_protocol::binding::SMS_BINDING_KIND;
 /// from these. Admitted via the normal DTN path so a member or peer
 /// station can register a destination over any carrier.
 const KIND_TRANSPORT_BINDING: &str = rrn_protocol::binding::BINDING_KIND;
-// Governance record kinds carried over DTN (T2.1.3); the strings mirror the
+// Governance record kinds carried over DTN; the strings mirror the
 // `pub(crate)` discriminators in `rrn-governance` (a proposal, its co-signature,
 // and a ballot).
 const KIND_GOV_PROPOSAL: &str = "rrn.gov.proposal";
@@ -6831,7 +6830,7 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         // admitted (couriers must keep outbox order, ADR-0020 §4).
         LE::UnknownTransaction | LE::NotProposed => RefusalReason::NotProposed,
         // Certificate-backed spend / return refusals (ADR-0021 §3–§5). Each has a
-        // machine-stable slug so a courier's owner (and T2.3.3's evidence
+        // machine-stable slug so a courier's owner (and the evidence
         // assembly) can branch on the exact cause. `UnknownCertificate` and
         // `CertificateNotOutstanding` are shared with the return path; in the
         // cert context they read as "no such certificate" and "already returned".
@@ -6844,7 +6843,7 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         // Everything else has no more specific slug: future-dated/inconsistent
         // testimony, wrong dispute state, not-a-party, closed window, over-long
         // reason, already-responded, member mismatch on a return, invalid state, and
-        // the T2.3.4 admission bounds (`MemoTooLong`, `CertBackedSpendLimit`,
+        // the admission bounds (`MemoTooLong`, `CertBackedSpendLimit`,
         // `EquivocationBlocked`) — none of which warrant a new wire slug.
         _ => RefusalReason::Rejected,
     }
@@ -6899,7 +6898,7 @@ fn parse_tx_id(s: &str) -> Result<TransactionId, rpc::RpcError> {
 }
 
 /// Parses a `rrn1…` address list into 32-byte author public keys — the `author`
-/// column of `receipt_deliveries` (T2.2.4). Each must be a valid address.
+/// column of `receipt_deliveries`. Each must be a valid address.
 fn parse_author_keys(addrs: &[String]) -> Result<Vec<[u8; 32]>, rpc::RpcError> {
     addrs
         .iter()
@@ -6907,7 +6906,7 @@ fn parse_author_keys(addrs: &[String]) -> Result<Vec<[u8; 32]>, rpc::RpcError> {
         .collect()
 }
 
-/// Parses a hex record hash into 32 bytes (a `receipts_ack` argument; T2.2.4).
+/// Parses a hex record hash into 32 bytes (a `receipts_ack` argument).
 fn parse_record_hash(s: &str) -> Result<[u8; 32], rpc::RpcError> {
     let bytes = unhex(s).ok_or_else(|| invalid_params(format!("invalid record hash {s:?}")))?;
     bytes
@@ -7137,8 +7136,8 @@ fn channel_method_is_replica_safe(method: &str) -> bool {
     )
 }
 
-/// The oracle tier a listing at this price defaults to — the bottom of the M1.8
-/// ladder for small trades, the next rung above it for the rest.
+/// The oracle tier a listing at this price defaults to — the bottom of the
+/// oracle-tier ladder for small trades, the next rung above it for the rest.
 ///
 /// Phase 1 supports tiers 1 and 2 only
 /// ([`ORACLE_TIER_MAX`](rrn_marketplace::listing::ORACLE_TIER_MAX)), so the
@@ -7147,7 +7146,7 @@ fn channel_method_is_replica_safe(method: &str) -> bool {
 /// above the range by `validate`. Commons-surface subsidies can be negative,
 /// which the absolute value folds in with small trades where they belong.
 fn suggest_oracle_tier(amount_centi: i64) -> u8 {
-    // 5 Commons, the boundary the M1.8.2 ladder puts between tier 1 and tier 2.
+    // 5 Commons, the boundary the oracle-tier ladder puts between tier 1 and tier 2.
     const TIER_2_FROM_CENTI: i64 = 500;
     if amount_centi.saturating_abs() < TIER_2_FROM_CENTI {
         1
@@ -7414,7 +7413,7 @@ fn periods_charged_of(
         .unwrap_or(0)
 }
 
-/// The station's current SMS sender registry (T2.7.1), derived from the log's
+/// The station's current SMS sender registry, derived from the log's
 /// `rrn.net.sms_binding` records: the set of MSISDNs currently bound to an
 /// identity, latest-binding-wins per identity, so a member who rebinds to a new
 /// number drops the old one from the set. Self-signing is re-checked here (signer
@@ -7501,7 +7500,7 @@ fn proposal_of(state: &TransactionState) -> Option<&TransactionProposal> {
     }
 }
 
-/// The listing a transaction pays for, if it is a marketplace payment (T1.7.6):
+/// The listing a transaction pays for, if it is a marketplace payment:
 /// the `listing_id` the buyer signed into the proposal, named as a marketplace
 /// [`ListingId`]. `None` for a direct pay.
 fn linked_listing(state: &TransactionState) -> Option<ListingId> {
@@ -7804,7 +7803,7 @@ mod tests {
         assert_eq!(v["balance_centi"], 0);
     }
 
-    // --- disputes (T1.10.5) -------------------------------------------------
+    // --- disputes -------------------------------------------------
 
     /// Drives the operator dispute surface end to end without a jury: raise a
     /// dispute over a confirmed transaction, read it back, respond, and let it
@@ -7905,7 +7904,7 @@ mod tests {
         assert_eq!(err.code, rpc::INVALID_PARAMS);
     }
 
-    /// Drives the escalation surface (T1.10.4b) over RPC. This bare core seats no
+    /// Drives the escalation surface over RPC. This bare core seats no
     /// jury (no established members), so a raised dispute is a genuine cannot-seat
     /// case: the station (a party) escalates it to the electorate, and with no
     /// electorate to reach quorum it fails open — the transaction settles. The
@@ -7982,7 +7981,7 @@ mod tests {
         ));
     }
 
-    // --- marketplace wiring (T1.7.0) ----------------------------------------
+    // --- marketplace wiring ----------------------------------------
 
     use rrn_marketplace::lifecycle::append_listing_created;
     use rrn_marketplace::listing::{
@@ -8268,7 +8267,7 @@ mod tests {
         assert_eq!(result["listings"].as_array().unwrap().len(), 1);
     }
 
-    // --- operator marketplace (T1.7.3) --------------------------------------
+    // --- operator marketplace --------------------------------------
 
     /// A CLI-style call: the operator's socket, no envelope and no signer, since
     /// the station's own wallet is the identity every write here is signed by.
@@ -8290,7 +8289,7 @@ mod tests {
         core.handle_call(&req).unwrap_err()
     }
 
-    // --- headroom certificates (T2.3.1, ADR-0021) ---------------------------
+    // --- headroom certificates (ADR-0021) ---------------------------
 
     #[test]
     fn cert_request_and_list_over_rpc() {
@@ -8489,7 +8488,7 @@ mod tests {
         assert_eq!(code, rpc::READ_REPLICA);
     }
 
-    // --- DTN bundle ingest (T2.2.3, ADR-0020) -------------------------------
+    // --- DTN bundle ingest (ADR-0020) -------------------------------
 
     use rrn_protocol::bundle::{Bundle, EntryEnvelope};
     use rrn_protocol::outbox::{OutboxEntry, SignedOutboxEntry};
@@ -8583,7 +8582,7 @@ mod tests {
     /// End-to-end via DTN only: two members sign a proposal and confirmation
     /// offline, the station admits both from a single ingested bundle, and the
     /// transaction settles a full window after **ingest** — never after the
-    /// (earlier) claimed `confirmed_at`. Proves the T2.1.2 admission-clock
+    /// (earlier) claimed `confirmed_at`. Proves the admission-clock
     /// integration: no live submission RPC is used.
     #[test]
     fn dtn_happy_path_admits_and_settles_from_admission() {
@@ -8648,8 +8647,8 @@ mod tests {
         );
     }
 
-    /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle (acceptance 3,
-    /// T2.1.3). A founder signs a statute proposal and a ballot offline; the station
+    /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle (acceptance 3).
+    /// A founder signs a statute proposal and a ballot offline; the station
     /// admits each from an ingested bundle through `admit_gov_proposal` /
     /// `admit_gov_vote` — no live governance RPC — writing the station-signed window
     /// attestation on admission. The window and the counted ballot both anchor on
@@ -9339,7 +9338,7 @@ mod tests {
         );
     }
 
-    /// T2.3.4 step 9 closes the T2.3.3 "too fragmented to prove" residual: a
+    /// A later step closes the "too fragmented to prove" residual: a
     /// certificate admits at most `MAX_EVIDENCE_ITEMS - 1` cert-backed spends, so an
     /// overspend can never be split across more admitted spends than one evidence
     /// bundle can carry. The engine refuses the `MAX_EVIDENCE_ITEMS`-th admitted
@@ -9693,7 +9692,7 @@ mod tests {
         );
     }
 
-    /// The T2.2.4 receipt round trip (ADR-0020 §3): Bob signs a proposal offline;
+    /// The receipt round trip (ADR-0020 §3): Bob signs a proposal offline;
     /// a **courier** (neither transacting party) submits the bundle and fetches
     /// the receipt to carry home — bumping the fetch count but leaving it
     /// unconfirmed; Bob's own device then fetches over the authenticated channel
@@ -9783,7 +9782,7 @@ mod tests {
     }
 
     /// The operator's own-wallet author path: `receipts_ack` confirms a receipt by
-    /// record hash, the CLI counterpart to the mobile author fetch (T2.2.4).
+    /// record hash, the CLI counterpart to the mobile author fetch.
     #[test]
     fn dtn_receipts_ack_confirms_by_record_hash() {
         let mut core = test_core();
@@ -9926,7 +9925,7 @@ mod tests {
     }
 
     /// A Tier-2 confirmation carried over DTN is held to the **same** reputation-
-    /// staking bar the live paths enforce (T1.8.2): once bootstrap grace has
+    /// staking bar the live paths enforce: once bootstrap grace has
     /// ended, a confirmer below the Member band is refused `tier2-stake` — the
     /// DTN path is not a way around the gate. Pins the shared
     /// `tier2_confirmation_gate`.
@@ -10098,7 +10097,7 @@ mod tests {
     #[test]
     fn a_created_listings_oracle_tier_follows_the_price_unless_it_is_given() {
         let mut core = test_core();
-        // Under 5 Commons → tier 1; at or above → tier 2 (the M1.8.2 ladder).
+        // Under 5 Commons → tier 1; at or above → tier 2 (the oracle-tier ladder).
         let mut params = create_params("Cheap squash");
         params["amount_centi"] = serde_json::json!(499);
         assert_eq!(
@@ -10500,7 +10499,7 @@ mod tests {
         assert_eq!(after["listings"].as_array().unwrap().len(), 1);
     }
 
-    // --- service contract charge sweep (T1.7.7 Part D) ----------------------
+    // --- service contract charge sweep ----------------------
 
     use rrn_marketplace::contract::{
         append_contract_termination, append_service_contract, ContractId, ContractTermination,
@@ -11017,7 +11016,7 @@ mod tests {
     }
 
     /// Frames a signed record into the hex a channel `submit_*` param carries —
-    /// the way a phone hands the station a whole `SignedPayload` (T1.3.4 framing).
+    /// the way a phone hands the station a whole `SignedPayload`.
     fn record_hex<T>(payload: T, signer: &Keypair) -> String
     where
         T: Clone + Into<dcbor::prelude::CBOR>,
@@ -11123,7 +11122,7 @@ mod tests {
         assert_ne!(detail["state"], "active");
     }
 
-    // --- governance wiring (T1.9.7b) ----------------------------------------
+    // --- governance wiring ----------------------------------------
 
     const TEN_MONTHS: i64 = 10 * 30 * 86_400;
 
@@ -11408,7 +11407,7 @@ mod tests {
             serde_json::json!({ "community_id": "commons" }),
         );
         // A Charter is published (the station derives the proposal's window from
-        // it on admission; the author no longer signs the window, T2.1.3).
+        // it on admission; the author no longer signs the window).
         assert!(
             effective_charter(&core.db, core.wallet.address.public_key())
                 .unwrap()

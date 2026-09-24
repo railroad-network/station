@@ -15,7 +15,7 @@
 //!
 //! A [`DeliveryReceipt`] is **never appended to the community log**. It attests
 //! delivery, not a ledger fact; the ledger facts (settlement, cancellation) are
-//! their own station-signed records (ADR-0005). T2.2.3 persists receipts in a
+//! their own station-signed records (ADR-0005). Ingest persists receipts in a
 //! local, unsigned table for redelivery. `received_at` is the station's
 //! admission-clock reading at ingest — evidence of when it answered, testimony
 //! only (ADR-0022 §3), never an input to any window.
@@ -64,7 +64,7 @@ pub enum RefusalReason {
     /// keep outbox order, ADR-0020 §4).
     NotProposed,
     /// The confirmer of a Tier-2 payment does not clear the Member band and the
-    /// community is past bootstrap grace, so the reputation-staking gate (T1.8.2)
+    /// community is past bootstrap grace, so the reputation-staking gate
     /// refuses the confirmation. An eligibility fault, not a signature or state
     /// fault — a courier's owner can tell "raise your standing" from a generic
     /// rejection.
@@ -86,7 +86,7 @@ pub enum RefusalReason {
     CertExpired,
     /// A cert-backed spend would push the certificate's cumulative admitted spend
     /// past its cap (ADR-0021 §5) — the excess is refused (and is equivocation
-    /// evidence, T2.3.3).
+    /// evidence).
     CertOverspent,
     /// A co-signature targets an emergency declaration whose first threshold
     /// crossing was refused by a §4 cap: the declaration is dead and never
@@ -342,7 +342,7 @@ pub type SignedReceipt = SignedPayload<DeliveryReceipt>;
 /// as bytes over a carrier (or hex over RPC).
 ///
 /// This is the exact byte format an offline receiver decodes and verifies the
-/// station signature over (the mobile FFI's `receipt_parse`, T2.4.2). Because
+/// station signature over (the mobile FFI's `receipt_parse`). Because
 /// the signature covers only the payload's canonical bytes (ADR-0002), the
 /// envelope may be re-framed freely without invalidating it.
 pub fn encode_signed(signed: &SignedReceipt) -> Vec<u8> {

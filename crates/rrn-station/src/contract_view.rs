@@ -1,4 +1,4 @@
-//! Service-contract reads for the CLI (T1.7.7).
+//! Service-contract reads for the CLI.
 //!
 //! Where [`crate::inquiry_view`] shapes the negotiation that precedes a deal,
 //! this shapes the standing order that follows one: [`detail`] turns one

@@ -5,8 +5,8 @@
 //! member devices to the station over any carrier (LoRa, SMS, paper, another
 //! member's phone) and land later, with proof of delivery. This crate is the
 //! typed, canonical, fixture-locked wire layer of that mechanism. It is pure
-//! data plus validation — no storage (`rrn-storage`, T2.2.2), no ingest or
-//! receipt issuance (`rrn-station`, T2.2.3), no networking.
+//! data plus validation — no storage (`rrn-storage`), no ingest or
+//! receipt issuance (`rrn-station`), no networking.
 //!
 //! Three record shapes make up the layer:
 //!
@@ -26,7 +26,7 @@
 //!   reason. A receipt is transport state, not community state: it is never
 //!   appended to the community log.
 //!
-//! [`paper`] is the paper/QR *text* layer over these shapes (T2.5.1): multi-part
+//! [`paper`] is the paper/QR *text* layer over these shapes: multi-part
 //! QR chunking for bundles and receipts, and single-QR forms for certificates and
 //! offline spend vouchers. It is a carriage encoding — the bytes it moves are the
 //! same signed payloads above, and their signatures remain the only integrity

@@ -1,4 +1,4 @@
-//! The portable `{signer, sig, body}` signed-record envelope (T2.4.2).
+//! The portable `{signer, sig, body}` signed-record envelope.
 //!
 //! A [`rrn_crypto::signed::SignedPayload`] is a serde envelope, not a dCBOR
 //! value, so a signed record needs an explicit framing to travel as bytes over a

@@ -33,7 +33,7 @@ record (a proposal, confirmation, vote, vouch, dispute opening, …) and is itse
 a `SignedPayload<OutboxEntry>` signed by that device (member) key. The chain
 makes carried records tamper-evident, makes a courier that drops an entry leave
 a detectable **gap**, and makes an owner who signs two entries at the same
-position an **outbox fork** — provable equivocation (ADR-0021, T2.3.3).
+position an **outbox fork** — provable equivocation (ADR-0021).
 
 `OutboxEntry` body (the signed canonical CBOR):
 
@@ -102,7 +102,7 @@ understand them and makes `bundle_id` a stable function of the concatenated
 carriage.
 
 **`bundle_id`** = Blake3 of the bundle's encoded bytes. It identifies a
-*carriage unit* (for chunking in T2.2.5) and is deliberately **not** stable
+*carriage unit* (for chunking in the framing layer) and is deliberately **not** stable
 under re-bundling: the same record in two bundles has two `bundle_id`s. Receipts
 therefore key on `record_hash`, never on `bundle_id`.
 
@@ -122,7 +122,7 @@ witness need not split equivocation evidence across bundles and one fork pair
 cannot poison an otherwise-valid bundle. Only a strictly **decreasing** position
 is refused (the courier-reorder tripwire). Signatures are **not** checked at
 decode — this order check is structural hygiene over *claimed* authors, not a
-security boundary; ingest (T2.2.3) verifies signatures and answers a fork's
+security boundary; ingest verifies signatures and answers a fork's
 losing side per record (`outbox-fork`, or `known` for a duplicate).
 
 ---
@@ -157,7 +157,7 @@ no `reason`.
 
 A receipt is **transport state, not community state**: it is **never appended to
 the community log**. The ledger facts it reports (a settlement, a cancellation)
-are their own station-signed records (ADR-0005); T2.2.3 persists receipts in a
+are their own station-signed records (ADR-0005); the station persists receipts in a
 local, unsigned table for redelivery.
 
 Ingestion is idempotent (ADR-0020 §3): re-submitting a bundle can only reproduce
@@ -180,13 +180,13 @@ outside this table, so the set is also the length bound:
 | `duplicate` | a record content-identical to one already on the log was re-presented as a *new* admission (distinct from the benign `known` outcome) |
 | `tier-unsupported` | the record's oracle tier is above what this phase admits — blocked, never clamped (ADR-0011) |
 | `not-proposed` | the referenced transaction is absent or not in the state the record needs (couriers must keep outbox order, ADR-0020 §4) |
-| `tier2-stake` | a Tier-2 confirmer does not clear the Member band past bootstrap grace (T1.8.2) |
+| `tier2-stake` | a Tier-2 confirmer does not clear the Member band past bootstrap grace |
 | `cert-misuse` | a cert-backed proposal is not a positive-amount spend — a payment request cannot ride an escrow (ADR-0021 §3–§4) |
 | `cert-unknown` | a cert-backed proposal (or return) names a certificate the station never issued (ADR-0021 §3) |
 | `cert-returned` | a cert-backed proposal (or return) names a certificate already returned (ADR-0021 §2–§3) |
 | `cert-wrong-member` | a cert-backed proposal names a certificate belonging to another member than its sender (ADR-0021 §3) |
 | `cert-expired` | a cert-backed proposal arrived past its certificate's spend-admissibility boundary (validity + grace + skew — ADR-0021 §4) |
-| `cert-overspent` | a cert-backed spend would exceed its certificate's cap (ADR-0021 §5); the excess is refused and is equivocation evidence (T2.3.3) |
+| `cert-overspent` | a cert-backed spend would exceed its certificate's cap (ADR-0021 §5); the excess is refused and is equivocation evidence |
 | `rejected` | a state-machine or plausibility fault with no more specific slug (machine-stable catch-all) |
 
 A reader that does not recognise a slug treats the outcome as an unknown refusal
@@ -202,7 +202,7 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
   signed record or admission.
 - **Fork = equivocation evidence.** An outbox fork (`is_fork`) is a signed,
   self-incriminating pair: two entries the same key signed at one position. It
-  is the evidence primitive ADR-0021/T2.3.3 turn into an automatic dispute.
+  is the evidence primitive ADR-0021 turn into an automatic dispute.
 - **`bundle_id` is unstable by design.** It names a carriage unit, not content;
   never use it to identify or dedup a record. `record_hash` is the content
   identifier.
@@ -217,12 +217,12 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
 
 ## 5. Consumed by
 
-- **T2.2.2** — outbox store in `rrn-storage` (persist a device's outbox chain).
-- **T2.2.3** — station bundle ingest + signed delivery-receipt issuance; the
+- Outbox store in `rrn-storage` (persist a device's outbox chain).
+- Station bundle ingest + signed delivery-receipt issuance; the
   local receipt table.
-- **T2.4.2** — mobile FFI over these types; the mobile repo verifies
+- Mobile FFI over these types; the mobile repo verifies
   `cross_platform_dtn.json` byte-identically.
-- **T2.5.1** — paper/QR encodings of bundles and certificates.
+- Paper/QR encodings of bundles and certificates.
 
 ## 6. Future (out of scope here)
 
@@ -230,7 +230,7 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
   already log-public *within the community*, so this leaks nothing new to a
   community member. Sealing a bundle to the station key (privacy against an
   outside courier — ADR-0008 sealed envelopes) is a later privacy upgrade, not
-  built in T2.2.1.
+  built in the bundle layer.
 
 ---
 
@@ -238,7 +238,7 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
 
 When bundles and receipts move over a *constrained* carrier — the Reticulum
 sidecar, and behind it LoRa at ~250 B/s — three things ride on top of the framing
-layer (`rrn_protocol::framing`, T2.2.5). All of this is carrier-agnostic: it moves
+layer (`rrn_protocol::framing`). All of this is carrier-agnostic: it moves
 opaque frames and never inspects a sealed/signed payload.
 
 ### 7.1 Payload-kind tag
@@ -298,11 +298,11 @@ identity, never merged with it (ADR-0013 "bind, do not collapse"). Fields:
 `address`, `destination` (hex), `issued_at`. Fixture:
 `tests/fixtures/cross_platform_binding.json`.
 
-The record type and its self-signed `validate()` landed in T2.6.2
+The record type and its self-signed `validate()` landed with the Reticulum transport
 (`rrn_protocol::binding`). **Appending a binding to the log and reading peers'
-bindings back into a routing directory landed in T2.6.4**, alongside the
-station-originated outbound path (T2.6.2 wired the inbound receive → ingest →
-receipt path; T2.6.4 closes the loop with originate → ingest → receipt →
+bindings back into a routing directory landed later**, alongside the
+station-originated outbound path (the transport work wired the inbound receive → ingest →
+receipt path; the outbound work closes the loop with originate → ingest → receipt →
 delivered). A binding is admitted through the same DTN front door as any record
 (self-signed, else a per-record `Rejected` refusal); the directory is derived by
 log replay, keeping per address the binding with the highest `issued_at` (log

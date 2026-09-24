@@ -30,7 +30,7 @@ Two forces pull on the choice of how to achieve this:
    defined by *our wrapper around a general-purpose encoder* is something they
    would have to reverse-engineer.
 
-A complication surfaced while implementing this task (M0.1, T0.1.3) that
+A complication surfaced while implementing this task that
 invalidated an assumption baked into the original task spec: the spec sketched a
 serde-based API (`to_canonical_bytes<T: Serialize>`), but **`dcbor` has no serde
 integration** — it has its own CBOR data model and `From`/`TryFrom`

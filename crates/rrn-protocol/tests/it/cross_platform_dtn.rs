@@ -1,4 +1,4 @@
-//! Cross-platform DTN wire fixtures (T2.2.1).
+//! Cross-platform DTN wire fixtures.
 //!
 //! One fully-populated, byte-stable vector for each of the three wire records —
 //! an outbox entry, a carriage bundle, and a station delivery receipt — so the
@@ -90,7 +90,7 @@ struct ReceiptVector {
     signature_hex: String,
     /// The portable **receipt-envelope bytes** (`{signer, sig, body}` canonical
     /// dCBOR) an offline receiver decodes and verifies — the exact format the
-    /// mobile FFI's `receipt_parse` (T2.4.2) consumes.
+    /// mobile FFI's `receipt_parse` consumes.
     envelope_hex: String,
 }
 
@@ -212,7 +212,7 @@ fn build_receipt_vector() -> ReceiptVector {
 
 fn build_fixture() -> Fixture {
     Fixture {
-        comment: "Cross-platform DTN wire fixtures for T2.2.1 (ADR-0020). One fully-populated \
+        comment: "Cross-platform DTN wire fixtures (ADR-0020). One fully-populated \
             vector per record: outbox entry, carriage bundle, station delivery receipt. \
             `canonical_hex` is each record's canonical dCBOR (== From<T> for CBOR); signed \
             records also record the Ed25519 signature over those bytes. Deterministic \

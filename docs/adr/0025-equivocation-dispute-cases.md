@@ -3,14 +3,14 @@
 ## Status
 
 Accepted — direction maintainer-ratified 2026-09-04; jury path implemented and
-mechanics finalized in T2.3.4 (2026-09-05).
+mechanics finalized in the jury implementation (2026-09-05).
 
 The `EquivocationRecord`, its evidence verification, the station's detection
-wiring, and the reputation input shipped in T2.3.3 (PR #29). T2.3.4 built the jury
+wiring, and the reputation input shipped in the earlier equivocation work (PR #29). The jury work built the jury
 machinery this ADR governs: the juror-ballot and re-seat record kinds, the
 identity-keyed case derivation, the admission-anchored draw, payee recusal, the
 station-signed terminal ruling, and the certificate-issuance gate. The exact
-mechanics settled by T2.3.4 are recorded in *Mechanics* below.
+mechanics settled by the jury work are recorded in *Mechanics* below.
 
 Date: 2026-09-04 (finalized 2026-09-05)
 
@@ -18,7 +18,7 @@ Date: 2026-09-04 (finalized 2026-09-05)
 
 ADR-0021 §5 says a proven equivocation (a certificate overspend or an
 outbox-chain fork) "automatically opens an ADR-0014 dispute … flowing to a jury
-like any other." T2.3.3 implemented everything except the jury, and building the
+like any other." The earlier work implemented everything except the jury, and building the
 jury revealed that an equivocation case is **not** "a dispute like any other":
 
 - ADR-0014's `rrn-dispute` machinery is welded to transactions at every layer. A
@@ -72,18 +72,18 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
    before subject-recusal if that is what seats a panel, exactly as ADR-0014 does;
    the subject is never eligible to judge their own case.
 4. **Verdict records.** A new `EquivocationVerdictRecord` kind (defined in
-   `rrn-ledger::escrow` in T2.3.3) with decisions `Confirm | Overturn`, distinct
-   from `JurorVerdict` so no shipped wire format changes. The T2.3.3 record names a
+   `rrn-ledger::escrow`) with decisions `Confirm | Overturn`, distinct
+   from `JurorVerdict` so no shipped wire format changes. The equivocation record names a
    single `equivocation_id` (a content address) and scoring neutralizes per record;
    because a case is keyed by *identity* (§1), **an `Overturn` must neutralize every
    record attached to that identity, not just the one content-address it names** —
-   T2.3.4 either keys the verdict by the case identity or emits one `Overturn` per
+   The jury path either keys the verdict by the case identity or emits one `Overturn` per
    attached record. Until then the honest single-writer station holds exactly one
    record per identity (dedup, §1), so the distinction is latent; the jury path must
    not inherit it silently.
 5. **Three log-derived terminal states; a lapse is `Lapsed`, not a synthesized
    `Confirm`.** The reputation penalty applies at **record verification**, not at
-   verdict (T2.3.3), so the status quo after a verified record is *already*
+   verdict, so the status quo after a verified record is *already*
    "penalty applied." A case therefore has three terminal states, each derived
    from the log: `Confirmed` (a jury affirmed the evidence), `Overturned` (a jury
    invalidated it — the penalty lifts), and `Lapsed` (the window closed with no
@@ -97,7 +97,7 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
    affirmative `Confirmed`, so jury inaction never enacts anything new.
 6. **Neutralize-only enactment.** An equivocation verdict voids no transfer and
    settles nothing; `Overturn` simply lifts the reputation penalty (already wired
-   in T2.3.3's scoring), and `Confirmed`/`Lapsed` append nothing to the ledger.
+   in the equivocation scoring), and `Confirmed`/`Lapsed` append nothing to the ledger.
    No new ledger enactment primitive touches balances.
 7. **The reputation consequence, and the cert-issuance gate.** A verified,
    un-overturned equivocation **zeroes both live reputation dimensions** — trade
@@ -109,10 +109,10 @@ enactment vary by case kind** — no case-kind-specific eligibility or draw twea
    the member from issuing new headroom certificates** until it is overturned — a
    derived eligibility gate in the spirit of ADR-0011's Tier-2 stake: you
    double-committed offline credit, you get no fresh offline credit until a jury
-   says otherwise. (The reputation zeroing shipped in T2.3.3; the cert-issuance
-   gate is T2.3.4.)
+   says otherwise. (The reputation zeroing shipped earlier; the cert-issuance
+   gate is the jury work.)
 
-## Mechanics (finalized in T2.3.4)
+## Mechanics (finalized in the jury implementation)
 
 These fill in the details §1–§7 left to the follow-up ticket; they do not change
 any ratified direction.
@@ -172,8 +172,8 @@ any ratified direction.
 - Identity-keyed cases and admission-anchored seeding cost a little more
   bookkeeping than content-address keying but close a real panel-grinding vector
   and prevent double-penalizing one offence proved two ways.
-- Until T2.3.4 lands, a verified equivocation zeroes reputation with **no jury
-  recourse**; T2.3.3's `verify_evidence` re-check during scoring is the interim
+- Until the jury path lands, a verified equivocation zeroes reputation with **no jury
+  recourse**; the equivocation `verify_evidence` re-check during scoring is the interim
   guard against a malicious/buggy station (see the threat model). A good-faith
   outbox fork from a wallet restored from backup is the canonical `Overturn`
   ground — and the station refuses to record a "fork" whose two entries are
@@ -184,9 +184,9 @@ any ratified direction.
 - **Anchoring cascade.** Zeroing a member's dimensions drops their composite, so
   if they were the *sole* anchor of another identity (ADR-0009 identity anchoring),
   that identity falls back to the anchor cap until re-anchored. This is the intended
-  chain-of-trust cost of vouching for someone who then equivocates, but T2.3.4
+  chain-of-trust cost of vouching for someone who then equivocates, but the jury work
   should surface it (a de-anchored member is not themselves accused).
-- **Overturn signer trust (done in T2.3.4).** Both reputation scoring
+- **Overturn signer trust (done in the jury work).** Both reputation scoring
   (`overturned_equivocations`) and the ledger snapshot (`equivocation_verdict`) now
   honor an `Overturn` only when its signer matches the signer of the equivocation
   record it names — the station that recorded the offence. A peer-gossiped
@@ -220,7 +220,7 @@ any ratified direction.
   (a false headroom claim *and* a failed settlement) and fills both of ADR-0009's
   reserved negative slots; denting only attestation accuracy would leave trade
   reliability — the dimension a counterparty actually reads — pristine.
-- **Ship the full jury path inside T2.3.3.** Rejected: it forces this ADR's
+- **Ship the full jury path inside the earlier work.** Rejected: it forces this ADR's
   question to be answered implicitly in code review rather than explicitly here,
   and makes an already-large ticket larger.
 
@@ -237,5 +237,5 @@ any ratified direction.
 - ADR-0015 — bootstrap grace, why small communities lapse and must re-seat.
 - ADR-0020 §2 — outbox forks, one of the two equivocation bases.
 - ADR-0022 / PR #19 — admission-time anchoring, reused for the sortition seed.
-- T2.3.3 (this milestone) — records, verification, detection, and reputation
-  input; T2.3.4 — the jury path this ADR governs.
+- The equivocation-record work — records, verification, detection, and reputation
+  input; the jury path — the path this ADR governs.

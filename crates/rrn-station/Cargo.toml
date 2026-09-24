@@ -21,24 +21,24 @@ path = "src/main.rs"
 rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
 rrn-storage = { path = "../rrn-storage", version = "0.1" }
 # DTN wire formats (ADR-0020): outbox entries, bundles, delivery receipts. The
-# station is the DTN admission point (T2.2.3) and speaks these on ingest.
+# station is the DTN admission point and speaks these on ingest.
 rrn-protocol = { path = "../rrn-protocol", version = "0.1" }
 rrn-identity = { path = "../rrn-identity", version = "0.1" }
 rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
 rrn-reputation = { path = "../rrn-reputation", version = "0.1" }
-# The marketplace (M1.6). This is its first dependent — nothing referenced it
-# while M1.6 was crate-only work — which is what brings tantivy and its ~60
+# The marketplace. This is its first dependent — nothing referenced it
+# while the marketplace was crate-only work — which is what brings tantivy and its ~60
 # transitive crates into the daemon's build.
 rrn-marketplace = { path = "../rrn-marketplace", version = "0.1" }
-# Governance (M1.9): the enactment sweep that puts passed proposals into force.
+# Governance: the enactment sweep that puts passed proposals into force.
 rrn-governance = { path = "../rrn-governance", version = "0.1" }
 rrn-dispute = { path = "../rrn-dispute", version = "0.1" }
 
 tokio = { version = "1", features = ["full"] }
-# The mobile-facing HTTP surface (ADR-0008 / T1.3.3+): plain HTTP over local
+# The mobile-facing HTTP surface (ADR-0008): plain HTTP over local
 # TCP as a dumb carrier — the security boundary is the application-layer sealed
 # envelope, not the transport. axum is tokio-native, so it runs on the existing
-# runtime, and its long-poll support is what T1.3.5 will build push on.
+# runtime, and its long-poll support is what push is built on.
 axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -55,7 +55,7 @@ rpassword = "7"
 # secret-key bytes the recovery RPC moves around.
 dcbor = "0.25"
 # mDNS/DNS-SD advertisement so a mobile can find this station on the local
-# network without typing an IP (T1.3.2). Pure Rust with no async-runtime
+# network without typing an IP. Pure Rust with no async-runtime
 # dependency of its own — it runs its own thread — so it does not constrain the
 # tokio version here. Discovery is not a security boundary (see mdns.rs).
 mdns-sd = "0.20"
@@ -65,8 +65,8 @@ mdns-sd = "0.20"
 # the `image` stack; base64 is the RFC 4648 alphabet the mobile decoder expects.
 qrcode = { version = "0.14", default-features = false }
 base64 = "0.22"
-# Temp dir for the `VACUUM INTO` snapshot taken during `station backup`
-# (T1.11.3): the live database is copied to a throwaway file, read into the
+# Temp dir for the `VACUUM INTO` snapshot taken during `station backup`:
+# the live database is copied to a throwaway file, read into the
 # encrypted archive, and the temp dir is removed on drop.
 tempfile = "3"
 # Zeroizing the reconstructed Volume Master Key after it has been handed to the
@@ -75,7 +75,7 @@ tempfile = "3"
 zeroize = { version = "1", features = ["derive"] }
 
 # Send SIGTERM to the supervised `rnsd` sidecar for a graceful stop before
-# SIGKILL (T2.6.1) — tokio's `Child` only exposes SIGKILL (`start_kill`). Unix
+# SIGKILL — tokio's `Child` only exposes SIGKILL (`start_kill`). Unix
 # only (the sidecar is a POSIX daemon; `rnsd` is not a Windows service), and the
 # `signal` feature is the whole of what we use. MIT-licensed (allow-listed).
 [target.'cfg(unix)'.dependencies]

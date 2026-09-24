@@ -30,7 +30,7 @@ forces against it:
 - **The marketplace feeds reputation, so it inherits reputation's constraints.**
   ADR-0009 fixed domain competence as a dimension fed by "marketplace
   transactions tagged with a controlled category vocabulary." Reputation is
-  replayable from the log by design (T1.5.7), and it can only stay replayable if
+  replayable from the log by design, and it can only stay replayable if
   its inputs are on the log too. A listing category living in a mutable table
   would be a reputation input that a receiving station cannot verify.
 
@@ -43,7 +43,7 @@ forces against it:
 - **Phase 1 measures almost nothing about a provider yet.** The design doc's
   listing primitive (Section 9.2) carries a `history` summary — completed
   transactions, disputes, average rating. Phase 1 has no dispute mechanism
-  (M1.8+) and no reviews at all (explicitly out of scope). The same honesty
+  (a later phase) and no reviews at all (explicitly out of scope). The same honesty
   problem ADR-0009 hit with dormant dimensions arrives here, in a place buyers
   look at when deciding whom to trust.
 
@@ -55,7 +55,7 @@ forces against it:
   of the network can ever satisfy — and unlike the anchoring deadlock, which was
   global and loud, this fails silently, one listing at a time.
 
-The M1.6 task spec fixes the field shapes. This ADR adopts them, resolves the
+The marketplace task spec fixes the field shapes. This ADR adopts them, resolves the
 places where they under-specify or collide with decisions already locked, and
 records why.
 
@@ -82,13 +82,13 @@ One schema serves all three surfaces, with a `surface` discriminant:
 | `pricing` | `Pricing` | `{ amount_centi: i64, model: PricingModel, negotiable: bool }`. |
 | `availability` | `Availability` | `{ status, capacity: Option<u32>, next_slot: Option<i64> }`. |
 | `requirements` | `Requirements` | `{ min_reputation: f32, community_member_only: bool, federation_only: bool }`. |
-| `oracle_tier` | `u8` | The M1.8 ladder. Phase 1 accepts `1` or `2` only. |
+| `oracle_tier` | `u8` | The oracle-tier ladder. Phase 1 accepts `1` or `2` only. |
 | `federation_visible` | `bool` | Phase 2. **Must be `false` in Phase 1**; validation rejects `true` rather than accepting a promise nothing honors. |
 | `created_at` | `i64` | Unix seconds, from the provider's signed content. |
 | `expires_at` | `Option<i64>` | `None` = no expiry. |
 
 `amount_centi` is signed integer centicommons, the same unit and the same sign
-convention as `TransactionProposal` (ADR-0005 / M0.5): never floats, and the sign
+convention as `TransactionProposal` (ADR-0005): never floats, and the sign
 carries direction.
 
 **`history` is not a field.** Design overview Section 9.2 shows it inside the
@@ -96,10 +96,10 @@ listing; it is instead **derived at read time** from settled transactions
 referencing the listing. A provider must not sign a claim about their own track
 record — it would be self-attested, and it would go stale the moment the next
 transaction settles. Of its three components, only `completed` has a Phase-1
-source: `disputes` has no mechanism until M1.8+, and `avg_rating` has none at all
+source: `disputes` has no mechanism yet, and `avg_rating` has none at all
 (reviews are out of scope for the milestone). **The two unsourced components are
 reported as absent, never as `0`** — a listing showing "0 disputes" when disputes
-cannot be recorded is a claim the system cannot back, and the M1.7 UI must render
+cannot be recorded is a claim the system cannot back, and the marketplace UI must render
 absence, following the same rule the Standing screen follows for dormant
 dimensions.
 
@@ -197,7 +197,7 @@ Closed listings **stay on the log forever**; the index hides them by default.
 `ListingId` is the Blake3 hash of the listing's canonical bytes, and `id` is
 **excluded from the hashed content** — it *is* that hash. Encoding omits it;
 decoding recomputes it. A decoded listing therefore cannot carry an id that
-disagrees with its own contents. This mirrors `TransactionId` exactly (M0.5), for
+disagrees with its own contents. This mirrors `TransactionId` exactly, for
 the same reason.
 
 ### Linking transactions to listings
@@ -205,7 +205,7 @@ the same reason.
 `TransactionProposal` gains one optional field, `listing_id: Option<ListingId>`.
 Transactions without it remain valid and remain the norm for direct payment;
 commercial transactions carry it, which is what lets a listing's completed-count
-be derived and what will feed domain competence in M1.7.
+be derived and what will feed domain competence later.
 
 **The field is omitted from the canonical CBOR when `None` — not encoded as
 null.** This deviates from the convention `memo` established (explicit
@@ -240,7 +240,7 @@ today — and a listing demanding more is rejected. A provider cannot publish an
 offer that is arithmetically closed to everyone.
 
 The bound is derived from the dormant-dimension list, never written as a literal,
-so it rises on its own as M1.7 and M1.9 light dimensions up. That it varies by
+so it rises on its own as later milestones light dimensions up. That it varies by
 phase is acceptable because **it only ever moves up**: validation is a create-time
 gate, never re-applied on read, so no already-published listing becomes invalid
 when the ceiling moves, and the rejected cases become accepted rather than the
@@ -262,7 +262,7 @@ Two derived structures, both rebuildable from the log:
 - **`listings_index`** — a SQLite table keyed by `listing_id`, carrying `surface`,
   `category`, `provider`, `status`, `expires_at`, `price_centi`,
   `reputation_at_creation`, `created_at`, indexed for filter queries. Per house
-  style (T1.5.5) its SQL lives in `rrn-storage`; `rrn-marketplace` never issues
+  style its SQL lives in `rrn-storage`; `rrn-marketplace` never issues
   raw SQL.
 - **A tantivy index** over `title + description + category`, persisted at
   `<data_dir>/marketplace_index/`.
@@ -280,10 +280,10 @@ Ranking is text relevance from tantivy **multiplied** by a provider-reputation
 factor, so reputation breaks ties and lifts strong providers without letting a
 high score surface an irrelevant listing.
 
-Reputation enters ranking from the **M1.5 snapshot cache**, never a fresh replay.
+Reputation enters ranking from the **reputation snapshot cache**, never a fresh replay.
 Scoring is O(N) in log size, and anchoring made it O(V·N); a search returning
 fifty results must not trigger fifty replays on the station's single writer thread
-(the residual already noted for `reputation_band` in T1.5.9). `reputation_at_creation`
+(the residual already noted for `reputation_band`). `reputation_at_creation`
 is stored in the index as a historical fact about the moment of listing, for audit
 and for tie-breaking stability — current standing is what ranks.
 
@@ -317,7 +317,7 @@ implementation detail and may change freely — a rebuild is always available.
   keeps it honest; the recovery path is deletion.
 
 - **Reputation and the marketplace are now mutually dependent.** Reputation ranks
-  listings; listing categories will feed domain competence in M1.7. The cycle is
+  listings; listing categories will feed domain competence later. The cycle is
   broken only by the direction of derivation: both are computed from the log, and
   neither reads the other's cache as an input to its own scoring. Search reads
   reputation snapshots; reputation must never read the marketplace index.
@@ -330,7 +330,7 @@ implementation detail and may change freely — a rebuild is always available.
 
 - **Every listing field is provider-asserted.** Nothing verifies that the grain
   exists, that the slot is real, or that the capacity is honest. Oracle tiers
-  (M1.8) and the dispute window are what will bind claims to reality; until then
+ and the dispute window are what will bind claims to reality; until then
   the marketplace's integrity guarantee is narrow and exact: *the provider said
   this, signed, at this time, and cannot deny it.* The threat model's
   `rrn-marketplace` section must state that boundary rather than imply the
@@ -342,7 +342,7 @@ implementation detail and may change freely — a rebuild is always available.
   and much simpler design. Rejected because it makes the offer unprovable: the
   evidence a dispute needs is what the listing said at the moment of agreement, and
   an `UPDATE` destroys it. It would also put a reputation input (category) outside
-  the replayable log, breaking T1.5.7 portability.
+  the replayable log, breaking reputation portability.
 
 - **A separate schema per surface.** Goods, Services, and Commons genuinely use
   the availability fields differently, and three types would encode that in the
@@ -368,7 +368,7 @@ implementation detail and may change freely — a rebuild is always available.
   provider's signature cover a number they did not choose. A signed record must say
   what its signer said.
 
-- **Defer `listing_id` on `TransactionProposal` to M1.7.** Would keep M1.6 purely
+- **Defer `listing_id` on `TransactionProposal` to a later milestone.** Would keep the marketplace work purely
   station-side with no mobile coupling. Rejected because the linkage is the part of
   the data model that most needs locking now, and adding a field to a
   content-addressed record is exactly the change that benefits from landing with
@@ -380,9 +380,9 @@ implementation detail and may change freely — a rebuild is always available.
 
 ## References
 
-- Design overview [Section 9, The Marketplace](../design/Railroad-Network-Overview.md#9-the-marketplace) — full source, in particular 9.1 (three surfaces), 9.2 (the listing primitive), 9.4 (predictive matching, whose Phase-1 form is the `Need` record in T1.6.7), 9.5 (end-to-end transaction flow).
+- Design overview [Section 9, The Marketplace](../design/Railroad-Network-Overview.md#9-the-marketplace) — full source, in particular 9.1 (three surfaces), 9.2 (the listing primitive), 9.4 (predictive matching, whose Phase-1 form is the `Need` record), 9.5 (end-to-end transaction flow).
 - [ADR-0002](0002-canonical-serialization-dcbor.md) — canonical dCBOR and the `kind` discriminant convention these records follow.
 - [ADR-0005](0005-station-signed-settlement.md) — the station-as-signer pattern that `ListingClosed` reuses for expiry.
 - [ADR-0009](0009-universal-reputation-algorithm.md) — the reachable-composite ceiling that bounds `min_reputation`, the `DomainTag` namespace the category vocabulary shares, and the snapshot cache search ranks from.
-- M0.5 transaction format (`rrn-ledger::transaction`) — `TransactionProposal`, the sign convention for `amount_centi`, and the content-addressing pattern `ListingId` mirrors.
-- M1.6 task spec (`Phase 1 Tasks/M1.6 Marketplace Data Model.md`) — T1.6.2 through T1.6.7 implement this ADR.
+- The ledger transaction format (`rrn-ledger::transaction`) — `TransactionProposal`, the sign convention for `amount_centi`, and the content-addressing pattern `ListingId` mirrors.
+- The marketplace task spec implements this ADR.

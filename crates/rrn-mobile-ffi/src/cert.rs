@@ -1,4 +1,4 @@
-//! Escrowed offline spending for the mobile client (T2.4.2, ADR-0021).
+//! Escrowed offline spending for the mobile client (ADR-0021).
 //!
 //! Thin marshalling over `rrn-ledger`'s escrow and transaction types so the app
 //! can request a headroom certificate, read a certificate it holds, sign a
@@ -90,7 +90,7 @@ pub struct CertificateInfo {
 }
 
 /// Parses a station-signed headroom certificate, verifying the station
-/// signature, and returns its non-secret fields (T2.4.2, ADR-0021 §1).
+/// signature, and returns its non-secret fields (ADR-0021 §1).
 ///
 /// `expected_station_pubkey` is the 32-byte key of the member's paired station:
 /// the certificate must be signed by it, else [`StationSignatureInvalid`](CertError::StationSignatureInvalid).
@@ -264,7 +264,7 @@ pub enum OfflineSpendVerdict {
 /// verdict of `Ok` is *not* a guarantee the spend will be admitted — the spender
 /// may have committed the same headroom elsewhere. The cap still bounds the
 /// community's loss and the overspend is provable equivocation the station will
-/// refuse and record (T2.3.2/T2.3.3): the station-side admission re-checks the
+/// refuse and record: the station-side admission re-checks the
 /// cumulative cap over *all* admitted spends, not just the presented ones, and
 /// refuses the excess (see `rrn-ledger`'s `check_cert_backed` and the
 /// `cert_backed_spends` admission tests). Receivers who need more assurance can

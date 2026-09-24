@@ -5,7 +5,7 @@
 //! `.rrnwallet` file: the canonical-CBOR encoding of an [`EncryptedWallet`],
 //! whose ciphertext is the wallet's secret material sealed with
 //! XChaCha20-Poly1305 under a key derived from the user's passphrase via
-//! argon2id. Lose the file *and* there is no social recovery (M0.4) → the
+//! argon2id. Lose the file *and* there is no social recovery → the
 //! identity is gone; that is by design.
 //!
 //! # The encryption scheme

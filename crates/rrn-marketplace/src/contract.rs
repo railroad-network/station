@@ -1,14 +1,14 @@
 //! Service contracts — the recurring commitment a buyer and a provider enter
 //! into when a subscription service (a weekly veg box, a monthly checkup) is
 //! agreed, the step that turns a one-off [`inquiry`](crate::inquiry) into a
-//! standing order (T1.7.7).
+//! standing order.
 //!
 //! A one-off sale settles as a single [`TransactionProposal`](rrn_ledger::transaction::TransactionProposal)
 //! the buyer signs. A subscription cannot: the buyer is not present to sign each
 //! period's charge. Resolved with a *direct debit* — the buyer's one signature on
 //! the [`ServiceContract`] pre-authorizes every identical period, and the station
 //! executes each period's balance move directly (the ledger side is
-//! [`ContractCharge`](rrn_ledger::contract), T1.7.7 Part C). Two record kinds
+//! [`ContractCharge`](rrn_ledger::contract)). Two record kinds
 //! live on the log for one contract:
 //!
 //! | Kind | Payload | Signer |
@@ -508,7 +508,7 @@ impl ContractRecords {
     /// have already been charged, or `None` if none is due at `now`.
     ///
     /// The sweep hands in `periods_charged` — the count of periods already
-    /// billed, which lives in the ledger, not here (T1.7.7 Part C/D) — so this
+    /// billed, which lives in the ledger, not here — so this
     /// crate performs no ledger lookup, exactly as the inquiry gate takes the
     /// buyer's reputation as an input rather than reading it. A period is billable
     /// when it is due, still within the commitment's duration, and (if the

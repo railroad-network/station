@@ -102,8 +102,8 @@ impl<'db> Engine<'db> {
     /// at or before the shared spend-admissibility boundary
     /// ([`spend_admissible_until`]); and this spend fits within the certificate's
     /// remaining allowance (`cap − consumed`). The overspend error carries the
-    /// three amounts structurally — T2.3.3 reads them at ingest to assemble
-    /// equivocation evidence, never by string-matching.
+    /// three amounts structurally — equivocation assembly reads them at ingest,
+    /// never by string-matching.
     fn check_cert_backed(
         &self,
         snapshot: &LedgerSnapshot,
@@ -148,7 +148,7 @@ impl<'db> Engine<'db> {
         }
         // Bound the number of admitted cert-backed spends per certificate so a
         // cumulative overspend always stays provable within `MAX_EVIDENCE_ITEMS`
-        // evidence items (ADR-0021 §5, T2.3.4 step 9). Without this a member could
+        // evidence items (ADR-0021 §5). Without this a member could
         // fragment a cap into hundreds of tiny within-cap spends, so that proving a
         // later overspend would need more admitted spends than one evidence bundle
         // can carry. Capping admitted spends at `MAX_EVIDENCE_ITEMS - 1` keeps one
@@ -179,7 +179,7 @@ impl<'db> Engine<'db> {
         }
 
         // Front-door memo bound: an admitted spend must stay small enough to embed
-        // verbatim as equivocation evidence (ADR-0021 §5, T2.3.4 step 9), so no
+        // verbatim as equivocation evidence (ADR-0021 §5), so no
         // overspend is ever unprovable for want of an unembeddable admitted half.
         if !p.memo_within_bounds() {
             return Err(Error::MemoTooLong {
@@ -1676,7 +1676,7 @@ mod tests {
         ));
     }
 
-    // --- Headroom certificates (T2.3.1, ADR-0021) ---------------------------
+    // --- Headroom certificates (ADR-0021) -----------------------------------
 
     use crate::credit::CreditConfig;
     use crate::escrow::{CertId, CertificateRequest, CertificateReturn};
@@ -2064,7 +2064,7 @@ mod tests {
         ));
     }
 
-    // --- memo bound + cert-backed spend limit + equivocation gate (T2.3.4) ----
+    // --- memo bound + cert-backed spend limit + equivocation gate ------------
 
     use crate::escrow::{
         EquivocationBasis, EquivocationRecord, EquivocationVerdictRecord, EvidenceItem,

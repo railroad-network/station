@@ -38,7 +38,7 @@ sections below):
 ADR-0023 §2 says an emergency "takes force at the admission of the co-signature that
 brings the count of distinct electorate signatures to at least the threshold," anchored
 on the admission clock and restated in a station-signed `emergency_activated` record so
-every replica agrees on the boundary (ADR-0022 §1). The T2.8.2 implementation
+every replica agrees on the boundary (ADR-0022 §1). The emergency implementation
 (`rrn_governance::emergency`) has two gaps in *when* that activation fires and *how long*
 a declaration may wait to fire it.
 
@@ -229,7 +229,7 @@ the member why.
   facts it restates." Every record this ADR adds (`emergency_refused`,
   `emergency_declaration_admitted`) has authority **only** "the station said so," so
   signer-pinning of station attestations is a **precondition** of this ADR (it is already
-  the noted priority follow-up from the T2.8.2 reviews).
+  the noted priority follow-up from the emergency reviews).
 - **New station-signed record kinds** — `rrn.gov.emergency_refused` (D1) and
   `rrn.gov.emergency_declaration_admitted` (D2), each needing a distinct `kind`
   discriminator and cross-platform CBOR fixtures (ADR-0023 §2 discipline). **D1 alone adds

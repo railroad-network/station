@@ -16,7 +16,7 @@
 //! it. Phase 0 logs are small, so a full scan per query is fine.
 //!
 //! A recurring service contract charges through a second station-signed balance
-//! record, [`ContractCharge`] (T1.7.7): a direct debit with no settlement window.
+//! record, [`ContractCharge`]: a direct debit with no settlement window.
 //! It is folded here alongside settlements, keyed on `(contract_ref,
 //! period_index)` so each period counts once — the same once-only discipline the
 //! settlement fold applies per `proposal_id`, and the backstop that lets the
@@ -36,7 +36,7 @@ use rrn_storage::log::AppendLog;
 /// The balance of `who`, in centicommons, derived from the log's balance records
 /// — settlements and contract charges. Positive = net credit; negative = net debt.
 ///
-/// Both balance records are station-signed (ADR-0005, T1.7.7). Only a record whose
+/// Both balance records are station-signed (ADR-0005). Only a record whose
 /// envelope signer is the community `station` moves a balance: a forged
 /// settlement or contract charge injected via gossip `append_raw` is skipped, so it
 /// can never debit or credit an account here. This is the highest-value pin — this

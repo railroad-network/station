@@ -17,11 +17,11 @@ truth** for the Swift, Kotlin, and React Native bindings — they are generated
 from it, so they cannot drift from the Rust or from each other. Keep the surface
 narrow: only what mobile actually performs.
 
-Current surface (M1.1 T1.1.1): `Keypair`, `PublicKey`, `Signature`, `Hash`.
+Current surface: `Keypair`, `PublicKey`, `Signature`, `Hash`.
 `SecretKey` is **deliberately not exposed** — the secret seed never crosses the
-FFI boundary in the clear (no-export-secret rule, ADR-0006). Address parsing
-(T1.1.3), the wallet file format (T1.1.5), and `SignedPayload`/dcbor (T1.1.7)
-extend this UDL in their own tasks.
+FFI boundary in the clear (no-export-secret rule, ADR-0006). Address parsing,
+the wallet file format, and `SignedPayload`/dcbor extend this UDL in their own
+tasks.
 
 ## Version pinning
 
@@ -40,7 +40,7 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 xcode-select --install
 ```
 
-Android (deferred in M1.1 — no JDK/SDK in the current dev environment): add
+Android (deferred — no JDK/SDK in the current dev environment): add
 `aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`, install the
 Android NDK, and generate the AAR with `uniffi-bindgen-react-native`.
 

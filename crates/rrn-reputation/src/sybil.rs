@@ -169,7 +169,7 @@ pub fn is_anchored(
 }
 
 /// Like [`is_anchored`], but only vouches (and voucher evidence) admitted within
-/// the log prefix `[1, max_seq]` count — the position-bounded form T2.1.3 uses so
+/// the log prefix `[1, max_seq]` count — the position-bounded form used so
 /// a back-dated anchoring vouch admitted after a window closes cannot retroactively
 /// anchor a member into a pinned electorate.
 pub fn is_anchored_bounded(
@@ -215,7 +215,7 @@ pub fn anchoring_voucher(
 
 /// Like [`anchoring_voucher`], but only vouches admitted within the log prefix
 /// `[1, max_seq]` are considered, and the voucher's composite is judged from the
-/// same bounded prefix (T2.1.3). `max_seq == u64::MAX` is the unbounded form.
+/// same bounded prefix. `max_seq == u64::MAX` is the unbounded form.
 pub fn anchoring_voucher_bounded(
     db: &Database,
     address: &Address,

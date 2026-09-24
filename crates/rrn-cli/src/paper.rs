@@ -1,4 +1,4 @@
-//! `rrn paper` — the operator/courier paper-fallback tools (T2.5.2).
+//! `rrn paper` — the operator/courier paper-fallback tools.
 //!
 //! Turns station-held payloads into printable QR sheets, and turns scanned QR
 //! *text* back into ingested bundles: the physical-credential leg of the
@@ -54,11 +54,11 @@ use rrn_station::rpc_client::UnixClient;
 use crate::{emit, parse, Format};
 
 /// Pixels per QR module in generated PNGs, and the quiet-zone width in modules.
-/// Fixed and generous — print reliability over file size (the T2.5.1 intent).
+/// Fixed and generous — print reliability over file size.
 const PNG_SCALE: usize = 6;
 const QUIET: usize = 4;
 
-/// The `rrn paper …` subcommands (T2.5.2).
+/// The `rrn paper …` subcommands.
 #[derive(clap::Subcommand)]
 pub enum PaperCmd {
     /// Classify and pretty-print any paper payload(s) without ingesting them —
