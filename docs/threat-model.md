@@ -530,7 +530,7 @@ authenticity of vouches (a forged vouch is a fake social relationship).
 > Shamir social recovery threats are added with social recovery. The in-person vouch
 > *mechanism* (handoff, mobile-signed write, directional push, member-scoped
 > reads, device-only nicknames) is analyzed in [Vouching surface
->](#vouching-surface-m14); vouch *content* trust — the social-graph /
+>](#vouching-surface); vouch *content* trust — the social-graph /
 > Sybil-resistance analysis, as opposed to vouch *authenticity* — remains
 > deferred to `rrn-reputation`.
 
@@ -1453,7 +1453,7 @@ ingest path against oversized carriage.
 - *Residual risk (accepted for Phase 2):* an outside courier holding a bundle
   or receipt sees who transacted with whom, memos, and each record's fate. The
   SMS carrier additionally exposes this to the phone network (see [SMS as a DTN
-  carrier](#sms-as-a-dtn-carrier-station-t271)).
+  carrier](#sms-as-a-dtn-carrier-station)).
 
 #### Denial of service
 
@@ -1546,7 +1546,7 @@ per-member ingest rate-limiting (a known limitation). The retransmit loop
 (`DtnSyncer`'s `RRNC` request-missing/ack over `missing()`) and the airtime
 budget (`rrn_protocol::airtime`, consuming `sustained_bytes_per_sec`) are built
 and analyzed under [DTN transport over a constrained
-carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026).
+carrier](#dtn-transport-over-a-constrained-carrier-station-adr-00130026).
 
 #### Paper / QR text encodings
 
@@ -1830,7 +1830,7 @@ credit and never delivers.
 > both below).
 >
 > **The marketplace RPC work adds the first marketplace writes reachable over a socket**, so the
-> an earlier note that "every marketplace write is unreachable" no longer holds
+> earlier note that "every marketplace write is unreachable" no longer holds
 > either. `marketplace_create_listing`, `marketplace_close_listing`, and
 > `marketplace_announce_need` append listing and need records, signed by the
 > **station's own wallet**, and `marketplace_my_listings` / `marketplace_matches`
@@ -2085,7 +2085,7 @@ credit and never delivers.
   week, and identity anchoring holds every dimension at 1.0 until an established
   member vouches, so a ring of self-dealing accounts scores slowly and visibly.
   See [Sybil clusters and manufactured
-  standing](#sybil-clusters-and-manufactured-standing-m15), which also records
+  standing](#sybil-clusters-and-manufactured-standing), which also records
   what those measures do *not* stop.
 - *Mitigation (shipped):* the marketplace side is that standing actually
   affects discovery — search ranks relevance **multiplied** by a provider's
@@ -2095,7 +2095,7 @@ credit and never delivers.
   distinguish from honest trade; quantitative detection is deferred to Phase 3.
 - *Residual risk:* nothing yet feeds marketplace activity *back* into reputation.
   `domain_competence` — the dimension a category was made a controlled vocabulary
-  to protect — is still structurally `0.0`, and its first inputs arrive with the
+  to protect — is still structurally `0.0`, and its first inputs arrive with
   the marketplace transaction flow. Wash sales against listings therefore buy nothing extra
   today, and the moment they could is the moment that dimension goes live.
 
@@ -2742,7 +2742,7 @@ implementation, and adds two station-signed record kinds
   could reach the writer's log *markerless*, bypassing eligibility, the
   duplicate-co-sign guard, and the D3 checks. The activation work had already de-fanged the one
   activation consequence (a markerless crossing is not activatable, ADR-0027 D1b).
-  the writer/replica split closes the general bypass by role: the community's **writer never
+  The writer/replica split closes the general bypass by role: the community's **writer never
   pulls** (it runs no gossip client and refuses to start with a peer list, so no
   gossiped record — governance or otherwise — can reach the writer's chain at
   all; `do_append_entries` also refuses on a writer as defence in depth), and a
@@ -3289,7 +3289,7 @@ availability of the single-threaded core.
 - *Mitigation:* the station records each `(author, position)` it sees. A second
   validly-signed entry at a seen position with **different** content is an outbox
   fork: the later side is refused `outbox-fork` and both envelopes are persisted
-  verbatim to `outbox_forks` as the equivocation evidence the scorer consumes; the
+  verbatim to `outbox_forks` as the equivocation evidence the record assembly consumes; the
   bundle continues. A **gap** (a position beyond the contiguous head) does not
   refuse the entry — couriers legitimately carry partial chains (ADR-0020 §2) —
   but the contiguous head does not advance past the gap, so a suppressed entry
@@ -4158,9 +4158,9 @@ picture; the boundaries that now exist, each analyzed in its own section:
 |---|---|---|---|
 | Mobile ↔ station (`/rpc`, `/subscribe`, plain HTTP on the LAN) | a sealed, signed dCBOR envelope | the mobile's signature + the pairing bond; sealed to the station key | [Mobile–station transport](#mobilestation-transport) |
 | DTN bundle ingest (`bundle_submit` over the operator socket, the mobile channel, Reticulum, SMS, or paper) | an unsigned bundle of signed outbox entries | `outbox::validate` per entry, then the engine front door | [DTN bundle ingest](#dtn-bundle-ingest-station-adr-0020) |
-| Reticulum: `rnsd` sidecar + LXMF adapter co-process (length-prefixed pipe) | opaque frames | nothing — a dumb carrier; framing CRC/Blake3 then the signatures inside | [Reticulum transport sidecar](#reticulum-transport-sidecar-station-adr-0013--adr-0026), [DTN transport over a constrained carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026) |
-| SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station-t271) |
-| Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli-t252) |
+| Reticulum: `rnsd` sidecar + LXMF adapter co-process (length-prefixed pipe) | opaque frames | nothing — a dumb carrier; framing CRC/Blake3 then the signatures inside | [Reticulum transport sidecar](#reticulum-transport-sidecar-station-adr-0013--adr-0026), [DTN transport over a constrained carrier](#dtn-transport-over-a-constrained-carrier-station-adr-00130026) |
+| SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station) |
+| Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli) |
 | Gossip peer TCP — **replica-only pull** (`[network] role`; a writer never pulls and takes no peers; loopback by default, no peers in the pilot) | line-JSON `WireEntry` | signature + content hash in `append_raw`; a **replica** re-derives but admits nothing, and the **writer** never reads this boundary at all (ADR-0020 §7 Clarification) | [`rrn-station`](#rrn-station--rrn-cli) |
 | Encrypted volume: `sudo -n` mount helper, the console unlock ceremony | holders' pasted `rrnrecover-resp:` lines | the console fingerprint, then the reconstructed VMK's address | [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) |
 
@@ -4218,7 +4218,7 @@ entry citing its ADR or the section that owns it.
   identity anchoring stop a lone fake identity, but a *pair* of colluding
   identities can trade with each other to raise the uncapped composites that
   qualify them to anchor each other (see [Sybil clusters and manufactured
-  standing](#sybil-clusters-and-manufactured-standing-m15)). Statistical graph
+  standing](#sybil-clusters-and-manufactured-standing)). Statistical graph
   analysis is Phase 3.
 - **Governance has no spam bound, no ballot secrecy, and a capturable bootstrap
   electorate.** Nothing rate-limits proposals from a standing member; the

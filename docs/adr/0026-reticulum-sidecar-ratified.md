@@ -7,7 +7,7 @@ which returned accept with caveats, and then confirmed the outcome; the caveats
 are folded in:
 §4's license wording softened to "denied by our current allowlist" — EPL-2.0
 revisitable like MPL-2.0, AGPL not — and §7 records the conditions carried into
-The Reticulum transport: propagation-node (`PROPAGATED`) delivery and an LXMF-stamp stance as
+the Reticulum transport: propagation-node (`PROPAGATED`) delivery and an LXMF-stamp stance as
 explicit acceptance criteria, the adapter topology/line-protocol choices, and the
 adapter-identity custody handed to the at-rest work). Ratifying the sidecar does not
 pre-approve the transport design; see §7.

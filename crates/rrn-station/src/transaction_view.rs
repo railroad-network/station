@@ -26,8 +26,8 @@ use crate::rpc::TransactionRow;
 
 /// The member's transactions, most recent first, capped at `limit` if given.
 ///
-/// `log`/`station` are used only to resolve the title of any marketplace payment
-///, so history reads as what it bought. The lookup is memoised
+/// `log`/`station` are used only to resolve the title of any marketplace payment,
+/// so history reads as what it bought. The lookup is memoised
 /// by [`ListingId`] and, when a limit is given, runs only on the rows kept — a
 /// member with many marketplace payments pays per-listing once, not per-row.
 pub fn member_transactions(

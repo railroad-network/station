@@ -245,8 +245,8 @@ pub enum CloseReason {
     ProviderClosed,
     /// The station closed it for housekeeping.
     StationCleanup,
-    /// Every unit sold — the last settled sale took the stock to zero
-    /// took it there. Unlike the others this is **derived**: [`state_of`]
+    /// Every unit sold — the last settled sale took the stock to zero.
+    /// Unlike the others this is **derived**: [`state_of`]
     /// synthesizes it from the [`StockConsumed`] records, and no signed
     /// `ListingClosed` ever carries it (`station_may_sign` refuses it below), so
     /// no party can *claim* sold-out — it is only ever what the sales add up to.

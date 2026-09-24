@@ -8647,7 +8647,7 @@ mod tests {
         );
     }
 
-    /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle (acceptance 3).
+    /// End-to-end via DTN only: the `rrn.gov.*` kinds ride a bundle.
     /// A founder signs a statute proposal and a ballot offline; the station
     /// admits each from an ingested bundle through `admit_gov_proposal` /
     /// `admit_gov_vote` — no live governance RPC — writing the station-signed window

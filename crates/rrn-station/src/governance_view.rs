@@ -1,7 +1,7 @@
 //! Member- and operator-facing governance reads.
 //!
 //! The governance engine ([`rrn_governance`]) — the Charter, proposals,
-//! voting, tallying, and enactment — but exposed none of it to a reader. This
+//! voting, tallying, and enactment — was built, but exposed none of it to a reader. This
 //! module is that read path: it turns the log-derived governance state into the
 //! flat, JSON-shaped views the `rrn governance` CLI prints and the mobile renders,
 //! so a member can see the current Charter, browse proposals with their live tally
