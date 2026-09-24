@@ -363,7 +363,7 @@ fn concerns(
             .unwrap_or(false),
         // Vouches in both directions: the ones the member signed feed its own
         // attestation accuracy, and the ones it received are what a receiving
-        // station needs in order to judge how it was anchored (T1.5.8).
+        // station needs in order to judge how it was anchored.
         VOUCH_KIND_TAG => Vouch::try_from(cbor)
             .map(|v| {
                 let voucher = Address::from_public_key(entry.payload.signer);

@@ -1,4 +1,4 @@
-//! T2.7.1 — SMS as a DTN carrier, end to end.
+//! SMS as a DTN carrier, end to end.
 //!
 //! Proves the SMS path a real deployment relies on:
 //!

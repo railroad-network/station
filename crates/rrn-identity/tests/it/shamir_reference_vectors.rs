@@ -1,5 +1,5 @@
 //! Cross-validation of our own Shamir implementation against independent,
-//! published references — the "did we roll our own correctly?" test (T0.4.5).
+//! published references — the "did we roll our own correctly?" test.
 //!
 //! Three sections, all over GF(256) under the Rijndael polynomial (0x11B,
 //! generator `x+1`), the field our [`rrn_identity::recovery`] uses and the one

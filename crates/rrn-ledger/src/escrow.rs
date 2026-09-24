@@ -15,8 +15,8 @@
 //! ([`crate::credit::committed_debits_centi`]). A spend that references the
 //! certificate, within its cap and validity, is later admitted without a fresh
 //! floor check — the headroom was already paid for. (Spending against a
-//! certificate is T2.3.2; this module delivers issuance, return, and the
-//! reservation arithmetic.)
+//! certificate is handled elsewhere; this module delivers issuance, return, and
+//! the reservation arithmetic.)
 //!
 //! Three signed record kinds carry the instrument, each following the
 //! content-addressed, omit-when-`None` discipline of
@@ -435,7 +435,7 @@ pub struct CertificateState {
 ///
 /// This is the **single shared definition** of the escrow boundary: the
 /// reservation-release condition in [`crate::credit::committed_debits_centi`] and
-/// T2.3.2's cert-backed-spend admission bound are the same instant, derived here,
+/// the cert-backed-spend admission bound are the same instant, derived here,
 /// so over- and under-reservation cannot diverge. A spend is admissible while
 /// `now <= spend_admissible_until(cert, config)` — the certificate's `expires_at`
 /// extended by the DTN delivery grace and the engine's clock-skew tolerance.
@@ -446,7 +446,7 @@ pub fn spend_admissible_until(cert: &HeadroomCertificate, config: &CreditConfig)
 }
 
 // ===========================================================================
-// Provable equivocation (ADR-0021 §5, T2.3.3)
+// Provable equivocation (ADR-0021 §5)
 // ===========================================================================
 //
 // Offline spending cannot be *prevented* under a partition — no connectivity,
@@ -1015,7 +1015,7 @@ mod tests {
         );
     }
 
-    // --- equivocation records (T2.3.3) --------------------------------------
+    // --- equivocation records -----------------------------------------------
 
     use crate::transaction::TransactionProposal;
     use rrn_crypto::signed::SignedPayload;

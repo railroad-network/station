@@ -1,4 +1,4 @@
-//! T2.5.2 paper end-to-end, without images: the real `rrn` binary drives a live
+//! Paper end-to-end, without images: the real `rrn` binary drives a live
 //! daemon over its socket. A bundle authored offline (member B's confirmation of
 //! an operator proposal) is encoded to QR *text* with the shared codec, ingested
 //! from a file, and the station's delivery receipt is exported and shown back —
@@ -263,7 +263,7 @@ async fn paper_export_ingest_receipts_roundtrip() {
         assert!(cred_txt.exists());
         assert_eq!(std::fs::read_to_string(&cred_txt).unwrap().trim(), b_str);
 
-        // show classifies every T2.5.1 fixture by kind.
+        // show classifies every paper fixture by kind.
         for (file, kind) in [
             ("multipart_bundle.txt", "bundle"),
             ("certificate.txt", "certificate"),

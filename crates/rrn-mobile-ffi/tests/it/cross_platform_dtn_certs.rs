@@ -1,4 +1,4 @@
-//! Cross-platform DTN + certificate FFI fixtures (T2.4.2).
+//! Cross-platform DTN + certificate FFI fixtures.
 //!
 //! One deterministic, byte-stable vector for each new envelope the mobile app
 //! encodes or decodes through this crate's DTN / escrow surface — an outbox
@@ -429,7 +429,7 @@ fn build_offline_spend() -> Vec<OfflineSpendVector> {
 
 fn build_fixture() -> Fixture {
     Fixture {
-        comment: "Cross-platform DTN + certificate FFI fixtures for T2.4.2 (ADR-0020/0021). \
+        comment: "Cross-platform DTN + certificate FFI fixtures (ADR-0020/0021). \
             Each `*_envelope_hex` / `bundle_hex` is canonical dCBOR (rrn_crypto::serialize is the \
             source of truth, ADR-0002). This Rust test drives the FFI decode side (bundle_parse, \
             receipt_parse, certificate_parse, offline_spend_verify) over these exact bytes; the \

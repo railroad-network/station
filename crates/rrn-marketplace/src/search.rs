@@ -27,7 +27,7 @@
 //! score surface an irrelevant listing. A query with no text scores every
 //! candidate's relevance as `1.0`, which leaves reputation ordering the results.
 //!
-//! Reputation is read from the M1.5 snapshot cache and **never** recomputed per
+//! Reputation is read from the reputation snapshot cache and **never** recomputed per
 //! result: scoring is O(N) in the log and anchoring made it O(V·N), so a page of
 //! fifty results must not become fifty replays on the station's single writer
 //! thread. A provider with no cached snapshot ranks as `0.0` rather than
@@ -55,7 +55,7 @@ use crate::{Error, Result};
 /// How stale a cached reputation snapshot may be before ranking treats the
 /// provider as unscored.
 ///
-/// A day: the station refreshes snapshots hourly (T1.5.5), so this tolerates a
+/// A day: the station refreshes snapshots hourly, so this tolerates a
 /// long outage of that sweep without ever falling back to a live replay. Ranking
 /// is a presentation decision, and a slightly stale score is a far smaller
 /// problem than a search that replays the log.

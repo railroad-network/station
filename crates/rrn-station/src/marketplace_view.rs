@@ -1,6 +1,6 @@
-//! Marketplace reads for the mobile and the CLI (T1.7.0).
+//! Marketplace reads for the mobile and the CLI.
 //!
-//! M1.6 built the marketplace ([`rrn_marketplace`]) but nothing in the workspace
+//! The marketplace ([`rrn_marketplace`]) was built, but nothing in the workspace
 //! depended on it, so no listing was reachable over any network surface. This
 //! module is that read path: it turns [`SearchHit`]s and a
 //! [`ListingState`] into the flat, JSON-shaped views a browse screen and a
@@ -22,7 +22,7 @@
 //!
 //! [`rrn_marketplace::search::SearchQuery`] takes whatever `limit` its caller
 //! asks for, which is fine inside the crate and not fine on a network surface —
-//! the M1.6 threat model names this as the gap M1.7 has to close. [`search`]
+//! the marketplace threat model names this as the gap this module has to close. [`search`]
 //! clamps to [`MAX_SEARCH_LIMIT`] rather than erroring: a client asking for too
 //! much gets a page, not a failure, and no caller can turn one request into an
 //! unbounded index read.
@@ -42,7 +42,7 @@ use crate::reputation_view::band_name;
 /// The controlled category vocabulary, re-exported so a client can name it
 /// without depending on [`rrn_marketplace`] directly.
 ///
-/// The CLI builds `--category`'s accepted values from this (T1.7.3), which is the
+/// The CLI builds `--category`'s accepted values from this, which is the
 /// same reason it shares [`crate::rpc`]'s wire types rather than restating them: a
 /// second copy of the list would drift, and expanding it is a protocol change.
 pub use rrn_marketplace::listing::CATEGORIES;
@@ -66,7 +66,7 @@ pub struct AvailabilityRow {
     pub next_slot: Option<i64>,
 }
 
-/// A recurring service's standing terms, flattened for the wire (T1.7.7).
+/// A recurring service's standing terms, flattened for the wire.
 ///
 /// A [`Services`](Surface::Services) listing may be a standing order rather than
 /// a one-off: it carries the cadence, length, notice, and penalty a
@@ -145,17 +145,17 @@ pub struct ListingDetailView {
     pub card: ListingCard,
     /// The community the listing was published in.
     pub community: String,
-    /// The full description (markdown, per T1.7.2).
+    /// The full description (markdown).
     pub description: String,
     /// The minimum capped composite an inquirer must have. Recorded provider
-    /// intent; T1.7.4 is where it becomes a check against a specific buyer.
+    /// intent; the inquiry path is where it becomes a check against a specific buyer.
     pub min_reputation: f32,
     /// Whether the provider will deal only with members of `community`. Same
-    /// standing as `min_reputation`: stated here, enforced in T1.7.4.
+    /// standing as `min_reputation`: stated here, enforced on inquiry.
     pub community_member_only: bool,
     /// The dispute tier a sale would run under (1 or 2 in Phase 1).
     pub oracle_tier: u8,
-    /// The standing terms, when this listing is a recurring service (T1.7.7).
+    /// The standing terms, when this listing is a recurring service.
     /// Absent on a one-off offer. A client badges the offer as recurring and, on
     /// an agreed inquiry, the phone snapshots these into the contract it signs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,8 +173,8 @@ pub struct ListingDetailView {
     /// is one member on one tap (see [`crate::vouch_view`]).
     pub provider_vouches_received: u64,
     /// Whether the *authenticated* caller may open an inquiry against this
-    /// listing, computed against its [`Requirements`](rrn_marketplace::listing::Requirements)
-    /// (T1.7.4). `None` for an anonymous read (the operator socket). A courtesy
+    /// listing, computed against its [`Requirements`](rrn_marketplace::listing::Requirements).
+    /// `None` for an anonymous read (the operator socket). A courtesy
     /// that lets the client disable "Inquire" with a reason — the enforcement
     /// point is `submit_inquiry`, not this.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,7 +380,7 @@ pub fn my_listings(
 /// The active listings that answer one need, best match first, as browse cards.
 ///
 /// Ranking and the fill-fraction weighting are [`rrn_marketplace::need`]'s
-/// (T1.6.7); this only shapes the result, so a match list and a browse list
+///; this only shapes the result, so a match list and a browse list
 /// render through the same card.
 ///
 /// `find_matches` returns listings rather than ranked hits, so unlike [`search`]

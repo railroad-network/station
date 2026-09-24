@@ -9,9 +9,9 @@ Date: 2026-07-14
 ## Context
 
 [ADR-0006](0006-m1-client-architecture.md) settled *who holds the keys* (the
-mobile) and left a constraint for M1.3: "the mobile–station transport is not a
+mobile) and left a constraint for the transport work: "the mobile–station transport is not a
 trusted channel where the station vouches for the caller; every request carries
-the mobile's signature and is verified against the paired identity." M1.3 now
+the mobile's signature and is verified against the paired identity." This work now
 has to build that link. This ADR fixes how the bytes get from a phone to a
 station, and — more importantly — *which layer is responsible for protecting
 them*.
@@ -38,16 +38,15 @@ The forces:
   further our security properties live inside Apple's and Google's stacks, the
   more of our threat model is downstream of their policy changes, their review
   processes, and their release schedules.
-- **We already own the primitive.** M0.4's social recovery seals each Shamir
+- **We already own the primitive.** The social-recovery layer seals each Shamir
   shard to its holder: X25519 ECDH over keys converted from the holder's Ed25519
   identity, then XChaCha20-Poly1305, keyed through blake3's `derive_key` KDF
   (`crates/rrn-identity/src/recovery/encryption.rs`). That is precisely
   "encrypt this to an Ed25519 identity." A station *is* an Ed25519 identity, and
   pairing is what puts its public key in the mobile's hands. The code is written,
-  tested against cross-implementation vectors, and already crosses the mobile FFI
-  (T1.2.3).
+  tested against cross-implementation vectors, and already crosses the mobile FFI.
 
-The M1.3 task spec proposed HTTPS with self-signed per-station certificates and
+The transport task spec proposed HTTPS with self-signed per-station certificates and
 fingerprint pinning at pairing time. **This ADR deliberately departs from that
 proposal**; the reasoning is recorded under Alternatives Considered so the
 departure is legible rather than looking like drift.
@@ -64,7 +63,7 @@ The envelope, not the connection, carries every security property:
 - **Signed, per ADR-0006.** The canonical request payload — canonical dCBOR, per
   [ADR-0002](0002-canonical-serialization-dcbor.md) — is signed with the
   mobile's Ed25519 identity key.
-- **Sealed to the recipient's paired identity**, reusing the M0.4 sealed-box
+- **Sealed to the recipient's paired identity**, reusing the sealed-box
   scheme unchanged: ephemeral X25519 keypair, ECDH against the recipient's
   identity key converted Edwards→Montgomery, XChaCha20-Poly1305 under a
   blake3-derived key. Mobile→station is sealed to the station's identity;
@@ -78,9 +77,9 @@ The envelope, not the connection, carries every security property:
   signature from a member on a message that member never sent them.
 - **Replay defense inside the signed bytes**: a per-mobile monotonic nonce and a
   timestamp, matching the ledger's existing discipline (design overview Section
-  10.8) and specified concretely in T1.3.4.
+  10.8) and specified concretely in the transport implementation.
 
-**Pairing binds static public keys and nothing else** (T1.3.3). There is no
+**Pairing binds static public keys and nothing else**. There is no
 certificate, so there is no certificate to pin, expire, or rotate. The station's
 identity key *is* its identity. The human-verifiable confirmation code is derived
 from both static public keys, so it authenticates the pair rather than a
@@ -100,7 +99,7 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
   strongest reason for the decision.
 - **Our security properties depend on our own Rust, not on a platform TLS
   stack.** The seal and the signature are computed by `rrn-identity` code that
-  already runs on both platforms through the uniffi surface from M1.1
+  already runs on both platforms through the uniffi surface
   ([ADR-0007](0007-rust-mobile-ffi-uniffi.md)). One implementation, one audit
   surface, identical behaviour on iOS and Android — rather than a custom trust
   module written twice in two platform languages, which is exactly where our
@@ -109,7 +108,7 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
   Raspberry Pi that lapses would have broken pairing for every member of that
   community at once; that failure mode simply does not exist here.
 - **Accepted: no forward secrecy.** Compromise of a station's long-term identity
-  key retroactively decrypts any captured traffic sealed to it. The M1.3 spec
+  key retroactively decrypts any captured traffic sealed to it. The transport spec
   already deems per-request forward secrecy "overkill for Phase 1," and we
   concur for the local-network case. **Follow-up:** because pairing already
   establishes both static keys, a Noise_KK session is a clean upgrade path if
@@ -133,27 +132,27 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
 - **One remaining platform dependency: cleartext HTTP needs an ATS allowance on
   iOS.** `NSAllowsLocalNetworking` exists for exactly this case and permits
   cleartext to local destinations without the broad `NSAllowsArbitraryLoads`
-  flag; mDNS (T1.3.2) gives us a `.local` name to target.
+  flag; mDNS gives us a `.local` name to target.
   `NSLocalNetworkUsageDescription` is required for LAN access regardless of
-  transport choice. Both are to be confirmed during T1.3.4 implementation.
+  transport choice. Both are to be confirmed during implementation.
 - **The station grows an HTTP server.** A plain-HTTP listener is new dependency
   surface for `rrn-station` (the workspace has no HTTP crate today), though a
   markedly smaller one than an HTTP + TLS + cert-generation stack.
-- **Downstream tasks shift.** T1.3.2's mDNS TXT records drop the proposed
-  `cert_fp` field, keeping `address` and `version`. T1.3.3 stores
+- **Downstream tasks shift.** The discovery layer's mDNS TXT records drop the proposed
+  `cert_fp` field, keeping `address` and `version`. Pairing stores
   `(station_pubkey, station_host)` rather than a cert fingerprint, and derives its
-  8-hex confirmation code from the two static keys. T1.3.4's envelope is the
+  8-hex confirmation code from the two static keys. The request envelope is the
   sealed form specified here rather than a bare JSON `auth` block.
 - **The threat model's existing prediction holds.** `docs/threat-model.md`'s
   mobile–station transport section already anticipated that "the channel is
   encrypted with keys established at pairing" — this decision is what makes that
   sentence true. Converting its *planned* mitigations to shipped ones is
-  T1.3.4's job.
+  the request layer's job.
 
 ## Alternatives Considered
 
 - **HTTPS with self-signed per-station certs, fingerprint-pinned at pairing**
-  (the M1.3 spec's proposal). Rejected on three counts. *Platform dependence:*
+  (the transport spec's proposal). Rejected on three counts. *Platform dependence:*
   React Native's `fetch` exposes no hook to override certificate trust — iOS ATS
   and NSURLSession reject a self-signed cert outright and Android's OkHttp
   consults the system trust store — so pinning would require a bespoke native
@@ -174,12 +173,12 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
 - **A Noise session (Noise_KK) over TCP.** Rejected *for Phase 1*, not on
   merit — it is a well-analyzed framework, WireGuard-proven, and pairing already
   gives both sides the static keys Noise_KK wants. But it adds handshake state,
-  session resumption, and reconnection logic to buy forward secrecy that the M1.3
+  session resumption, and reconnection logic to buy forward secrecy that the transport design
   spec explicitly scopes out, and a session is the thing that cannot cross
   store-and-forward. Retained as the named upgrade path above.
 - **Hand-rolled bespoke transport encryption.** Rejected, and worth stating
   explicitly so nobody reads this ADR as license for it. The chosen design is not
-  a new construction: it reuses M0.4's existing, tested, cross-implementation-
+  a new construction: it reuses the existing, tested, cross-implementation-
   vetted sealed-box scheme, with a deliberately boring composition (canonical
   dCBOR, sign-then-seal, recipient bound into the signed bytes, nonce and
   timestamp). Novel cryptography remains out of bounds.
@@ -187,7 +186,7 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
   ecosystem support, for no benefit at our scale — and both carry the same
   session-oriented transport lock-in as TLS.
 - **WebSocket as the primary channel.** Rejected: request/response is the
-  dominant pattern, and long-poll (T1.3.5) covers push more simply than
+  dominant pattern, and long-poll covers push more simply than
   WebSocket reconnection logic. Revisit in Phase 2 if push rates spike.
 
 ## References
@@ -205,7 +204,7 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
   makes a self-contained envelope the load-bearing choice
 - Design overview, Section 10.8 "Security Architecture" — per-identity monotonic
   nonce plus timestamp as the replay defense
-- `crates/rrn-station/src/rpc.rs` — the M0.6.3 IPC envelope this extends
+- `crates/rrn-station/src/rpc.rs` — the IPC envelope this extends
 - [`docs/threat-model.md`](../threat-model.md) — mobile–station transport section
-- M1.3 task spec — T1.3.2 discovery, T1.3.3 pairing, T1.3.4 authenticated
-  requests, T1.3.5 push; all constrained by this ADR
+- The transport task spec — discovery, pairing, authenticated
+  requests, and push; all constrained by this ADR

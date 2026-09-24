@@ -1,5 +1,5 @@
-//! Property tests for the framing/reassembly layer (T2.2.5) — the heart of the
-//! ticket. Chunking must be exactly invertible under arbitrary reordering and
+//! Property tests for the framing/reassembly layer — the heart of the
+//! DTN carriage layer. Chunking must be exactly invertible under arbitrary reordering and
 //! duplication; it must never yield a *wrong* payload under loss; and a full
 //! bundle must survive a lossy, duplicating, reordering, corrupting carrier with a
 //! retransmit-until-complete driver.

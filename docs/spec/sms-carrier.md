@@ -19,7 +19,7 @@ station decodes, ingests each carried bundle through the *same* front door every
 other carrier uses (ADR-0020 §3), and texts the station-signed delivery receipt
 back. Integrity and authenticity live in the per-record signatures inside the
 carried bytes (ADR-0008/0013), never in SMS. This is the same posture as paper
-(T2.5.x) and LoRa/Reticulum (T2.6.2): a dumb carrier on the degradation ladder.
+and LoRa/Reticulum: a dumb carrier on the degradation ladder.
 
 **Not custody.** The feature-phone model — a human texting `PAY 5 TO ALICE` with the
 station holding the member's keys — is deliberately **out of scope**: it would break
@@ -174,4 +174,4 @@ model is re-send driven, exactly like paper:
   SMS (140 bytes/part) instead of base64url over GSM-7 would recover the ~33%
   base64url expansion. A possible future efficiency gain; not implemented (many
   gateways and handsets handle 8-bit data SMS poorly, and it would fork the wire
-  grammar). Noted for T2.7.2's gateway evaluation.
+  grammar). Noted for the future gateway evaluation.

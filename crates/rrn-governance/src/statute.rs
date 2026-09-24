@@ -20,7 +20,7 @@
 //! [`effective_charter`](crate::tally::effective_charter), which folds an enacted
 //! amendment onto the founder root). Any downstream effect a statute describes —
 //! changing a config value, say — is spelled out in its body and applied by hand;
-//! an automatic rule engine for those is Phase 2 (ADR-0012, task T1.9.7 scope).
+//! an automatic rule engine for those is Phase 2 (ADR-0012).
 //!
 //! # Trust: written under a guard, believed only on re-derivation
 //!

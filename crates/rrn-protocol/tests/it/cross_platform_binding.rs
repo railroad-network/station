@@ -1,4 +1,4 @@
-//! Cross-platform transport-binding wire fixture (T2.6.2, ADR-0013).
+//! Cross-platform transport-binding wire fixture (ADR-0013).
 //!
 //! Pins the canonical dCBOR bytes and Ed25519 signature of a `rrn.net.binding`
 //! record so the mobile repo verifies a byte-identical encoding (ADR-0002). The
@@ -55,7 +55,7 @@ fn build_fixture() -> Fixture {
     // Sanity: the fixture must validate as a self-signed binding.
     binding::validate(&signed).expect("fixture binding validates");
     Fixture {
-        _comment: "Cross-platform transport-binding fixture (T2.6.2, ADR-0013). \
+        _comment: "Cross-platform transport-binding fixture (ADR-0013). \
                    `canonical_hex` is the canonical dCBOR of the rrn.net.binding \
                    payload; `signature_hex` is the self-signature over it. \
                    Deterministic (blake3-derived seed); regenerate with RRN_REGEN=1."

@@ -21,7 +21,7 @@
 //!   only vs. Tier 2 reputation stake + dispute window), plus the opt-up rules.
 //! - [`contract`] — the [`contract::ContractCharge`], a second station-signed
 //!   balance record: the per-period direct debit a recurring service contract
-//!   executes (T1.7.7), a sibling of the settlement record.
+//!   executes, a sibling of the settlement record.
 //! - [`credit`] — the debt floor (ADR-0018): the engine refuses a debit whose
 //!   signer would be committed below a bounded negative balance, counting both
 //!   the settled balance and every pending debit they have already signed.
@@ -245,7 +245,7 @@ pub enum Error {
     /// A cert-backed spend would push the certificate's cumulative admitted spend
     /// past its cap (ADR-0021 §5). The excess spend is refused; the conjunction of
     /// the admitted spends and this refused one is a self-contained proof of
-    /// equivocation that T2.3.3 assembles at ingest — so this error carries the
+    /// equivocation that ingest assembles — so this error carries the
     /// three amounts *structurally* (never string-matched) for that evidence.
     #[error(
         "certificate overspent: cap {cap_centi}, already consumed {consumed_centi}, \
@@ -262,7 +262,7 @@ pub enum Error {
     /// A proposal's `memo` exceeds [`transaction::MAX_MEMO_BYTES`]. Bounded at the
     /// front door so an admitted cert-backed spend is always small enough to embed
     /// verbatim as equivocation evidence (well under
-    /// [`escrow::MAX_EVIDENCE_ITEM_BYTES`]) — ADR-0021 §5, T2.3.4 step 9.
+    /// [`escrow::MAX_EVIDENCE_ITEM_BYTES`]) — ADR-0021 §5.
     #[error("proposal memo exceeds the maximum length ({max} bytes)")]
     MemoTooLong {
         /// The configured maximum ([`transaction::MAX_MEMO_BYTES`]).
@@ -272,7 +272,7 @@ pub enum Error {
     /// admitted the maximum number of cert-backed spends
     /// ([`escrow::MAX_EVIDENCE_ITEMS`] − 1). The cap keeps a cumulative overspend
     /// provable within [`escrow::MAX_EVIDENCE_ITEMS`] evidence items (one slot
-    /// reserved for the refused spend) — ADR-0021 §5, T2.3.4 step 9. The spend is
+    /// reserved for the refused spend) — ADR-0021 §5. The spend is
     /// refused; it is not itself an equivocation (there is no second commitment).
     #[error("certificate has reached its cert-backed spend limit ({max} admitted spends)")]
     CertBackedSpendLimit {

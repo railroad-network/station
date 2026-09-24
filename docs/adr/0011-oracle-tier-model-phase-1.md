@@ -20,9 +20,9 @@ cross-community trade deserves more than either. The four tiers:
 - **Tier 3** — physical-artifact evidence and three community witnesses.
 - **Tier 4** — cross-community validation and governance approval.
 
-M0.5 already shipped Tier 1 in all but name: every transaction is
+The ledger already shipped Tier 1 in all but name: every transaction is
 bilaterally confirmed and waits out a settlement window before balances move.
-M1.8 adds Tier 2 and pins down what Phase 1 does — and does not — implement, so
+This ADR adds Tier 2 and pins down what Phase 1 does — and does not — implement, so
 that a receiving station and the federation protocol agree on how a transaction
 is classified and what that classification costs.
 
@@ -34,7 +34,7 @@ Two forces shape the decision beyond "just do Section 4.3":
   *cannot* be given the scrutiny its amount demands. The question is what to do
   with it in the meantime.
 
-- **Reputation is derived from the log, never stored** (ADR-0009, T1.5.7). Any
+- **Reputation is derived from the log, never stored** (ADR-0009). Any
   new reputation-affecting fact inherits that constraint: it has to be
   reconstructible by replay, or it cannot feed the score on a second station.
   The naive sketch of a stake — a mutable "locked reputation" balance and a
@@ -117,7 +117,7 @@ from its tier, so — like the tier itself — it is reconstructible from the si
 proposal and never separately recorded. A demo or test may collapse both to a
 few seconds with a single uniform override (`SettlementConfig::uniform`, exposed
 as `[settlement] window_seconds` in station config). Per-community window tuning
-is deferred to M1.9 governance; the defaults apply until then.
+is deferred to governance; the defaults apply until then.
 
 ## Consequences
 
@@ -138,7 +138,7 @@ is deferred to M1.9 governance; the defaults apply until then.
   stake-forfeiture path that gives the Tier-2 stake teeth. Storing the stake as a
   signed record later is an additive, omit-when-zero change if a future
   requirement wants it on the wire. The mobile surface for tier + countdown and
-  the bootstrap-grace banner is a tracked follow-up (T1.8.6).
+  the bootstrap-grace banner is a tracked follow-up.
 
 ## Alternatives Considered
 
@@ -158,7 +158,7 @@ is deferred to M1.9 governance; the defaults apply until then.
 - **Per-community tunable tier boundaries.** Rejected: the boundaries are fixed
   at the protocol level so classification is identical across the federation
   (Phase 2 interop). Only the *windows* are earmarked for per-community tuning,
-  and only from M1.9.
+  and only once governance ships.
 
 ## References
 

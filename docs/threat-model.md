@@ -3,7 +3,7 @@
 This is a **living document**. It grew incrementally as each crate was built:
 every crate's task spec included a "threat model entry" acceptance item, which
 is where that crate's section was filled in. It has had three end-to-end passes:
-at M0.7 (Phase 0 audit prep), across Phase 1 as each crate landed, and a
+at the Phase 0 audit-prep stage, across Phase 1 as each crate landed, and a
 **Phase 2 consolidation on 2026-09-13** that reconciled the per-ticket sections
 added during single-community resilience work, wrote the [Phase 2
 summary](#phase-2-summary--the-resilience-surface), and rewrote [Known
@@ -33,7 +33,7 @@ FFI crate, DTN ingest) are verified here.
 
 ## Scope
 
-Phase 0 (this repo, through milestone M0.7) covers:
+Phase 0 (this repo) covers:
 
 - Cryptographic primitives: Ed25519 signing, Blake3 hashing, canonical CBOR
   (`rrn-crypto`)
@@ -48,7 +48,7 @@ Phase 0 (this repo, through milestone M0.7) covers:
 - The daemon/CLI boundary and local IPC for the two-station demo
   (`rrn-station`, `rrn-cli`)
 
-Phase 1 (from M1.0) extends the scope with:
+Phase 1 extends the scope with:
 
 - The **mobile client** as the authoritative key-holder (per
   [ADR-0006](adr/0006-m1-client-architecture.md)) — device-level protection of
@@ -113,7 +113,7 @@ Deferred to Phase 3 (multi-community federation) and beyond:
 - The Rust compiler/toolchain and the cryptographic crates we depend on
   (`ed25519-dalek`, `blake3`, `chacha20poly1305`, `argon2`) are trusted to
   correctly implement their published algorithms. Supply-chain risk on the
-  dependency tree is mitigated by `cargo audit` and `cargo deny` (T0.0.3).
+  dependency tree is mitigated by `cargo audit` and `cargo deny`.
 - The OS-provided CSPRNG (via `getrandom`) provides sufficient entropy
   for key generation and nonces.
 - Our own Shamir's Secret Sharing implementation (`rrn-identity`, per
@@ -355,9 +355,9 @@ CRDT state is derived by replaying it and is never authoritative on its own.
 convergence of CRDT merges; the on-disk schema as a stable contract; durability
 of committed writes.
 
-> Populated through M0.2 (SQLite schema, the three CRDTs, and the hash-chained
+> Populated with the storage layer (SQLite schema, the three CRDTs, and the hash-chained
 > log). Replay-derived state and any further residual risks are revisited as the
-> ledger (M0.5) builds on this layer.
+> ledger builds on this layer.
 
 #### Spoofing
 
@@ -365,7 +365,7 @@ of committed writes.
   though it came from a legitimate identity.
 - *Mitigation:* authenticity is not the database's job — every record destined
   for the log is a `rrn-crypto::SignedPayload`, and `AppendLog::append` verifies
-  the signature before writing (T0.2.6). The raw SQLite tables enforce structure
+  the signature before writing. The raw SQLite tables enforce structure
   (foreign key `attestations.signer → identities.pubkey`), not authenticity.
 - *Residual risk:* a row inserted directly via SQL bypasses signature checks;
   that is the Tampering threat below, caught on read by chain verification, not
@@ -379,8 +379,7 @@ of committed writes.
 - *Mitigation:* the append-only log chains each entry to the Blake3
   `content_hash` of the previous one (`prev_hash`), so any in-place edit,
   reorder, or deletion breaks the chain and is detected by
-  `AppendLog::verify_chain` (T0.2.6). CRDT state is rebuilt from the log
-  (T0.2.7), so a tampered derived row (e.g. `balances`) is overwritten by replay
+  `AppendLog::verify_chain`. CRDT state is rebuilt from the log, so a tampered derived row (e.g. `balances`) is overwritten by replay
   — the log wins. Append operations are wrapped in a single SQLite transaction
   so an entry is never half-written.
 - *Threat (schema drift):* the on-disk schema silently diverges from the code's
@@ -464,7 +463,7 @@ of committed writes.
   keeps `rrn-storage` below identity/protocol. Delivery-receipt outcomes are
   applied idempotently, and a station reporting a *different* outcome for a record
   it already answered trips `ConflictingAck` — a tamper/equivocation tripwire the
-  ADR-0021 equivocation work (T2.3.3) builds on.
+  ADR-0021 equivocation work builds on.
 - *Residual risk:* outbox rows share the database's at-rest posture — plaintext
   under the default profile, inside the member-keyed container under the
   encrypted profile (ADR-0024; see [Information disclosure](#information-disclosure)
@@ -499,7 +498,7 @@ of committed writes.
   (OR-Set tombstones).
 - *Mitigation:* all storage operations return `Result` and do not panic on
   malformed rows; `verify_chain` and replay are O(N) but Phase 0 logs are small,
-  with snapshotting deferred (T0.2.7 supports replay `from_seq` as the
+  with snapshotting deferred (replay supports `from_seq` as the
   foundation). OR-Set tombstone garbage collection is a known, documented
   deferral.
 - *Residual risk:* no size limits on log/CRDT growth yet; a local writer can bloat
@@ -520,20 +519,20 @@ Turns raw keys into identities: bech32m addresses (`address`), the
 passphrase-encrypted wallet (`wallet`), the generic signed `Attestation`
 (`attestation`), and the first concrete attestation — the `vouch`. Social
 recovery (`recovery`, ADR-0004) is the highest-stakes part of this crate and is
-populated separately in M0.4.
+populated separately in the social-recovery layer.
 
 **Assets:** the wallet's secret key at rest (the whole identity — lose it or
 leak it and the identity is forged or gone); the secret key in memory while
 unlocked; the binding between a public key and its human-readable address; the
 authenticity of vouches (a forged vouch is a fake social relationship).
 
-> Populated through M0.3 (addresses, wallet encryption, attestation, vouch).
-> Shamir social recovery threats are added in M0.4. The M1.4 in-person vouch
+> Populated through the identity layer (addresses, wallet encryption, attestation, vouch).
+> Shamir social recovery threats are added with social recovery. The in-person vouch
 > *mechanism* (handoff, mobile-signed write, directional push, member-scoped
 > reads, device-only nicknames) is analyzed in [Vouching surface
-> (M1.4)](#vouching-surface-m14); vouch *content* trust — the social-graph /
+>](#vouching-surface); vouch *content* trust — the social-graph /
 > Sybil-resistance analysis, as opposed to vouch *authenticity* — remains
-> deferred to `rrn-reputation` (M1.5).
+> deferred to `rrn-reputation`.
 
 #### Spoofing — forged identity or forged vouch
 
@@ -649,7 +648,7 @@ confidentiality of each shard in transit and at rest with its holder; the
 correctness of the field arithmetic and interpolation (a bug silently corrupts
 or leaks the key).
 
-> Populated through T0.4.7 (GF(256) arithmetic, the split/reconstruct, shard
+> Populated through the Shamir implementation (GF(256) arithmetic, the split/reconstruct, shard
 > encryption, and the recovery package/flow).
 
 #### Tampering / spoofing — the recovery package and flow
@@ -832,7 +831,7 @@ by a settled, doubly-signed transaction); the *exactly-once* application of a
 settlement; the per-sender nonce sequence; the authenticity of every lifecycle
 transition; the derivability of all state from the log.
 
-> Populated in M0.5. The engine derives all transaction state by replaying the
+> Populated with the ledger. The engine derives all transaction state by replaying the
 > append-only log; the materialized `balances` table is a cache. Settlement and
 > cancellation entries are signed by the local station — see
 > [ADR-0005](adr/0005-station-signed-settlement.md).
@@ -909,7 +908,7 @@ transition; the derivability of all state from the log.
 
 - *Threat:* a signed proposal is a bearer token; replaying it could apply the
   same debit twice (a double-spend), or a settlement could be applied twice.
-- *Mitigation:* **replay protection** (T0.5.6) — each sender has a monotonic
+- *Mitigation:* **replay protection** — each sender has a monotonic
   nonce with no gaps and no duplicates (`Error::BadNonce`), and a proposal whose
   content-addressed id is already in the log is rejected
   (`Error::DuplicateProposal`). A proposal is only valid inside its time window
@@ -917,7 +916,7 @@ transition; the derivability of all state from the log.
   of drift tolerance, so a stale capture cannot be replayed indefinitely.
   Settlement is **idempotent**: `Settler::settle` checks the derived state is
   not already `Settled` *before* any balance write, so settling twice can never
-  double-apply (T0.5.5, T0.5.7).
+  double-apply.
 - *Residual risk:* the nonce is per-sender on a single writer; within a
   community that is the only writer (ADR-0020), so a sender "acting on two
   stations" is a Phase 3 federation problem. The ±5 minute drift window is a
@@ -997,8 +996,8 @@ transition; the derivability of all state from the log.
   `tier2_stake_centi_asof`, the position-bounded reputation forms). A vouch or
   settlement admitted *after* a round opened — however old the `issued_at`/
   `settled_at` it back-dates to (ADR-0022 §3 makes such testimony legal) — can no
-  longer pack a pool, recuse a candidate, or shift a weight (ADR-0022 §5,
-  T2.11.2), closing the back-dated-evidence packing vector for the jury draw, the
+  longer pack a pool, recuse a candidate, or shift a weight (ADR-0022 §5),
+  closing the back-dated-evidence packing vector for the jury draw, the
   escalation vote, and the equivocation re-seat that the governance path had
   already closed. The residual is now the same station-clock trust
   root as the settlement windows above, not a per-member timestamp attack; verdict
@@ -1024,8 +1023,8 @@ transition; the derivability of all state from the log.
   tolerance) stops counting: the engine refuses its confirmation by the
   station's own clock past that boundary, so a counterparty who ignores a
   proposal cannot permanently consume the sender's headroom.
-- *Residual risk:* the recurring-contract charge path (`ContractCharge`,
-  T1.7.7) is not floor-checked, so contract periods can land a buyer below the
+- *Residual risk:* the recurring-contract charge path (`ContractCharge`)
+  is not floor-checked, so contract periods can land a buyer below the
   floor (the buyer did sign the contract; folding contract exposure into the
   committed position is the named follow-up). The floor is per-station
   config until a governance surface exists, so an operator can weaken it. What
@@ -1092,7 +1091,7 @@ fixtures in `tests/fixtures/cross_platform_certificates.json`.
   below), and the cap bounds the exposure. The receiver's offline verification is only as good as the spend
   history a spender presents (ADR-0021 Consequences); the cap still bounds the
   damage.
-- *Threat (T2.3.2): the floor-bypass carve-out admitting an unbacked debit.* A
+- *Threat: the floor-bypass carve-out admitting an unbacked debit.* A
   cert-backed spend is admitted **without a fresh debt-floor check** — the single
   deliberate floor bypass in the codebase (`Engine::submit_proposal`, guarded
   loudly with the ADR-0021 §4 reference). A forged or mismatched `cert_id`, or a
@@ -1107,7 +1106,7 @@ fixtures in `tests/fixtures/cross_platform_certificates.json`.
   (`CertificateWrongMember`); (5) `now` is at or before the shared
   `spend_admissible_until` boundary (`CertificateExpired`); and (6) the spend fits
   within `cap − consumed` (`CertificateOverspent`, carrying the three amounts
-  structurally for the T2.3.3 evidence, never string-matched). Every *other*
+  structurally for the equivocation evidence, never string-matched). Every *other*
   proposal check (signature, sender match, tier, nonce, duplicate, and the
   admission-clock window) still applies unchanged, so DTN is not a bypass of any of
   them. The ADR-0021 §6 floor invariant — after every admitted operation, every
@@ -1138,7 +1137,7 @@ fixtures in `tests/fixtures/cross_platform_certificates.json`.
   log cannot contain such a record, because the engine admits a cert-backed spend
   only against the signer's own outstanding certificate.
 
-#### Provable equivocation (ADR-0021 §5, T2.3.3)
+#### Provable equivocation (ADR-0021 §5)
 
 Offline double-commitment cannot be *prevented* under a partition, only made
 provable, attributable, and costly. When the station refuses a cert overspend or
@@ -1175,8 +1174,7 @@ The record kinds are `rrn.credit.equivocation` and
 - *Mitigation:* not reachable today — the verdict kind is refused
   (`UnroutableKind`) on DTN and has no RPC surface, so only the station can append
   one — and both reputation (`overturned_equivocations`) and the snapshot honor
-  an `Overturn` only when its envelope signer is the **community station key**
-  (T2.11.3): the scorer and `LedgerSnapshot::derive` are handed that key and gate
+  an `Overturn` only when its envelope signer is the **community station key**: the scorer and `LedgerSnapshot::derive` are handed that key and gate
   `signer == station`, so a member's self-signed `Overturn` (even one relayed once
   cross-station sync admits foreign records) is inert.
 - *Threat: evidence-size denial of service.* A record padded with many or huge
@@ -1225,7 +1223,7 @@ The record kinds are `rrn.credit.equivocation` and
   receiver can *see* the proof (`equivocation_for_cert`), but making them whole is
   future work.
 
-#### Equivocation jury (ADR-0025, T2.3.4)
+#### Equivocation jury (ADR-0025)
 
 A verified equivocation opens a sortition-jury case (`rrn-dispute::equivocation`)
 that reuses the ADR-0014 pool/draw/recusal primitives but has its own case
@@ -1264,10 +1262,9 @@ distinct discriminators, canonical dCBOR, and cross-platform fixtures.
   terminal `EquivocationVerdictRecord` **signed by the community station key**
   (`overturned_equivocations` and the snapshot's `equivocation_verdict` both gate
   `signer == station`, the key threaded into the scorer and
-  `LedgerSnapshot::derive` by T2.11.3). The equivocation record itself is pinned to
+  `LedgerSnapshot::derive`). The equivocation record itself is pinned to
   the same key, so the two agree for every genuine record; a member's self-signed
-  "overturn" is inert (tested at the ledger and reputation layers). *Mitigated
-  (T2.11.3):* this is now a pin to the known community key, not a record-author
+  "overturn" is inert (tested at the ledger and reputation layers). *Mitigated:* this is now a pin to the known community key, not a record-author
   gate, so the vector holds even once cross-station sync admits foreign records — a
   member who self-signs a genuine record of *their own* overspend to win the
   first-wins dedup is skipped at derivation (wrong signer), and a self-signed
@@ -1296,7 +1293,7 @@ distinct discriminators, canonical dCBOR, and cross-platform fixtures.
   overspend would need more admitted spends than `MAX_EVIDENCE_ITEMS` can carry, or
   pads a spend's `memo` past `MAX_EVIDENCE_ITEM_BYTES` so its admitted half cannot
   be embedded.
-- *Mitigation (T2.3.4 step 9):* the ledger caps a proposal's `memo` at
+- *Mitigation (the jury path, step 9):* the ledger caps a proposal's `memo` at
   `MAX_MEMO_BYTES` (well under the evidence-item ceiling) and refuses the
   `MAX_EVIDENCE_ITEMS`-th admitted cert-backed spend per certificate
   (`CertBackedSpendLimit`), reserving one slot for the refused overspend — so every
@@ -1369,12 +1366,12 @@ it.
 
 ### `rrn-protocol`
 
-> **Phase 2 (T2.2.1).** The crate stops being a stub: it now carries the
+> **Phase 2.** The crate stops being a stub: it now carries the
 > delay-tolerant-submission *wire layer* of ADR-0020 — per-device **outbox
 > chains**, carriage **bundles**, and station **delivery receipts**
 > (`docs/spec/dtn-bundles.md`). This section covers that wire layer as built.
 > This is pure data + validation (no storage, ingest, or networking — those are
-> T2.2.2/T2.2.3); the *federation* attack surface (cross-community forks, Sybil
+> elsewhere); the *federation* attack surface (cross-community forks, Sybil
 > federation, treaty abuse) remains Phase 3 work and is not pre-filled here.
 
 The layer moves signed member commitments store-and-forward to the community's
@@ -1436,7 +1433,7 @@ ingest path against oversized carriage.
   record — each entry is self-attributed and position-ordered. Two valid entries
   by one author at the same `position` with different `entry_hash` are an
   **outbox fork** (`is_fork`): a signed, self-incriminating pair that is the
-  evidence primitive ADR-0021/T2.3.3 turn into an automatic dispute. Same
+  evidence primitive ADR-0021 turn into an automatic dispute. Same
   position *and* same hash is a duplicate, not a fork (idempotent re-carriage).
 - *Residual risk:* fork *detection* here is the primitive only; the consequence
   (the station-signed record, reputation input, jury case) is the `rrn-ledger`
@@ -1456,7 +1453,7 @@ ingest path against oversized carriage.
 - *Residual risk (accepted for Phase 2):* an outside courier holding a bundle
   or receipt sees who transacted with whom, memos, and each record's fate. The
   SMS carrier additionally exposes this to the phone network (see [SMS as a DTN
-  carrier](#sms-as-a-dtn-carrier-station-t271)).
+  carrier](#sms-as-a-dtn-carrier-station)).
 
 #### Denial of service
 
@@ -1480,9 +1477,9 @@ ingest path against oversized carriage.
   A delivery receipt is transport state, never appended to the community log, so
   it cannot be replayed into ledger state.
 
-#### Carrier framing and reassembly (T2.2.5)
+#### Carrier framing and reassembly
 
-*Implemented in T2.2.5.* The pluggable transport seam
+*Implemented in the framing layer.* The pluggable transport seam
 ([`transport::FrameTransport`](../crates/rrn-protocol/src/transport.rs), ADR-0013)
 and the carrier-agnostic chunking/reassembly above it
 ([`framing`](../crates/rrn-protocol/src/framing.rs)) that lets a bundle far larger
@@ -1549,11 +1546,11 @@ per-member ingest rate-limiting (a known limitation). The retransmit loop
 (`DtnSyncer`'s `RRNC` request-missing/ack over `missing()`) and the airtime
 budget (`rrn_protocol::airtime`, consuming `sustained_bytes_per_sec`) are built
 and analyzed under [DTN transport over a constrained
-carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026).
+carrier](#dtn-transport-over-a-constrained-carrier-station-adr-00130026).
 
-#### Paper / QR text encodings (T2.5.1)
+#### Paper / QR text encodings
 
-*Implemented in T2.5.1.* The paper-fallback text layer
+*Implemented in the paper-codec layer.* The paper-fallback text layer
 ([`paper`](../crates/rrn-protocol/src/paper.rs), `docs/spec/qr-payloads.md`
 §§5–7): multi-part QR chunking for bundles and receipts (`rrnp:`), and single-QR
 forms for certificates (`rrncert:`) and offline spend vouchers (`rrnspend:`). Like
@@ -1603,7 +1600,7 @@ malicious oversized single-QR string.
   and bare-address forms) and reports anything else as `Unknown`, never guessing.
 
 *Residual / out of scope:* QR image rendering, PDF layout, and camera scanning
-(T2.5.2 CLI; mobile repo for phones); sealed/private paper forms (a `rrnspend:`
+(the paper CLI; mobile repo for phones); sealed/private paper forms (a `rrnspend:`
 voucher is community-public data like any other carried record — a photographed
 sheet leaks the same as an intercepted bundle, §Information-disclosure above).
 
@@ -1689,9 +1686,9 @@ lifetime); the integrity of the local log under entries pulled from peers; the
 confidentiality and integrity of the CLI↔daemon channel; the availability of the
 daemon (one local user, one writer).
 
-> Populated in M0.6. The CLI and the gossip layer speak the same line-delimited
+> Populated with the daemon/CLI. The CLI and the gossip layer speak the same line-delimited
 > JSON envelope ([`rpc`]) over two different transports. The gossip stub is
-> deliberately minimal (T0.6.6). Phase 2 **retired it in place** rather than
+> deliberately minimal. Phase 2 **retired it in place** rather than
 > replacing it (ADR-0020 §7): read-replica gossip still exists for replica
 > copies of the chain, but the DTN bundle path is the canonical resilience
 > mechanism. The prior "gossip ingest bypasses the front door" bypass is
@@ -1822,18 +1819,18 @@ between a listing and the transaction that fulfils it; fair discovery (open
 listings actually surface); a buyer's protection against a lister who takes
 credit and never delivers.
 
-> **Where M1.7 leaves this (supersedes the M1.6 framing).** M1.6 could say that
+> **Where the marketplace UI work leaves this (supersedes the data-model framing).** The data-model work could say that
 > no network surface reached any of this, because nothing in the workspace
-> depended on `rrn-marketplace`. **That is no longer true.** T1.7.0 makes
+> depended on `rrn-marketplace`. **That is no longer true.** The marketplace UI work makes
 > `rrn-station` its first dependent: the daemon holds the search index, rebuilds
 > it from the log at startup, keeps it in step as listing records are appended or
 > replicated, and serves two **read** methods to paired mobiles —
-> `marketplace_search` and `marketplace_listing`. Two gaps M1.6 named as deferred
+> `marketplace_search` and `marketplace_listing`. Two gaps the data-model work named as deferred
 > are closed by that same wiring (the search `limit` clamp and the expiry sweep,
 > both below).
 >
-> **T1.7.3 adds the first marketplace writes reachable over a socket**, so the
-> M1.7.0 note that "every marketplace write is unreachable" no longer holds
+> **The marketplace RPC work adds the first marketplace writes reachable over a socket**, so the
+> earlier note that "every marketplace write is unreachable" no longer holds
 > either. `marketplace_create_listing`, `marketplace_close_listing`, and
 > `marketplace_announce_need` append listing and need records, signed by the
 > **station's own wallet**, and `marketplace_my_listings` / `marketplace_matches`
@@ -1850,19 +1847,19 @@ credit and never delivers.
 >
 > Two things are still deferred and named here rather than in a task doc. A
 > **member's** marketplace writes — a phone signing its own listing, which the
-> station records without holding the key — arrive in T1.7.2, and are a different
+> station records without holding the key — arrive later, and are a different
 > authorization question from the operator path above: the envelope's signer must
 > equal the record's provider, as `submit_vouch` already requires. And the
 > `Requirements` enforcement that turns recorded provider intent into an access
-> check arrives in T1.7.4 — until then the note under *Requirements that are
-> stated but not yet enforced* stands, and note that T1.7.3 makes it *easier* to
+> check arrives with the inquiry flow — until then the note under *Requirements that are
+> stated but not yet enforced* stands, and note that the RPC work makes it *easier* to
 > reach: `rrn list --min-reputation` records a threshold that nothing yet checks.
 
-#### Spoofing — publishing or editing as someone else (M1.6)
+#### Spoofing — publishing or editing as someone else
 
 - *Threat:* a member publishes a listing under another member's name, or edits or
   withdraws a listing that is not theirs, to misdirect trade or damage a rival.
-- *Mitigation (shipped, T1.6.3/T1.6.4):* every marketplace record is a
+- *Mitigation (shipped):* every marketplace record is a
   `SignedPayload`, and each append helper checks the envelope's signer against
   the claim inside the record before writing.
   `lifecycle::append_listing_created` refuses a listing whose signer is not its
@@ -1875,13 +1872,13 @@ credit and never delivers.
 - *Residual risk:* nothing rate-limits a member publishing under *their own*
   name — see [Listing spam](#listing-spam).
 
-#### Tampering — a record that never passed the write path (M1.6)
+#### Tampering — a record that never passed the write path
 
 - *Threat:* the append guards above are local. A replicated entry arrives through
-  `AppendLog::append_raw` (M0.6 gossip) and never touches them, so a peer that
+  `AppendLog::append_raw` (gossip) and never touches them, so a peer that
   writes whatever it likes into its own log could otherwise export forged updates
   and closes into ours.
-- *Mitigation (shipped, T1.6.4/T1.6.5):* **replay re-applies the same
+- *Mitigation (shipped):* **replay re-applies the same
   authorization rules it would have applied on the write path.**
   `lifecycle::scan` — the single traversal behind both the append guards and the
   state machine — skips any record whose signer was not entitled to write it,
@@ -1897,13 +1894,13 @@ credit and never delivers.
   dishonestly; that is [listing fraud](#listing-fraud--the-lister-never-delivers)
   and reputation, not authorization, is what stands against it.
 
-#### Elevation of privilege — the station signing beyond its remit (M1.6)
+#### Elevation of privilege — the station signing beyond its remit
 
 - *Threat:* the station holds a key and runs unattended, so a compromised or
   misconfigured station could sign marketplace records that look like member
   decisions — most damagingly, withdrawing a member's offer and making it read as
   the member's own choice.
-- *Mitigation (shipped, T1.6.4):* `lifecycle::closer_is_entitled` splits close
+- *Mitigation (shipped):* `lifecycle::closer_is_entitled` splits close
   authority by reason. The provider may close their listing **only** as
   `ProviderClosed`; the station may close it **only** as `ExpirationReached` or
   `StationCleanup`. The station may attest to what happened with no party present
@@ -1915,12 +1912,12 @@ credit and never delivers.
   one that is attributable in the log and cannot be disguised as a member's
   decision.
 
-#### Tampering — the derived index disagreeing with the log (M1.6)
+#### Tampering — the derived index disagreeing with the log
 
 - *Threat:* search answers from two derived stores rather than from the log. If
   either drifted, the marketplace could show offers that are closed, hide offers
   that are open, or return a listing under an identity nothing else knows it by.
-- *Mitigation (shipped, T1.6.6):* **the index is authoritative over nothing.**
+- *Mitigation (shipped):* **the index is authoritative over nothing.**
   Both the `listings_index` table and the tantivy index are rebuilt from a full
   replay by `search::SearchIndex::rebuild`, deleting the tantivy directory is
   always a safe repair, and a test pins that a rebuild reproduces exactly what
@@ -1935,7 +1932,7 @@ credit and never delivers.
   writes the log, so the two **can** diverge — the cost ADR-0010 accepted
   knowingly when it chose tantivy over FTS5. Divergence degrades discovery until
   a rebuild; it cannot corrupt the log or move credit.
-- *Mitigation (shipped, T1.7.0 — closes the M1.6 gap):* the expiry sweep is
+- *Mitigation (shipped — closes the earlier gap):* the expiry sweep is
   wired. `Core::do_expire_listings` runs on a timer
   (`timers.listing_expiry_interval_secs`, default 300s), finds every listing whose
   derived state is `Expired`, and appends a station-signed `ListingClosed
@@ -1951,12 +1948,12 @@ credit and never delivers.
   The sweep makes the derivation a fact on the log for peers replicating it; it is
   not what protects a buyer.
 
-#### Denial of service — what a member may write onto a permanent log (M1.6)
+#### Denial of service — what a member may write onto a permanent log
 
 - *Threat:* the log is append-only and replicated to every station in the
   community, so an unbounded member-writable field is a community-wide storage
   cost that can never be reclaimed.
-- *Mitigation (shipped, T1.6.3):* listing text is bounded — `MAX_TITLE_BYTES`
+- *Mitigation (shipped):* listing text is bounded — `MAX_TITLE_BYTES`
   (200) and `MAX_DESCRIPTION_BYTES` (8 KiB) — and `category` must come from the
   controlled `CATEGORIES` vocabulary rather than being free text. The category
   bound is not only about size: a marketplace category and a reputation
@@ -1967,22 +1964,22 @@ credit and never delivers.
 - *Residual risk:* the bounds cap one record, not how many records a member may
   write. See [Listing spam](#listing-spam).
 
-#### Denial of service — the cost of indexing and searching (M1.6)
+#### Denial of service — the cost of indexing and searching
 
 - *Threat:* discovery must not become a way to make the station do unbounded work,
   since the core thread is the single writer for everything including payments.
-- *Mitigation (shipped, T1.6.6):* ranking reads provider standing **only** from
-  the M1.5 snapshot cache (`get_cached_profile`, one day's tolerance against an
+- *Mitigation (shipped):* ranking reads provider standing **only** from
+  the reputation snapshot cache (`get_cached_profile`, one day's tolerance against an
   hourly sweep) and memoizes it per provider within a search, so a page of fifty
   results from one prolific provider is one lookup rather than fifty. A cache miss
   ranks the provider as unscored rather than triggering a replay — scoring is O(N)
   in the log and anchoring made it O(V·N), so a search must never be able to
   provoke one. Structured filters run in SQLite before text relevance is computed,
   so relevance is only ever calculated for listings that could be returned.
-- *Mitigation (shipped, T1.7.0 — closes the M1.6 gap):* result size is no longer
+- *Mitigation (shipped — closes the earlier gap):* result size is no longer
   the network caller's choice. `marketplace_view::search` clamps `limit` to
   `MAX_SEARCH_LIMIT` (100) before the query reaches the index, and every caller
-  goes through it: T1.7.3 added a second transport (the operator socket's
+  goes through it: the RPC work added a second transport (the operator socket's
   `marketplace_search`) and routed it through the *same* `run_marketplace_search`
   the channel method calls, rather than a parallel path that would have needed its
   own clamp to be remembered. The clamp overrides rather than rejects, so an
@@ -1995,11 +1992,11 @@ credit and never delivers.
 - *Residual risk:* `reputation_at_creation` **is** computed by a replay
   (`score_at`), once per listing at index time. That is the one place the cost is
   affordable and it is paid off the search path entirely, but a burst of new
-  listings is a burst of replays, and no rate limit stands behind it. **T1.7.3
+  listings is a burst of replays, and no rate limit stands behind it. **The RPC work
   shipped the first write surface that can produce such a burst and did not add a
   budget** — deliberately, because that surface is the operator's own socket, where
   the only caller who can drive it is the one who already holds the station's key
-  and could spend its credit instead. The budget becomes load-bearing in T1.7.2,
+  and could spend its credit instead. The budget becomes load-bearing with paired mobiles,
   which is the first path letting a *member* publish over the network, and it
   should be a per-identity publication limit rather than a per-request one:
   clamping one request does nothing about a thousand of them. Note also that
@@ -2011,9 +2008,9 @@ credit and never delivers.
   Nothing limits how often a paired mobile may search, and a startup index rebuild
   plus each expiry sweep are full log replays on the single writer thread. A
   per-mobile read budget is the same fix already named for the reputation read path
-  in T1.5.9, and it should cover both.
+  in the reputation-read surface, and it should cover both.
 
-#### Information disclosure — offers and demand are both public (M1.6)
+#### Information disclosure — offers and demand are both public
 
 - *Threat:* a listing states what a member has, and a `Need` states what they
   lack. Both are signed records on a log that replicates to the whole community,
@@ -2030,15 +2027,15 @@ credit and never delivers.
   household's circumstances, and it cannot be retracted from the log once said.
   Needs carry no expiry sweep either; `valid_until` only stops them matching.
   Whether needs should be ephemeral rather than logged is worth revisiting when
-  M1.7 gives them a UI and real members start writing them.
+  the marketplace UI work exposes them and real members start writing them.
 
-#### Requirements that are stated but not yet enforced (M1.6 → M1.7)
+#### Requirements that are stated but not yet enforced
 
 - *Threat:* `Requirements` lets a provider say a buyer must hold a minimum
   reputation or be a community member. A requirement that is displayed but not
   checked is worse than none, because it tells a provider they are protected when
   they are not.
-- *Mitigation (shipped, T1.6.3):* what M1.6 guarantees is that the requirement is
+- *Mitigation (shipped):* what the data-model work guarantees is that the requirement is
   *reachable*. `min_reputation` is rejected above the highest composite anyone can
   currently attain (derived from ADR-0009's dormant-dimension weights, never a
   literal), so a provider cannot publish an offer that is arithmetically closed to
@@ -2047,10 +2044,10 @@ credit and never delivers.
   capped, public composite, never the raw score, which exists only to make
   anchoring computable.
 - *Residual risk:* **nothing enforces `min_reputation` or `community_member_only`
-  against a buyer yet.** M1.6 validates them; the check belongs at the point a
-  buyer approaches a provider, which is the inquiry flow in T1.7.4. Until then they
+  against a buyer yet.** The data-model work validates them; the check belongs at the point a
+  buyer approaches a provider, which is the inquiry flow. Until then they
   are provider intent recorded on the log, not access control, and the UI must not
-  present them as the latter. T1.7.0 sharpens this rather than fixing it: the
+  present them as the latter. The marketplace UI work sharpens this rather than fixing it: the
   `marketplace_listing` detail view now carries both fields to any paired mobile,
   so the requirement is *displayed* over the network before anything checks it. The
   view's field docs say so explicitly, so that whoever renders them cannot mistake
@@ -2060,15 +2057,15 @@ credit and never delivers.
 
 - *Threat:* a member posts a listing, the buyer transacts, and the good or
   service never arrives.
-- *Planned mitigation (M1.7, building on `rrn-ledger`):* a sale is not final on
+- *Planned mitigation (building on `rrn-ledger`):* a sale is not final on
   posting — it settles through the ledger's bilateral confirmation + settlement
   window (the Tier 1/2 oracle), so credit is not released until the buyer
   confirms delivery, and a non-delivery leaves the transaction
   unconfirmed/disputed and dents the lister's reputation (`rrn-reputation`).
-- *Residual risk (M1.6):* **the binding between a listing and the transaction
+- *Residual risk:* **the binding between a listing and the transaction
   that fulfils it does not exist yet**, so none of the above is wired. ADR-0010
   decided that `listing_id` belongs on `TransactionProposal` and deferred the
-  field itself to M1.7; until it lands, a settled transaction carries no record of
+  field itself to a later milestone; until it lands, a settled transaction carries no record of
   which offer it answered, and a dispute cannot be tied back to what was promised.
   The field must be **omitted** from a proposal's CBOR when absent rather than
   encoded as null — `TransactionProposal` recomputes its id from its encoded
@@ -2083,14 +2080,14 @@ credit and never delivers.
 
 - *Threat:* colluding identities run wash sales against each other's listings to
   manufacture positive transaction history and inflate standing.
-- *Mitigation (shipped, M1.5):* this threat is owned by `rrn-reputation` and its
+- *Mitigation (shipped):* this threat is owned by `rrn-reputation` and its
   Phase 1 answer is in place — velocity limiting caps any dimension at 0.5 per
   week, and identity anchoring holds every dimension at 1.0 until an established
   member vouches, so a ring of self-dealing accounts scores slowly and visibly.
   See [Sybil clusters and manufactured
-  standing](#sybil-clusters-and-manufactured-standing-m15), which also records
+  standing](#sybil-clusters-and-manufactured-standing), which also records
   what those measures do *not* stop.
-- *Mitigation (shipped, T1.6.6):* the marketplace side is that standing actually
+- *Mitigation (shipped):* the marketplace side is that standing actually
   affects discovery — search ranks relevance **multiplied** by a provider's
   current composite, so manufactured standing does lift a listing, and the
   reputation defences above are what bound how much of it can be manufactured.
@@ -2098,15 +2095,15 @@ credit and never delivers.
   distinguish from honest trade; quantitative detection is deferred to Phase 3.
 - *Residual risk:* nothing yet feeds marketplace activity *back* into reputation.
   `domain_competence` — the dimension a category was made a controlled vocabulary
-  to protect — is still structurally `0.0`, and its first inputs arrive with the
-  M1.7 transaction flow. Wash sales against listings therefore buy nothing extra
+  to protect — is still structurally `0.0`, and its first inputs arrive with
+  the marketplace transaction flow. Wash sales against listings therefore buy nothing extra
   today, and the moment they could is the moment that dimension goes live.
 
 #### Listing spam
 
 - *Threat:* an identity floods the marketplace with junk listings to bury real
   ones or degrade discovery.
-- *Mitigation (shipped, T1.6.3/T1.6.6):* listings are signed, so every one is
+- *Mitigation (shipped):* listings are signed, so every one is
   attributable to an identity whose creation is Sybil-bounded by vouching; each is
   bounded in size (200-byte title, 8 KiB description) and confined to the
   controlled category vocabulary; and ranking multiplies relevance by the
@@ -2118,10 +2115,10 @@ credit and never delivers.
   unlimited *distinct* listings, each permanently replicated to every station in
   the community, and low ranking hides them from search without removing their
   storage cost. Ranking is a discovery defence, not an admission-control one. A
-  per-identity publication budget is still the missing piece. T1.7.3 exposed
+  per-identity publication budget is still the missing piece. The RPC work exposed
   publishing over a socket without adding one, which is defensible only because
   that socket is the operator's own (see the note at the head of this section);
-  T1.7.2 exposes it to paired mobiles, and that is where the budget has to land
+  the paired-mobile work exposes it to paired mobiles, and that is where the budget has to land
   rather than being deferred again.
 
 ### `rrn-reputation`
@@ -2144,14 +2141,14 @@ inherited standing.
 > context is exactly as re-derivable as the profile it produces, and the
 > `reputation_snapshots` table remains a droppable cache (ADR-0009).
 
-> As of M1.6 a score has a second consumer: search ranking multiplies text
+> As of the marketplace work a score has a second consumer: search ranking multiplies text
 > relevance by the provider's current composite, read from the snapshot cache
 > ([`rrn-marketplace`](#rrn-marketplace)). That makes standing worth
 > manufacturing for commercial reasons as well as social ones, and it is why the
 > marketplace section treats the reputation defences here as *its* Sybil
 > mitigation rather than restating them.
 
-> Implemented in M1.5 (T1.5.1–T1.5.8) against [ADR-0009](adr/0009-universal-reputation-algorithm.md),
+> Implemented against [ADR-0009](adr/0009-universal-reputation-algorithm.md),
 > which locks the algorithm at the federation-protocol level: no station operator
 > can retune weights, decay, bands, or the Sybil constants, so "score my community
 > generously" is not a reachable configuration.
@@ -2160,7 +2157,7 @@ inherited standing.
 
 - *Threat:* a member with bad standing abandons the identity and starts fresh,
   or attempts to carry standing to a clean identity, to escape a bad history.
-- *Mitigation (shipped, T1.5.4):* reputation is **non-transferable** — it is
+- *Mitigation (shipped):* reputation is **non-transferable** — it is
   derived from log evidence bound to the identity keypair
   (`rrn-reputation::scoring`), never a stored token that can be moved, and a fresh
   identity replays to an empty profile.
@@ -2168,13 +2165,13 @@ inherited standing.
   whitewashing by starting over is *mitigated, not eliminated*, and is a known
   limitation carried from the identity layer. Abandoning an identity also costs
   nothing in Phase 1 because there is no negative evidence to escape — cancelled
-  transactions score neutral and no fraud finding exists until M1.8.
+  transactions score neutral and no fraud finding exists yet.
 
 #### Attestation farming
 
 - *Threat:* colluding identities issue each other positive attestations to
   inflate scores.
-- *Partial mitigation (shipped, T1.5.4/T1.5.8):* the velocity cap below bounds the
+- *Partial mitigation (shipped):* the velocity cap below bounds the
   *rate* of inflation, and all inputs decay (`rrn-reputation::decay`), so farmed
   standing has to be continuously re-farmed.
 - *Residual risk:* **this is the largest known Phase 1 gap.** With no fraud-finding
@@ -2183,14 +2180,14 @@ inherited standing.
   dimension (ADR-0009, Consequences). Weighting attestations by the attester's own
   standing and discounting reciprocal or clustered ones needs the graph analysis
   deferred to Phase 3; retroactively marking an attestation wrong needs fraud
-  findings (M1.8+). Sophisticated collusion inside a real vouch cluster remains
+  findings (a later phase). Sophisticated collusion inside a real vouch cluster remains
   hard to detect.
 
 #### Time-decay gaming
 
 - *Threat:* a member times their behavior to exploit the decay curve — front-load
   good conduct, then coast on a slowly-decaying score.
-- *Mitigation (shipped, T1.5.6):* decay is continuous rather than stepped
+- *Mitigation (shipped):* decay is continuous rather than stepped
   (`rrn-reputation::decay`, fractional months), so there is no cliff or reset
   boundary to time behavior against.
 - *Residual risk:* the 0.1/month rate is a policy tradeoff; at that rate a maxed
@@ -2199,12 +2196,12 @@ inherited standing.
   member who front-loads and stops is indistinguishable from one who is merely
   quiet, which is deliberate (Phase 3 may add a reentry reward).
 
-#### Sybil clusters and manufactured standing (M1.5)
+#### Sybil clusters and manufactured standing
 
 - *Threat:* an attacker stands up many identities and transacts or vouches among
   them to manufacture standing cheaply — the cluster scoring itself into
   legitimacy without any real member's involvement.
-- *Mitigation (shipped, T1.5.8):* **velocity limiting.** No dimension may gain
+- *Mitigation (shipped):* **velocity limiting.** No dimension may gain
   more than 0.5 per week (`rrn-reputation::sybil::check_velocity`, run on every
   snapshot refresh). Because a dimension maxes at 5.0 and each event is worth 0.5,
   a fake identity needs ten weeks of sustained fabricated activity to reach the
@@ -2212,14 +2209,14 @@ inherited standing.
   manufacture in parallel. Violations are logged for operator review and never
   auto-punish: an automatic penalty would be a griefing vector, since anyone who
   can drive transactions at a member could push them over the cap.
-- *Mitigation (shipped, T1.5.8):* **identity anchoring.** Every dimension of an
+- *Mitigation (shipped):* **identity anchoring.** Every dimension of an
   identity is held at 1.0 until a member holding at least a Member-band composite
   (2.0) vouches for it — applied inside `ReputationScorer::score_at`, so
   snapshots, exports and remote re-verification all see the same capped profile.
   The evidence keeps accruing underneath the cap, so an anchoring vouch reveals
   the standing already earned rather than starting it. A vouch for oneself is
   ignored. ADR-0009's original 3.0 threshold was unreachable in Phase 1 and was
-  amended to the band floor in T1.5.8; the reasoning is recorded in the ADR.
+  amended to the band floor; the reasoning is recorded in the ADR.
 - *Residual risk:* **anchoring stops a lone fake identity, not a patient pair.** A
   prospective voucher is judged on their *uncapped* composite — necessarily so,
   or no member could ever be the first anchor and mutual vouchers would be
@@ -2244,19 +2241,19 @@ inherited standing.
   verifies, but it does expose one member's trade history inside another member's
   bundle. A succinct proof of the voucher's standing is the Phase 3 improvement.
 
-#### Reading a score over the mobile channel (T1.5.9)
+#### Reading a score over the mobile channel
 
 - *Threat:* the read path that shows a member their standing becomes a way to
   enumerate *other* members' reputations, or to make the station do expensive
   work on demand.
-- *Mitigation (shipped, T1.5.9):* the two reads disclose deliberately different
+- *Mitigation (shipped):* the two reads disclose deliberately different
   amounts. `reputation` (`reputation_view::member_reputation`) is **member-scoped
   to the authenticated signer** — it takes no address param, like `list_vouches`
   and `vouch_counts` — so the five-dimension breakdown, the anchoring state, and
   the anchoring voucher's identity are only ever your own. `reputation_band`
   (`reputation_view::address_band`) does take an address, which is a considered
   exception: a band is what one member shows another in order to be worth trading
-  with (M1.7 listing cards), and ADR-0009 puts no local policy on who may see a
+  with (marketplace listing cards), and ADR-0009 puts no local policy on who may see a
   score. It returns only the band and composite, never the breakdown. Both ride
   the sealed, signed channel, so only a paired mobile can call either
   ([Mobile–station transport](#mobilestation-transport)).
@@ -2290,7 +2287,7 @@ The defining control is who counts as a voter: the electorate is the community's
 **established members** — effective (anchored) composite reputation at or above
 the Member band ([`BAND_MEMBER_MIN`](#rrn-reputation) = 2.0), the same standing
 `rrn-reputation` gates a Tier-2 confirmation on. One established member, one
-vote. This is a deliberate ADR-0012 refinement of the M1.0 scaffold's original
+vote. This is a deliberate ADR-0012 refinement of the initial scaffold's original
 "vote weight is a vouched identity, not reputation" framing: vote *weight* is
 still flat (never scaled by score), but vote *eligibility* is reputation-gated,
 which means governance inherits `rrn-reputation`'s Sybil posture wholesale.
@@ -2300,7 +2297,7 @@ a tally and of the effective Charter from signed records; the legitimacy of a
 Charter's founding and amendment lineage; the availability of the proposal
 channel.
 
-> Implemented in M1.9 (T1.9.3–T1.9.8, RPC/CLI surface T1.9.7b) against
+> Implemented in the governance layer against
 > [ADR-0012](adr/0012-charter-format-and-amendments.md), which fixes the Charter
 > schema, the founder/amendment rules, and the established-member electorate at
 > the design level. Mitigations below are **shipped** unless marked otherwise.
@@ -2313,7 +2310,7 @@ channel.
 
 - *Threat:* one person casts many votes by controlling many identities, or stands
   up enough fake "members" to swing or manufacture a quorum.
-- *Mitigation (shipped, T1.9.5/T1.9.6; re-anchored to the admission clock per ADR-0022):* only an
+- *Mitigation (shipped; re-anchored to the admission clock per ADR-0022):* only an
   established member may vote — `append_vote` and the `votes` replay both gate
   each ballot on eligibility (composite ≥ 2.0) *as of the proposal's open log
   position* (`is_eligible_asof`; the ballot's own `cast_at` is testimony nothing
@@ -2346,7 +2343,7 @@ channel.
   back-date under ADR-0022 §3), a faction could admit **back-dated** vouches
   *after* a proposal opened and retroactively grow that proposal's electorate,
   changing a concluded tally's denominator on replay.
-- *Mitigation (shipped, T2.1.3, ADR-0022):* governance no longer does author-clock
+- *Mitigation (shipped, ADR-0022):* governance no longer does author-clock
   arithmetic. A proposal's deliberation/voting window and implementation time are
   derived from the station's **admission** of the proposal and restated in a
   station-signed `rrn.gov.proposal_window` attestation, so the window is a signed,
@@ -2385,14 +2382,14 @@ channel.
   `rrn.gov.proposal_window` injected *before* the genuine one would, if believed, win
   `window_of`'s earliest-match and directly set
   `voting_ends_at`/`implementation_at`/`admitted_at` — moving the outcome gate and the
-  eligibility instant. **Closed by T2.1.4:** the reader now pins the attestation's
+  eligibility instant. **Closed by station-signer pinning:** the reader now pins the attestation's
   envelope signer to the community station key and skips any other, so the earliest
   *validated* (station-signed) window wins and a forged one is invisible — the same pin
   now applies to `ProposalImplemented` and the three emergency attestations (see
   "Emergency activation + declaration TTL" below for the consolidated residual list).
   The station clock at admission remains the operational trust root
   (ADR-0022 §6). **The dispute-escalation, jury, and equivocation electorates are
-  now prefix-bounded too** (T2.11.2): `rrn-dispute` computes every pool, electorate,
+  now prefix-bounded too**: `rrn-dispute` computes every pool, electorate,
   and weight over `grace_electorate_asof`/`tier2_stake_centi_asof` at the anchoring
   admission seq, so the back-dating vector the governance path closed is closed for
   the dispute paths as well (see the `rrn-ledger` "Resolution-layer re-anchoring"
@@ -2423,9 +2420,9 @@ channel.
 
 - *Threat:* an identity floods the community with proposals to bury real ones or
   force constant voting.
-- *Mitigation (shipped, T1.9.4):* authorship itself requires established standing
+- *Mitigation (shipped):* authorship itself requires established standing
   (`append_proposal` gates the author on eligibility at the proposal's open
-  admission position, T2.1.3), and a
+  admission position), and a
   proposal does not reach a ballot until at least `DEFAULT_COSIGN_THRESHOLD` (3)
   *distinct established* members other than the author co-sign it (`append_cosign`
   + `proposal_records`). A motion nobody else with standing will endorse never
@@ -2444,7 +2441,7 @@ channel.
 
 - *Threat:* an actor pays members to vote a chosen way, or coerces/retaliates
   against them for how they voted.
-- *Mitigation (shipped, T1.9.5/T1.9.6):* one-established-member-one-vote caps the
+- *Mitigation (shipped):* one-established-member-one-vote caps the
   value of any single vote, lowering the return on buying it, and every ballot is
   a signed record, so a vote is socially accountable.
 - *Residual risk:* that same signing means **votes are attributable, not secret**
@@ -2460,7 +2457,7 @@ channel.
 
 - *Threat:* an attacker gossips forged ballots, or a station reports a tally its
   ballots do not support, to fake an outcome.
-- *Mitigation (shipped, T1.9.6):* a tally is never stored — `tally` recomputes it
+- *Mitigation (shipped):* a tally is never stored — `tally` recomputes it
   from the signed ballots in the log every time, counting only votes that
   `votes` admits (self-signed by the voter, on a published proposal, admitted
   after the proposal's open position, from a member eligible at that position;
@@ -2485,7 +2482,7 @@ channel.
 
 - *Threat:* someone publishes a Charter naming themselves the founders, or pushes
   through an amendment that captures the community's rules.
-- *Mitigation (shipped, T1.9.3/T1.9.7):* a Charter is a `MultiSignedPayload`
+- *Mitigation (shipped):* a Charter is a `MultiSignedPayload`
   whose `verify_founders` requires valid signatures from at least
   `ceil(founders × 0.75)` of the addresses the Charter itself names as founders —
   signatures from non-founders are verified but **ignored**, so padding the signer
@@ -2508,7 +2505,7 @@ channel.
 #### Founder key disclosure at multi-founder genesis
 
 - *Threat:* the multi-founder `charter-init` path exposes founder secret keys.
-- *Mitigation (shipped, T1.9.7b):* it is a bootstrap-time, operator-run path over
+- *Mitigation (shipped):* it is a bootstrap-time, operator-run path over
   the station's **local Unix socket** — the CLI reads each founder's hex secret
   from a file and hands it to the daemon, which does all signing; nothing crosses
   the network.
@@ -2523,7 +2520,7 @@ channel.
 
 - *Threat:* a gossiped "this proposal is now in force" record makes the community
   treat an un-passed or premature proposal as enacted.
-- *Mitigation (shipped, T1.9.7):* enactment is a guarded, replay-checked record.
+- *Mitigation (shipped):* enactment is a guarded, replay-checked record.
   `record_implementation` refuses to write one for a proposal that has not passed,
   is not yet past its `implementation_at`, or is already implemented, and
   `enacted_statutes` re-derives passage and due-time when it builds the
@@ -2534,7 +2531,7 @@ channel.
   so compliance is still a matter of members and operators honoring it (the
   statute→config rule engine is Phase 3).
 
-#### Emergency governance — the coup lever (T2.8.2, ADR-0023)
+#### Emergency governance — the coup lever (ADR-0023)
 
 Emergency governance lets a supermajority of the electorate *compress the
 deliberation/voting window* for a narrow class of measures during a declared
@@ -2601,7 +2598,7 @@ then lapses* — and withhold every adjacent one.
   `rrn-ledger` or `rrn-reputation`: the settlement and dispute windows, the debt
   floor, certificates, and reputation are untouched, by construction. A flood does
   not authorize economic restructuring.
-- *Mitigated (T2.1.4) — the station signer is now pinned on the attestations.* The
+- *Mitigated — the station signer is now pinned on the attestations.* The
   `emergency_activated` attestation (like ADR-0022's `ProposalWindow` and
   `ProposalImplemented`) was trusted structurally — its declaration must re-derive as
   having crossed the supermajority — and the derivation now **also** verifies the
@@ -2615,7 +2612,7 @@ then lapses* — and withhold every adjacent one.
   strictly "genesis") rather than any attestation field or the amendable
   effective charter (defence in depth, and replica-determinism). A duplicate/bogus
   attestation still cannot *block* the real one: the "already activated" check runs only
-  after legitimacy passes. The consolidated post-T2.1.4 residual list is under
+  after legitimacy passes. The consolidated residual list is under
   "Emergency activation + declaration TTL" below.
 - *Residual — a renewal re-pins the electorate at its own activation.* Each activation
   in a chain pins at its own position, so a chain that renews mid-emergency can refresh
@@ -2636,10 +2633,10 @@ then lapses* — and withhold every adjacent one.
   will not see until admitted — an honest cost of deciding in a crisis, mitigated but
   not eliminated by the 24 h window floor.
 
-#### Emergency activation + declaration TTL (T2.8.3, ADR-0027)
+#### Emergency activation + declaration TTL (ADR-0027)
 
-T2.8.3 hardens *when* an emergency may fire and *how long* a part-signed
-declaration may wait, closing two paths ADR-0027 identified in the T2.8.2
+The emergency activation and TTL work hardens *when* an emergency may fire and *how long* a part-signed
+declaration may wait, closing two paths ADR-0027 identified in the emergency-governance
 implementation, and adds two station-signed record kinds
 (`rrn.gov.emergency_refused`, `rrn.gov.emergency_declaration_admitted`).
 
@@ -2647,10 +2644,10 @@ implementation, and adds two station-signed record kinds
   the first position its supermajority is reached, and only there); of the
   **declaration TTL** (a stale consent cannot be fired months later); and of the new
   station-signed markers, which must be replay-derivable at one attested pin each.
-- *Elevation — reviving a cap-refused crisis.* Under T2.8.2 a first crossing that a
+- *Elevation — reviving a cap-refused crisis.* Under the emergency implementation a first crossing that a
   §4 cap refused left **no record**, so a later co-signature (once the cooldown had
   passed) re-satisfied the standing condition and activated on consents gathered for
-  the earlier, refused crisis. T2.8.3 writes a station-signed `emergency_refused`
+  the earlier, refused crisis. The activation work writes a station-signed `emergency_refused`
   marker at the refused crossing — in the **same transaction** as the crossing record
   (a batched-append log API; a crash between the two commits would otherwise leave a
   markerless crossing) — and replay maintains a `dead` set: a declaration with a
@@ -2661,7 +2658,7 @@ implementation, and adds two station-signed record kinds
   `an_independent_replay_of_a_refused_chain_never_revives`.
 - *Tampering — a stale non-colluding consent.* A member's genuine co-signature on a
   declaration that fell one short could, months later, be the base a different group
-  fires an emergency on. T2.8.3 bounds the gathering window: a declaration whose first
+  fires an emergency on. The activation work bounds the gathering window: a declaration whose first
   crossing is not reached within `EMERGENCY_DECLARATION_TTL` (7 d) of its
   **station-signed** admission instant (the eager `emergency_declaration_admitted`
   anchor) no longer counts. The TTL is measured against the signed anchor, never the
@@ -2683,8 +2680,8 @@ implementation, and adds two station-signed record kinds
   `RefusalReason` variants on the DTN receipt path, so an offline co-signer learns why
   their courier-carried co-sign did nothing. The §6 report surfaces refused and
   expired declarations, not only activations.
-- *Mitigated (T2.1.4) — station-signer pinning, across all five station-signed
-  governance kinds.* The residual T2.8.3 carried — that a forged station attestation
+- *Mitigated — station-signer pinning, across all five station-signed
+  governance kinds.* The residual the activation work carried — that a forged station attestation
   could move a window, an electorate pin, a TTL anchor, or an activation/refusal
   decision — is **closed**. Replay now verifies the envelope signer of every
   station-signed governance record (`ProposalWindow`, `ProposalImplemented`,
@@ -2694,7 +2691,7 @@ implementation, and adds two station-signed record kinds
   `emergency::{declaration_admitted_at, derive_emergencies}`); a record signed by any
   other key is **skipped** exactly as a forged member record is (the
   `Address::from_public_key(signer) != …` idiom, now a direct `PublicKey` compare).
-  This closes the supermajority-free levers T2.8.3 named: a hostile gossip peer that
+  This closes the supermajority-free levers the activation work named: a hostile gossip peer that
   learns a declaration's hash can no longer inject an `emergency_declaration_admitted`
   with `admitted_at = 0` (to fake TTL-expiry) or a far-future instant (to defeat the
   TTL), nor a forged `emergency_refused` (to kill a live declaration), nor a forged
@@ -2704,27 +2701,27 @@ implementation, and adds two station-signed record kinds
   replay either (skip-not-halt). The invariant suite is
   `crates/rrn-governance/tests/it/station_signer_pinning.rs`; ADR-0020 (single writer) and ADR-0022 (the station
   attests) already made this decision, so no new ADR was needed.
-- *Residual — surviving after T2.1.4 and T2.11.3.* Items 1 and 2 below are now
-  **closed** by T2.11.3 (the ledger sibling of T2.1.4); the read-replica consequence
+- *Residual — surviving after the station-signer pinning work.* Items 1 and 2 below are now
+  **closed** by the ledger signer-pinning (the sibling of the governance pinning); the read-replica consequence
   and the freshness witness remain:
-  1. **Ledger station-signed records — CLOSED (T2.11.3).** `SettlementRecord`,
+  1. **Ledger station-signed records — CLOSED.** `SettlementRecord`,
      `CancellationRecord`, `HeadroomCertificate`, `ContractCharge`,
      `EquivocationRecord` and `EquivocationVerdictRecord` (`rrn-ledger`) are now pinned
      to the community station key at every replay reader — `LedgerSnapshot::derive`,
      `balance_of`, `events`, `history`, portability selection, and the reputation
-     scorer all gate `signer == station`, threaded in as a parameter exactly as T2.1.4
+     scorer all gate `signer == station`, threaded in as a parameter exactly as the governance pinning
      did for governance. A forged `SettlementRecord` injected via gossip `append_raw`
      is skipped (moves no balance; leaves the tx `Confirmed`); a forged certificate
      reserves nothing (a spend naming it is refused `UnknownCertificate`); a forged
      equivocation record occupies no dedup slot. Invariant suite in
      `crates/rrn-ledger/tests/it/ledger_signer_pinning.rs`.
-  2. **The equivocation verdict community-key pin — CLOSED (T2.11.3).**
+  2. **The equivocation verdict community-key pin — CLOSED.**
      `rrn-reputation::scoring::overturned_equivocations` and the snapshot's
      `equivocation_verdict` now gate `signer == station` (the community key), not the
      equivocation record's own signer, so a member cannot self-sign an `Overturn` even
      once cross-station sync admits foreign records.
   3. **A gossip read-replica cannot derive governance *or balances* until it is told
-     the writer's key.** Per the T2.1.4/T2.11.3 decision (a), the pin is against the
+     the writer's key.** Per the signer-pinning decision (a), the pin is against the
      writer's own key; a second-`init`ed peer that derives under a *different* key gets
      the **genesis charter and nothing else** for governance, and — heavier for the
      ledger — **no settlements, certificates or equivocations at all**, so every
@@ -2738,14 +2735,14 @@ implementation, and adds two station-signed record kinds
      one ADR should switch *both* governance and ledger to the configured key at once.)
   4. **The log-head freshness / stale-signature witness** that ADR-0027 defers is
      unchanged: pinning proves *who* signed, not that the signer's view was fresh.
-- *Gossip ingest bypasses the front door — CLOSED (T2.11.4, ADR-0020 §7
+- *Gossip ingest bypasses the front door — CLOSED (ADR-0020 §7
   Clarification).* Previously `do_append_entries` (the gossip pull path) admitted
   any signature-valid record via `append_raw` with no front-door gate — so a
   member `emergency_cosign` couriered to a hostile peer instead of the station
   could reach the writer's log *markerless*, bypassing eligibility, the
-  duplicate-co-sign guard, and the D3 checks. T2.8.3 had already de-fanged the one
+  duplicate-co-sign guard, and the D3 checks. The activation work had already de-fanged the one
   activation consequence (a markerless crossing is not activatable, ADR-0027 D1b).
-  T2.11.4 closes the general bypass by role: the community's **writer never
+  The writer/replica split closes the general bypass by role: the community's **writer never
   pulls** (it runs no gossip client and refuses to start with a peer list, so no
   gossiped record — governance or otherwise — can reach the writer's chain at
   all; `do_append_entries` also refuses on a writer as defence in depth), and a
@@ -2767,9 +2764,9 @@ pocket and onto a consumer OS, which is a materially different environment from
 the station's. Two surfaces matter: the device itself, and the link from the
 device to the station.
 
-> The subsections below were written as the mobile milestones landed (M1.1
-> crypto/FFI, M1.2 auth/UI, M1.3 transport and pairing, M1.4 vouching, M2.4 DTN
-> and certificates). Each states whether its mitigations are **shipped** or
+> The subsections below were written as the mobile milestones landed:
+> crypto/FFI, auth/UI, transport and pairing, vouching, and DTN
+> and certificates. Each states whether its mitigations are **shipped** or
 > **planned** as of its milestone; the client code lives in the sibling
 > `mobile` repository and is verified there (see the note at the top of this
 > document). The station-side halves — the sealed channel, `rrn-mobile-ffi`,
@@ -2781,7 +2778,7 @@ device to the station.
 passphrase; the integrity of the app doing the signing.
 
 - **Device theft.** *Threat:* the phone is stolen and the thief tries to extract
-  or use the key. *Planned mitigation (M1.1/M1.2):* the key is held in the OS
+  or use the key. *Planned mitigation:* the key is held in the OS
   secure store (iOS Keychain / Android Keystore), gated behind the device
   biometric/passcode, and the wallet is encrypted at rest (argon2id +
   XChaCha20-Poly1305, the same scheme `rrn-identity` uses on the station); a lost
@@ -2794,20 +2791,20 @@ passphrase; the integrity of the app doing the signing.
   device-trust assumption (carried from Phase 0), a compromised OS is *outside*
   the trust boundary — app-level controls cannot defend against it.
 - **OS-level key extraction.** *Threat:* the secret key is lifted out of secure
-  storage. *Planned mitigation (M1.1):* prefer hardware-backed, non-exportable
+  storage. *Planned mitigation:* prefer hardware-backed, non-exportable
   keys (Secure Enclave / StrongBox) where possible. *Residual risk / open design
   question:* our Rust crypto (via uniffi, [ADR-0007](adr/0007-rust-mobile-ffi-uniffi.md))
   must *use* the signing key, so it may not be able to live as a non-exportable
-  hardware key. M1.1 must resolve this — likely a hardware-backed wrapping key
+  hardware key. The FFI work must resolve this — likely a hardware-backed wrapping key
   that protects an exportable signing key — and the residual extraction risk
   depends on that resolution. Flagged, not yet settled.
 - **Shoulder surfing during passphrase entry.** *Threat:* an observer reads the
-  passphrase as it is typed. *Planned mitigation (M1.2):* secure (non-echoing)
+  passphrase as it is typed. *Planned mitigation:* secure (non-echoing)
   text entry, with biometric unlock as the default so the passphrase is seldom
   typed at all. *Residual risk:* direct physical observation is reduced, not
   eliminated.
 - **Biometric spoofing.** *Threat:* a fake fingerprint or face defeats the
-  unlock. *Planned mitigation (M1.2):* rely on the platform's biometric liveness
+  unlock. *Planned mitigation:* rely on the platform's biometric liveness
   (Face ID / Touch ID / BiometricPrompt); the biometric only *gates access* to
   the key store, it is not itself the key. *Residual risk:* the platform
   biometric's strength is the ceiling — a defeated biometric equals device
@@ -2815,7 +2812,7 @@ passphrase; the integrity of the app doing the signing.
 
 ### `mobile/src/crypto/SecureStore`
 
-*Implemented in M1.1 (T1.1.2).* The one API through which the mobile app writes
+*Implemented in the mobile FFI.* The one API through which the mobile app writes
 sensitive bytes — foremost the wallet secret — to OS-backed storage. A single TS
 interface (`save`/`load`/`delete`/`has`) over `react-native-keychain`, with
 per-platform hardening. This subsection makes concrete the "secure store"
@@ -2838,7 +2835,7 @@ their retrieval.
 - **Layered with passphrase encryption.** *Threat:* an attacker who extracts the
   stored bytes (see *OS-level key extraction* above) obtains the secret. *Mitigation:*
   double protection — the wallet secret is passphrase-encrypted (argon2id +
-  XChaCha20-Poly1305, the `.rrnwallet` format, T1.1.5) *before* it is written
+  XChaCha20-Poly1305, the `.rrnwallet` format) *before* it is written
   here, so Keychain/Keystore extraction yields ciphertext, not the key.
   SecureStore's job is OS-level isolation and biometric gating; confidentiality
   of the secret does not rest on it alone. *Residual risk:* a weak user passphrase
@@ -2859,7 +2856,7 @@ their retrieval.
   it holds only as ciphertext-at-rest, not against a keylogger capturing the
   passphrase on the same compromised OS. *Residual risk:* accepted and
   documented; app-level controls cannot defend a rooted device. Runtime
-  jailbreak/root *detection* is out of scope for M1.1 (deferred to hardening).
+  jailbreak/root *detection* is out of scope for the mobile FFI (deferred to hardening).
 - **Data lifetime.** Modern iOS/Android wipe keychain/keystore entries on app
   uninstall, so secrets do not survive removal of the app; and device-only
   accessibility keeps them off backups/other devices. *Residual risk:* none
@@ -2868,7 +2865,7 @@ their retrieval.
 
 ### `mobile` crypto FFI surface (`rrn-mobile-ffi`, wallet file)
 
-*Implemented in M1.1 (T1.1.3–T1.1.7).* The mobile app performs **no**
+*Implemented in the mobile FFI.* The mobile app performs **no**
 cryptography of its own: address parsing, signing, Blake3 hashing, the
 `.rrnwallet` file format, and canonical-dCBOR signed payloads all cross into the
 pure-Rust `rrn-crypto` / `rrn-identity` code through a single, narrow uniffi
@@ -2898,19 +2895,19 @@ station agree byte-for-byte on addresses, signatures, and wallet files.
   *Mitigation:* there is exactly one implementation (Rust), reached from both
   sides; mobile carries no parallel codec. The agreement is locked by committed
   cross-platform fixtures generated by the station and consumed by mobile CI —
-  `cross_platform_address.json` (T1.1.3), `cross_platform_sign.json` (T1.1.4,
-  byte-identical signatures), `cross_platform_wallet.json` (T1.1.5, each
+  `cross_platform_address.json`, `cross_platform_sign.json`
+  (byte-identical signatures), `cross_platform_wallet.json` (each
   station-sealed `.rrnwallet` decrypts to its recorded identity), the
-  consolidated `ffi_invariants.json` (T1.1.6, incl. Blake3 hash determinism), and
-  `cross_platform_canonical.json` + `cross_platform_signed_payload.json` (T1.1.7,
-  canonical dCBOR and a `SignedPayload<TransactionProposal>` that signs to
+  consolidated `ffi_invariants.json` (incl. Blake3 hash determinism), and
+  `cross_platform_canonical.json` + `cross_platform_signed_payload.json`
+  (canonical dCBOR and a `SignedPayload<TransactionProposal>` that signs to
   byte-identical bytes). *Residual risk:* the fixtures cover the invariants
-  enumerated, not the entire input space; the Rust property tests (T1.1.6) widen
+  enumerated, not the entire input space; the Rust property tests widen
   that coverage.
 - **Signed-payload canonicalization is Rust's, not a mobile encoder.** *Threat:*
   the same logical payload canonicalizes to *different* bytes on mobile than on
   the station, so a mobile-signed message is rejected — or, worse, two distinct
-  values collide to one signature. *Mitigation:* `canonical_bytes` (T1.1.7) takes
+  values collide to one signature. *Mitigation:* `canonical_bytes` takes
   a **tagged value model** as transport JSON and re-encodes it with the one dCBOR
   encoder in Rust; the JSON is never itself the signed form. The tagged model
   carries what plain JSON cannot — byte strings (addresses/hashes/keys) and exact
@@ -2951,9 +2948,9 @@ station agree byte-for-byte on addresses, signatures, and wallet files.
   pending the RN-wrapper build (ADR-0007 accepted risk); until then the wrappers
   are exercised against Rust-generated fixtures, not the live native module.
 
-### `mobile` DTN + certificate FFI surface (`rrn-mobile-ffi`, M2.4)
+### `mobile` DTN + certificate FFI surface (`rrn-mobile-ffi`)
 
-*Implemented in M2.4 (T2.4.2).* Extends the crypto FFI above with the primitives
+*Implemented in the mobile DTN FFI.* Extends the crypto FFI above with the primitives
 the app needs to participate in delay-tolerant submission (ADR-0020) and escrowed
 offline spending (ADR-0021) while partitioned: build and carry its own outbox
 chain, assemble/inspect bundles, read station delivery receipts, hold and read
@@ -3008,8 +3005,7 @@ carried through the DTN/cert signers.
   spender withholds earlier cert spends from a new receiver, so `offline_spend_verify`
   returns `Ok` for a spend that the station will ultimately refuse as an overspend.
   *Mitigation:* this is accepted by design — the cap bounds the community's loss and
-  the overspend is provable equivocation the station refuses and records
-  (T2.3.2/T2.3.3); the FFI's `Ok` is explicitly documented as "verifies against
+  the overspend is provable equivocation the station refuses and records; the FFI's `Ok` is explicitly documented as "verifies against
   *presented* history", not "will be admitted". A receiver who needs more can demand
   the spender's outbox-chain segment since issuance, where a suppressed entry shows
   as a gap. *Residual risk:* the once-per-member deliberate burn ADR-0021 §6 prices
@@ -3041,9 +3037,9 @@ carried through the DTN/cert signers.
   into the binary; noted, and revisited if a lighter split of the ledger types is
   warranted.
 
-### `mobile` social-recovery UI surface (M1.2)
+### `mobile` social-recovery UI surface
 
-*Implemented in M1.2 (T1.2.3).* The wallet UI for Shamir social recovery
+*Implemented in the mobile app.* The wallet UI for Shamir social recovery
 ([ADR-0004](adr/0004-own-shamir-implementation.md)): the owner splits their key
 across a circle of holders and hands each a sealed shard (`ChooseHolders` →
 `RecoverySplit` → `DistributeShards`), and a holder receives a shard sent to them
@@ -3136,10 +3132,10 @@ mobile's Ed25519 identity key, framed with that signature, then **sealed** to th
 station's public key (anonymous X25519→blake3→XChaCha20-Poly1305 box, the same
 `rrn-identity::sealed` construction recovery uses). The station opens it, and the
 mitigations below are what the shipped `rpc_envelope` / `core::do_rpc_request`
-pipeline enforces (T1.3.4).
+pipeline enforces.
 
 - **MITM on the local network.** *Threat:* an attacker on the same LAN intercepts
-  or alters traffic between mobile and station. *Mitigation (shipped, T1.3.4):*
+  or alters traffic between mobile and station. *Mitigation (shipped):*
   every request carries the mobile's signature over the exact payload bytes, so
   any tampering fails verification regardless of the channel; and the payload is
   sealed to the station's key, so a snooper reads only ciphertext. TLS is
@@ -3147,7 +3143,7 @@ pipeline enforces (T1.3.4).
   survives store-and-forward carriers TLS cannot (ADR-0008). *Residual risk:*
   traffic-analysis metadata (below), and any exposure before pairing completes.
 - **Replay.** *Threat:* a captured sealed request is replayed to repeat its
-  effect. *Mitigation (shipped, T1.3.4):* **two independent nonces** apply. The
+  effect. *Mitigation (shipped):* **two independent nonces** apply. The
   channel enforces a **per-mobile monotonic transport nonce**, persisted in
   `paired_mobiles.json` (`PairedMobiles::accept_nonce`) and checked before
   dispatch, plus a ±5-minute timestamp-skew bound (`TIMESTAMP_SKEW_SECS`) — a
@@ -3160,7 +3156,7 @@ pipeline enforces (T1.3.4).
   never reached the ledger is simply refused on retry (the mobile skips to the
   next nonce).
 - **Station impersonation.** *Threat:* a rogue host poses as the member's paired
-  station. *Mitigation (shipped, T1.3.3/T1.3.4):* the request is sealed to the
+  station. *Mitigation (shipped):* the request is sealed to the
   paired station's public key, so only the real station can open it; the
   `recipient` key is **bound inside the mobile's signature**, so a station cannot
   peel a signed request out of its envelope and re-seal it to a third party; and
@@ -3169,7 +3165,7 @@ pipeline enforces (T1.3.4).
   pairing was made.
 - **Signer impersonation / unpaired access.** *Threat:* a device that is not the
   member — an unpaired key, or one paired mobile trying to act as another —
-  submits requests. *Mitigation (shipped, T1.3.4):* the station authorizes on the
+  submits requests. *Mitigation (shipped):* the station authorizes on the
   `signer` recovered from the verified signature: it must be in
   `paired_mobiles`, and because `signer` is inside the signed bytes a mobile
   cannot claim another's identity. Write methods additionally bind the *submitter*
@@ -3180,14 +3176,13 @@ pipeline enforces (T1.3.4).
 - **Paired-mobile compromise.** *Threat:* an attacker obtains a member's unlocked
   device or identity key and acts as that member until noticed. *Mitigation
   (shipped):* the mobile holds the key sealed at rest (passphrase + keychain) and
-  the app gates on a lock screen that drops the unlocked wallet when backgrounded
-  (T1.3.4), narrowing the window; either side can revoke the bond at any time
+  the app gates on a lock screen that drops the unlocked wallet when backgrounded, narrowing the window; either side can revoke the bond at any time
   (operator `station unpair <address>`, or the mobile from Settings), after which
   the next request is rejected as unpaired. *Residual risk:* actions taken with a
   live key before revocation stand — this is the inherent limit of a bearer key,
   the same as any self-custody wallet.
 - **Envelope confidentiality / traffic analysis.** *Threat:* an observer learns
-  content or metadata from the link. *Mitigation (shipped, T1.3.4):* the sealed
+  content or metadata from the link. *Mitigation (shipped):* the sealed
   box keeps request and response *contents* confidential to the two endpoints on
   plain HTTP. *Residual risk (accepted):* the seal has **no forward secrecy** —
   it uses the station's long-term key, so a future compromise of that secret
@@ -3198,7 +3193,7 @@ pipeline enforces (T1.3.4).
   is out of scope.
 - **Pairing-time TOFU.** *Threat:* pairing is trust-on-first-use, so an attacker
   present at the *first* contact can interpose and become the "trusted" station.
-  *Mitigation (shipped, T1.3.3):* an out-of-band **short authentication string** —
+  *Mitigation (shipped):* an out-of-band **short authentication string** —
   an 8-hex code derived from *both* static public keys (`blake3(tag ‖ station_pk
   ‖ mobile_pk)`), displayed by the station operator (`station pair-mobile`) and on
   the mobile, which a human compares in person. A man-in-the-middle would have to
@@ -3208,7 +3203,7 @@ pipeline enforces (T1.3.4).
   only as safe as the pairing environment; this remains a user-facing risk.
 - **Push updates over the long-poll (`/subscribe`).** *Threat:* the push channel
   could leak a member's events to an eavesdropper, deliver a forged event, or be
-  used to exhaust the station. *Mitigation (shipped, T1.3.5):* `/subscribe` reuses
+  used to exhaust the station. *Mitigation (shipped):* `/subscribe` reuses
   the **same sealed, signed envelope** as `/rpc` — authenticated by the mobile's
   key, sealed to the station, replay-bound by the same per-request transport
   nonce, skew-checked, and gated on the paired list — so all of the MITM, replay,
@@ -3226,12 +3221,12 @@ pipeline enforces (T1.3.4).
   the paired-member set (an unpaired key cannot authenticate to open one at all).
   A per-mobile single-flight/connection cap is the named hardening if this
   matters at scale.
-- **Background-sync signing credential (mobile, T1.3.6).** *Threat:* draining
+- **Background-sync signing credential (mobile).** *Threat:* draining
   `/subscribe` while the app is backgrounded or killed needs the mobile's signing
   key, but the normal model keeps the key only in memory after a passphrase
   unlock and drops it on background — a headless task has no unlocked wallet.
   Making the key usable in the background is inherently a weakening of that
-  posture. *Mitigation (shipped, T1.3.6):* the capability is **opt-in and
+  posture. *Mitigation (shipped):* the capability is **opt-in and
   default-off**; nothing is provisioned unless the user turns on Background sync.
   When they do, the wallet is re-encrypted under a fresh random secret and the
   blob + secret are stored at **device-unlock accessibility** (`WHEN_UNLOCKED_
@@ -3249,10 +3244,10 @@ pipeline enforces (T1.3.4).
 
 ### DTN bundle ingest (station, ADR-0020)
 
-*Implemented in T2.2.3.* The station is the **DTN admission point**: it accepts a
+*Implemented in the station ingest path.* The station is the **DTN admission point**: it accepts a
 [`Bundle`](spec/) of signed outbox entries from any carrier — an operator over
 the Unix socket (`bundle_submit`), a paired mobile courier over the sealed
-`/rpc` channel (`bundle_submit`, T2.4.2 FFI later) — validates each entry, tracks
+`/rpc` channel (`bundle_submit`, mobile FFI later) — validates each entry, tracks
 each author's chain (fork/gap), routes each embedded record through the **same**
 engine front door the live path uses, and answers with one station-signed
 [`DeliveryReceipt`](spec/). Admission order is arrival order; no claimed timestamp
@@ -3294,7 +3289,7 @@ availability of the single-threaded core.
 - *Mitigation:* the station records each `(author, position)` it sees. A second
   validly-signed entry at a seen position with **different** content is an outbox
   fork: the later side is refused `outbox-fork` and both envelopes are persisted
-  verbatim to `outbox_forks` as the equivocation evidence T2.3.3 consumes; the
+  verbatim to `outbox_forks` as the equivocation evidence the record assembly consumes; the
   bundle continues. A **gap** (a position beyond the contiguous head) does not
   refuse the entry — couriers legitimately carry partial chains (ADR-0020 §2) —
   but the contiguous head does not advance past the gap, so a suppressed entry
@@ -3344,7 +3339,7 @@ availability of the single-threaded core.
 #### Elevation of privilege — the Tier-2 confirmation staking gate
 
 - *Threat:* a Tier-2 confirmation carried over DTN could bypass the reputation-
-  band **staking eligibility gate** (T1.8.2) that governs who may confirm a
+  band **staking eligibility gate** that governs who may confirm a
   Tier-2 payment once bootstrap grace has ended — the gate historically lived in
   the channel/operator handler, not in the engine front door the DTN path shares,
   so an ineligible confirmer could have used DTN as a way around it.
@@ -3358,9 +3353,9 @@ availability of the single-threaded core.
   admission (signature, state, debt floor, expiry) applies to DTN confirmations
   as well. Covered by `dtn_tier2_confirmation_is_held_to_the_staking_bar`.
 
-#### Receipt pickup and relay (T2.2.4)
+#### Receipt pickup and relay
 
-*Implemented in T2.2.4.* The outbound half of the DTN loop (ADR-0020 §3:
+*Implemented in the receipt-relay path.* The outbound half of the DTN loop (ADR-0020 §3:
 "receipts travel back by the same carriers"). Once a bundle is ingested, the
 station queues one **receipt-delivery** row per reported record
 (`receipt_deliveries`, migration 0007), keyed by record hash and pointing at the
@@ -3436,9 +3431,9 @@ receipt discloses.
   reconstructible from the log — no integrity loss, only the accepted risk that a
   receipt an author wrongly confirmed is reclaimed early and must be re-derived.
 
-### Paper credential layer (station + CLI, T2.5.2)
+### Paper credential layer (station + CLI)
 
-*Implemented in T2.5.2.* The operator/courier side of the Class-4 paper fallback:
+*Implemented in the paper CLI.* The operator/courier side of the Class-4 paper fallback:
 the `rrn paper` command family turns station-held payloads into printable QR
 sheets (`export-receipts`, `cert`, `credential`, `render`) and turns scanned QR
 *text* back into ingested bundles (`ingest`), with an offline inspection path
@@ -3517,14 +3512,14 @@ backlog.
 
 ### Reticulum transport sidecar (station, ADR-0013 / ADR-0026)
 
-*Supervisor implemented in T2.6.1; the `FrameTransport` wiring over it is T2.6.2;
-the RNode/LoRa radio interface config + field-acceptance tooling is T2.6.3.* The station may run the Python Reticulum daemon
+*Supervisor implemented in the sidecar work; the `FrameTransport` wiring over it is the transport work;
+the RNode/LoRa radio interface config + field-acceptance tooling is the LoRa bring-up work.* The station may run the Python Reticulum daemon
 (`rnsd`) as an **external, supervised, version-pinned OS service** to carry
 federation and collapse-mode traffic (ADR-0013). It is off by default
 (`[sidecar] enabled = false`); when on, `rrn-station::sidecar` runs it as an
 appliance-style managed child — version-pinned, output captured to `tracing`,
 restarted with backoff, killed cleanly (SIGTERM→SIGKILL) on shutdown — and mirrors
-its posture into the `status` connectivity block (T2.4.1). The foundational
+its posture into the `status` connectivity block. The foundational
 property, restated so nothing downstream forgets it: **Reticulum is a dumb
 carrier**. It moves opaque bytes that are already sealed and signed at the app
 layer (ADR-0002/0008/0020); it is never the identity, integrity, or encryption
@@ -3599,7 +3594,7 @@ now runs a second, unaudited runtime and process.
   HMAC) is treated as a *bonus* layer only; the confidentiality guarantee is the
   app-layer XChaCha20-Poly1305 seal, never Reticulum's unaudited crypto.
 
-#### The physical radio interface — spectrum misuse and RF exposure (T2.6.3)
+#### The physical radio interface — spectrum misuse and RF exposure
 
 - *Threat:* enabling a LoRa radio adds a physical **RF transmit** surface the earlier
   TCP-only carrier never had. Misconfiguration can transmit on an illegal frequency
@@ -3634,10 +3629,10 @@ to any system that *uses* it; an operator who enables the sidecar runs
 field-restricted software. This is documented for operators, not resolved in code;
 see ADR-0026.
 
-### DTN transport over a constrained carrier (station, T2.6.2/T2.6.4, ADR-0013/0026)
+### DTN transport over a constrained carrier (station, ADR-0013/0026)
 
-*Inbound carriage implemented in T2.6.2; outbound origination + receipt
-correlation + the binding directory in T2.6.4.* The `DtnSyncer` moves bundles and receipts over any
+*Inbound carriage implemented in the transport work; outbound origination + receipt
+correlation + the binding directory in the outbound work.* The `DtnSyncer` moves bundles and receipts over any
 `FrameTransport` — the Reticulum sidecar via a supervised Python LXMF adapter
 (`rrn-station::reticulum`) in production — pacing outbound frames through a
 token-bucket airtime budgeter and reassembling inbound ones, with a small
@@ -3661,7 +3656,7 @@ correctness of identity→destination routing.
   request-missing at worst causes a redundant resend (deduped, and paced as
   economic overhead). A forged `ack` makes the sender drop its retransmit cache;
   the residual is that a carrier-level forger can **deny delivery** of that one
-  payload (a subsequent request goes unanswered) until app-level tracking (T2.2.4)
+  payload (a subsequent request goes unanswered) until app-level tracking
   re-bundles it — a connectivity event, not a forgery. Neither control frame can
   forge, alter, or misattribute a **record**, because a record's integrity is its
   own signature, re-verified at the ingest front door. A `TransportBinding` is
@@ -3670,7 +3665,7 @@ correctness of identity→destination routing.
   destination, and redirecting to a wrong destination only *denies* delivery — the
   misrouted bundle is still sealed/signed and cannot be read or forged by whoever
   receives it. (The daemon wiring that appends and reads bindings from the log
-  landed in **T2.6.4**: a `rrn.net.binding` is admitted through the same DTN front
+  landed with the **outbound origination work**: a `rrn.net.binding` is admitted through the same DTN front
   door as any record — self-signed by the bound identity, else a per-record
   `Rejected` refusal — and the routing directory is derived by log replay,
   keeping per address the binding with the highest `issued_at` (log order breaking
@@ -3679,7 +3674,7 @@ correctness of identity→destination routing.
   ADR-0022's trust model while still surviving a stale binding arriving late by
   courier after a fresh one.)
 
-#### Outbound origination and receipt correlation (T2.6.4)
+#### Outbound origination and receipt correlation
 
 - *Threat:* a malicious carrier **replays or forges a delivery receipt** to make a
   sender believe an undelivered economic bundle landed, so the sender stops
@@ -3727,10 +3722,10 @@ correctness of identity→destination routing.
   not swallowed), while bulk yields (oldest-dropped, starvable) *by design*.
   Reticulum's own control traffic is external load that shares the channel; it is
   budgeted as bulk-class pressure, and **measuring its real announce cost on a
-  live LoRa link is a T2.6.3 field-test TODO** (the number here is a design
+  live LoRa link is a field-test TODO** (the number here is a design
   estimate). Radio jamming is an availability residual with no transport-layer
   fix: the mitigation is the lower rung of the degradation ladder — **paper
-  fallback** (T2.5.x), which no jammer reaches.
+  fallback** (paper), which no jammer reaches.
 
 #### Residual — starvation and metadata
 
@@ -3751,10 +3746,10 @@ correctness of identity→destination routing.
   rest of the data directory. Losing it to a seizure costs a signed re-bind
   ("bind, do not collapse"), never identity recovery.
 
-### SMS as a DTN carrier (station, T2.7.1)
+### SMS as a DTN carrier (station)
 
-*Implemented in T2.7.1 (the codec, seam, relay engine, and daemon bridge; the real
-modem/gateway backend is T2.7.2).* A paired phone with cellular text but no data
+*Implemented (the codec, seam, relay engine, and daemon bridge; the real
+modem/gateway backend is a future gateway task).* A paired phone with cellular text but no data
 encodes its outbox into GSM-7-safe `rrnp:` chunks (`rrn_protocol::paper`, sized to
 `[sms] max_parts_per_message`) and texts them to the station's number; the
 `rrn_station::sms::SmsRelay` reassembles per sender, ingests each completed bundle
@@ -3831,9 +3826,9 @@ custodial keys) is **explicitly not built**: it would break the keys-stay-with-
 members principle (ADR-0006). There is no command parser; SMS carries only
 already-signed payloads. Adding custody is a new-ADR decision, not a code change.
 
-### Vouching surface (M1.4)
+### Vouching surface
 
-*Implemented in M1.4 (T1.4.1–T1.4.5).* The in-person vouch flow and its
+*Implemented in the vouching work.* The in-person vouch flow and its
 persistent record: a member scans (or pastes) another member's address, signs a
 vouch attestation on-device, and submits it over the authenticated channel; the
 station appends it and pushes a `vouch_received` event to the subject; both
@@ -3842,7 +3837,7 @@ a vouch is the `rrn-identity::vouch` attestation from Phase 0 — but it adds ne
 *surfaces*: an in-person QR handoff, a mobile-signed write, a directional push,
 member-scoped reads, and a device-only nickname. The attestation's own
 authenticity guarantees are the `rrn-identity` *Spoofing/Tampering* entries
-above; this section covers what M1.4 wraps around them.
+above; this section covers what the vouching work wraps around them.
 
 **Assets:** the authenticity of a vouch (that it was issued by the named voucher,
 about the intended subject); the confidentiality of the vouch social graph (who
@@ -3851,7 +3846,7 @@ label for a person; the correctness of the community a vouch is stamped into.
 
 - **Vouching as someone else (spoofing).** *Threat:* a device submits a vouch
   attributed to another member, or relays a vouch signed by a third party.
-  *Mitigation (shipped, T1.4.3):* a vouch is an `rrn-crypto::SignedPayload` built
+  *Mitigation (shipped):* a vouch is an `rrn-crypto::SignedPayload` built
   and signed on the voucher's device (`mobile/src/wallet/vouch.ts::createSignedVouch`,
   canonical dCBOR through the one Rust encoder — there is no per-domain vouch FFI);
   the station's `channel_submit_vouch` (`rrn-station::core`) binds the *submitter*
@@ -3860,11 +3855,11 @@ label for a person; the correctness of the community a vouch is stamped into.
   voucher nor relay someone else's vouch. *Residual risk:* a valid signature proves
   authorship, not trustworthiness — a real-but-malicious member (or a Sybil cluster
   of mutually-vouching keys) issues cryptographically-sound vouches; content trust
-  is `rrn-reputation`'s job (M1.5), see [No Sybil resistance](#known-limitations).
+  is `rrn-reputation`'s job, see [No Sybil resistance](#known-limitations).
 - **Vouching for the wrong subject (handoff substitution).** *Threat:* an attacker
   interposes on the in-person handoff — a swapped QR, a look-alike address — so the
-  member unknowingly stakes their word on the attacker's key. *Mitigation (shipped,
-  T1.4.1/T1.4.2):* the flow is in-person and the review step shows the subject
+  member unknowingly stakes their word on the attacker's key. *Mitigation (shipped):*
+  the flow is in-person and the review step shows the subject
   address (and identicon) before the single signing tap; the address QR is parsed
   by `parseAddressQr`, and any nickname carried in the `rrn:address?…&n=` form is
   treated as a **display hint only, never trusted** (pre-filled but editable);
@@ -3883,7 +3878,7 @@ label for a person; the correctness of the community a vouch is stamped into.
   fails there too ([Mobile–station transport](#mobilestation-transport)).
 - **Disclosing the vouch social graph.** *Threat:* the read and push surfaces let
   one member enumerate *others'* vouch relationships — a privacy-sensitive social
-  graph. *Mitigation (shipped, T1.4.1/T1.4.4/T1.4.5):* the reads are **member-scoped
+  graph. *Mitigation (shipped):* the reads are **member-scoped
   to the authenticated signer** — `list_vouches` / `vouch_counts`
   (`member_vouches` / `member_vouch_counts`) take no address param and only ever
   return the caller's own given/received vouches — and the push is **directional**:
@@ -3893,7 +3888,7 @@ label for a person; the correctness of the community a vouch is stamped into.
   *Residual risk:* the vouch records (voucher, subject, statement, stake) are
   plaintext in the station log like all other log content — exposed to a local
   attacker or seized station media, the accepted whole-DB-plaintext limitation.
-  *Residual risk (T1.7.0 — narrows the member-scoping claim above):* the
+  *Residual risk (narrows the member-scoping claim above):* the
   `marketplace_listing` detail view returns `provider_vouches_received`, a *count*
   of vouches naming another member, so that a buyer weighing an offer can see
   whether the provider is socially attested. It is deliberately a scalar and not a
@@ -3905,7 +3900,7 @@ label for a person; the correctness of the community a vouch is stamped into.
   `vouch_counts`, not to every vouch-derived number on the surface.
 - **The private nickname stays private.** *Threat:* the human label a voucher types
   for a subject leaks to the subject, or federates to other stations along with the
-  vouch. *Mitigation (shipped, T1.4.5):* the nickname is **deliberately not part of
+  vouch. *Mitigation (shipped):* the nickname is **deliberately not part of
   the signed attestation** — it is persisted device-only
   (`mobile/src/wallet/vouchNicknames.ts`, `SecureStoreKeys.VOUCH_NICKNAMES`), keyed
   by subject address, as a display hint for the voucher's own browser. Because it
@@ -3927,12 +3922,12 @@ label for a person; the correctness of the community a vouch is stamped into.
   planned), and the append-only log grows unbounded (shared Phase-0 limitation).
 - **Manufacturing standing via vouches (elevation of privilege).** *Threat:*
   colluding identities vouch for each other to mint reputation or membership
-  standing. *Mitigation:* a vouch grants **no authority on its own** in M1.4 —
+  standing. *Mitigation:* a vouch grants **no authority on its own** —
   `reputation_stake_centi` is recorded but deliberately **not enforced** (there is
-  no reputation system until M1.5), and the `community` a vouch is stamped into is
+  no reputation system yet), and the `community` a vouch is stamped into is
   read from the station's `whoami` at vouch time (authoritative), not chosen by the
   phone. Reputation weighting by vouch-graph position, counterparty diversity, and
-  time decay is the *planned* `rrn-reputation` mitigation (M1.5), consistent with the
+  time decay is the *planned* `rrn-reputation` mitigation, consistent with the
   `rrn-reputation` *Attestation farming* entry above. *Residual risk:* Sybil clusters
   of mutually-vouching keys are cryptographically valid — [No Sybil
   resistance](#known-limitations); their standing is bounded only once reputation
@@ -3940,8 +3935,8 @@ label for a person; the correctness of the community a vouch is stamped into.
 
 Vouches are only ever created in the interactive foreground flow — there is no
 background vouch path — so the opt-in background-signing credential
-([Mobile–station transport](#mobilestation-transport), T1.3.6) does not sign
-vouches; its residual risk is unchanged by M1.4.
+([Mobile–station transport](#mobilestation-transport)) does not sign
+vouches; its residual risk is unchanged by the vouching work.
 
 ### Encrypted at-rest storage and the boot ceremony (station, ADR-0024)
 
@@ -4163,9 +4158,9 @@ picture; the boundaries that now exist, each analyzed in its own section:
 |---|---|---|---|
 | Mobile ↔ station (`/rpc`, `/subscribe`, plain HTTP on the LAN) | a sealed, signed dCBOR envelope | the mobile's signature + the pairing bond; sealed to the station key | [Mobile–station transport](#mobilestation-transport) |
 | DTN bundle ingest (`bundle_submit` over the operator socket, the mobile channel, Reticulum, SMS, or paper) | an unsigned bundle of signed outbox entries | `outbox::validate` per entry, then the engine front door | [DTN bundle ingest](#dtn-bundle-ingest-station-adr-0020) |
-| Reticulum: `rnsd` sidecar + LXMF adapter co-process (length-prefixed pipe) | opaque frames | nothing — a dumb carrier; framing CRC/Blake3 then the signatures inside | [Reticulum transport sidecar](#reticulum-transport-sidecar-station-adr-0013--adr-0026), [DTN transport over a constrained carrier](#dtn-transport-over-a-constrained-carrier-station-t262t264-adr-00130026) |
-| SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station-t271) |
-| Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli-t252) |
+| Reticulum: `rnsd` sidecar + LXMF adapter co-process (length-prefixed pipe) | opaque frames | nothing — a dumb carrier; framing CRC/Blake3 then the signatures inside | [Reticulum transport sidecar](#reticulum-transport-sidecar-station-adr-0013--adr-0026), [DTN transport over a constrained carrier](#dtn-transport-over-a-constrained-carrier-station-adr-00130026) |
+| SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station) |
+| Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli) |
 | Gossip peer TCP — **replica-only pull** (`[network] role`; a writer never pulls and takes no peers; loopback by default, no peers in the pilot) | line-JSON `WireEntry` | signature + content hash in `append_raw`; a **replica** re-derives but admits nothing, and the **writer** never reads this boundary at all (ADR-0020 §7 Clarification) | [`rrn-station`](#rrn-station--rrn-cli) |
 | Encrypted volume: `sudo -n` mount helper, the console unlock ceremony | holders' pasted `rrnrecover-resp:` lines | the console fingerprint, then the reconstructed VMK's address | [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) |
 
@@ -4223,7 +4218,7 @@ entry citing its ADR or the section that owns it.
   identity anchoring stop a lone fake identity, but a *pair* of colluding
   identities can trade with each other to raise the uncapped composites that
   qualify them to anchor each other (see [Sybil clusters and manufactured
-  standing](#sybil-clusters-and-manufactured-standing-m15)). Statistical graph
+  standing](#sybil-clusters-and-manufactured-standing)). Statistical graph
   analysis is Phase 3.
 - **Governance has no spam bound, no ballot secrecy, and a capturable bootstrap
   electorate.** Nothing rate-limits proposals from a standing member; the
@@ -4240,9 +4235,8 @@ entry citing its ADR or the section that owns it.
   own activation. (Both charter doors — amendment *and* replacement founder
   charter — are now frozen at admission during an emergency; ADR-0023 §3(b) is
   met. The gossip front-door bypass that once let a gossiped record skip these
-  checks is closed by the writer/replica role split — T2.11.4, ADR-0020 §7.)
-- **The gossip front-door bypass is closed; a replica is a role, not a bypass
-  (T2.11.4).** A station is now a **writer** (owns the chain, never pulls, refuses
+  checks is closed by the writer/replica role split — ADR-0020 §7.)
+- **The gossip front-door bypass is closed; a replica is a role, not a bypass.** A station is now a **writer** (owns the chain, never pulls, refuses
   to start with peers) or a **read-replica** (pulls a copy, admits nothing —
   every write surface refuses, and the admitting sweep timers do not run). So a
   gossiped record can no longer reach the *writer's* chain ungated (ADR-0020 §7

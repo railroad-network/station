@@ -12,7 +12,7 @@ Mutual credit runs on negative balances: when you receive value, your balance
 goes down, and that is the system working as designed (Overview §3.1). But
 nothing anywhere bounded *how far* down. The threat model has carried the gap
 since Phase 0 — "**No credit limits / no debt bound.** A sender can settle into
-arbitrary debt" — and Phase 1 shipped M1.11 pilot readiness without closing it.
+arbitrary debt" — and Phase 1 shipped pilot readiness without closing it.
 A design review (2026-08-25) flagged the combination that makes it urgent
 before a real 90-day pilot:
 
@@ -38,7 +38,7 @@ at zero and, in a mutual-credit economy, typically go negative before they go
 positive — cannot participate; too loose and the walk-away subsidy is material.
 Reputation-scaled limits (Overview §5.7, "reputation as collateral") are the
 eventual answer, but they need a reputation input the young community does not
-have and a governance surface (M1.9 statutes) nothing yet wires to
+have and a governance surface (statutes) nothing yet wires to
 configuration.
 
 ## Decision
@@ -90,7 +90,7 @@ Concretely (`rrn-ledger::credit`, enforced by the `Engine` front door):
    claimed optimal.
 5. **The floor is station-configured, community-tuned later.** Like the
    settlement windows (ADR-0011), the floor is an operator config value until
-   M1.9+ governance grows a surface for enacting economic parameters. It is
+   Later governance grows a surface for enacting economic parameters. It is
    deliberately *not* per-member: individual limits are the
    reputation-collateral feature (Overview §5.7), a later milestone.
 
@@ -104,7 +104,7 @@ Concretely (`rrn-ledger::credit`, enforced by the `Engine` front door):
   ceiling; a member can run a realistic few weeks of consumption before
   earning, without touching it.
 - **Residual: the contract-charge path is not floor-checked.** A recurring
-  service contract's per-period `ContractCharge` (T1.7.7) debits the buyer
+  service contract's per-period `ContractCharge` debits the buyer
   directly, station-signed, without passing `submit_proposal`. The buyer did
   sign the *contract*, so the commitment story is coherent, but total contract
   exposure is not counted against the floor and a charge can land a buyer

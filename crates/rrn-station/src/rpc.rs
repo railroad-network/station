@@ -120,7 +120,7 @@ pub struct ProposeParams {
     /// Optional human-readable memo, part of the signed proposal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
-    /// Optional oracle-tier **opt-up** (T1.8.1): the sender asking this payment
+    /// Optional oracle-tier **opt-up**: the sender asking this payment
     /// be held to a higher tier than its amount alone requires. `None` — the
     /// common case — takes the amount's floor. Ignored unless it is a genuine
     /// lift (see `TransactionProposal::with_tier`).
@@ -128,7 +128,7 @@ pub struct ProposeParams {
     pub oracle_tier: Option<u8>,
 }
 
-/// `bundle_submit` params (T2.2.3): a DTN [`Bundle`](rrn_protocol::bundle::Bundle)'s
+/// `bundle_submit` params: a DTN [`Bundle`](rrn_protocol::bundle::Bundle)'s
 /// canonical bytes, hex-encoded — matching the repo convention for byte-carrying
 /// RPC params (see the `_hex` fields on the charter methods).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,7 +145,7 @@ pub struct BundleSubmitResult {
     pub receipt_hex: String,
 }
 
-/// `receipts_fetch` params (T2.2.4, ADR-0020 §3): pick up pending delivery
+/// `receipts_fetch` params (ADR-0020 §3): pick up pending delivery
 /// receipts to carry back. Over the operator/Unix-socket surface this is a
 /// **courier** fetch — it bumps each receipt's fetched count but never confirms
 /// delivery (a courier is not the author).
@@ -173,7 +173,7 @@ pub struct ReceiptsFetchResult {
     pub truncated: bool,
 }
 
-/// `receipts_ack` params (T2.2.4): the operator, acting as the **author** of
+/// `receipts_ack` params: the operator, acting as the **author** of
 /// records on this station's own wallet, confirms it has received the delivery
 /// receipts for the named records — so the retention sweep may reclaim them. The
 /// courier `receipts_fetch` never confirms; this is the operator's author-path
@@ -303,7 +303,7 @@ pub struct RecoverImportResult {
 }
 
 /// `status` result — a live, entirely *derived* snapshot for degradation
-/// legibility (T2.4.1): who this station is, and a `connectivity` block. Nothing
+/// legibility: who this station is, and a `connectivity` block. Nothing
 /// here is cached authoritative state; each field is recomputed at call time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatusResult {
@@ -329,7 +329,7 @@ pub struct StatusResult {
 
 /// The connectivity portion of a [`StatusResult`]: peer reachability, the
 /// mobile-listener state, and pending DTN queue depths — everything an operator
-/// needs to read "am I isolated, and is anything stuck?" at a glance (T2.4.1).
+/// needs to read "am I isolated, and is anything stuck?" at a glance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectivityBlock {
     /// This station's role — `"writer"` (owns the chain, never pulls) or
@@ -354,7 +354,7 @@ pub struct ConnectivityBlock {
     pub mobile_listener_bound: bool,
     /// Outbox entries still awaiting a delivery outcome. This is the *device*
     /// outbox (a wallet's own send queue) — populated by the CLI-wallet path
-    /// (T2.5.2) and the mobile wallet (T2.4.2), not by the daemon itself, so on a
+    /// and the mobile wallet, not by the daemon itself, so on a
     /// station with no local wallet outbox it reads `0`. Included now so the metric
     /// is live the moment those paths land.
     #[serde(default)]
@@ -363,7 +363,7 @@ pub struct ConnectivityBlock {
     /// ack.
     #[serde(default)]
     pub pending_receipts: u64,
-    /// The supervised Reticulum sidecar's posture (T2.6.1, ADR-0013). Defaults to
+    /// The supervised Reticulum sidecar's posture (ADR-0013). Defaults to
     /// `disabled` on a station with no sidecar configured (or a bare test core).
     #[serde(default)]
     pub sidecar: SidecarStatus,
@@ -375,7 +375,7 @@ fn default_role() -> String {
     "writer".to_string()
 }
 
-/// The Reticulum sidecar's state in a [`ConnectivityBlock`] (T2.6.1). Purely
+/// The Reticulum sidecar's state in a [`ConnectivityBlock`]. Purely
 /// derived degradation-legibility state — the sidecar is a dumb carrier
 /// (ADR-0013), so nothing here is signed or authoritative.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -426,7 +426,7 @@ pub struct WhoamiResult {
     /// reads this rather than hardcoding the string so it cannot drift.
     #[serde(default)]
     pub community: String,
-    /// Whether the community is still in Tier-2 **bootstrap grace** (T1.8.6):
+    /// Whether the community is still in Tier-2 **bootstrap grace**:
     /// fewer than [`grace_threshold`](Self::grace_threshold) members have reached
     /// the Member band, so *any* member may confirm a Tier-2 payment without
     /// meeting the standing floor. The mobile shows a persistent banner while this
@@ -448,7 +448,7 @@ pub struct WhoamiResult {
 }
 
 /// `transactions` params — the mobile-facing, member-relative view of the
-/// ledger (T1.3.4). Unlike `history` (operator summary strings), this returns
+/// ledger. Unlike `history` (operator summary strings), this returns
 /// structured rows the wallet UI renders directly.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TransactionsParams {
@@ -461,7 +461,7 @@ pub struct TransactionsParams {
 }
 
 /// One transaction, correlated from its log events and expressed relative to the
-/// querying member (T1.3.4). The station does the stitching; the wallet renders.
+/// querying member. The station does the stitching; the wallet renders.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionRow {
     /// The content-addressed transaction id, hex-encoded.
@@ -478,7 +478,7 @@ pub struct TransactionRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
     /// The marketplace listing this paid for, hex — present on a marketplace
-    /// payment, absent on a direct pay (T1.7.6 Stage B).
+    /// payment, absent on a direct pay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_id: Option<String>,
     /// That listing's title, resolved from the marketplace log so history reads
@@ -487,14 +487,14 @@ pub struct TransactionRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_title: Option<String>,
     /// The headroom certificate this spend drew against, hex — present on a
-    /// cert-backed offline spend (ADR-0021 §3, T2.3.2), absent on an ordinary
+    /// cert-backed offline spend (ADR-0021 §3), absent on an ordinary
     /// proposal. Lets the wallet mark a payment as backed by escrow and gives
-    /// T2.4.2's receiver-side checks a row-level hook.
+    /// the receiver-side checks a row-level hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_id: Option<String>,
     /// Lifecycle: `pending` | `confirmed` | `settled` | `cancelled`.
     pub state: String,
-    /// The oracle tier that governs this transaction (T1.8.1): `1` — settlement
+    /// The oracle tier that governs this transaction: `1` — settlement
     /// window only — or `2` — reputation stake + dispute window. This is the
     /// *effective* tier (amount floor lifted by any opt-up), what the UI shows
     /// and what Tier-2 machinery keys on, not the proposal's raw opt-up field.
@@ -511,8 +511,8 @@ pub struct TransactionRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<i64>,
     /// Unix seconds the settlement window closes — the confirmation's *admission*
-    /// time plus this tier's window (Tier 1 = 24h, Tier 2 = 48h; ADR-0022 §2,
-    /// T1.8.4/T1.8.6), i.e. when the community's ledger learned of the
+    /// time plus this tier's window (Tier 1 = 24h, Tier 2 = 48h; ADR-0022 §2),
+    /// i.e. when the community's ledger learned of the
     /// confirmation, not the receiver-claimed `confirmed_at`. Present once
     /// confirmed, so the wallet can count down to settlement without hardcoding
     /// the window or re-deriving it from the tier. Absent while still pending.
@@ -540,7 +540,7 @@ pub struct NextNonceParams {
     pub address: Option<String>,
 }
 
-// --- marketplace (T1.7.3) ---------------------------------------------------
+// --- marketplace ---------------------------------------------------
 //
 // The operator-facing half of the marketplace. The read methods answer with the
 // same [`crate::marketplace_view`] shapes the mobile channel serves, so a browse
@@ -549,7 +549,7 @@ pub struct NextNonceParams {
 //
 // Writes here are signed by the **station's own wallet**, which on an operator's
 // socket is the operator's identity — the precedent `vouch` and `propose` set.
-// A mobile's marketplace writes are a different path (T1.7.2): the phone holds
+// A mobile's marketplace writes are a different path: the phone holds
 // the key and the station only records what it already signed.
 
 /// `marketplace_search` params — every filter optional, so `{}` is a valid
@@ -629,7 +629,7 @@ pub struct CreateListingParams {
     pub expires_at: Option<i64>,
     /// The cadence of a recurring service: `daily`, `weekly`, or `monthly`.
     /// `None` for a one-off listing. Only a `services` listing may recur, and the
-    /// remaining `recurring_*` fields are read only when this is set (T1.7.7).
+    /// remaining `recurring_*` fields are read only when this is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every: Option<String>,
     /// How many periods a recurring commitment runs for; required with `every`.
@@ -670,7 +670,7 @@ pub struct CloseListingResult {
     pub reason: String,
 }
 
-/// `marketplace_edit_listing` params (T1.7.2 Phase B). Every field but the id is
+/// `marketplace_edit_listing` params. Every field but the id is
 /// optional: an edit patches only what it names, and the current listing supplies
 /// the rest. A listing's identity — surface, category, title, requirements — is
 /// fixed at publication (ADR-0010) and has no field here.
@@ -743,7 +743,7 @@ pub struct MatchesParams {
 /// `marketplace_inquire` params (operator socket) — open an inquiry against a
 /// listing, signed by the station wallet. The mobile signs its own
 /// [`rrn_marketplace::inquiry::InquiryOpened`] and submits it over the channel
-/// instead (T1.7.4).
+/// instead.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InquireParams {
     /// The hex listing id to inquire about.
@@ -864,11 +864,11 @@ pub struct ContractTerminateParams {
 // [`crate::marketplace_view`]'s view structs, which carry `&'static str` tags and
 // so are `Serialize`-only by construction — there is no type for a client to
 // deserialize back into. Both clients read them as JSON: the mobile already does
-// (T1.7.0), and the CLI's text mode renders from the same `serde_json::Value` it
+//, and the CLI's text mode renders from the same `serde_json::Value` it
 // would otherwise print. A struct here with a `serde_json::Value` hole in it
 // would document less than the view does.
 
-/// `next_nonce` result — the nonce a member's next proposal must carry (T1.3.4).
+/// `next_nonce` result — the nonce a member's next proposal must carry.
 ///
 /// The ledger requires each sender's proposals to be strictly sequential, and
 /// the nonce is part of the *signed* proposal, so the mobile must learn its
@@ -881,12 +881,12 @@ pub struct NextNonceResult {
     pub nonce: u64,
 }
 
-// --- Headroom certificates (T2.3.1, ADR-0021) -------------------------------
+// --- Headroom certificates (ADR-0021) -------------------------------
 //
 // The operator-facing half of offline spending certificates. `cert_request` is
 // signed by the **station's own wallet**, the precedent `propose`/`vouch` set —
 // the operator reserves headroom for the station's own identity ahead of a
-// partition. A member signing their own request on a phone is T2.4.2's mobile
+// partition. A member signing their own request on a phone is the mobile
 // FFI path, deliberately not built here. `cert_list` is a derived read of a
 // member's outstanding certificates.
 
@@ -928,7 +928,7 @@ pub struct CertRow {
     /// The reserved cap, in centicommons.
     pub cap_centi: i64,
     /// Cumulative admitted cert-backed spend so far, in centicommons (always 0
-    /// until T2.3.2 lands cert-backed spends).
+    /// until cert-backed spends land).
     pub consumed_centi: i64,
     /// The still-reservable remainder (`cap_centi − consumed_centi`).
     pub remaining_centi: i64,
@@ -958,7 +958,7 @@ pub struct CertExportParams {
 /// [`rrn_ledger::escrow::encode_certificate_envelope`]), hex-encoded. This is the
 /// exact byte form the `rrncert:` QR carries and the mobile FFI's
 /// `certificate_parse` verifies, so a certificate reserved online can be printed
-/// onto a wallet card for the offline-spend flow (T2.5.2).
+/// onto a wallet card for the offline-spend flow.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CertExportResult {
     /// The certificate envelope bytes, hex-encoded.
@@ -1058,7 +1058,7 @@ pub struct DtnPushesResult {
     pub pushes: Vec<DtnPushRow>,
 }
 
-// --- Governance (T1.9.7b) ---------------------------------------------------
+// --- Governance ---------------------------------------------------
 
 /// `governance_init_charter` params — publish a community's genesis Charter.
 ///
@@ -1351,7 +1351,7 @@ pub struct GovEmergencyReportResult {
     pub inert_declarations: Vec<EmergencyInertDeclaration>,
 }
 
-// --- Disputes (T1.10.5) -----------------------------------------------------
+// --- Disputes -----------------------------------------------------
 //
 // The operator-facing half of the dispute layer. The writes (`dispute_raise`,
 // `dispute_respond`, `dispute_rule`) are signed by the **station's own wallet**,

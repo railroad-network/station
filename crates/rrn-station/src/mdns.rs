@@ -13,14 +13,14 @@
 //! Per ADR-0008 the advertisement is **unauthenticated**. Anything on the LAN
 //! can publish this service type, and every TXT record is attacker-controlled:
 //! the `address` here is a *claim*, not a proof. A discovered station is an
-//! untrusted `(host, port, claimed address)` tuple until pairing (T1.3.3) binds
+//! untrusted `(host, port, claimed address)` tuple until pairing binds
 //! its static public key out-of-band, and thereafter every exchange is
 //! authenticated by the sealed envelope rather than by anything learned here.
 //! Nothing in this module is a security boundary, which is exactly why it is
 //! safe to lean on the platform's mDNS stack on the mobile side.
 //!
 //! There is deliberately **no certificate fingerprint** in the TXT records. The
-//! M1.3 task spec originally called for a `cert_fp`, but ADR-0008 chose sealed
+//! An earlier design originally called for a `cert_fp`, but ADR-0008 chose sealed
 //! envelopes over TLS, so there is no certificate to fingerprint.
 //!
 //! # Scope
@@ -42,7 +42,7 @@ use tokio::sync::watch;
 ///
 /// # Why not `_railroad-station`
 ///
-/// The M1.3 task spec asked for `_railroad-station._tcp`, which is **illegal**:
+/// An earlier design asked for `_railroad-station._tcp`, which is **illegal**:
 /// RFC 6763 §7 caps a Service Name at 15 characters and `railroad-station` is
 /// 16. mdns-sd rejects it — but only on its own daemon thread, *after*
 /// `register` has returned `Ok`, so the station would have logged that it was

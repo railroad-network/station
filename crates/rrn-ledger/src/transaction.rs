@@ -91,7 +91,7 @@ impl TryFrom<CBOR> for TransactionId {
     }
 }
 
-/// A reference to the marketplace listing a proposal settles (T1.7.6).
+/// A reference to the marketplace listing a proposal settles.
 ///
 /// The ledger holds it as **opaque 32 bytes** — a marketplace `ListingId` in raw
 /// form — so `rrn-ledger` stays free of a dependency on `rrn-marketplace`, which
@@ -125,7 +125,7 @@ impl TryFrom<CBOR> for ListingRef {
 /// equivocation evidence — well under
 /// [`escrow::MAX_EVIDENCE_ITEM_BYTES`](crate::escrow::MAX_EVIDENCE_ITEM_BYTES)
 /// (64 KiB), leaving ample room for the proposal's fixed fields, so every
-/// overspend stays provable (ADR-0021 §5, T2.3.4 step 9). Matches
+/// overspend stays provable (ADR-0021 §5). Matches
 /// [`MAX_DISPUTE_REASON_BYTES`](crate::dispute::MAX_DISPUTE_REASON_BYTES), the
 /// other member-authored free-text field, so the front door is uniform.
 pub const MAX_MEMO_BYTES: usize = 2048;
@@ -148,7 +148,7 @@ pub struct TransactionProposal {
     /// Optional human-readable note. Part of the signed content.
     pub memo: Option<String>,
     /// The marketplace listing this proposal settles, when it came from an agreed
-    /// inquiry (T1.7.6); `None` for a direct pay. **Additive to a content-addressed
+    /// inquiry; `None` for a direct pay. **Additive to a content-addressed
     /// record**, so it is OMITTED from the CBOR when `None` (never `null`) — see
     /// the `From`/`TryFrom` impls below and ADR-0010.
     pub listing_id: Option<ListingRef>,
@@ -234,7 +234,7 @@ impl TransactionProposal {
         self.memo.as_ref().map_or(0, String::len) <= MAX_MEMO_BYTES
     }
 
-    /// Links this proposal to the marketplace listing it settles (T1.7.6),
+    /// Links this proposal to the marketplace listing it settles,
     /// recomputing its content [`id`](Self::id) with the link included. Used when
     /// an agreed inquiry produces a payment; a direct send never calls this.
     pub fn with_listing(mut self, listing: ListingRef) -> Self {
@@ -244,7 +244,7 @@ impl TransactionProposal {
     }
 
     /// Opts this transaction *up* the oracle ladder to `tier`, recomputing its
-    /// content [`id`](Self::id) with the opt-up included (T1.8.1).
+    /// content [`id`](Self::id) with the opt-up included.
     ///
     /// `tier` must be a genuine lift for this amount ([`crate::tier::is_valid_opt_up`]):
     /// strictly above the amount's own floor and no higher than

@@ -1,4 +1,4 @@
-//! Inquiry reads for the mobile and the CLI (T1.7.4).
+//! Inquiry reads for the mobile and the CLI.
 //!
 //! Where [`crate::marketplace_view`] shapes listings, this shapes the inquiry
 //! thread a buyer and provider negotiate in: [`thread`] turns one inquiry's
@@ -55,7 +55,7 @@ pub struct InquiryThreadView {
     /// Whether the listing invites offers. When false, the only close a party
     /// may agree to is at `listed_amount_centi`.
     pub negotiable: bool,
-    /// The listing's standing terms, when it is a recurring service (T1.7.7).
+    /// The listing's standing terms, when it is a recurring service.
     /// Present so an agreed thread carries everything the buyer's phone needs to
     /// build the [`ServiceContract`](rrn_marketplace::contract::ServiceContract)
     /// it signs — the cadence, alongside the `final_price_centi` already here.

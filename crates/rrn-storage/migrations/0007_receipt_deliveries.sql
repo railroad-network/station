@@ -1,4 +1,4 @@
--- Receipt-delivery tracking (ADR-0020 §3; T2.2.4).
+-- Receipt-delivery tracking (ADR-0020 §3).
 --
 -- Closes the DTN loop: a delivery receipt the station issued for an ingested
 -- bundle must travel *back* to each record's author by the same dumb carriers

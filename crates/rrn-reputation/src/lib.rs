@@ -22,8 +22,8 @@
 //! [`scoring`] replays the log into a profile, [`decay`] applies the time
 //! weighting, [`portability`] makes a profile signed and replayable off its
 //! home station, and [`sybil`] holds the velocity and identity-anchoring
-//! defenses. The M1.5 modules began as placeholders (T1.5.2), each filled in by
-//! its own later M1.5 task. [`staking`] is the M1.8 addition: the Tier-2 oracle's
+//! defenses. The reputation modules began as placeholders, each filled in
+//! later. [`staking`] is a later addition: the Tier-2 oracle's
 //! reputation stake and its bootstrap grace. [`context`] holds the shared engine
 //! all of these delegate to: one replay of the log prefix, indexed and memoized,
 //! answering a whole scoring query at `O(N + A)` instead of re-replaying per

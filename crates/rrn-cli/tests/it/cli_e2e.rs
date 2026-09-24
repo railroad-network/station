@@ -1,4 +1,4 @@
-//! CLI acceptance (T0.6.4): the real `rrn` binary against a live daemon.
+//! CLI acceptance: the real `rrn` binary against a live daemon.
 //!
 //! The daemon runs in-process (an `rrn_station::Station`); the CLI is the
 //! actually-built `rrn` binary, invoked over the station's socket. Each
@@ -99,7 +99,7 @@ async fn cli_drives_daemon() {
         let out = Command::new(RRN).arg("init").output().unwrap();
         assert!(out.status.success());
 
-        // --- marketplace (T1.7.3) ---------------------------------------
+        // --- marketplace ------------------------------------------------
         //
         // The whole operator loop against a live daemon: publish, browse, read
         // one in full, state a need, see it matched, then withdraw the offer.

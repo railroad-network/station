@@ -407,7 +407,8 @@ mod tests {
     // Smoke tests for the marshalling wrappers. The cryptographic behaviour
     // itself is tested in rrn-crypto / rrn-identity; here we only assert the
     // FFI-shaped conversions round-trip through the real types correctly. The
-    // cross-platform (mobile == station) invariants land in T1.1.6.
+    // cross-platform (mobile == station) invariants are covered by the
+    // cross-platform fixture tests.
 
     #[test]
     fn sign_verify_roundtrips_through_ffi_shapes() {

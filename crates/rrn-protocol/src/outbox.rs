@@ -108,7 +108,7 @@ impl OutboxEntry {
 
     /// The `kind` discriminator of the carried record (`"rrn.<area>.<name>"`),
     /// read from its canonical bytes. Used to pace a bundle by the importance of
-    /// its contents (T2.6.2 airtime budgeting). `None` if the record is not a CBOR
+    /// its contents (airtime budgeting). `None` if the record is not a CBOR
     /// map with a string `kind` — which a validly-signed record always is, so a
     /// `None` here means malformed carriage, and the caller treats it as the
     /// lowest priority rather than elevating it.
@@ -204,7 +204,7 @@ pub fn validate(signed: &SignedOutboxEntry) -> Result<()> {
 /// author claiming the same [`position`](OutboxEntry::position) with different
 /// content ([`entry_hash`](OutboxEntry::entry_hash)).
 ///
-/// This is the device-owner equivocation primitive ADR-0021/T2.3.3 builds on.
+/// This is the device-owner equivocation primitive ADR-0021 builds on.
 /// Two entries with the same position *and* the same hash are a duplicate (the
 /// same entry carried twice), **not** a fork. Both entries must independently
 /// [`validate`]; an entry that does not verify is not evidence of anything.

@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-platform equivocation jury wire fixtures for T2.3.4 (ADR-0025). A juror-signed EquivocationBallot (rrn.dispute.equivocation_ballot, an overturn in round 0) and an established-member-signed EquivocationReseat (rrn.dispute.equivocation_reseat, opening round 1). canonical_hex is each record's canonical dCBOR (== From<T> for CBOR); signature_hex is the signer's Ed25519 signature over it. Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
+  "_comment": "Cross-platform equivocation jury wire fixtures for ADR-0025. A juror-signed EquivocationBallot (rrn.dispute.equivocation_ballot, an overturn in round 0) and an established-member-signed EquivocationReseat (rrn.dispute.equivocation_reseat, opening round 1). canonical_hex is each record's canonical dCBOR (== From<T> for CBOR); signature_hex is the signer's Ed25519 signature over it. Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
   "ballot": {
     "juror_pubkey": "df0aa0e55c158d57bc84b3fe929da618e97c5123f66406127ab141b06cc0286a",
     "equivocation_id": "aa7adf0947e58a3d9b983954e4ae62533333a9ab2b15826d1e21687d46653e30",

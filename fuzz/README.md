@@ -3,8 +3,8 @@
 Coverage-guided fuzz targets for the workspace's parsing, decoding, and
 state-transition boundaries, built with
 [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html) and
-`libfuzzer-sys`. The first three targets cover `rrn-crypto` (the M0.1 baseline);
-the rest, added in M0.7 for audit prep, extend the same panic-baseline
+`libfuzzer-sys`. The first three targets cover `rrn-crypto` (the initial baseline);
+the rest, added for audit prep, extend the same panic-baseline
 discipline across `rrn-storage`, `rrn-identity`, and `rrn-ledger`.
 
 The goal in Phase 0 is a **panic baseline**: every target must survive arbitrary

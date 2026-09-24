@@ -74,4 +74,4 @@ related components) to generate Swift and Kotlin bindings to `rrn-crypto` and
 - [ADR-0006](0006-m1-client-architecture.md) — decided crypto runs on mobile,
   which is what created the need for a binding generator
 - uniffi-rs (Mozilla) — used in Firefox Sync and other production code
-- M1.1 task spec — the actual FFI implementation (this ADR only fixes the tool)
+- The mobile FFI task spec — the actual FFI implementation (this ADR only fixes the tool)

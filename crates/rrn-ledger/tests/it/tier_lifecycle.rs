@@ -1,4 +1,4 @@
-//! The oracle tier ladder, end to end through the [`Engine`] (T1.8.5).
+//! The oracle tier ladder, end to end through the [`Engine`].
 //!
 //! [`lifecycle.rs`](super) already tells the single-transaction story; this test
 //! adds the Phase-1 tier dimension: a low-value Tier-1 transfer clears on the

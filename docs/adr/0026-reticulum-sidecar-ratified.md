@@ -7,23 +7,23 @@ which returned accept with caveats, and then confirmed the outcome; the caveats
 are folded in:
 §4's license wording softened to "denied by our current allowlist" — EPL-2.0
 revisitable like MPL-2.0, AGPL not — and §7 records the conditions carried into
-T2.6.2: propagation-node (`PROPAGATED`) delivery and an LXMF-stamp stance as
+the Reticulum transport: propagation-node (`PROPAGATED`) delivery and an LXMF-stamp stance as
 explicit acceptance criteria, the adapter topology/line-protocol choices, and the
-adapter-identity custody handed to T2.9.1). Ratifying the sidecar does not
-pre-approve T2.6.2's design; see §7.
+adapter-identity custody handed to the at-rest work). Ratifying the sidecar does not
+pre-approve the transport design; see §7.
 
 Date: 2026-09-07
 
-> **Human-review checkpoint (T2.6.1).** This ADR records the outcome of the
+> **Human-review checkpoint.** This ADR records the outcome of the
 > Phase-2 spike that [ADR-0013](0013-federation-transport-reticulum.md)
 > chartered. The supervisor, the spike, and the threat-model section it references
-> landed with it; the *decision* was ratified as above before T2.6.2 begins
+> landed with it; the *decision* was ratified as above before the transport work begins
 > building the `FrameTransport` backend on top of it.
 >
 > **ADR-number note.** ADR-0013 anticipated this taking number 0023. By the time
 > the ticket ran, the README board had reserved 0023 (emergency governance,
-> T2.8.1) and 0024 (at-rest encryption, T2.9.1), and 0025 was written — so this
-> takes the next free number, **0026**. Cross-references (T2.6.x tickets, threat
+> the emergency work) and 0024 (at-rest encryption, the at-rest work), and 0025 was written — so this
+> takes the next free number, **0026**. Cross-references (the Reticulum work, threat
 > model, the board) point here.
 
 ## Context
@@ -36,9 +36,9 @@ precisely — "confirm the sidecar end-to-end and answer one question that decid
 whether the native path is even viable for Phase 3: *does reticulum-rs drive an
 RNode over LoRa yet, or is the reference required for the radio story?*" — and
 flagged three things to verify before committing: the exact pinned versions, the
-Rust↔`rnsd` interface for T2.6.2, and the Reticulum-License distribution posture.
+Rust↔`rnsd` interface for the transport work, and the Reticulum-License distribution posture.
 
-This ADR is that follow-up. Its inputs are the T2.6.1 spike
+This ADR is that follow-up. Its inputs are the sidecar spike
 (`crates/rrn-station/tests/it/reticulum_spike.rs`, run against a pinned `rnsd`) and a
 fresh survey of the Reticulum ecosystem as of the ticket date (2026-09-07); the
 out-of-tree Reticulum fit assessment (2026-08-10) is its predecessor and several
@@ -68,13 +68,13 @@ Reticulum packet/link/crypto layer to use it), and the *control* RPC
 — what `rnstatus`/`rnpath` use — with no message layer. The supported way to send
 or receive an LXMF message is an in-process Python program that imports `RNS` and
 `LXMF` and attaches transparently to the running `rnsd` shared instance. **This is
-the single most important finding for T2.6.2** and it shapes the Rust↔`rnsd`
+the single most important finding for the transport work** and it shapes the Rust↔`rnsd`
 interface below.
 
-**3. The T2.6.2 Rust↔`rnsd` interface: a thin Python LXMF adapter co-process, not
+**3. The transport Rust↔`rnsd` interface: a thin Python LXMF adapter co-process, not
 a socket the station speaks directly.** Because there is no neutral RPC, the
 station cannot "talk to `rnsd` over its socket" the way it talks to, say,
-`postgres`. T2.6.2 therefore implements the `FrameTransport` seam over a **small,
+`postgres`. The transport work therefore implements the `FrameTransport` seam over a **small,
 supervised Python adapter** (an evolution of the spike's `scripts/spike/`
 helper into a supported component) that the station drives over a local line
 protocol — hand it opaque outbound bundle bytes + a destination, receive inbound
@@ -82,8 +82,8 @@ bytes — while the adapter attaches to `rnsd` and does the `LXMF.LXMessage` /
 `handle_outbound` / delivery-callback dance. `LXMessage` takes opaque `bytes`
 content directly (`set_content_from_bytes`), so our sealed/signed bundle rides as
 the message body unmodified. The adapter is *carrier plumbing* and holds no RRN
-key; the station stays the master process that supervises it (the T2.6.1
-supervisor already manages `rnsd`; T2.6.2 extends the pattern to the adapter, or
+key; the station stays the master process that supervises it (the sidecar
+supervisor already manages `rnsd`; the transport work extends the pattern to the adapter, or
 folds the adapter into the same supervised subtree). The status/health probe uses
 the control RPC (`rnstatus`) that the generated config's shared instance exposes.
 
@@ -113,7 +113,7 @@ LXMF.
 It boots two station-*supervised* `rnsd` instances (asserting each actually
 reaches `Running`, and requiring the LXMF helpers to attach to the supervised
 shared instance rather than stand in as the RNS instance themselves) linked over
-a local TCP interface, and carries a **real signed `Bundle`** (from the T2.2.1
+a local TCP interface, and carries a **real signed `Bundle`** (from the DTN bundle work
 record types) A→B over LXMF, asserting byte-identical delivery **with the receiver
 started only after the send is already in flight** — path request → later announce
 → path discovery → direct delivery. It passed in ~14 s.
@@ -124,7 +124,7 @@ the conductor pattern's shape, but it is **not** the full LXMF store-and-forward
 where a message survives with neither endpoint online — that needs a propagation
 node (LXMF `PROPAGATED`), and a `DIRECT` message cannot even be constructed until
 the recipient's identity has been recalled from an announce. Standing up a
-propagation-node variant is folded into T2.6.2, where the transport layer lands.
+propagation-node variant is folded into the transport work, where the transport layer lands.
 The Python side is a <100-line spike-support helper under `scripts/spike/`; the
 production Rust↔`rnsd` interfacing choice is §3 above, part of this ADR per
 ADR-0013's charter.
@@ -149,8 +149,8 @@ operator runbook (community-setup), not resolved in code. This is a *stronger*
 argument for the sidecar over a linked native port than ADR-0013 had — a linked
 Reticulum-License (or EPL/AGPL, §4) crate would fail our allowlist outright.
 
-**7. Conditions carried into T2.6.2 (from the ratification review).** Ratifying
-the sidecar does not pre-approve T2.6.2's design; these are named as acceptance
+**7. Conditions carried into the transport work (from the ratification review).** Ratifying
+the sidecar does not pre-approve the transport design; these are named as acceptance
 criteria / open decisions it must settle, none of which reopens *this* decision:
 
 - **Adapter topology is a deliberate choice, not an inheritance from the spike.**
@@ -169,21 +169,21 @@ criteria / open decisions it must settle, none of which reopens *this* decision:
   it proves unworkable the sidecar is still right, but the scope-reduction claim
   must be re-stated.
 - **LXMF stamps (proof-of-work) need a position.** The spike runs
-  `enforce_stamps=False`; T2.6.2 must decide the stance, weighing propagation-node
+  `enforce_stamps=False`; the transport work must decide the stance, weighing propagation-node
   abuse resistance against CPU cost on a Pi-class station.
 - **The adapter's Reticulum identity is a new persisted secret at rest.** It is
   *not* an RRN key (nothing here holds one), but it is a private key that decides
-  who may *receive* for this station: its custody belongs in T2.9.1's at-rest
+  who may *receive* for this station: its custody belongs in the at-rest
   scope, and its rotation/re-bind rides ADR-0013's "bind, do not collapse" signed
   association — neither is wired yet.
 
 ## Consequences
 
-- **T2.6.2 has a concrete shape.** It builds the `FrameTransport` impl over a
+- **The transport work has a concrete shape.** It builds the `FrameTransport` impl over a
   supervised Python LXMF adapter (§3), not over a mythical neutral `rnsd` socket.
   This is a larger surface than "open a socket" — a second supervised co-process
   and a local line protocol — but it is the only supported programmatic path, and
-  the T2.6.1 supervisor is the reusable half of it. Announce-budget/airtime pacing
+  the sidecar supervisor is the reusable half of it. Announce-budget/airtime pacing
   (ADR-0013's constrained-link concern) lives in that same layer.
 - **The hermetic, license-clean Rust workspace is preserved, and that is now a
   headline benefit.** `rnsd`, `lxmf`, and their Python dependency tree are
@@ -194,7 +194,7 @@ criteria / open decisions it must settle, none of which reopens *this* decision:
   accepted the operational cost of a supervised Python service on every station
   that enables the carrier; §3 adds the LXMF adapter to that supervised subtree.
   The appliance discipline (version pin, backoff, clean kill, status legibility)
-  that T2.6.1 built for `rnsd` is what contains it, and applies to the adapter
+  that the sidecar built for `rnsd` is what contains it, and applies to the adapter
   too.
 - **Off by default.** `[sidecar] enabled = false`; a station carries traffic over
   Reticulum only where an operator opts in. No pilot or single-community
@@ -234,11 +234,11 @@ criteria / open decisions it must settle, none of which reopens *this* decision:
   principle Reticulum extends to the station↔station hop.
 - [ADR-0002](0002-canonical-serialization-dcbor.md) — the canonical dCBOR the app
   layer signs, transport-independent.
-- T2.6.1 — this ticket: the supervisor (`rrn-station::sidecar`), the spike
+- The sidecar work — the supervisor (`rrn-station::sidecar`), the spike
   (`crates/rrn-station/tests/it/reticulum_spike.rs`), the spike helper
   (`scripts/spike/lxmf_pingpong.py`), and the CI `reticulum-spike` lane.
-- T2.6.2 (next) — the `FrameTransport` backend and announce/airtime budget over
-  the interface decided in §3; T2.6.3 — RNode/LoRa interface template and hardware
+- The transport work (next) — the `FrameTransport` backend and announce/airtime budget over
+  the interface decided in §3; the RNode/LoRa work — the interface template and hardware
   bring-up.
 - [`docs/threat-model.md`](../threat-model.md) — "Reticulum transport sidecar"
   section (process compromise = carrier compromise, announce budget, initiator

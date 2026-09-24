@@ -6,7 +6,7 @@
 > **Status note (2026-07-04).** Parts of this overview predate the implementation and the
 > Architecture Decision Records. Where this document and an ADR in [`docs/adr/`](../adr/)
 > conflict, **the ADR is authoritative**. Locked implementation decisions (libraries,
-> formats, units) are summarized in the repository's `CLAUDE.md`.
+> formats, units) are recorded in the ADRs under [`docs/adr/`](../adr/).
 
 ---
 
@@ -1212,9 +1212,9 @@ after multi-node sync ships means a wire-format break:
 > testimony that decide nothing zero-sum, and cross-record order is log order —
 > so "signed before the deadline" backdating is defeated by construction.
 > Settlement and dispute windows now run from confirmation admission
-> (`rrn-ledger`, T2.1.1–T2.1.2). **Criterion 1** (bounded invariants under
+> (`rrn-ledger`). **Criterion 1** (bounded invariants under
 > partition) remains open: ADR-0021 specifies escrowed headroom certificates,
-> but the implementation is still owed (T2.3.x).
+> but the implementation is still owed.
 
 > **Updated 2026-09-13.** Criterion 1 is discharged: escrowed headroom
 > certificates, certificate-backed spends, and provable equivocation with its

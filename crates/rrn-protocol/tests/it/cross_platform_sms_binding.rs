@@ -1,4 +1,4 @@
-//! Cross-platform SMS-binding wire fixture (T2.7.1).
+//! Cross-platform SMS-binding wire fixture.
 //!
 //! Pins the canonical dCBOR bytes and Ed25519 signature of a `rrn.net.sms_binding`
 //! record so the mobile repo verifies a byte-identical encoding (ADR-0002). The
@@ -55,7 +55,7 @@ fn build_fixture() -> Fixture {
     // Sanity: the fixture must validate as a self-signed SMS binding.
     binding::validate_sms_binding(&signed).expect("fixture sms binding validates");
     Fixture {
-        _comment: "Cross-platform SMS-binding fixture (T2.7.1). `canonical_hex` is \
+        _comment: "Cross-platform SMS-binding fixture. `canonical_hex` is \
                    the canonical dCBOR of the rrn.net.sms_binding payload; \
                    `signature_hex` is the self-signature over it. Deterministic \
                    (blake3-derived seed); regenerate with RRN_REGEN=1."

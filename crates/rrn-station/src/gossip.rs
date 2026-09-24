@@ -33,8 +33,7 @@ use crate::rpc_client::request_response;
 /// may take before it is abandoned as unreachable. A station on a loopback-only
 /// host must never park a gossip round — or, through it, its own shutdown — on the
 /// OS TCP SYN timeout of a routable-but-dead peer (~75s macOS / ~127s Linux). The
-/// bound keeps a round proportional to `peers.len()` and shutdown prompt (ADR-0020;
-/// T2.4.1).
+/// bound keeps a round proportional to `peers.len()` and shutdown prompt (ADR-0020).
 pub const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The health of one peer, as last observed by the gossip loop. Derived, in-memory
@@ -49,7 +48,7 @@ pub struct PeerHealth {
     pub last_attempt_at: Option<i64>,
 }
 
-/// Shared, in-memory connectivity snapshot the `status` RPC reports from (T2.4.1).
+/// Shared, in-memory connectivity snapshot the `status` RPC reports from.
 /// Written by the gossip loop and the startup path; read by the status handler.
 /// Purely derived degradation-legibility state — nothing here is signed, logged,
 /// or required for correctness.
@@ -65,7 +64,7 @@ pub struct ConnectivityState {
     pub mobile_bound: AtomicBool,
     /// Per-peer reachability, keyed by peer address.
     pub peer_health: Mutex<HashMap<String, PeerHealth>>,
-    /// The Reticulum sidecar's live posture (T2.6.1). Written by the sidecar
+    /// The Reticulum sidecar's live posture. Written by the sidecar
     /// supervisor, read by the status handler; `Disabled` until the supervisor
     /// says otherwise (and forever, when `[sidecar] enabled = false`).
     pub sidecar: Mutex<crate::sidecar::SidecarState>,
@@ -287,7 +286,7 @@ fn reply<T: Serialize>(req: &Request, value: &T) -> Response {
 /// Each peer exchange is bounded by [`PEER_DIAL_TIMEOUT`], so one unreachable peer
 /// cannot stall the round (or shutdown). Outcomes update `connectivity`, and a
 /// peer flipping reachable↔unreachable logs one `info`; ordinary offline rounds
-/// stay at `debug` so an offline month does not fill the log (T2.4.1).
+/// stay at `debug` so an offline month does not fill the log.
 pub async fn gossip_loop(
     interval: Duration,
     peers: Arc<Vec<String>>,
@@ -387,7 +386,7 @@ async fn peer_call<T: for<'de> Deserialize<'de>>(
         params,
     };
     // Bound the whole exchange — connect and the single request/response — so a
-    // black-holed peer cannot hang the round on the OS SYN timeout (T2.4.1). The
+    // black-holed peer cannot hang the round on the OS SYN timeout. The
     // caller also wraps the round in `PEER_DIAL_TIMEOUT`; this inner bound protects
     // any direct `peer_call` and keeps the failure mode a clean typed error.
     let response = tokio::time::timeout(PEER_DIAL_TIMEOUT, async {

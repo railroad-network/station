@@ -28,7 +28,7 @@
 //!   that reputation reads (ADR-0025 §4, and see the crate layering note below).
 //! - **Three terminal states, and a lapse is [`Lapsed`](EquivResolution::Lapsed),
 //!   never a synthesized confirm** (ADR-0025 §5). The reputation penalty applies at
-//!   record verification (T2.3.3), so a lapse leaving it standing *is* ADR-0014's
+//!   record verification, so a lapse leaving it standing *is* ADR-0014's
 //!   fail-open. A `Lapsed` case is **re-seatable** by any established member via an
 //!   [`EquivocationReseat`] record, which opens a fresh round anchored to its own
 //!   admission position.

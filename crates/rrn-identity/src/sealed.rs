@@ -38,7 +38,7 @@ use zeroize::Zeroize;
 use rrn_crypto::keypair::{PublicKey, SecretKey};
 
 /// blake3 KDF domain-separation context for the mobile↔station transport sealed
-/// envelope (ADR-0008, T1.3.4). Distinct from the recovery-shard context
+/// envelope (ADR-0008). Distinct from the recovery-shard context
 /// (`recovery::encryption::KDF_CONTEXT`) so the two sealing purposes derive
 /// independent keys and a box sealed for one can never open as the other. Shared
 /// here because both `rrn-station` (which opens requests / seals responses) and

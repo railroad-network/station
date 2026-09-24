@@ -2,7 +2,7 @@
 
 This is an **execution runbook** for the LoRa radio field-acceptance run — the human-gated
 checklist in `docs/lora-radio-bringup.md §5`. It is written to be followed step-by-step by a
-Claude Code session running on **each** of two machines, one radio per machine. It is the
+an automated agent session running on **each** of two machines, one radio per machine. It is the
 operational companion to `docs/lora-radio-bringup.md` (the reference: firmware, config keys,
 compliance table); when the two disagree, that guide and the ADRs win.
 
@@ -27,7 +27,7 @@ The two agents **cannot message each other.** A handful of values must pass betw
 machines; the **human relays them by hand.** Watch for these markers:
 
 - 🔴 **STOP — ASK THE HUMAN.** Do not proceed or guess. (Region/frequency/power and any
-  hardware ambiguity are always STOP gates — a Claude must never invent a transmit frequency
+  hardware ambiguity are always STOP gates — an agent must never invent a transmit frequency
   or power.)
 - 📤 **RELAY OUT.** Print this value clearly and tell the human to carry it to the other
   machine.

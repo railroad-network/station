@@ -2,10 +2,10 @@
 
 > Note: the signing parity fixture lives in the **`rrn-crypto`** crate
 > (`crates/rrn-crypto/tests/fixtures/cross_platform_sign.json`), since signing is
-> `rrn_crypto::keypair`, not identity. See T1.1.4 and
+> `rrn_crypto::keypair`, not identity. See
 > [`crates/rrn-crypto/tests/it/cross_platform_sign.rs`](../../../rrn-crypto/tests/it/cross_platform_sign.rs).
 
-## `cross_platform_address.json` — mobile/station address parity (T1.1.3)
+## `cross_platform_address.json` — mobile/station address parity
 
 Locks the `rrn1…` address for a set of public keys so the **mobile** client and
 the **station** agree byte-for-byte. Unlike the Shamir vectors below, there is
@@ -31,9 +31,9 @@ cp crates/rrn-identity/tests/fixtures/cross_platform_address.json \
 The `committed_fixture_is_in_sync` test fails if the committed JSON drifts from
 what the generator produces, so a stale fixture cannot pass CI unnoticed.
 
-## `cross_platform_wallet.json` — mobile/station wallet-file parity (T1.1.5)
+## `cross_platform_wallet.json` — mobile/station wallet-file parity
 
-Locks the `.rrnwallet` file format (M0.3.3: canonical-CBOR envelope, argon2id +
+Locks the `.rrnwallet` file format (canonical-CBOR envelope, argon2id +
 XChaCha20-Poly1305) so a wallet created on one platform opens on the other.
 `rrn_identity::wallet` *is* the source of truth; mobile reaches the same code
 through the uniffi FFI (`rrn-mobile-ffi`).
@@ -61,15 +61,16 @@ cp crates/rrn-identity/tests/fixtures/cross_platform_wallet.json \
    ../mobile/__tests__/fixtures/cross_platform_wallet.json
 ```
 
-## `ffi_invariants.json` — consolidated FFI invariants (T1.1.6)
+## `ffi_invariants.json` — consolidated FFI invariants
 
-Rolls the mobile/station invariants that T1.1.3–T1.1.5 locked separately into
+Rolls the mobile/station invariants that the address, signing, and wallet
+fixtures locked separately into
 **one** fixture both sides run against, and adds the one invariant no prior
 fixture covered: **Blake3 hash determinism**. Each section reaches the same Rust
 core mobile reaches via `rrn-mobile-ffi` — `rrn_crypto` for hashing/signing,
 `rrn_identity` for addresses/wallets — so there is one implementation of each
 primitive, not two. (This test lives in `rrn-identity` rather than `rrn-crypto`,
-where the T1.1.6 spec text places it, because the consolidated invariants span
+where the spec text places it, because the consolidated invariants span
 both crates and `rrn-identity` is the one that can reach both.)
 
 Generated and verified by [`tests/it/ffi_invariants.rs`](../it/ffi_invariants.rs); the
@@ -86,9 +87,9 @@ test fails on drift); the wallet `encrypted` bytes are randomized per encrypt
 ciphertext and are checked by invariant, not by bytes.
 
 > Generic dcbor canonical-bytes determinism is **not** here — its `canonical_bytes`
-> FFI surface is a T1.1.7 deliverable, and the only dcbor bytes crossing the
+> FFI surface is a later deliverable, and the only dcbor bytes crossing the
 > boundary today (randomized wallet blobs) cannot back a byte-determinism check.
-> That invariant lands in T1.1.7.
+> That invariant lands with that later FFI surface.
 
 Regenerate (deterministic sections bit-for-bit; wallet ciphertext changes):
 

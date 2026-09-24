@@ -1,4 +1,4 @@
-//! Tier-2 reputation staking and the bootstrap grace (T1.8.2).
+//! Tier-2 reputation staking and the bootstrap grace.
 //!
 //! A Tier-2 transaction (Overview §4.3) is confirmed by the receiver *staking
 //! their reputation* on it being real: §4.2.2's reputation staking. This module
@@ -45,10 +45,10 @@ use crate::model::{BAND_MEMBER_MIN, DIMENSION_MAX};
 use crate::Result;
 
 /// Members at the Member band the community needs before the Tier-2 bootstrap
-/// grace ends (T1.8.2). Below this, any member may confirm a Tier-2 transaction;
+/// grace ends. Below this, any member may confirm a Tier-2 transaction;
 /// at or above it, the [`BAND_MEMBER_MIN`] floor applies to everyone.
 ///
-/// A Phase-1 default (revisited in the M1.8 oracle ADR): small enough that a
+/// A Phase-1 default (revisited in the oracle ADR): small enough that a
 /// fresh ~20-person community leaves bootstrap quickly once a trusted core
 /// forms, large enough that grace does not end on a single member's standing.
 pub const BOOTSTRAP_GRACE_THRESHOLD: usize = 3;
@@ -122,7 +122,7 @@ pub fn established_member_count(db: &Database, at_time: i64, station: &PublicKey
 /// than [`BOOTSTRAP_GRACE_THRESHOLD`] members hold an effective composite at or
 /// above the Member band (ADR-0015).
 ///
-/// This is the single shared predicate the oracle ladder (T1.8), governance
+/// This is the single shared predicate the oracle ladder, governance
 /// (ADR-0012), and disputes (ADR-0014) all key their bootstrap relaxations off,
 /// so a community is either bootstrapping or it is not — uniformly across all
 /// three. Like [`established_member_count`] it is a pure function of the log.
@@ -157,7 +157,7 @@ pub fn grace_electorate(
 }
 
 /// Like [`established_members`], but each identity is scored from only the log
-/// prefix `[1, max_seq]` (T2.1.3). A member whose band-crossing evidence was
+/// prefix `[1, max_seq]`. A member whose band-crossing evidence was
 /// admitted after `max_seq` is excluded whatever timestamp that evidence claims —
 /// the position-bounded form governance uses to pin an electorate at a window's
 /// log position (ADR-0022 §5), closing the back-dated-evidence packing vector.
@@ -171,7 +171,7 @@ pub fn established_members_asof(
     Ok(ScoringContext::new(db, station, max_seq)?.established_members(at_time))
 }
 
-/// Position-bounded [`established_member_count`] (T2.1.3): the count as of the log
+/// Position-bounded [`established_member_count`]: the count as of the log
 /// prefix `[1, max_seq]`.
 pub fn established_member_count_asof(
     db: &Database,
@@ -182,7 +182,7 @@ pub fn established_member_count_asof(
     Ok(established_members_asof(db, at_time, max_seq, station)?.len())
 }
 
-/// Position-bounded [`in_grace`] (T2.1.3): whether the community was in bootstrap
+/// Position-bounded [`in_grace`]: whether the community was in bootstrap
 /// grace as of the log prefix `[1, max_seq]`.
 pub fn in_grace_asof(
     db: &Database,
@@ -193,7 +193,7 @@ pub fn in_grace_asof(
     Ok(established_member_count_asof(db, at_time, max_seq, station)? < BOOTSTRAP_GRACE_THRESHOLD)
 }
 
-/// Position-bounded [`grace_electorate`] (T2.1.3): the governing electorate as of
+/// Position-bounded [`grace_electorate`]: the governing electorate as of
 /// the log prefix `[1, max_seq]`. Founders (a genesis fact) still count during
 /// grace regardless of position; only the *established* set is prefix-bounded, so
 /// no standing manufactured after `max_seq` can enter the electorate.
@@ -233,7 +233,7 @@ pub enum Tier2Eligibility {
 
 /// The pure eligibility rule, given the confirmer's effective composite, the
 /// stake they would put up, and how many members are established. Split out from
-/// the scoring so the branching — the actual policy (T1.8.2) — is tested on its
+/// the scoring so the branching — the actual policy — is tested on its
 /// own, without manufacturing reputation in the log.
 fn decide(effective_composite: f32, stake_centi: u64, established: usize) -> Tier2Eligibility {
     if effective_composite >= BAND_MEMBER_MIN {
@@ -258,7 +258,7 @@ fn decide(effective_composite: f32, stake_centi: u64, established: usize) -> Tie
 }
 
 /// Decides whether `confirmer` may confirm a Tier-2 transaction at `at_time`, and
-/// what they stake (T1.8.2). See the module docs for the rule.
+/// what they stake. See the module docs for the rule.
 ///
 /// The established-member count is only computed when the confirmer is below the
 /// floor (an established confirmer short-circuits), so the steady-state path stays
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn position_bound_excludes_evidence_admitted_after_it() {
-        // The back-dating vector (T2.1.3): a voucher earns real standing, then —
+        // The back-dating vector: a voucher earns real standing, then —
         // after some log position — an anchoring vouch for `subject` is admitted,
         // back-dated so its `issued_at` is old. A wall-clock scorer would see it;
         // a position-bounded scorer pinned before its admission must not.

@@ -20,7 +20,7 @@ below to its parser.
 ## 1. Address
 
 Used to receive a payment (the [Receive] screen) and as a **vouch target**: the
-subject shows their address QR and the voucher scans it (M1.4).
+subject shows their address QR and the voucher scans it.
 
 ### Canonical form — bare bech32
 
@@ -63,7 +63,7 @@ Mobile reference: `src/ledger/addressQr.ts` (`parseAddressQr` / `encodeAddressQr
 ## 2. Recovery shard
 
 Used by social-recovery distribution: a member hands each holder one sealed shard
-of their wallet secret, as a QR (M1.2.3).
+of their wallet secret, as a QR.
 
 ### Form — `rrnrecovery:` prefix
 
@@ -98,7 +98,7 @@ accepted; each form's section states which it uses.
 Mobile↔station pairing does **not** use a QR code. It is a network handshake: the
 mobile POSTs a signed pairing request to the station over the LAN, the operator
 confirms on the station CLI, and both sides compare an 8-hex Short Authentication
-String (SAS) derived from both static public keys (ADR-0008, T1.3.3). A headless
+String (SAS) derived from both static public keys (ADR-0008). A headless
 Pi cannot scan a QR, and one QR cannot carry both parties' keys — hence the
 network+SAS design instead.
 
@@ -136,9 +136,9 @@ The scanner routes by prefix, so every prefix is a reserved namespace. Allocated
 | `rrn1…`         | bare bech32m address (§1)           | shipped             |
 | `rrn:`          | address URI envelope / deep links   | §1 parsed; rest reserved |
 | `rrnrecovery:`  | recovery shard (§2)                 | shipped             |
-| `rrnp:`         | multi-part paper chunk (§5)         | implemented (T2.5.1) |
-| `rrncert:`      | single-QR certificate (§6)          | implemented (T2.5.1) |
-| `rrnspend:`     | spend voucher (§7)                  | implemented (T2.5.1) |
+| `rrnp:`         | multi-part paper chunk (§5)         | implemented |
+| `rrncert:`      | single-QR certificate (§6)          | implemented |
+| `rrnspend:`     | spend voucher (§7)                  | implemented |
 
 ---
 
@@ -220,7 +220,7 @@ Rust reference: `rrn_protocol::paper` (`encode_certificate`, `decode_certificate
 
 The offline point-of-sale form: one code the **payer** renders, the receiver
 scans and verifies entirely offline (ADR-0021 §3, via the mobile FFI's
-`offline_spend_verify` or the T2.5.2 CLI):
+`offline_spend_verify` or the paper CLI):
 
 ```
 rrnspend:<base64url of a SpendVoucher CBOR container>
@@ -250,7 +250,7 @@ Rust reference: `rrn_protocol::paper` (`SpendVoucher`, `encode_spend_voucher`,
 
 ## Mobile reference (paper forms §§5–7)
 
-To be implemented in the mobile repo — see the T2.4.2 / T2.5.1 handoff. The Rust
+To be implemented in the mobile repo — see the mobile FFI and paper-codec handoff. The Rust
 codecs in `rrn_protocol::paper` are canonical; the mobile parser must produce
 byte-identical strings, verified against the committed vectors in
 `crates/rrn-protocol/tests/fixtures/paper/` (`multipart_bundle.txt`,

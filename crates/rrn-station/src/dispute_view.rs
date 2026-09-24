@@ -1,8 +1,8 @@
-//! Member- and operator-facing dispute reads (T1.10.5).
+//! Member- and operator-facing dispute reads.
 //!
-//! M1.10 built the dispute engine — the frozen `Disputed` state in
-//! [`rrn_ledger`], and the sortition jury in [`rrn_dispute`] — but exposed none of
-//! it to a reader. This module is that read path: it turns the log-derived dispute
+//! The dispute engine — the frozen `Disputed` state in
+//! [`rrn_ledger`], and the sortition jury in [`rrn_dispute`] — was built, but
+//! exposed none of it to a reader. This module is that read path: it turns the log-derived dispute
 //! state into the flat, JSON-shaped views the `rrn dispute` CLI prints and the
 //! mobile renders, so a party can see a dispute's grievance and responses, and a
 //! juror (or anyone) can see the seated panel, the verdicts so far, and where the

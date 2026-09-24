@@ -1,4 +1,4 @@
-//! Member-relative vouch tallies for the "your vouching chain" display (T1.4.4).
+//! Member-relative vouch tallies for the "your vouching chain" display.
 //!
 //! After a successful vouch the mobile shows two truthful numbers: how many
 //! *people* this member has vouched for (`given`) and how many have vouched for
@@ -8,7 +8,7 @@
 //! people" the mobile renders stays truthful.
 //!
 //! Like [`crate::history`] and [`crate::transaction_view`], this is a live scan
-//! of the append-only log — correctness now, without an index. M1.5's reputation
+//! of the append-only log — correctness now, without an index. The reputation crate's
 //! indexing will make it O(1); until then a linear scan is fine at Phase-0 log
 //! sizes and keeps the phone a renderer of numbers the station computes once.
 
@@ -68,7 +68,7 @@ pub fn member_vouch_counts(db: &Database, member: &Address) -> rrn_storage::Resu
     })
 }
 
-/// One vouch as the browser lists it (T1.4.5): both parties' addresses plus the
+/// One vouch as the browser lists it: both parties' addresses plus the
 /// attestation's community, statement, stake, and issue time. Unlike the
 /// push-only [`crate::events::VouchRow`] — which carries only the voucher, since
 /// the subject is the notification's recipient — a list row names *both* sides,
@@ -111,7 +111,7 @@ pub struct VouchLists {
 ///
 /// `offset` then `limit` window each list independently after ordering. Like
 /// [`member_vouch_counts`] this is a live log scan (correctness without an
-/// index); M1.5's reputation indexing will make it O(1).
+/// index); the reputation crate's indexing will make it O(1).
 pub fn member_vouches(
     db: &Database,
     member: &Address,

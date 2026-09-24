@@ -1,10 +1,10 @@
-//! Delay-tolerant bundle sync over any [`FrameTransport`] (T2.6.2, ADR-0013).
+//! Delay-tolerant bundle sync over any [`FrameTransport`] (ADR-0013).
 //!
 //! This is the engine that moves DTN bundles and delivery receipts station↔station
 //! and device↔station over a constrained carrier — the Reticulum sidecar in
 //! production ([`crate::reticulum`]), a fault-injecting mock in tests. It is
 //! **generic over the carrier**: it holds any `FrameTransport` and drives it,
-//! which is exactly the seam T2.10.1's 72-hour outage harness needs (construct it
+//! which is exactly the seam the 72-hour outage harness needs (construct it
 //! with a mock carrier and drive simulated time).
 //!
 //! What it composes:

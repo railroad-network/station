@@ -187,7 +187,7 @@ later pass rather than widening this milestone.
   built to receive it — no new stored balance, no locked-reputation mutation, no
   violation of ADR-0009's derive-from-log rule. Adjudication disperses rather
   than centralizes: no permanent arbiter role, no charter-anointed judge, and a
-  selection anyone can audit by replay. The hard cases reuse the M1.9 governance
+  selection anyone can audit by replay. The hard cases reuse the governance
   vote instead of a second bespoke procedure. The `Confirmed → Disputed` rail
   laid inert in Phase 1 gets used for what it was cut for, and the Phase-1 exit
   criterion "dispute system exercised at least once" becomes reachable.
@@ -215,7 +215,7 @@ later pass rather than widening this milestone.
   The mobile surface (raise a dispute from `TransactionDetail`, respond as the
   counterparty, cast a juror verdict, see the outcome) and the threat-model
   dispute-layer section that ADR-0011 left as a Phase-2 placeholder are tracked
-  in the M1.10 task set.
+  in the dispute task set.
 
 ## Alternatives Considered
 
@@ -280,4 +280,4 @@ later pass rather than widening this milestone.
 - Design overview, Section 4.3 — "The Tiered Oracle Model"; Section 7 — the
   dispute layer; Phase-1 exit criteria (dispute system exercised at least once).
 - Threat model — `rrn-ledger` § "Oracle tiering and the reputation stake"
-  (to gain a dispute-layer subsection under M1.10).
+  (to gain a dispute-layer subsection).

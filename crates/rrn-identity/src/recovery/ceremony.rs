@@ -1,4 +1,4 @@
-//! The recovery *reconstruction* ceremony (T1.11.3 Slice D, ADR-0016).
+//! The recovery *reconstruction* ceremony (ADR-0016).
 //!
 //! Arming ([`super::flow::RecoveryPackage::create`]) hands each holder a shard
 //! sealed to them. Reconstruction is the reverse ritual, and this module is its

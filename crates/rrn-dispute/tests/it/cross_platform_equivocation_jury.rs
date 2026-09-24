@@ -1,5 +1,5 @@
-//! Cross-platform wire fixtures for the equivocation jury record kinds (T2.3.4,
-//! ADR-0025).
+//! Cross-platform wire fixtures for the equivocation jury record kinds
+//! (ADR-0025).
 //!
 //! One byte-stable vector per new signed record kind: a juror-signed
 //! [`EquivocationBallot`] and an established-member-signed [`EquivocationReseat`].
@@ -95,7 +95,7 @@ fn build_fixture() -> Fixture {
     assert!(signed_reseat.verify().is_ok());
 
     Fixture {
-        comment: "Cross-platform equivocation jury wire fixtures for T2.3.4 (ADR-0025). A \
+        comment: "Cross-platform equivocation jury wire fixtures for ADR-0025. A \
             juror-signed EquivocationBallot (rrn.dispute.equivocation_ballot, an overturn in \
             round 0) and an established-member-signed EquivocationReseat \
             (rrn.dispute.equivocation_reseat, opening round 1). canonical_hex is each record's \

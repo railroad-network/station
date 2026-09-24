@@ -151,7 +151,7 @@ impl TryFrom<CBOR> for SettlementRecord {
 ///
 /// Holds the station keypair (to sign settlement records) and a borrowed
 /// [`Database`]. Settlement is invoked explicitly with a `now` argument — there
-/// is no timer here; the daemon (M0.6) calls [`Settler::sweep`] periodically.
+/// is no timer here; the daemon calls [`Settler::sweep`] periodically.
 pub struct Settler<'db> {
     config: SettlementConfig,
     station: Keypair,
@@ -193,7 +193,7 @@ impl<'db> Settler<'db> {
                 // truncating the dispute window that shares this instant.
                 let window = self.config.window_for(proposal.payload.effective_tier()) as i64;
                 // Every `Confirmed` state carries confirmation admission metadata:
-                // replay seeds it on the confirm transition (T2.1.1 invariant), so
+                // replay seeds it on the confirm transition (an invariant), so
                 // `None` here is a snapshot-derivation bug, not reachable data. Fail
                 // loudly rather than silently skipping a settlement.
                 let admitted_at = snapshot

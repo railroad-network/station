@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPIKE SUPPORT ONLY — T2.6.1 (ADR-0013). Not production code, not shipped to
+# SPIKE SUPPORT ONLY (ADR-0013). Not production code, not shipped to
 # operators. This is the Python side of the Reticulum integration spike: it
 # attaches to a running, station-supervised `rnsd` shared instance and moves one
 # opaque LXMF message end to end. It exists because RNS/LXMF expose no
@@ -114,7 +114,7 @@ def role_send(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="T2.6.1 LXMF spike helper")
+    p = argparse.ArgumentParser(description="LXMF spike helper")
     p.add_argument("role", choices=["hash", "recv", "send"])
     p.add_argument("--config")
     p.add_argument("--storage")

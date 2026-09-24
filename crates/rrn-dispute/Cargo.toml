@@ -35,7 +35,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 # Cross-platform wire fixtures for the equivocation ballot / re-seat record kinds
-# (T2.3.4): JSON vectors the mobile repo verifies byte-identically, following the
+# (ADR-0025): JSON vectors the mobile repo verifies byte-identically, following the
 # repo's `cross_platform_*.json` regenerate-and-committed convention.
 serde_json = "1"
 hex = "0.4"

@@ -1,4 +1,4 @@
-//! Daemon IPC acceptance (T0.6.3): a real station, raw socket lines.
+//! Daemon IPC acceptance: a real station, raw socket lines.
 //!
 //! Connects to a running station's Unix socket and speaks the line-delimited
 //! JSON protocol by hand to check the envelope contract: a known method

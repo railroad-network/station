@@ -26,9 +26,9 @@
 //! It deliberately does *not* depend on `rrn-ledger`: governance decides policy,
 //! it does not move credit. The dependency arrows point up the stack.
 //!
-//! Phase 1 (M1.9): the Charter, statutes, and **direct voting only**. The other
+//! Phase 1: the Charter, statutes, and **direct voting only**. The other
 //! voting mechanisms of the design overview are Phase 2+ (ADR-0012). The modules
-//! below are filled in by the tasks that follow T1.9.2.
+//! below are filled in by the tasks that follow.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

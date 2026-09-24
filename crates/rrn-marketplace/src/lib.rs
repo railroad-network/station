@@ -34,7 +34,7 @@
 //! `rrn-storage`.
 //!
 //! [`listing`], [`lifecycle`], [`search`], [`need`], and [`inquiry`] are all
-//! implemented (T1.6.3–T1.6.7, T1.7.4): a buyer's approach to a provider is the
+//! implemented: a buyer's approach to a provider is the
 //! signed [`inquiry`] thread, where a listing's requirements first become a
 //! check against a specific buyer.
 

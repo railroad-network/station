@@ -19,7 +19,7 @@
 //! Authorship requires standing: the author must be an **established member** —
 //! effective (anchored) composite reputation at or above the Member band
 //! ([`BAND_MEMBER_MIN`]) — as of the proposal's **open log position**, the seq at
-//! which the station admitted it (ADR-0012 § 5, ADR-0022 / T2.1.3). Reading the
+//! which the station admitted it (ADR-0012 § 5, ADR-0022). Reading the
 //! gate at the admission position rather than the author's self-asserted
 //! `created_at` is what makes replay deterministic *and* unspoofable: a back-dated
 //! timestamp cannot change who was established when the proposal opened.
@@ -33,14 +33,14 @@
 //! # One window: deliberate and vote together (Phase 1)
 //!
 //! Phase 1 runs deliberation and voting as a **single window** (the concurrent
-//! model chosen for M1.9): the window opens at the proposal's **admission** and
+//! model chosen for Phase 1): the window opens at the proposal's **admission** and
 //! closes at `voting_ends_at = admitted_at + window_days`, where `window_days` is
 //! the Charter's `deliberation_window_days` for a statute or admin rule and its
 //! `charter_deliberation_window_days` for an amendment. The window is *not* author
 //! testimony and *not* part of the signed proposal (ADR-0022): the station
 //! restates it in a signed [`crate::window::ProposalWindow`] attestation on
 //! admission, and it is populated back onto the [`Proposal`] on replay. Members
-//! discuss and cast ballots (T1.9.5) over that one span. A passed non-emergency
+//! discuss and cast ballots over that one span. A passed non-emergency
 //! proposal takes effect after `implementation_delay_days` more
 //! ([`Proposal::implementation_at`]); an [`Emergency`](ProposalKind::Emergency)
 //! takes effect immediately on passing (its higher approval bar, not a shorter
@@ -203,7 +203,7 @@ pub struct Proposal {
     pub kind: ProposalKind,
     /// Unix seconds the proposal was created — the author's clock. **Testimony
     /// only** (ADR-0022): plausibility-bounded display/evidence, never window
-    /// arithmetic. The window runs from *admission*, not this (T2.1.3).
+    /// arithmetic. The window runs from *admission*, not this.
     pub created_at: i64,
     /// Unix seconds the deliberation/voting window closes. **Not signed and not
     /// author-set**: derived from the station's admission of the proposal and
@@ -233,7 +233,7 @@ impl Proposal {
         created_at: i64,
     ) -> Result<Self, ProposalError> {
         // The window fields are NOT author-set and NOT part of the signed content
-        // (ADR-0022, T2.1.3): they are derived from the station's *admission* of
+        // (ADR-0022): they are derived from the station's *admission* of
         // this proposal and carried in the station-signed [`crate::window::ProposalWindow`]
         // attestation, then populated back onto this struct on replay
         // ([`find_proposal`]). At construction/sign time they are placeholder zeros.
@@ -304,7 +304,7 @@ pub struct ProposalCosign {
     /// whose content disagrees with its signature is rejected, not resolved.
     pub cosigner: Address,
     /// Unix seconds the endorsement was made — the co-signer's clock. **Testimony
-    /// only** (ADR-0022 / T2.1.3): the co-signer's standing is judged at the
+    /// only** (ADR-0022): the co-signer's standing is judged at the
     /// proposal's open log position, not here.
     pub cosigned_at: i64,
 }
@@ -326,7 +326,7 @@ pub struct ProposalRecords {
     pub cosigners: HashSet<Address>,
     /// The log seq at which the proposal was admitted — its *open* position. The
     /// electorate (co-sign threshold, voter eligibility, quorum denominator) is
-    /// pinned here (T2.1.3), so nothing admitted later can pack it. `0` when
+    /// pinned here, so nothing admitted later can pack it. `0` when
     /// `proposal` is absent.
     pub open_seq: u64,
     /// The station's admission-clock reading at the proposal's open position. `0`
@@ -357,12 +357,12 @@ pub enum ProposalPhase {
     /// in this phase.
     Deliberation,
     /// Co-sign threshold met and the window still open: published, and open for
-    /// direct voting (T1.9.5). Phase 1 deliberation and voting share this one
+    /// direct voting. Phase 1 deliberation and voting share this one
     /// window (ADR-0012).
     Voting,
     /// The window has closed. `published` says whether it ever cleared the
     /// co-sign threshold; one that did not never opened for voting and has lapsed.
-    /// Whether a published proposal *passed* is the tally's call (T1.9.6).
+    /// Whether a published proposal *passed* is the tally's call.
     Concluded {
         /// Whether the proposal reached the co-sign threshold before closing.
         published: bool,
@@ -397,7 +397,7 @@ pub(crate) fn founder_set(db: &Database) -> Result<Vec<Address>, ProposalError> 
 }
 
 /// The co-sign threshold in force for a proposal opened at `(open_time, open_seq)`
-/// (ADR-0015 § 3, position-pinned per T2.1.3).
+/// (ADR-0015 § 3, position-pinned).
 ///
 /// Outside bootstrap grace this is the configured [`DEFAULT_COSIGN_THRESHOLD`].
 /// **During grace** it clamps down to the number of *other* eligible members — the
@@ -423,7 +423,7 @@ pub fn effective_cosign_threshold(
 }
 
 /// The composite reputation `address` held at `at_time`, computed from the log
-/// prefix `[1, max_seq]` (T2.1.3) — the composite as it stood at a window's *open*
+/// prefix `[1, max_seq]` — the composite as it stood at a window's *open*
 /// log position, so evidence admitted after it cannot change the reading whatever
 /// timestamp it claims. Used for the rich error the write path reports when the
 /// established-member gate refuses. `max_seq == u64::MAX` is the whole log.
@@ -439,7 +439,7 @@ pub(crate) fn composite_at_position(
         .composite())
 }
 
-/// [`is_eligible`] pinned at a log *position* (T2.1.3, ADR-0022 §5): whether
+/// [`is_eligible`] pinned at a log *position* (ADR-0022 §5): whether
 /// `address` was in the governing electorate as of the prefix `[1, max_seq]` at
 /// `at_time` — an established member then, or a genesis `founder` while the
 /// community was in bootstrap grace then. Governance judges every actor
@@ -468,7 +468,7 @@ pub(crate) fn is_eligible_asof(
 /// reaches the write path's verdict. Returns the authorized proposal with its
 /// window fields populated from the station attestation, plus its *open* position
 /// `(open_seq, open_time)` — the attestation's seq and attested admission instant
-/// (ADR-0022 / T2.1.3), never the author's `created_at`.
+/// (ADR-0022), never the author's `created_at`.
 fn find_proposal(
     log: &AppendLog,
     proposal_id: &ProposalId,
@@ -495,7 +495,7 @@ fn find_proposal(
         // A proposal with no attestation is not yet windowed — not authorized to
         // read — so skip it rather than fall back to this replica's re-stamped
         // `entry.created_at`, which differs per replica and would split the derived
-        // window, electorate, and outcome across replicas (T2.1.3 acceptance 1). The
+        // window, electorate, and outcome across replicas. The
         // attestation's own signer is pinned to the station.
         let Some((w, open_seq)) = window_and_seq_of(log, proposal_id, station) else {
             continue;
@@ -559,7 +559,7 @@ pub fn proposal_records(
         if cosign.cosigner == author {
             continue;
         }
-        // Eligibility is pinned at the proposal's open position (T2.1.3): the
+        // Eligibility is pinned at the proposal's open position: the
         // co-signing electorate is frozen when the proposal opens, so standing
         // manufactured during the window does not admit a co-signer.
         if !is_eligible_asof(
@@ -613,7 +613,7 @@ pub fn all_proposals(
         }
         // The window (and the admission instant it carries) comes from the station
         // attestation, never this replica's re-stamped `created_at`; a proposal
-        // with no attestation is not yet windowed and is not returned (T2.1.3). The
+        // with no attestation is not yet windowed and is not returned. The
         // attestation's own signer is pinned to the station.
         let Some((w, open_seq)) = window_and_seq_of(log, &proposal.proposal_id, station) else {
             continue;
@@ -621,7 +621,7 @@ pub fn all_proposals(
         proposal.voting_ends_at = w.voting_ends_at;
         proposal.implementation_at = w.implementation_at;
         // Author eligibility at the proposal's open position: the attestation's seq
-        // and the attested admission instant (ADR-0022 §5, T2.1.3).
+        // and the attested admission instant (ADR-0022 §5).
         let open_time = w.admitted_at;
         if !is_eligible_asof(
             db,
@@ -642,7 +642,7 @@ pub fn all_proposals(
 
 /// Publishes an author's proposal: appends the author-signed [`Proposal`], then
 /// the station-signed [`crate::window::ProposalWindow`] attestation that anchors
-/// its window on this admission (ADR-0022 / T2.1.3).
+/// its window on this admission (ADR-0022).
 ///
 /// Rejects a proposal whose signer is not its author, one that breaks its own
 /// rules, one whose author was not eligible at the proposal's *open* position, and
@@ -785,7 +785,7 @@ pub fn append_cosign(
     if cosign.cosigner == proposal.author {
         return Err(ProposalError::AuthorCannotCosign);
     }
-    // Co-signer eligibility is pinned at the proposal's open position (T2.1.3),
+    // Co-signer eligibility is pinned at the proposal's open position,
     // the same electorate replay counts, not the co-signer's own clock.
     let (open_seq, open_time) = (records.open_seq, records.open_time);
     if !is_eligible_asof(
@@ -980,7 +980,7 @@ impl From<Proposal> for CBOR {
         m.insert("proposal_kind", p.kind);
         m.insert("created_at", p.created_at);
         // `voting_ends_at`/`implementation_at` are deliberately NOT in the signed
-        // content (T2.1.3): the window is not author testimony but a function of
+        // content: the window is not author testimony but a function of
         // the station's admission time, restated in the signed ProposalWindow
         // attestation. Including them would sign author-clock arithmetic and hash
         // it into `proposal_id`.

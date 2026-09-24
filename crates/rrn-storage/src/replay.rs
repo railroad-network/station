@@ -45,7 +45,7 @@ pub fn replay_log(log: &AppendLog, handler: &mut dyn CrdtHandler, from_seq: u64)
 ///
 /// Absolute (not delta) totals are what make replay idempotent — applying the
 /// entry is a pointwise-max merge, so re-applying it is a no-op. This is a
-/// Phase 0 stand-in; M0.5 replaces it with real, type-tagged transactions.
+/// Phase 0 stand-in; later work replaces it with real, type-tagged transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BalanceEntry {
     /// The replica whose G-Counter totals this entry reports.
@@ -92,7 +92,7 @@ impl TryFrom<CBOR> for BalanceEntry {
 ///
 /// Entries whose payload bytes decode as a [`BalanceEntry`] are merged into the
 /// counter; all others are ignored. Decoding-as-detection is a Phase 0
-/// simplification — M0.5 introduces explicit payload type tags.
+/// simplification — later work introduces explicit payload type tags.
 #[derive(Default)]
 pub struct BalanceHandler {
     counter: PnCounter,

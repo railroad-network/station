@@ -23,12 +23,12 @@
 //! invalid listing is one that cannot exist, not one that exists and is ignored.
 //! Decoding does **not** validate — it is structural, like the ledger's records,
 //! because `TryFrom<CBOR>` can only report a `dcbor::Error` and would throw away
-//! which rule was broken. Replay revalidates with [`Listing::validate`] (T1.6.4),
+//! which rule was broken. Replay revalidates with [`Listing::validate`],
 //! where a typed [`ListingError`] survives.
 //!
 //! Two rules are deliberately *not* here, because they need context a listing
 //! does not carry: that the signer is the `provider`, and that an update's
-//! signer matches the original. Both belong to the append/replay path (T1.6.4).
+//! signer matches the original. Both belong to the append/replay path.
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
@@ -62,9 +62,9 @@ pub const CATEGORIES: &[&str] = &[
     "transportation",
 ];
 
-/// Lowest oracle tier a Phase-1 listing may claim (the M1.8 ladder).
+/// Lowest oracle tier a Phase-1 listing may claim (the oracle-tier ladder).
 pub const ORACLE_TIER_MIN: u8 = 1;
-/// Highest oracle tier a Phase-1 listing may claim; tiers 3+ arrive with M1.8.
+/// Highest oracle tier a Phase-1 listing may claim; tiers 3+ arrive in a later phase.
 pub const ORACLE_TIER_MAX: u8 = 2;
 
 /// Longest permitted `title`, in bytes of UTF-8.
@@ -398,7 +398,7 @@ impl TryFrom<CBOR> for Requirements {
     }
 }
 
-/// How often a recurring service bills (T1.7.7).
+/// How often a recurring service bills.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Frequency {
     /// Once a day.
@@ -457,7 +457,7 @@ impl TryFrom<CBOR> for Frequency {
     }
 }
 
-/// The recurring cadence a service listing declares (T1.7.7): the provider's
+/// The recurring cadence a service listing declares: the provider's
 /// standing terms for a subscription, which a [`ServiceContract`](crate::contract::ServiceContract)
 /// snapshots when a buyer signs up. The per-period price is the listing's own
 /// [`Pricing`]; these are the *other* terms of the commitment.
@@ -510,7 +510,7 @@ impl TryFrom<CBOR> for RecurringTerms {
 /// Every field is provider-asserted: nothing here verifies that the grain
 /// exists or the slot is real. The guarantee is narrow and exact — *the
 /// provider said this, signed, at this time, and cannot deny it*. Oracle tiers
-/// (M1.8) and the dispute window are what will bind claims to reality.
+/// and the dispute window are what will bind claims to reality.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Listing {
     /// Content address: Blake3 of every *other* field's canonical bytes.
@@ -536,7 +536,7 @@ pub struct Listing {
     pub availability: Availability,
     /// What the provider asks of a taker.
     pub requirements: Requirements,
-    /// Claimed oracle tier, `1..=2` in Phase 1 (the M1.8 ladder).
+    /// Claimed oracle tier, `1..=2` in Phase 1 (the oracle-tier ladder).
     pub oracle_tier: u8,
     /// Phase 2 federation visibility. Must be `false` in Phase 1.
     pub federation_visible: bool,
@@ -545,7 +545,7 @@ pub struct Listing {
     /// Unix seconds after which the listing is stale and the station's sweep
     /// should close it. `None` means it stands until closed by hand.
     pub expires_at: Option<i64>,
-    /// The recurring cadence, when this is a subscription service (T1.7.7);
+    /// The recurring cadence, when this is a subscription service;
     /// `None` for a one-off offer. **Additive to a content-addressed record**, so
     /// it is OMITTED from the CBOR when `None` (ADR-0010) — a listing published
     /// before this field existed keeps its id.
@@ -636,7 +636,7 @@ impl Listing {
         listing
     }
 
-    /// Declares this listing a recurring service on the given terms (T1.7.7),
+    /// Declares this listing a recurring service on the given terms,
     /// recomputing its content [`id`](Self::id) with the cadence included. Only a
     /// `Services` listing may carry one — [`validate`](Self::validate) enforces it.
     pub fn with_recurring(mut self, terms: RecurringTerms) -> Self {
@@ -816,7 +816,7 @@ pub enum ListingError {
         /// The offending expiry.
         expires_at: i64,
     },
-    /// A recurring cadence on a surface that is not `Services` (T1.7.7).
+    /// A recurring cadence on a surface that is not `Services`.
     #[error("only a Services listing may recur, not {surface:?}")]
     RecurringNotAService {
         /// The surface that forbids it.

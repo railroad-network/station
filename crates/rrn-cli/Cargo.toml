@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 # The CLI shares the wire types and Unix-socket client with the daemon rather
-# than redefining them, so the two cannot drift (see T0.6.3's "shared types"
-# note). It pulls in only the `rpc` / `rpc_client` surface.
+# than redefining them, so the two cannot drift (the "shared types" approach).
+# It pulls in only the `rpc` / `rpc_client` surface.
 rrn-station = { path = "../rrn-station", version = "0.1" }
 
 # The paper tools decode and *verify* paper-carried payloads locally — QR text

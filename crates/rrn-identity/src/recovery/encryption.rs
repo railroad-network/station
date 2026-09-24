@@ -170,7 +170,7 @@ pub fn decrypt_shard(
     Ok(RawShard { index, data })
 }
 
-// --- canonical CBOR (for the recovery package, T0.4.7) ----------------------
+// --- canonical CBOR (for the recovery package) ------------------------------
 
 impl From<EncryptedShard> for CBOR {
     fn from(s: EncryptedShard) -> Self {

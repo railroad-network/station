@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-platform SMS-binding fixture (T2.7.1). `canonical_hex` is the canonical dCBOR of the rrn.net.sms_binding payload; `signature_hex` is the self-signature over it. Deterministic (blake3-derived seed); regenerate with RRN_REGEN=1.",
+  "_comment": "Cross-platform SMS-binding fixture. `canonical_hex` is the canonical dCBOR of the rrn.net.sms_binding payload; `signature_hex` is the self-signature over it. Deterministic (blake3-derived seed); regenerate with RRN_REGEN=1.",
   "signer_seed": "a04628753628000e38b0cd625cb904325518404cbe16821c4d3abd326aafef7a",
   "address": "rrn12437aq7u53nt3ch92etpv48udsw3d2mwutx6snqyr3vvhkuwxppsj85h20",
   "msisdn": "+15551234567",

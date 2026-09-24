@@ -3,10 +3,10 @@
 // operations the mobile app actually performs. A small surface is a small
 // attack surface and a small maintenance surface.
 //
-// M1.1 T1.1.1 scope: the four rrn-crypto primitives (Keypair, PublicKey,
-// Signature, Hash). Address parsing (T1.1.3) reused those types. The wallet
-// file format (T1.1.5) adds WalletContents + EncryptedWallet below;
-// SignedPayload / dcbor (T1.1.7) extends this contract in its own task.
+// Initial scope: the four rrn-crypto primitives (Keypair, PublicKey,
+// Signature, Hash). Address parsing reused those types. The wallet
+// file format adds WalletContents + EncryptedWallet below;
+// SignedPayload / dcbor extends this contract in its own task.
 //
 // Deliberately NOT exposed: SecretKey. The secret seed never crosses the FFI
 // boundary in the clear — mobile holds it inside an opaque Keypair and never
@@ -18,7 +18,7 @@ namespace rrn_mobile_ffi {
     boolean is_valid_address(string address);
 
     // Serializes a signed-payload value to canonical (deterministic) dCBOR bytes
-    // (T1.1.7, ADR-0002). `payload_json` is the mobile tagged-value model: each
+    // (ADR-0002). `payload_json` is the mobile tagged-value model: each
     // node is a single-key object — {"text":…}, {"int":"<decimal>"},
     // {"bytes":"<hex>"}, {"bool":…}, {"null":null}, {"array":[…]}, or
     // {"map":[["key",node],…]}. The returned bytes are byte-identical to what
@@ -30,20 +30,20 @@ namespace rrn_mobile_ffi {
 
     // Reads the non-secret metadata off a distributable recovery shard payload
     // (the bytes from RecoveryPackage.shard_payload), for a holder's receive
-    // flow (T1.2.3). Does not decrypt the shard — only surfaces the routing
+    // flow. Does not decrypt the shard — only surfaces the routing
     // metadata so the holder app can confirm the shard is addressed to it and
     // file the payload under `original_address`. `Corrupt` if the bytes are not
     // canonical CBOR or do not match the payload shape.
     [Throws=RecoveryError]
     ShardInfo parse_shard_payload(bytes payload);
 
-    // Reads which identity a recovery request targets (T1.11.3 slice D), so a
+    // Reads which identity a recovery request targets, so a
     // holder's app can show what it is being asked to help recover before
     // contributing a shard. `Corrupt` if the request bytes are malformed.
     [Throws=RecoveryError]
     RecoveryRequestInfo parse_recovery_request(bytes request_payload);
 
-    // A holder's contribution to a recovery ceremony (T1.11.3 slice D): turns
+    // A holder's contribution to a recovery ceremony: turns
     // the shard the holder stored into a raw Shamir share re-sealed to the
     // operator's ephemeral recovery key (carried in `request_payload`). The raw
     // share never leaves in the clear — only the recovery secret opens the
@@ -52,7 +52,7 @@ namespace rrn_mobile_ffi {
     [Throws=RecoveryError]
     bytes respond_to_recovery(WalletContents wallet, bytes stored_shard_payload, bytes request_payload);
 
-    // ---- Delay-tolerant submission (T2.4.2, ADR-0020) --------------------
+    // ---- Delay-tolerant submission (ADR-0020) ----------------------------
     // Signed records cross as portable `{signer, sig, body}` envelope bytes; an
     // outbox entry envelope returned by `outbox_next_entry` is exactly what
     // `bundle_assemble` consumes and what the next `outbox_next_entry` takes as
@@ -84,7 +84,7 @@ namespace rrn_mobile_ffi {
     [Throws=DtnError]
     sequence<ReceiptOutcome> receipt_parse(bytes receipt_bytes, bytes expected_station_pubkey);
 
-    // ---- Escrowed offline spending (T2.4.2, ADR-0021) --------------------
+    // ---- Escrowed offline spending (ADR-0021) ----------------------------
 
     // Signs a member's request for a headroom certificate, returning it as
     // `{signer,sig,body}` envelope bytes. Never throws.
@@ -199,7 +199,7 @@ interface Hash {
 };
 
 // ---------------------------------------------------------------------------
-// Wallet file format (T1.1.5). A `.rrnwallet` is the canonical-CBOR encoding of
+// Wallet file format. A `.rrnwallet` is the canonical-CBOR encoding of
 // an EncryptedWallet: the identity's secret sealed with XChaCha20-Poly1305
 // under an argon2id key derived from the user's passphrase. Mobile goes through
 // rrn-identity for this — it never reimplements the format — so a wallet
@@ -264,7 +264,7 @@ interface EncryptedWallet {
 };
 
 // ---------------------------------------------------------------------------
-// Social recovery (T1.2.3). Split the wallet secret into N shards sealed to N
+// Social recovery. Split the wallet secret into N shards sealed to N
 // holders, any K of which reconstruct — see rrn-identity's `recovery` module.
 // This FFI exposes only the setup + holder-receive half of the ritual: build a
 // package, read out one sealed shard payload per holder to distribute, and (on
@@ -372,7 +372,7 @@ interface RecoveryPackage {
 };
 
 // ---------------------------------------------------------------------------
-// Delay-tolerant submission (T2.4.2, ADR-0020). Thin marshalling over
+// Delay-tolerant submission (ADR-0020). Thin marshalling over
 // rrn-protocol so the app builds/carries its own outbox chain, assembles and
 // inspects bundles, and reads station delivery receipts. See src/dtn.rs.
 
@@ -420,7 +420,7 @@ dictionary ReceiptOutcome {
 };
 
 // ---------------------------------------------------------------------------
-// Escrowed offline spending (T2.4.2, ADR-0021). Thin marshalling over
+// Escrowed offline spending (ADR-0021). Thin marshalling over
 // rrn-ledger's escrow / transaction types. See src/cert.rs.
 
 // Flat error surface for the fallible certificate operations.

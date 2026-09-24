@@ -24,8 +24,8 @@
 //! # Requirements become access control here
 //!
 //! A listing's [`Requirements`](crate::listing::Requirements) are recorded
-//! provider intent up to this point — M1.6 checks they are *reachable* and
-//! T1.7.2 lets a provider *set* them, but nothing ever checked them against a
+//! provider intent up to this point — earlier work checks they are *reachable*
+//! and lets a provider *set* them, but nothing ever checked them against a
 //! buyer. Opening an inquiry is the first moment a specific buyer approaches a
 //! specific offer, so it is the one place the check belongs. [`check_requirements`]
 //! is a pure comparison; the two facts it needs about the buyer — their capped
@@ -33,8 +33,8 @@
 //! *inputs*, supplied by the caller. That keeps this crate free of any reputation
 //! lookup and lets the local write path and replay run the identical check.
 //!
-//! Requirements are evaluated **at open time only** (ADR-0010, and the T1.7.4
-//! task note): a buyer whose standing drops mid-negotiation keeps the inquiry
+//! Requirements are evaluated **at open time only** (ADR-0010): a buyer whose
+//! standing drops mid-negotiation keeps the inquiry
 //! they legitimately opened. What a listing may demand — `min_reputation`,
 //! `community_member_only` — is immutable after creation (a
 //! [`ListingPatch`](crate::lifecycle::ListingPatch) cannot touch `requirements`),
@@ -73,7 +73,7 @@ pub(crate) const MESSAGE_KIND: &str = "rrn.marketplace.inquiry_message.v1";
 pub(crate) const CLOSED_KIND: &str = "rrn.marketplace.inquiry_closed.v1";
 
 /// How long an inquiry may sit without activity before the station's sweep
-/// closes it as [`Expired`](InquiryOutcome::Expired): seven days, per T1.7.4.
+/// closes it as [`Expired`](InquiryOutcome::Expired): seven days.
 /// Measured from the latest of the open and the last message.
 pub const INQUIRY_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -342,7 +342,7 @@ impl TryFrom<CBOR> for InquiryMessage {
 /// How an inquiry ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InquiryOutcome {
-    /// Both sides agreed on a price. The value is what a transaction (T1.7.6)
+    /// Both sides agreed on a price. The value is what a transaction
     /// will be proposed for.
     Agreed {
         /// The agreed price in centicommons.
@@ -638,8 +638,8 @@ fn closer_is_entitled(
 }
 
 /// Whether an `Agreed` price is one this listing will accept. A negotiable
-/// listing accepts any agreed price; a non-negotiable one only its listed price
-/// (T1.7.5). Non-`Agreed` outcomes carry no price and always pass.
+/// listing accepts any agreed price; a non-negotiable one only its listed price.
+/// Non-`Agreed` outcomes carry no price and always pass.
 fn agreed_price_ok(outcome: InquiryOutcome, listing: &Listing) -> bool {
     match outcome {
         InquiryOutcome::Agreed { final_price_centi } => {

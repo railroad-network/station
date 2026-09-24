@@ -456,7 +456,7 @@ fn charter_amendments_are_frozen_during_an_emergency_and_admit_after_lapse() {
     .expect("amendments admit once the emergency has lapsed");
 }
 
-// --- M2.11 conformance: the *founder-charter replacement* door is frozen too,
+// --- Emergency-freeze conformance: the *founder-charter replacement* door is frozen too,
 // not just the amendment path (ADR-0023 §3b, second door). -------------------
 
 /// A version-2 founder charter chained on the community's genesis root, signed by

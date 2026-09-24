@@ -8,12 +8,12 @@ members = [
     "crates/rrn-protocol",
     "crates/rrn-station",
     "crates/rrn-cli",
-    # Phase 1 (M1.0) skeletons.
+    # Phase 1 skeletons.
     "crates/rrn-marketplace",
     "crates/rrn-reputation",
     "crates/rrn-governance",
     "crates/rrn-dispute",
-    # Phase 1 (M1.1) mobile FFI binding surface over rrn-crypto / rrn-identity.
+    # Phase 1 mobile FFI binding surface over rrn-crypto / rrn-identity.
     "crates/rrn-mobile-ffi",
 ]
 # The cargo-fuzz crate is its own (nightly-only) workspace; keep it out of the

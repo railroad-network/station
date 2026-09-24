@@ -1,14 +1,14 @@
-//! Member-facing reputation reads for the mobile (T1.5.9).
+//! Member-facing reputation reads for the mobile.
 //!
-//! M1.5 built the scoring engine ([`rrn_reputation`]) but exposed nothing to a
+//! The scoring engine ([`rrn_reputation`]) was built but exposed nothing to a
 //! member, so a phone could not show anyone their own standing. This module is
 //! that read path: it turns a [`ReputationProfile`] into the flat, JSON-shaped
-//! view the mobile renders, and answers the band-for-an-address question M1.7's
-//! listing cards need.
+//! view the mobile renders, and answers the band-for-an-address question the
+//! marketplace listing cards need.
 //!
 //! # Reads come from the snapshot cache
 //!
-//! Scoring replays the whole log — since T1.5.8's anchoring it is O(V·N), one
+//! Scoring replays the whole log — since anchoring landed it is O(V·N), one
 //! replay per candidate voucher — so a read must never trigger one casually.
 //! Both entry points serve [`rrn_reputation::snapshot::get_cached_profile`] and
 //! fall back to [`rrn_reputation::snapshot::refresh_snapshot`] only on a miss,
@@ -49,7 +49,7 @@ pub const OWN_PROFILE_MAX_AGE_SECS: i64 = 300;
 /// How stale *another* address's band may be before a read recomputes it.
 ///
 /// Matches the station's default refresh interval, so a band read normally hits
-/// a snapshot the hourly sweep already wrote. M1.7's listing cards ask for one
+/// a snapshot the hourly sweep already wrote. The marketplace listing cards ask for one
 /// band per row, so this path must not be able to trigger a replay per card.
 pub const BAND_MAX_AGE_SECS: i64 = 3600;
 
@@ -79,7 +79,7 @@ pub struct ReputationView {
     pub band: &'static str,
     /// All five dimensions in ADR-0009 order, live ones and dormant ones alike.
     pub dimensions: Vec<DimensionRow>,
-    /// Per-category domain competence, empty until the marketplace (M1.7) feeds
+    /// Per-category domain competence, empty until the marketplace feeds
     /// it. Kept separate from `dimensions`, where domain competence appears as
     /// the single folded scalar that actually enters the composite.
     pub domain_competence: Vec<DomainRow>,
@@ -111,7 +111,7 @@ pub struct DomainRow {
     pub value: f32,
 }
 
-/// Just the band for an address, for a listing card (M1.7).
+/// Just the band for an address, for a listing card.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BandView {
     /// The scored identity's bech32m `rrn1…` address.

@@ -1,4 +1,4 @@
-//! Cross-platform equivocation wire fixtures (T2.3.3, ADR-0021 §5).
+//! Cross-platform equivocation wire fixtures (ADR-0021 §5).
 //!
 //! One byte-stable vector per new signed record kind: a station-signed
 //! [`EquivocationRecord`] on each basis (cert-overspend and outbox-fork) and a
@@ -171,7 +171,7 @@ fn build_fixture() -> Fixture {
     assert!(signed_verdict.verify().is_ok());
 
     Fixture {
-        comment: "Cross-platform equivocation wire fixtures for T2.3.3 (ADR-0021 §5). A \
+        comment: "Cross-platform equivocation wire fixtures (ADR-0021 §5). A \
             station-signed EquivocationRecord on each basis (cert-overspend, with a cert_id; \
             outbox-fork, without) and a station-signed EquivocationVerdictRecord (overturn). \
             Evidence items carry each member-signed artifact in full as a signer/sig/body triple. \

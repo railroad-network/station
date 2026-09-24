@@ -28,7 +28,7 @@
 //! # These checks are not the last line of defence
 //!
 //! The helpers here guard the *local* write path. A replicated entry arrives
-//! through `AppendLog::append_raw` (M0.6 gossip) and never passes through this
+//! through `AppendLog::append_raw` (gossip) and never passes through this
 //! module, so [`scan`] re-applies the same authorization rules when it derives
 //! state. Enforcing on the write path is what stops this station writing a bad
 //! record; enforcing in replay is what stops it believing someone else's. Both
@@ -38,7 +38,7 @@
 //!
 //! [`compute_state`] and [`compute_all_active`] replay the records into a
 //! [`ListingState`]. Nothing writes that state down: the log is canonical, and
-//! the materialized index built on top of it (T1.6.6) is a cache that can be
+//! the materialized index built on top of it is a cache that can be
 //! thrown away and rebuilt (ADR-0010).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -245,8 +245,8 @@ pub enum CloseReason {
     ProviderClosed,
     /// The station closed it for housekeeping.
     StationCleanup,
-    /// Every unit sold — the last settled sale took the stock to zero
-    /// (T1.7.6 Stage B). Unlike the others this is **derived**: [`state_of`]
+    /// Every unit sold — the last settled sale took the stock to zero.
+    /// Unlike the others this is **derived**: [`state_of`]
     /// synthesizes it from the [`StockConsumed`] records, and no signed
     /// `ListingClosed` ever carries it (`station_may_sign` refuses it below), so
     /// no party can *claim* sold-out — it is only ever what the sales add up to.
@@ -337,7 +337,7 @@ impl TryFrom<CBOR> for ListingClosed {
 }
 
 /// The station's attestation that a settled marketplace payment took one unit of
-/// a listing's stock (T1.7.6 Stage B).
+/// a listing's stock.
 ///
 /// When a listing-linked transaction settles, the provider is long gone — the
 /// settlement window closes 48h after the payment, with no party present — so,
@@ -395,15 +395,15 @@ pub type SignedStockConsumed = SignedPayload<StockConsumed>;
 
 /// Every record on the log concerning one listing, in log order.
 ///
-/// The single scan behind both the append guards here and the state machine in
-/// T1.6.5 — so authorization and replay can never read the log differently.
+/// The single scan behind both the append guards here and the state machine —
+/// so authorization and replay can never read the log differently.
 #[derive(Clone, Debug, Default)]
 pub struct ListingRecords {
     /// The creation record, absent if the listing was never published here.
     pub created: Option<Listing>,
     /// Every update, in log order.
     pub updates: Vec<ListingUpdated>,
-    /// Every station-attested sale, in log order (T1.7.6 Stage B).
+    /// Every station-attested sale, in log order.
     pub consumed: Vec<StockConsumed>,
     /// The close, if it has happened.
     pub closed: Option<ListingClosed>,
@@ -734,7 +734,7 @@ pub fn append_listing_closed(
     Ok(log.append(signed, now)?)
 }
 
-/// Records a station-attested sale against a listing (T1.7.6 Stage B): appends a
+/// Records a station-attested sale against a listing: appends a
 /// [`StockConsumed`] the settlement sweep signs when a listing-linked payment
 /// settles. Only the station may sign it (ADR-0005), and only against a listing
 /// this log has seen created.
@@ -765,7 +765,7 @@ pub fn append_stock_consumed(
 /// of the three marketplace listing kinds.
 ///
 /// For a caller maintaining a derived view incrementally — the station's search
-/// index (T1.7.0) — which has just appended or replicated entries and needs to
+/// index — which has just appended or replicated entries and needs to
 /// know which listings to recompute. The kind discriminants and the record shapes
 /// behind them belong to this module, and a daemon matching on kind strings
 /// itself would be a second copy of that mapping to keep in step.
@@ -901,7 +901,7 @@ fn state_of(records: &ListingRecords, now: i64) -> Option<ListingState> {
             closed_at: closed.closed_at,
         });
     }
-    // Sales consume stock (T1.7.6 Stage B). Only a listing that *tracks* stock
+    // Sales consume stock. Only a listing that *tracks* stock
     // (goods with a capacity) is affected; a service slot or a commons offer has
     // `capacity == None` and sells indefinitely. When the last unit goes, the
     // listing is sold out — derived here, never a stored close.
@@ -941,7 +941,7 @@ pub fn compute_state(
 /// Every listing on offer at `now`, in a deterministic order.
 ///
 /// One pass over the log for all listings, not one pass each: the browse index
-/// this feeds (T1.6.6) would otherwise replay the whole log once per listing on
+/// this feeds would otherwise replay the whole log once per listing on
 /// the station's single writer thread.
 ///
 /// Results are ordered by [`ListingId`], which is a content address — so two
@@ -962,7 +962,7 @@ pub fn compute_all_active(log: &AppendLog, station: &PublicKey, now: i64) -> Res
 /// Every listing this log has seen, with the state it is in at `now`, keyed by
 /// content address.
 ///
-/// The whole picture in one replay — what the materialized index (T1.6.6)
+/// The whole picture in one replay — what the materialized index
 /// rebuilds from, since it stores closed listings too and cannot be built from
 /// the active set alone.
 pub fn compute_all(
@@ -1069,7 +1069,7 @@ pub enum LifecycleError {
         /// The reason they claimed.
         reason: CloseReason,
     },
-    /// Only the station may attest a sale; this signer is not it (T1.7.6 Stage B).
+    /// Only the station may attest a sale; this signer is not it.
     #[error("{signer} may not attest a sale — only the station can")]
     ConsumeNotPermitted {
         /// Who tried.
@@ -1729,7 +1729,7 @@ mod tests {
         }
     }
 
-    // --- T1.6.5: the state machine ---------------------------------------
+    // --- the state machine -----------------------------------------------
 
     /// A moment comfortably inside the listing's window.
     const WHILE_OPEN: i64 = 1_850_000_000;
@@ -1792,7 +1792,7 @@ mod tests {
         assert_eq!(state.listing().unwrap().pricing.amount_centi, 199);
     }
 
-    // --- Stock consumption on settlement (T1.7.6 Stage B) -------------------
+    // --- Stock consumption on settlement -----------------------------------
 
     fn tx(n: u8) -> TransactionId {
         TransactionId(rrn_crypto::hash::Hash::from_bytes([n; 32]))

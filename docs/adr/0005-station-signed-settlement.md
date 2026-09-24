@@ -26,17 +26,17 @@ But the other two do not:
 
 - **settlement** happens *automatically* once the settlement window elapses.
   No transacting party performs an action at that moment — a background sweep
-  does. Yet settlement must be recorded in the log (M0.5 exit criterion and
-  T0.5.8 require a settlement entry, and `verify_chain` must still pass), so
+  does. Yet settlement must be recorded in the log (the exit criterion requires
+  a settlement entry, and `verify_chain` must still pass), so
   *someone* must sign it.
 - **cancellation** (withdrawal, rejection, or expiry) likewise may be triggered
   by expiry with no party present, and an expired/rejected proposal still needs
   an immutable record of *why* it ended.
 
-The M0.5 task specs sketched `Settler::new(db, config)` and an `Engine` with no
+The task specs sketched `Settler::new(db, config)` and an `Engine` with no
 signing key, which cannot append to the log. The specs predate the realization
 that the log is signature-gated; this is the kind of stale-signature gap the
-project has hit before (see the reconciliations in M0.1–M0.4).
+project has hit before (see the earlier reconciliations).
 
 ## Decision
 
@@ -94,7 +94,7 @@ anonymous log mutations.
   their secret keys.
 - **Don't log settlement at all; only mutate the materialized `balances`
   table.** Rejected: it contradicts "the log is the source of truth" and the
-  M0.5 exit criterion, and would make balances unauditable and
+  the exit criterion, and would make balances unauditable and
   non-reconstructible.
 - **Derive `Settled` purely from the passage of time at read-time** (no entry,
   compute "settled if confirmed_at + window <= now"). Rejected: settlement has a

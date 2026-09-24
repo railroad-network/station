@@ -10,7 +10,7 @@
 //!
 //! The weights and band thresholds here are fixed at the federation-protocol
 //! level; there is no config surface for them by design. Computing a profile
-//! from the log is a separate concern ([`crate::scoring`], T1.5.4).
+//! from the log is a separate concern ([`crate::scoring`]).
 
 use std::collections::BTreeMap;
 
@@ -46,11 +46,11 @@ pub const BAND_SENIOR_MIN: f32 = 4.5;
 /// get renormalized away — a dormant dimension pulls the composite down, and a
 /// consumer's job is to say so rather than hide it.
 pub const DORMANT_DIMENSIONS: &[(&str, f32)] = &[
-    // Until M1.9 (governance).
+    // Until governance.
     ("governance_participation", WEIGHT_GOVERNANCE_PARTICIPATION),
     // Phase 2+; no data source is planned in Phase 1.
     ("community_contribution", WEIGHT_COMMUNITY_CONTRIBUTION),
-    // Until the marketplace tags transactions with categories (M1.7).
+    // Until the marketplace tags transactions with categories.
     ("domain_competence", WEIGHT_DOMAIN_COMPETENCE),
 ];
 
@@ -62,7 +62,7 @@ pub const DORMANT_DIMENSIONS: &[(&str, f32)] = &[
 /// Derived from the ADR-0009 weights rather than written down as a literal, so
 /// it moves on its own when a milestone removes a dimension from
 /// [`DORMANT_DIMENSIONS`]. Two consumers depend on that: the mobile's Standing
-/// view, which must not imply an unreachable band is attainable (T1.5.9), and
+/// view, which must not imply an unreachable band is attainable, and
 /// marketplace listings, whose `min_reputation` is rejected above this ceiling
 /// so that a provider cannot demand standing no member can hold (ADR-0010).
 pub fn max_composite_now() -> f32 {
@@ -74,7 +74,7 @@ pub fn max_composite_now() -> f32 {
 /// `"construction"`.
 ///
 /// The controlled vocabulary these are drawn from is defined by the marketplace
-/// (M1.6/M1.7); Phase 1 produces no tags, so the competence map stays empty.
+/// (the marketplace); Phase 1 produces no tags, so the competence map stays empty.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DomainTag(pub String);
 
@@ -93,11 +93,11 @@ pub struct ReputationProfile {
     pub trade_reliability: f32,
     /// Ratio of this member's attestations that were not later proven wrong.
     pub attestation_accuracy: f32,
-    /// Votes cast and proposals authored. Reads `0.0` until governance (M1.9).
+    /// Votes cast and proposals authored. Reads `0.0` until governance.
     pub governance_participation: f32,
     /// Non-economic contribution. **Phase 1: always `0.0`** (no data source).
     pub community_contribution: f32,
-    /// Per-category competence. **Phase 1: empty**, fed by the marketplace (M1.7).
+    /// Per-category competence. **Phase 1: empty**, fed by the marketplace.
     pub domain_competence: BTreeMap<DomainTag, f32>,
     /// Unix seconds the profile is computed as of (decay is relative to this).
     pub last_updated: i64,
@@ -160,7 +160,7 @@ pub enum ReputationBand {
     New,
     /// `[2.0, 3.5)` — an established member (the Phase-1 ceiling lands here).
     Member,
-    /// `[3.5, 4.5)` — reachable only once domain competence has inputs (M1.7+).
+    /// `[3.5, 4.5)` — reachable only once domain competence has inputs.
     Trusted,
     /// `[4.5, 5.0]` — the top band; unreachable in Phase 1.
     Senior,

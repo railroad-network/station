@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Reticulum LXMF adapter — T2.6.2 (ADR-0026 §3). A supervised co-process the
-# station drives to move opaque carrier frames over LXMF. Unlike the T2.6.1 spike
+# Reticulum LXMF adapter (ADR-0026 §3). A supervised co-process the
+# station drives to move opaque carrier frames over LXMF. Unlike the earlier spike
 # helper (throwaway), this is a supported component: it is the ONE place RNS/LXMF
 # is spoken, because RNS exposes no language-neutral send/receive RPC (ADR-0026).
 #
@@ -67,7 +67,7 @@ def load_or_create_identity(path):
 
 
 def main():
-    p = argparse.ArgumentParser(description="T2.6.2 Reticulum LXMF adapter")
+    p = argparse.ArgumentParser(description="Reticulum LXMF adapter")
     p.add_argument("--config", required=True)
     p.add_argument("--identity", required=True)
     p.add_argument("--max-frame", type=int, default=500)

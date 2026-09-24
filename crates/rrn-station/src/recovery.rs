@@ -1,4 +1,4 @@
-//! Station key recovery — arming and reconstruction (T1.11.3, ADR-0016).
+//! Station key recovery — arming and reconstruction (ADR-0016).
 //!
 //! **Arming** ([`setup`]): split the station's wallet secret across a set of
 //! trusted holders with Shamir's secret sharing ([`rrn_identity::recovery`]),

@@ -30,7 +30,7 @@ path = "src/bin/uniffi-bindgen.rs"
 rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
 rrn-identity = { path = "../rrn-identity", version = "0.1" }
 # DTN wire formats (outbox chains, bundles, receipts) and the escrow certificate
-# / transaction types the offline-spending FFI surface wraps (T2.4.2). Adding
+# / transaction types the offline-spending FFI surface wraps. Adding
 # rrn-ledger pulls its transitive rrn-storage (bundled SQLite) into the mobile
 # binary even though this crate opens no database — the cost of reusing the one
 # canonical implementation of these records rather than re-encoding them here
@@ -43,7 +43,7 @@ rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
 # independently of that wrapper. `cli` exposes the in-crate uniffi-bindgen.
 uniffi = { version = "0.31", features = ["cli"] }
 thiserror = "1"
-# canonical_bytes (T1.1.7): parse the mobile tagged-JSON payload model and
+# canonical_bytes: parse the mobile tagged-JSON payload model and
 # re-emit it as canonical dCBOR. dcbor is pinned to the same 0.25 line as
 # rrn-crypto so the CBOR type is identical across the crate boundary; serde_json
 # parses the transport JSON; hex decodes byte-string nodes. These live here, at

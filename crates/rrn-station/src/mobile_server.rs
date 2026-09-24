@@ -1,15 +1,15 @@
 //! The mobile-facing HTTP surface (ADR-0008).
 //!
 //! A plain-HTTP listener a mobile on the local network reaches, bound to the
-//! `[mobile] listen` port that mDNS advertises (T1.3.2). Plain HTTP is
+//! `[mobile] listen` port that mDNS advertises. Plain HTTP is
 //! deliberate: the security boundary is the application-layer sealed-and-signed
 //! envelope, not the transport, so TLS would buy a property we already produce
 //! ourselves — see ADR-0008. Every handler forwards to the single-threaded
 //! [`Core`](crate::core), so there is no shared-state race here either.
 //!
-//! Routes: `POST /pair` (T1.3.3), `POST /rpc` — the authenticated request channel
-//! (T1.3.4) — and `POST /subscribe`, the long-poll for push-style updates
-//! (T1.3.5). The subscribe handler is the one place a request is *held open*: it
+//! Routes: `POST /pair`, `POST /rpc` — the authenticated request channel
+//! and `POST /subscribe`, the long-poll for push-style updates.
+//! The subscribe handler is the one place a request is *held open*: it
 //! authenticates through the core, then either returns pending events immediately
 //! or parks on the core's log-tail signal (up to `subscribe_hold`) and returns
 //! the moment a relevant event is appended. The wait lives here, never in the
@@ -30,7 +30,7 @@ use crate::core::{CoreHandle, SubscribeOutcome};
 use crate::pairing::{PairError, PairRequest, PairResponse};
 use crate::rpc_envelope::ChannelError;
 
-/// Request-body ceiling for the sealed channel. A `bundle_submit` (T2.2.3)
+/// Request-body ceiling for the sealed channel. A `bundle_submit`
 /// carries a DTN bundle up to [`MAX_BUNDLE_BYTES`] hex-encoded (≈ 2×) inside a
 /// signed, sealed envelope, so the axum default (2 MiB) would 413 a legitimate
 /// full bundle before the seal is ever opened. Sized to that worst case plus
@@ -85,7 +85,7 @@ pub async fn serve(
     }
 }
 
-/// `POST /pair` — a mobile's one-time pairing request (T1.3.3).
+/// `POST /pair` — a mobile's one-time pairing request.
 ///
 /// A rejected request maps to `400 Bad Request` with a short reason (the mobile
 /// shows it to the user); a core that is shutting down maps to `503`.
@@ -103,7 +103,7 @@ async fn pair(
     }
 }
 
-/// `POST /rpc` — a paired mobile's authenticated request (T1.3.4).
+/// `POST /rpc` — a paired mobile's authenticated request.
 ///
 /// The body is the opaque sealed envelope; the response body is the opaque
 /// sealed reply. The transport is bytes in, bytes out — everything meaningful is
@@ -117,7 +117,7 @@ async fn rpc(State(state): State<AppState>, body: Bytes) -> Result<Vec<u8>, (Sta
     }
 }
 
-/// `POST /subscribe` — a paired mobile's long-poll for push updates (T1.3.5).
+/// `POST /subscribe` — a paired mobile's long-poll for push updates.
 ///
 /// Same sealed envelope as `/rpc` (method `subscribe`, params carry the
 /// `last_seen_event_id` cursor). The handler authenticates through the core, then

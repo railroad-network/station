@@ -1,4 +1,4 @@
-//! Reticulum integration spike — T2.6.1 (ADR-0013), the Phase-2 spike ADR-0013
+//! Reticulum integration spike (ADR-0013), the Phase-2 spike ADR-0013
 //! chartered.
 //!
 //! This is a **non-hermetic, `#[ignore]`-by-default** lane: it needs a pinned
@@ -14,7 +14,7 @@
 //! to an initially-absent receiver; the payload is held (by the sender helper's
 //! own poll loop) until a path appears. Full LXMF-layer store-and-forward through
 //! a propagation node — where the message survives with *neither* endpoint
-//! online — is a T2.6.2 follow-up (see ADR-0026 §5).
+//! online — is a follow-up (see ADR-0026 §5).
 //!
 //! ## Running it
 //!
@@ -29,7 +29,7 @@
 //!
 //! ## What it does NOT do
 //!
-//! No radio (T2.6.3), no `FrameTransport` impl (T2.6.2). The bytes move over a
+//! No radio, no `FrameTransport` impl. The bytes move over a
 //! local TCP interface between the two `rnsd`s; Reticulum is exercised as the
 //! carrier, exactly as ADR-0013 frames it.
 
@@ -374,13 +374,13 @@ fn write_station_config(data_dir: &Path, reticulum_dir: &Path) {
     std::fs::write(data_dir.join("config.toml"), text).unwrap();
 }
 
-/// T2.6.4: originate → ingest → receipt → delivered over two **real** supervised
+/// Originate → ingest → receipt → delivered over two **real** supervised
 /// `rnsd` instances on local TCP, through the **production** path (RPC → outbound
 /// channel → `run_dtn_syncer` → LXMF adapter). The first end-to-end exercise of a
 /// station *originating* an outbound DTN push over a real Reticulum instance
-/// (still TCP, not radio — radio is T2.6.3's human-gated field run).
+/// (still TCP, not radio — radio is the human-gated field run).
 ///
-/// Run it exactly like the T2.6.1 spike (same pinned venv), with:
+/// Run it exactly like the integration spike (same pinned venv), with:
 /// ```sh
 /// RRN_SPIKE_RNSD=/tmp/rns/bin/rnsd RRN_SPIKE_PYTHON=/tmp/rns/bin/python \
 ///   cargo test -p rrn-station --test it -- --ignored --nocapture --exact \

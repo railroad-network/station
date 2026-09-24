@@ -13,7 +13,7 @@ rrn-crypto = { path = "../rrn-crypto", version = "0.1" }
 rrn-storage = { path = "../rrn-storage", version = "0.1" }
 rrn-identity = { path = "../rrn-identity", version = "0.1" }
 # Equivocation evidence embeds member-signed outbox entries verbatim and
-# re-derives an outbox fork with `outbox::is_fork` (ADR-0021 §5, T2.3.3). This is
+# re-derives an outbox fork with `outbox::is_fork` (ADR-0021 §5). This is
 # a data-structure/validation reuse of the wire type, not transport — the edge is
 # acyclic (`rrn-protocol` depends only on `rrn-crypto`/`rrn-identity`).
 rrn-protocol = { path = "../rrn-protocol", version = "0.1" }
@@ -29,7 +29,7 @@ tracing = "0.1"
 proptest = "1"
 # Narrates the lifecycle/idempotency integration tests under `--nocapture`.
 tracing-subscriber = "0.3"
-# Cross-platform SignedPayload<TransactionProposal> fixture (T1.1.7): drives the
+# Cross-platform SignedPayload<TransactionProposal> fixture: drives the
 # real mobile `canonical_bytes` FFI so the test proves the mobile tagged-JSON
 # path produces byte-identical canonical CBOR to the typed encoder. Dev-only —
 # rrn-mobile-ffi is never a runtime dependency of the ledger.

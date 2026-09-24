@@ -8,7 +8,7 @@
 //!   * **Idempotence:** `a.merge(a)` equals `a`.
 //!
 //! These are what guarantee that replicas which diverge and reconcile in any
-//! order converge to identical state — the M0.2 exit criterion. Tags (OR-Set)
+//! order converge to identical state — the CRDT convergence criterion. Tags (OR-Set)
 //! and clocks (LWW-Register) are supplied deterministically so the proptest
 //! cases are reproducible from their seed.
 

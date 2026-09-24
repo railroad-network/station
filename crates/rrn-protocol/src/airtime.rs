@@ -1,4 +1,4 @@
-//! Airtime budgeting for constrained carriers (T2.6.2, ADR-0013).
+//! Airtime budgeting for constrained carriers (ADR-0013).
 //!
 //! LoRa is honest about its ceiling: ~250 raw bytes/second, and duty-cycle rules
 //! in some regions cut *sustained* throughput to single-digit bytes/second

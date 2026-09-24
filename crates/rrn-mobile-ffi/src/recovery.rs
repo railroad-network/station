@@ -1,4 +1,4 @@
-//! FFI wrapper for social recovery (T1.2.3).
+//! FFI wrapper for social recovery.
 //!
 //! Thin marshalling over `rrn_identity::recovery` — no cryptographic logic of
 //! its own. The mobile owner builds a [`RecoveryPackage`] from their wallet and
@@ -189,8 +189,8 @@ pub fn parse_shard_payload(payload: Vec<u8>) -> Result<ShardInfo, RecoveryError>
 }
 
 /// A holder's contribution to a recovery ceremony: turn the shard they hold into
-/// a raw Shamir share re-sealed to the operator's ephemeral recovery key (T1.11.3
-/// slice D). `stored_shard_payload` is the payload the holder received and
+/// a raw Shamir share re-sealed to the operator's ephemeral recovery key.
+/// `stored_shard_payload` is the payload the holder received and
 /// stored; `request_payload` is the operator's [`RecoveryRequest`] bytes.
 ///
 /// The returned bytes are the sealed response for the operator to collect. The

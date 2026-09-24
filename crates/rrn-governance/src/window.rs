@@ -1,4 +1,4 @@
-//! The station-signed proposal-window attestation (ADR-0022, T2.1.3).
+//! The station-signed proposal-window attestation (ADR-0022).
 //!
 //! A proposal's deliberation/voting window and its implementation time are
 //! functions of *when the station admitted the proposal* plus the effective
@@ -38,7 +38,7 @@ fn days_to_secs(days: u8) -> i64 {
 }
 
 /// The `(voting_ends_at, implementation_at)` a proposal of `kind` runs under when
-/// admitted at `admitted_at`, per the effective `charter` (T2.1.3).
+/// admitted at `admitted_at`, per the effective `charter`.
 ///
 /// This is the whole of the window arithmetic, in one place, measured from the
 /// **admission** clock: a statute/admin rule runs the Charter's
@@ -158,7 +158,7 @@ pub fn window_of(
 }
 
 /// Like [`window_of`], but also returns the log seq of the attestation entry —
-/// the proposal's replica-stable **open position** (T2.1.3).
+/// the proposal's replica-stable **open position**.
 ///
 /// This is the seq of the *station-signed attestation*, not of the author's
 /// proposal entry: the attestation is the station's own record, so a peer that

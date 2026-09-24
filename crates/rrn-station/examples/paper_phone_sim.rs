@@ -1,5 +1,5 @@
 //! `paper-phone-sim` — a stand-in for a member's **phone** in the paper-fallback
-//! demo (T2.5.2). It is deliberately not part of the product and not a wallet: it
+//! demo. It is deliberately not part of the product and not a wallet: it
 //! exists so `scripts/demo-phase-2-paper.sh` (and a human) can play the offline
 //! member whose records travel only on paper.
 //!
@@ -24,7 +24,7 @@
 //! position 0 with an all-zero `prev_hash` — it keeps no chain state. Signing a
 //! *second* record with the same key would produce another position-0 entry,
 //! which the station treats as an outbox fork (refused, and recorded as
-//! equivocation evidence, T2.3.3). A real phone chains via
+//! equivocation evidence). A real phone chains via
 //! `rrn-mobile-ffi::outbox_next_entry`; this stand-in does not.
 
 use std::process::ExitCode;

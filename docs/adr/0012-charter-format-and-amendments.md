@@ -11,7 +11,7 @@ Date: 2026-08-06
 The design overview (Section 2.2) layers a community's governance on a stack of
 documents, each with its own permanence and its own bar for change: the
 **Charter** (constitutional), **statutes** (legislative), **administrative
-rules** (operational), and **precedent** (common law). M1.9 builds the first two
+rules** (operational), and **precedent** (common law). This work builds the first two
 layers and the direct-voting machinery that moves a proposal through the
 lifecycle in Section 2.4. This ADR fixes the **Charter** — its format, how it is
 signed into being, and how it is amended — because it is the layer everything
@@ -115,7 +115,7 @@ the cross-platform CBOR fixtures extend rather than fork. It is a new signed
 shape, so it gets its own cross-platform fixture: mobile must be able to *verify*
 a Charter even in Phase 1, and to *co-sign* one whenever charter authorship
 reaches the phone (Phase 1 mobile signs single-sig proposals and votes; a phone
-co-signing a genesis Charter is a Phase-1-optional path called out in T1.9.7b).
+co-signing a genesis Charter is a Phase-1-optional path called out separately).
 
 ### 3. The founding set is self-declared at genesis — trust on first use
 
@@ -138,7 +138,7 @@ the multisig has to be genuinely multi.
 ### 4. Amendments go through the vote lifecycle, not a second multisig
 
 The overview treats a Charter amendment as a *proposal* (Section 2.4;
-`ProposalKind::CharterAmendment { new_charter }` in T1.9.4), and once a community
+`ProposalKind::CharterAmendment { new_charter }`), and once a community
 exists it has the machinery to ratify one properly. So an amendment is **not** a
 fresh founder-style multisig — it is an ordinary proposal carrying the full
 replacement Charter, run at charter-level thresholds:
@@ -165,15 +165,15 @@ and `known_addresses` is the wrong one: it includes every address that ever
 transacted, a drive-by counterparty who has since left inflating the denominator
 and making quorum unreachable. Phase 1 defines the electorate as the
 **established members** — those whose *effective* (anchored) composite reputation
-is ≥ 2.0, the Member band — reusing M1.8's `established_member_count`
+is ≥ 2.0, the Member band — reusing the `established_member_count`
 (`rrn-reputation::staking`) rather than inventing a new roster.
 
 The consequence is deliberate and worth stating plainly: Phase 1 direct voting is
 **one established-member, one vote.** Proposal *authorship* already requires the
-same ≥ 2.0 (T1.9.4); this extends the bar to the ballot, which is the
+same ≥ 2.0; this extends the bar to the ballot, which is the
 capture-resistant choice — a flood of fresh or Sybil identities carries no
 governance weight until it has earned standing, exactly the defense Section 2.8
-asks for. It interacts with M1.8's bootstrap grace: a community with fewer than
+asks for. It interacts with bootstrap grace: a community with fewer than
 three established members has an electorate of zero to two, so it effectively has
 no formal governance yet. That is acceptable — a community that small settles
 things by talking, not by quorum — and it resolves the same way bootstrap grace
@@ -189,7 +189,7 @@ This preserves the crate's stated dependency posture and matches the scope — a
 statute that would change a ledger parameter (say, the settlement window ADR-0011
 earmarked for governance tuning) records the *intent* in the statute body in Phase
 1; wiring a passed statute to actually mutate a config value is a Phase 2 rule
-engine (T1.9.7 "out of scope"). No credit-moving path means no ledger dependency.
+engine (out of scope here). No credit-moving path means no ledger dependency.
 
 ## Consequences
 
@@ -197,7 +197,7 @@ engine (T1.9.7 "out of scope"). No credit-moving path means no ledger dependency
   up its constitution with nothing but the founders' own keys, and the resulting
   hash is the stable federation anchor the overview asks for. Defining the
   electorate as established members makes one-member-one-vote genuinely
-  Sybil-resistant for free, reusing machinery M1.8 already built. Amendments reuse
+  Sybil-resistant for free, reusing machinery already built. Amendments reuse
   the ordinary vote lifecycle, so there is exactly one ratification path to reason
   about and audit. `MultiSignedPayload` is a small, general primitive that other
   future N-of-M needs can share.
@@ -213,7 +213,7 @@ engine (T1.9.7 "out of scope"). No credit-moving path means no ledger dependency
   statutes against the Charter (Section 2.2.2), precedent linking (Section 2.2.4),
   and membership/expulsion governance (Section 2.6). The mobile Charter co-signing
   path and any federation-side hash pinning are called out where they arise
-  (T1.9.7b, Phase 2 federation).
+  (Phase 2 federation).
 
 ## Alternatives Considered
 
@@ -255,4 +255,4 @@ engine (T1.9.7 "out of scope"). No credit-moving path means no ledger dependency
   machinery this reuses.
 - `rrn-crypto::signed::SignedPayload` — the single-signer envelope
   `MultiSignedPayload` extends.
-- Threat model — `rrn-governance` § (to be populated at the M1.9 exit criterion).
+- Threat model — `rrn-governance` § (to be populated at the governance exit criterion).

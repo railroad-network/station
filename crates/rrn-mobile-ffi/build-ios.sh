@@ -3,7 +3,7 @@
 #   * an .xcframework wrapping the Rust static libs for device + simulator
 #   * the generated Swift bindings + C headers
 #
-# This is the reproducible recipe behind M1.1 T1.1.0. Station CI runs it to
+# This is the reproducible recipe for the iOS xcframework. Station CI runs it to
 # publish a versioned artifact; the mobile repo pulls the result (it needs no
 # Rust toolchain of its own — the "prebuilt artifact" decision).
 #

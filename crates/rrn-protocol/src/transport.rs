@@ -4,7 +4,7 @@
 //! self-contained signed payload to a peer, independent of whether the bytes move
 //! over TCP, Reticulum, LoRa, or SMS" — and deferred the *code* until "the trait
 //! lands with its first real second implementor." Phase 2 is that moment: LoRa
-//! (T2.6.2) and SMS (T2.7.1) both carry [`crate::bundle::Bundle`]s far larger than
+//! and SMS both carry [`crate::bundle::Bundle`]s far larger than
 //! their frame sizes over lossy, reordering, duplicating carriers. This module is
 //! the seam; [`crate::framing`] is the carrier-agnostic chunking above it.
 //!
@@ -25,7 +25,7 @@
 //! enforces). LoRa and SMS carriers are polled by their nature; an async push
 //! carrier adapts by draining into a buffer its `poll_recv` returns. The daemon
 //! wraps polling in its own runtime. ADR-0013 notes the seam is fresh and
-//! unshipped, so its first real integrator (T2.6.2) may revise this against the
+//! unshipped, so its first real integrator may revise this against the
 //! sidecar's API at near-zero cost; it is intentionally not gold-plated here.
 
 /// An opaque, carrier-specific peer designation — a *routing handle only*, never
@@ -45,7 +45,7 @@ impl Endpoint {
 /// Carrier properties a caller adapts to — frame budgeting (chunk sizing) and
 /// pacing (airtime/duty-cycle). Advisory: a transport reports these; the framing
 /// layer sizes chunks to [`max_frame_bytes`](TransportProfile::max_frame_bytes),
-/// and later a pacing layer (T2.6.2) respects the byte budget.
+/// and later a pacing layer respects the byte budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportProfile {
     /// The largest frame this carrier delivers whole, in bytes. The framing layer
@@ -53,7 +53,7 @@ pub struct TransportProfile {
     pub max_frame_bytes: usize,
     /// A rough sustained throughput budget in bytes/second, duty-cycle-adjusted;
     /// `None` means effectively unconstrained (e.g. TCP). Used by a later pacing
-    /// layer (T2.6.2), not here.
+    /// layer, not here.
     pub sustained_bytes_per_sec: Option<u32>,
     /// Whether frames can arrive dropped, duplicated, or reordered. `false` for an
     /// ordered reliable carrier (TCP, loopback); `true` for LoRa/SMS.
@@ -110,7 +110,7 @@ pub trait FrameTransport: Send + Sync {
 /// loss, duplication, reordering, and corruption without any real network.
 ///
 /// These live in the library (not behind `#[cfg(test)]`) so downstream crates'
-/// tests — the T2.4.1 offline integration, the T2.6.2 LoRa budget — can drive the
+/// tests — the offline integration, the LoRa budget — can drive the
 /// same carriers this crate's proptests do. The randomness is a small inline
 /// [`SplitMix64`] rather than the `rand` crate, so a wire-format crate gains no
 /// runtime `rand` dependency and a fixed seed pins *exact* fault sequences (golden
