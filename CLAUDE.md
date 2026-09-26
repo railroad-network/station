@@ -82,7 +82,7 @@ station/
 ├── Cargo.toml                  # workspace root, resolver = "2"
 ├── docs/
 │   ├── design/                 # design overview (canonical, updated in place with dated notes)
-│   ├── adr/                    # ADRs 0001–0028, MADR format — the locked-decision record
+│   ├── adr/                    # ADRs 0001–0037, MADR format — the locked-decision record
 │   ├── threat-model.md         # living STRIDE document, grown per milestone
 │   ├── security/               # audit-2026-08.md, phase-2-redteam.md
 │   ├── spec/                   # wire formats: qr-payloads, dtn-bundles, sms-carrier, vmk-boot-ceremony
@@ -114,7 +114,7 @@ Layered dependencies: `rrn-crypto` → `rrn-storage` → `rrn-identity` → `rrn
 
 ## Locked technical decisions
 
-The authoritative record is `docs/adr/` (0001–0028, append-only). Don't deviate without a
+The authoritative record is `docs/adr/` (0001–0037, append-only). Don't deviate without a
 new ADR. Core library choices:
 
 | Concern | Choice |
