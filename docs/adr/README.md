@@ -82,7 +82,7 @@ scheme (ADR-0017 renumbered: Phase 2 is now single-community resilience).
 | [0034](0034-community-tribunal-and-federation-arbitration.md) | The community tribunal and federation arbitration | Accepted |
 | [0035](0035-writer-succession-and-lineage-pinning.md) | Writer succession and lineage-aware signer pinning | Accepted |
 | [0036](0036-predictive-matching-v0.md) | Predictive matching, version 0 | Accepted |
-| [0037](0037-localization-codes-on-the-wire-readers-translate.md) | Localization: the wire carries codes, readers translate | Proposed |
+| [0037](0037-localization-codes-on-the-wire-readers-translate.md) | Localization: the wire carries codes, readers translate | Accepted |
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here, and the docs site's
