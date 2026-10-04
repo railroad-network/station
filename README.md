@@ -6,9 +6,10 @@
 > evidence (closed 2026-09-13; see [`docs/phase-2-exit-evidence.md`](docs/phase-2-exit-evidence.md)).
 > Phases 0 and 1 landed before it. What remains before anyone should trust this
 > with real value: the 90-day community pilot, two human-gated hardware
-> sign-offs, and an independent professional security audit. An internal
-> AI-assisted review found no High-severity issues (see
-> [Audit status](#audit-status)). **Do not use with real value.**
+> sign-offs, and an independent professional security audit. The second
+> internal AI-assisted review (October 2026) found five High-severity issues
+> that are open until their fixes land (see [Audit status](#audit-status)).
+> **Do not use with real value.**
 
 **Railroad Network** is a platform for self-organizing communities: a
 mutual-credit economy denominated in a single unit (the "Common"),
@@ -225,21 +226,40 @@ The phone-side install guide is the mobile repo's
 
 ## Audit status
 
-**Internal AI-assisted review complete; independent professional audit
-pending.** A full-workspace security review was performed on 2026-08-25 at
+**Two internal AI-assisted reviews complete, fixes for the second in
+progress; independent professional audit pending.**
+
+The **October 2026 review**, performed on 2026-10-02 at commit
+[`791db58`](https://github.com/railroad-network/station/commit/791db58), is the
+first to cover the resilience surface Phase 2 added: delay-tolerant submission,
+headroom certificates and equivocation, the admission clock, emergency
+governance, the radio and SMS carriers, paper tools, the `rrn wallet` member
+wallet, at-rest encryption, the writer/replica split, and member key recovery.
+It reported **five High-severity findings**, with 20 Medium, 15 Low, and 1
+Info. The Highs: a malformed unauthenticated pairing request halts the writer;
+one member's contract can make the charge sweep loop without bound; negative
+prices are accepted; the delay-tolerant door admits debits from keys that were
+never enrolled; and established standing can be manufactured in one settlement
+window. Six findings were reproduced by running a test. **Until each fix lands,
+those findings are open.** The full report, with a failure scenario per finding
+and a remediation order, is
+[`docs/security/audit-2026-10.md`](docs/security/audit-2026-10.md); each
+finding gets a dated update there when its fix merges.
+
+The **August 2026 review**, a full-workspace security review, was performed on 2026-08-25 at
 commit [`f59271c`](https://github.com/railroad-network/station/commit/f59271c),
 covering the cryptographic core, identity and recovery, storage, the ledger,
 and the station's network and ceremony surfaces. It reported **no
 High-severity findings**, with 3 Medium, 5 Low, and 4 Info findings
 concentrated at the protocol and exposure level. The full report is
 [`docs/security/audit-2026-08.md`](docs/security/audit-2026-08.md). The
-resilience surface Phase 2 added is covered by the living threat model and by
-the attacker-by-attacker checklist in
+resilience surface Phase 2 added is also covered by the living threat model and
+by the attacker-by-attacker checklist in
 [`docs/security/phase-2-redteam.md`](docs/security/phase-2-redteam.md),
 written for the independent audit team and for communities running their own
 outage drill.
 
-Important: the August review was a **code review performed by an AI model**
+Important: both reviews were **code reviews performed by an AI model**
 operated by the maintainer, **not** a penetration test or an attestation by a
 professional security firm. It was meant to raise the floor, not to clear the
 stack for production. Absence of a finding is not evidence of absence, and an

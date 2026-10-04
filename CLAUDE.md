@@ -44,10 +44,12 @@ numbering ("Phase 2" = federation). Now: Phase 2 = single-community resilience, 
 multi-community federation. ADRs 0001–0016 and the 2026-08 audit keep the old numbering as
 written; the threat model, design overview, and docs site use the new one.
 
-An internal AI-assisted security review is done (`docs/security/audit-2026-08.md`, no
-High-severity findings) and the Phase 2 surface has a red-team checklist
-(`docs/security/phase-2-redteam.md`); the independent professional audit is still
-pending. **Do not use with real value.**
+Two internal AI-assisted security reviews are done: `docs/security/audit-2026-08.md`
+(Phase 0–1 surface, no High-severity findings) and `docs/security/audit-2026-10.md`
+(everything through Phase 2 at `791db58`: **5 High**, 20 Medium, 15 Low, 1 Info — fixes
+in progress; until they land, the High findings are open). The Phase 2 surface also has a
+red-team checklist (`docs/security/phase-2-redteam.md`); the independent professional
+audit is still pending. **Do not use with real value.**
 
 **The docs site.** The human-facing documentation is an mdBook in the sibling repo
 `../railroad-network.github.io`, live at https://railroad-network.github.io, split by
@@ -84,7 +86,7 @@ station/
 │   ├── design/                 # design overview (canonical, updated in place with dated notes)
 │   ├── adr/                    # ADRs 0001–0037, MADR format — the locked-decision record
 │   ├── threat-model.md         # living STRIDE document, grown per milestone
-│   ├── security/               # audit-2026-08.md, phase-2-redteam.md
+│   ├── security/               # audit-2026-08.md, audit-2026-10.md, phase-2-redteam.md
 │   ├── spec/                   # wire formats: qr-payloads, dtn-bundles, sms-carrier, vmk-boot-ceremony
 │   ├── community-setup.md      # operator runbook (Parts 1–6 + command appendix)
 │   ├── background-reliability.md   # phones syncing when the app is closed, per vendor
@@ -280,8 +282,9 @@ via a pre-commit hook (`git config core.hooksPath .githooks`, set up by
   ADRs, or docs; describe the process neutrally instead ("an AI model", "AI-assisted
   review", "the maintainer delegated the review"). The "Generated with Claude Code"
   attribution line and the `Co-Authored-By` trailer are the only allowed mentions. One
-  deliberate exception: `docs/security/audit-2026-08.md` names the model on its
-  "**Performed by:**" line as provenance for that security document — leave it.
+  deliberate exception: the internal audit reports (`docs/security/audit-2026-08.md`,
+  `docs/security/audit-2026-10.md`) name the model on their "**Performed by:**" line as
+  provenance for those security documents — leave it, and nowhere else in them.
 - **No ticket numbers in code**: never write ticket identifiers (e.g. `T2.1.4`, `T1.9.7b`)
   into source, comments, doc-comments, commit messages, or PR descriptions. Tickets are
   ephemeral and gitignored; the code must stand on its own. Cite the durable record instead

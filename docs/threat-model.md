@@ -4389,6 +4389,10 @@ above; this is the index. Anticipated mitigations from the design overview
   sections of this document as an attacker-organized checklist
 - [`security/audit-2026-08.md`](security/audit-2026-08.md) — the August 2026
   internal review (old phase numbering)
+- [`security/audit-2026-10.md`](security/audit-2026-10.md) — the October 2026
+  internal review of everything through Phase 2 (new phase numbering); several of
+  its findings correct claims in this document, and those corrections land with
+  the fixes
 - [`phase-2-exit-evidence.md`](phase-2-exit-evidence.md) — the 72-hour outage
   harness and the Phase 2 exit statement
 - [`spec/dtn-bundles.md`](spec/dtn-bundles.md), [`spec/qr-payloads.md`](spec/qr-payloads.md),
