@@ -36,6 +36,10 @@ Please include:
 Per the project's open-source posture, every audit report is published, and
 the threat model states plainly what is *not* mitigated:
 
+- [`docs/security/audit-2026-10.md`](docs/security/audit-2026-10.md): the
+  October 2026 internal review of everything through Phase 2 (five High
+  findings, fixes in progress), with each finding's failure scenario and a
+  dated update as each fix lands.
 - [`docs/security/audit-2026-08.md`](docs/security/audit-2026-08.md): the
   August 2026 internal review, with each finding's failure scenario.
 - [`docs/security/phase-2-redteam.md`](docs/security/phase-2-redteam.md): the
