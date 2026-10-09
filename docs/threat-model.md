@@ -1028,7 +1028,7 @@ transition; the derivability of all state from the log.
   floor (the buyer did sign the contract; folding contract exposure into the
   committed position is the named follow-up). Contract terms are now bounded
   — at most 366 periods, each in 1..=49.99 Commons, so under the Tier-3 floor,
-  and at most 24 charges per contract per sweep (see
+  and at most 24 period charges per contract per sweep (see
   [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep));
   the floor check itself is unchanged. The floor is per-station
   config until a governance surface exists, so an operator can weaken it. What
@@ -2186,7 +2186,9 @@ credit and never delivers.
   sweep appends at most `MAX_CHARGES_PER_CONTRACT_PER_SWEEP` (24) period
   charges per contract; a longer backlog after downtime lands over successive
   sweeps. The once-only early-termination penalty does not count toward the
-  cap.
+  cap, and is levied only once the backlog has cleared — so whether a
+  termination counts as early, and owes the penalty, is the same however long
+  the station was down.
 - *Mitigation (shipped):* **the schedule and the notice window run from
   admission (ADR-0022).** Period `i` falls due at the contract's admission plus
   `i` periods, and a termination takes effect at its own admission plus the
@@ -2216,9 +2218,16 @@ credit and never delivers.
   keep a quiet inquiry from reading stale by dating a message in the future.
   An agreed inquiry still needs the provider's grant, so this delays an
   expiry; it moves no credit.
-- *Residual risk:* inquiry and contract validity are still derived against the
-  reputation cache at read time, not pinned to what the buyer held when the
-  record was admitted.
+- *Residual risk:* inquiry and contract validity are still derived at read
+  time — against the reputation cache, and against the listing's *current*
+  pricing (a provider may patch it) — not pinned to what held when the record
+  was admitted. A Commons provider who moves a subsidy listing's price from
+  below zero to above it makes past below-zero inquiries on it read as void;
+  no credit moves, since Commons never recurs.
+- *Residual risk:* `Listing::validate` does not bound a recurring listing's
+  own price to the contract range, so a recurring listing priced at zero or at
+  the Tier-3 floor or above can be published and agreed, and every contract on
+  it is then refused. A dead end, not a credit path.
 - *Residual risk:* charges already appended for a contract that the new bounds
   now invalidate stay on the log and in balances. Station-signed history is not
   rewritten; the sweep simply stops adding to it.

@@ -2866,8 +2866,17 @@ impl Core {
             // usual direction), or the provider pays the buyer (the reversed sign
             // the balance fold reads as provider→buyer). A contract that ran its
             // full course reads `Completed`, never `Terminated`, so it never pays.
+            //
+            // Only once every billable period is charged: a sweep stopped by the
+            // per-sweep cap reads a `periods_charged` short of what is owed, and
+            // a termination taking effect inside the final period would then
+            // read as early termination, with a penalty that an up-to-date
+            // station would never have charged. Waiting until the backlog clears
+            // makes the outcome the same however long the station was down.
             let penalty = records.contract.terms.early_termination_penalty_centi;
-            let penalty_due = penalty > 0 && !already.contains(&PENALTY_PERIOD_INDEX);
+            let backlog_clear = records.next_due_charge(now, periods_charged).is_none();
+            let penalty_due =
+                penalty > 0 && backlog_clear && !already.contains(&PENALTY_PERIOD_INDEX);
             if penalty_due {
                 if let ContractState::Ended {
                     reason: EndReason::Terminated { by, early: true },
@@ -7462,7 +7471,7 @@ const PENALTY_PERIOD_INDEX: u32 = u32::MAX;
 /// The most period charges one contract may receive in a single charge sweep —
 /// a day of hourly periods. A contract with a longer backlog (after downtime)
 /// catches up over successive sweeps. The early-termination penalty does not
-/// count toward it.
+/// count toward it, and is levied only once that backlog has cleared.
 const MAX_CHARGES_PER_CONTRACT_PER_SWEEP: u32 = 24;
 
 /// The set of period indices already charged for each contract, in one log pass.
@@ -11359,22 +11368,29 @@ mod tests {
         assert_eq!(core.tail_seq(), before);
     }
 
-    #[test]
-    fn a_catch_up_sweep_appends_at_most_the_cap_per_contract() {
-        let mut core = test_core();
-        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+    const DAY: i64 = 86_400;
+
+    /// Stands up a valid daily contract at `CONTRACT_PRICE`, admitted at `NOW`,
+    /// with the given duration, notice, and penalty; returns its id.
+    fn seed_daily_contract(
+        core: &Core,
+        provider: &Keypair,
+        buyer: &Keypair,
+        periods: u32,
+        notice_days: u32,
+        penalty_centi: i64,
+    ) -> ContractId {
         let buyer_addr = Address::from_public_key(buyer.public_key());
-        const DAY: i64 = 86_400;
         let daily = RecurringTerms {
             frequency: Frequency::Daily,
-            duration_periods: 60,
-            notice_period_days: 0,
-            early_termination_penalty_centi: 0,
+            duration_periods: periods,
+            notice_period_days: notice_days,
+            early_termination_penalty_centi: penalty_centi,
         };
-        let listing = listing_with(&provider, CONTRACT_PRICE, false, daily);
+        let listing = listing_with(provider, CONTRACT_PRICE, false, daily);
         append_listing_created(
             &mut AppendLog::new(&core.db),
-            rrn_crypto::signed::SignedPayload::sign(listing.clone(), &provider),
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), provider),
             NOW,
         )
         .unwrap();
@@ -11385,7 +11401,7 @@ mod tests {
         let admit_all = |_: &Listing, _: &Address| true;
         append_inquiry_opened(
             &mut AppendLog::new(&core.db),
-            rrn_crypto::signed::SignedPayload::sign(opened, &buyer),
+            rrn_crypto::signed::SignedPayload::sign(opened, buyer),
             &listing,
             0.0,
             true,
@@ -11402,7 +11418,7 @@ mod tests {
                     },
                     closed_at: NOW,
                 },
-                &provider,
+                provider,
             ),
             &station_pk,
             &admit_all,
@@ -11416,24 +11432,53 @@ mod tests {
             listing.provider,
             ContractTerms {
                 frequency: Frequency::Daily,
-                duration_periods: 60,
+                duration_periods: periods,
                 commons_per_period_centi: CONTRACT_PRICE,
                 performance_metrics: std::collections::BTreeMap::new(),
-                notice_period_days: 0,
-                early_termination_penalty_centi: 0,
+                notice_period_days: notice_days,
+                early_termination_penalty_centi: penalty_centi,
             },
             NOW,
         )
         .unwrap();
-        let cid = hex(&contract.contract_id.to_bytes());
+        let contract_id = contract.contract_id;
         append_service_contract(
             &mut AppendLog::new(&core.db),
-            rrn_crypto::signed::SignedPayload::sign(contract, &buyer),
+            rrn_crypto::signed::SignedPayload::sign(contract, buyer),
             &station_pk,
             &admit_all,
             NOW,
         )
         .unwrap();
+        contract_id
+    }
+
+    /// The buyer terminates `contract_id`, admitted at `NOW`.
+    fn buyer_terminates_at_now(core: &Core, buyer: &Keypair, contract_id: ContractId) {
+        append_contract_termination(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                ContractTermination {
+                    contract_id,
+                    terminated_by: TerminatedBy::Buyer,
+                    requested_at: NOW,
+                },
+                buyer,
+            ),
+            &core.station_pubkey(),
+            &|_: &Listing, _: &Address| true,
+            NOW,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_catch_up_sweep_appends_at_most_the_cap_per_contract() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let contract_id = seed_daily_contract(&core, &provider, &buyer, 60, 0, 0);
+        let cid = hex(&contract_id.to_bytes());
 
         // Sixty days of downtime: every period is owed, but each sweep bills at
         // most the cap and the backlog lands over successive sweeps.
@@ -11449,6 +11494,60 @@ mod tests {
         assert_eq!(
             ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -60 * CONTRACT_PRICE
+        );
+    }
+
+    #[test]
+    fn a_capped_backlog_levies_the_penalty_exactly_as_an_up_to_date_station_would() {
+        // A termination taking effect inside the final period: every period is
+        // still billable, so the contract completes and owes no penalty. A
+        // station down for the whole run must reach the same ledger, even though
+        // its first capped sweep sees only 24 periods charged.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let contract_id = seed_daily_contract(&core, &provider, &buyer, 60, 59, CONTRACT_PENALTY);
+        buyer_terminates_at_now(&core, &buyer, contract_id);
+        core.clock.set(NOW + 60 * DAY);
+        assert_eq!(core.do_charge_contracts(), 24);
+        assert_eq!(core.do_charge_contracts(), 24);
+        assert_eq!(core.do_charge_contracts(), 12);
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -60 * CONTRACT_PRICE,
+            "no penalty on a contract that ran its full course"
+        );
+        let detail = core
+            .run_contract_detail(&hex(&contract_id.to_bytes()), buyer_addr)
+            .unwrap();
+        assert_eq!(detail["ended_reason"], "completed");
+
+        // A genuinely early termination under the same backlog: notice closes on
+        // day 30, so periods 0..=30 bill (31 of them), then the penalty — once,
+        // in the sweep that clears the backlog, never before.
+        // A fresh core: the log keeps admission monotonic, so a contract seeded
+        // after the first core's clock moved would be admitted at that later time.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let contract_id = seed_daily_contract(&core, &provider, &buyer, 60, 30, CONTRACT_PENALTY);
+        buyer_terminates_at_now(&core, &buyer, contract_id);
+        core.clock.set(NOW + 60 * DAY);
+        assert_eq!(
+            core.do_charge_contracts(),
+            24,
+            "periods only, penalty waits"
+        );
+        assert_eq!(
+            core.do_charge_contracts(),
+            7 + 1,
+            "the rest, then the penalty"
+        );
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -31 * CONTRACT_PRICE - CONTRACT_PENALTY
         );
     }
 
