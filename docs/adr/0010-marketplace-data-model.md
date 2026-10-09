@@ -350,13 +350,26 @@ price is the only price an agreement can carry, so a price outside that range
 can never produce a contract. `Listing::validate` therefore refuses it, with
 `ListingError::RecurringPriceOutOfRange`, both at publish and on replay (where
 an out-of-range creation record is skipped, never a halt). Otherwise a dead-end
-listing could be published, inquired on and agreed. Because no valid contract
-can exist on such a listing, the replay rule hides no working contract.
+listing could be published, inquired on and agreed.
+
+On replay the rule is checked against the **creation record**. Once it is in
+force no out-of-range creation record can enter the log, at the front door or
+by replication, before any inquiry could attach to it, so no inquiry or
+contract can ever form on one and replay hides nothing. The one exposure is a
+listing admitted *before* the rule at an out-of-range price and later patched
+into range: a contract agreed on it after the patch is valid, and the rule
+would hide it. No such listing existed on any log when this was recorded, and
+no pilot had started. An **update** is checked at the write door, as every
+listing rule already is. Replay does not re-validate patches, which is a
+standing residual recorded in the threat model, not something this rule
+changes.
 
 A negotiable recurring listing is unchanged: its amount is an opening ask, the
 agreed offer is what a contract carries, and the contract validator bounds
 that. The `>= 0` rule for one-off Services and Goods listings, and the Commons
-subsidy rule, are unchanged.
+subsidy rule, are unchanged. This narrows the Services pricing rule for one
+sub-case. It changes neither the decision nor the Status, and adds no wire
+format.
 
 ## Alternatives Considered
 
