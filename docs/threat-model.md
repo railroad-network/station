@@ -1026,7 +1026,11 @@ transition; the derivability of all state from the log.
 - *Residual risk:* the recurring-contract charge path (`ContractCharge`)
   is not floor-checked, so contract periods can land a buyer below the
   floor (the buyer did sign the contract; folding contract exposure into the
-  committed position is the named follow-up). The floor is per-station
+  committed position is the named follow-up). Contract terms are now bounded
+  — at most 366 periods, each in 1..=49.99 Commons, so under the Tier-3 floor,
+  and at most 24 charges per contract per sweep (see
+  [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep));
+  the floor check itself is unchanged. The floor is per-station
   config until a governance surface exists, so an operator can weaken it. What
   a community does about a *departed* member's bounded debt remains a
   governance question the floor caps but does not answer.
@@ -1866,6 +1870,17 @@ credit and never delivers.
 > Anyone who can reach that socket can already move the station's credit;
 > publishing a listing under its name is strictly less than that.
 >
+> **Correction (October 2026 audit).** The sentence above about paired mobiles
+> describes the RPC work as it landed and is no longer true. The mobile channel
+> now carries member-signed marketplace writes — `submit_listing`,
+> `submit_listing_update`, `submit_listing_close`, `submit_inquiry`,
+> `submit_inquiry_message`, `submit_inquiry_close`, `submit_contract`, and
+> `submit_contract_termination` — each refusing a record whose signer is not
+> the authenticated mobile, and each going through the same append helper (and
+> the same replay rules) as the operator path. See
+> [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep)
+> for what a member-signed contract may commit to.
+>
 > Two things are still deferred and named here rather than in a task doc. A
 > **member's** marketplace writes — a phone signing its own listing, which the
 > station records without holding the key — arrive later, and are a different
@@ -2141,6 +2156,72 @@ credit and never delivers.
   that socket is the operator's own (see the note at the head of this section);
   the paired-mobile work exposes it to paired mobiles, and that is where the budget has to land
   rather than being deferred again.
+
+#### Recurring contracts and the charge sweep
+
+- *Threat:* a service contract is a direct debit. The buyer signs it once and
+  the station's charge sweep then appends a station-signed `ContractCharge` per
+  period, on the single core thread, with no party present and no pass through
+  the transaction engine's tier gate. The October 2026 audit showed what an
+  unbounded contract does with that: a one-second cadence, four billion
+  periods, and a buyer-chosen `started_at` of zero made one sweep append a
+  charge for every second since the epoch — forever, and again after each
+  restart. A second chain moved credit the wrong way: a buyer offered a
+  *negative* price on a Services listing, the provider accepted it, and every
+  period then debited the provider.
+- *Mitigation (shipped):* **the terms are bounded, on the write path and again
+  on replay.** `Listing::validate` (for a listing's recurring terms) and
+  `ServiceContract::validate` (for the contract's snapshot of them) both
+  enforce: a custom period of at least `MIN_CUSTOM_PERIOD_SECS` (one hour); at
+  most `MAX_DURATION_PERIODS` (366) periods, which is the lifetime bound on
+  period charges per contract; a notice period of at most
+  `MAX_NOTICE_PERIOD_DAYS` (366); and an early-termination penalty in
+  `0..=MAX_CONTRACT_CHARGE_CENTI`. The contract's per-period amount must be in
+  `1..=MAX_CONTRACT_CHARGE_CENTI` — positive, and under the Tier-3 floor
+  (ADR-0011), because a contract charge is a balance move the tier gate never
+  sees. `contract::scan` calls the same `validate`, so a contract admitted
+  before these bounds existed is skipped on replay (never a halt), and the
+  sweep never charges it.
+- *Mitigation (shipped):* **one sweep cannot loop on one contract.** The
+  sweep appends at most `MAX_CHARGES_PER_CONTRACT_PER_SWEEP` (24) period
+  charges per contract; a longer backlog after downtime lands over successive
+  sweeps. The once-only early-termination penalty does not count toward the
+  cap.
+- *Mitigation (shipped):* **the schedule and the notice window run from
+  admission (ADR-0022).** Period `i` falls due at the contract's admission plus
+  `i` periods, and a termination takes effect at its own admission plus the
+  notice period, with saturating arithmetic throughout. The buyer's
+  `started_at` and the terminator's `requested_at` stay in the signed records
+  as testimony and enter no arithmetic, so neither can back-date a backlog of
+  charges or shorten a notice window. The contract views report the admission
+  anchor as `started_at`, so it agrees with `next_charge_due`.
+- *Mitigation (shipped):* **a buyer cannot flip who pays whom.** On Goods and
+  Services an opening offer, a counter-offer, and an agreed price must all be
+  `>= 0`. On Commons a negative amount is a subsidy, allowed only when the
+  provider's own signed listing is priced below zero; a Commons listing at or
+  above zero negotiates like Goods. The rule is checked against the listing in
+  all three inquiry append paths and in `inquiry::scan`, where a record that
+  breaks it is skipped.
+- *Mitigation (shipped):* **no self-dealing inquiry.** An inquiry whose buyer
+  is the listing's own provider is refused at the front door (before the
+  requirements gate, so the error names the reason) and skipped on replay. One
+  identity can no longer agree a contract with itself.
+- *Residual risk:* contract charges are not floor-checked (ADR-0018; see
+  [unbounded debt](#elevation-of-privilege--unbounded-debt-adr-0018)). The
+  bounds above cap what one contract can move per period and over its
+  lifetime; they do not stop a buyer who signs several contracts from being
+  charged below the floor.
+- *Residual risk:* an inquiry's TTL still runs on party timestamps
+  (`opened_at`, `sent_at`) — only its arithmetic saturates — so a party can
+  keep a quiet inquiry from reading stale by dating a message in the future.
+  An agreed inquiry still needs the provider's grant, so this delays an
+  expiry; it moves no credit.
+- *Residual risk:* inquiry and contract validity are still derived against the
+  reputation cache at read time, not pinned to what the buyer held when the
+  record was admitted.
+- *Residual risk:* charges already appended for a contract that the new bounds
+  now invalidate stay on the log and in balances. Station-signed history is not
+  rewritten; the sweep simply stops adding to it.
 
 ### `rrn-reputation`
 

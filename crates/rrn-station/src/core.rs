@@ -2836,9 +2836,15 @@ impl Core {
             let total = records.total_periods();
             let mut periods_charged = already.iter().filter(|&&p| p < total).count() as u32;
 
-            // Catch up every period due since the last sweep — after downtime a
-            // contract can owe several at once.
-            while let Some(index) = records.next_due_charge(now, periods_charged) {
+            // Catch up periods due since the last sweep — after downtime a
+            // contract can owe several at once — but at most
+            // `MAX_CHARGES_PER_CONTRACT_PER_SWEEP` of them, so no one contract
+            // holds the core thread; the rest of the backlog lands next sweep.
+            let mut this_sweep = 0;
+            while this_sweep < MAX_CHARGES_PER_CONTRACT_PER_SWEEP {
+                let Some(index) = records.next_due_charge(now, periods_charged) else {
+                    break;
+                };
                 let charge = ContractCharge {
                     contract_ref,
                     buyer: records.buyer(),
@@ -2852,6 +2858,7 @@ impl Core {
                 }
                 appended += 1;
                 periods_charged += 1;
+                this_sweep += 1;
             }
 
             // Once, after the notice window closes on an early termination, levy
@@ -7272,7 +7279,8 @@ fn availability_for(
 /// CLI offers only the three named cadences; a `Custom` interval exists in the
 /// model but has no operator surface. `notice` and `penalty` default to zero (no
 /// notice, no penalty). The listing's own `validate` enforces the rest — that
-/// the surface is a service and the duration is at least one period.
+/// the surface is a service, the duration is 1..=366 periods, the notice at most
+/// 366 days, and the penalty under the Tier-3 floor.
 fn recurring_terms_from(
     every: &str,
     periods: Option<u32>,
@@ -7446,9 +7454,16 @@ fn parse_contract_id(s: &str) -> Result<ContractId, (i32, String)> {
 
 /// The `period_index` a contract's early-termination penalty rides on. Chosen
 /// past any real period so it neither counts toward `periods_charged` nor
-/// collides with a period's own idempotency key — a contract's duration is a
-/// handful of periods, never near `u32::MAX`.
+/// collides with a period's own idempotency key — a contract's duration is at
+/// most [`MAX_DURATION_PERIODS`](rrn_marketplace::listing::MAX_DURATION_PERIODS),
+/// never near `u32::MAX`.
 const PENALTY_PERIOD_INDEX: u32 = u32::MAX;
+
+/// The most period charges one contract may receive in a single charge sweep —
+/// a day of hourly periods. A contract with a longer backlog (after downtime)
+/// catches up over successive sweeps. The early-termination penalty does not
+/// count toward it.
+const MAX_CHARGES_PER_CONTRACT_PER_SWEEP: u32 = 24;
 
 /// The set of period indices already charged for each contract, in one log pass.
 ///
@@ -11144,6 +11159,614 @@ mod tests {
             ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
             -(2 * CONTRACT_PRICE) - CONTRACT_PENALTY
         );
+    }
+
+    // --- contract bounds, the charge schedule, and the sign rule ------
+
+    /// A services listing at `amount_centi` with `recurring` terms, built
+    /// *without* validating the cadence — `with_recurring` does not validate —
+    /// so a test can hold a listing the front door would refuse.
+    fn listing_with(
+        provider: &Keypair,
+        amount_centi: i64,
+        negotiable: bool,
+        recurring: RecurringTerms,
+    ) -> Listing {
+        let mut listing = recurring_listing(provider);
+        listing.pricing = Pricing {
+            amount_centi,
+            model: if negotiable {
+                PricingModel::Negotiable
+            } else {
+                PricingModel::Fixed
+            },
+            negotiable,
+        };
+        listing.with_recurring(recurring)
+    }
+
+    /// A contract assembled field by field without `validate`, its id recomputed
+    /// by a decode of its own bytes — what a hand-crafted gossiped record is.
+    fn unvalidated_contract(
+        inquiry_id: rrn_marketplace::inquiry::InquiryId,
+        listing: &Listing,
+        buyer: Address,
+        terms: ContractTerms,
+        started_at: i64,
+    ) -> ServiceContract {
+        let raw = ServiceContract {
+            contract_id: ContractId(Hash::from_bytes([0u8; 32])),
+            inquiry_id,
+            listing_id: listing.id,
+            buyer,
+            provider: listing.provider,
+            terms,
+            started_at,
+        };
+        rrn_crypto::serialize::from_canonical_bytes(&to_canonical_bytes(raw)).unwrap()
+    }
+
+    /// Appends a signed record to the core's log with no append-path guard, the
+    /// way a replicated entry arrives.
+    fn append_raw<T>(core: &Core, payload: T, signer: &Keypair, at: i64)
+    where
+        T: Clone + Into<dcbor::prelude::CBOR>,
+    {
+        AppendLog::new(&core.db)
+            .append(rrn_crypto::signed::SignedPayload::sign(payload, signer), at)
+            .unwrap();
+    }
+
+    /// The audit's hostile cadence: a one-second period for four billion periods.
+    const HOSTILE: RecurringTerms = RecurringTerms {
+        frequency: Frequency::Custom(1),
+        duration_periods: 4_000_000_000,
+        notice_period_days: 0,
+        early_termination_penalty_centi: 0,
+    };
+
+    fn hostile_terms() -> ContractTerms {
+        ContractTerms {
+            frequency: HOSTILE.frequency,
+            duration_periods: HOSTILE.duration_periods,
+            commons_per_period_centi: 1,
+            performance_metrics: std::collections::BTreeMap::new(),
+            notice_period_days: 0,
+            early_termination_penalty_centi: 0,
+        }
+    }
+
+    #[test]
+    fn contract_sweep_is_bounded_and_hostile_terms_are_refused() {
+        use rrn_marketplace::listing::{
+            ListingError, MAX_DURATION_PERIODS, MIN_CUSTOM_PERIOD_SECS,
+        };
+        let core = test_core();
+        let me = Keypair::generate();
+        let me_addr = Address::from_public_key(me.public_key());
+
+        // Each hostile bound is refused by name; together they are refused too.
+        let short = RecurringTerms {
+            duration_periods: CONTRACT_PERIODS,
+            ..HOSTILE
+        };
+        assert_eq!(
+            listing_with(&me, 1, false, short).validate(),
+            Err(ListingError::RecurringPeriodTooShort {
+                secs: 1,
+                min: MIN_CUSTOM_PERIOD_SECS,
+            })
+        );
+        let long = RecurringTerms {
+            frequency: Frequency::Daily,
+            ..HOSTILE
+        };
+        assert_eq!(
+            listing_with(&me, 1, false, long).validate(),
+            Err(ListingError::RecurringDurationTooLong {
+                periods: 4_000_000_000,
+                max: MAX_DURATION_PERIODS,
+            })
+        );
+        let hostile = listing_with(&me, 1, false, HOSTILE);
+        assert!(hostile.validate().is_err());
+        assert!(append_listing_created(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(hostile, &me),
+            NOW,
+        )
+        .is_err());
+
+        // A buyer cannot inquire against their own (valid) listing — refused by
+        // name, ahead of the requirements gate, on the library path and over the
+        // channel.
+        let listing = recurring_listing(&me);
+        append_listing_created(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), &me),
+            NOW,
+        )
+        .unwrap();
+        let opened =
+            InquiryOpened::new(listing.id, me_addr, "Sign me up.".into(), None, NOW).unwrap();
+        let err = append_inquiry_opened(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(opened.clone(), &me),
+            &listing,
+            0.0,
+            true,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            rrn_marketplace::Error::Inquiry(
+                rrn_marketplace::inquiry::InquiryError::BuyerIsProvider
+            )
+        ));
+        let mut core = core;
+        let env = envelope(
+            &me,
+            "submit_inquiry",
+            serde_json::json!({ "signed_inquiry": record_hex(opened, &me) }),
+        );
+        let (code, message) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("your own listing"), "{message}");
+    }
+
+    #[test]
+    fn an_already_admitted_hostile_contract_is_skipped_on_replay() {
+        // The audit's chain, appended raw as if admitted before the bounds
+        // existed: the hostile listing, a self-inquiry, its `Agreed` close, and a
+        // contract claiming to start at the epoch. Replay skips every layer, so
+        // the sweep appends nothing and cannot be wedged.
+        let mut core = test_core();
+        let me = Keypair::generate();
+        let me_addr = Address::from_public_key(me.public_key());
+        let listing = listing_with(&me, 1, false, HOSTILE);
+        append_raw(&core, listing.clone(), &me, NOW);
+        let opened = InquiryOpened::new(listing.id, me_addr, "x".into(), None, NOW).unwrap();
+        let inquiry_id = opened.inquiry_id;
+        append_raw(&core, opened, &me, NOW);
+        append_raw(
+            &core,
+            InquiryClosed {
+                inquiry_id,
+                outcome: InquiryOutcome::Agreed {
+                    final_price_centi: 1,
+                },
+                closed_at: NOW,
+            },
+            &me,
+            NOW,
+        );
+        let contract = unvalidated_contract(inquiry_id, &listing, me_addr, hostile_terms(), 0);
+        append_raw(&core, contract, &me, NOW);
+
+        let station_pk = core.station_pubkey();
+        assert!(rrn_marketplace::contract::all_contract_records(
+            &AppendLog::new(&core.db),
+            &station_pk,
+            &|_: &Listing, _: &Address| true,
+        )
+        .unwrap()
+        .is_empty());
+        let before = core.tail_seq();
+        assert_eq!(core.do_charge_contracts(), 0);
+        core.clock.set(NOW + 365 * 86_400);
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(core.tail_seq(), before);
+    }
+
+    #[test]
+    fn a_catch_up_sweep_appends_at_most_the_cap_per_contract() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        const DAY: i64 = 86_400;
+        let daily = RecurringTerms {
+            frequency: Frequency::Daily,
+            duration_periods: 60,
+            notice_period_days: 0,
+            early_termination_penalty_centi: 0,
+        };
+        let listing = listing_with(&provider, CONTRACT_PRICE, false, daily);
+        append_listing_created(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
+        let opened =
+            InquiryOpened::new(listing.id, buyer_addr, "Daily please.".into(), None, NOW).unwrap();
+        let inquiry_id = opened.inquiry_id;
+        let station_pk = core.station_pubkey();
+        let admit_all = |_: &Listing, _: &Address| true;
+        append_inquiry_opened(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(opened, &buyer),
+            &listing,
+            0.0,
+            true,
+            NOW,
+        )
+        .unwrap();
+        append_inquiry_closed(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                InquiryClosed {
+                    inquiry_id,
+                    outcome: InquiryOutcome::Agreed {
+                        final_price_centi: CONTRACT_PRICE,
+                    },
+                    closed_at: NOW,
+                },
+                &provider,
+            ),
+            &station_pk,
+            &admit_all,
+            NOW,
+        )
+        .unwrap();
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            buyer_addr,
+            listing.provider,
+            ContractTerms {
+                frequency: Frequency::Daily,
+                duration_periods: 60,
+                commons_per_period_centi: CONTRACT_PRICE,
+                performance_metrics: std::collections::BTreeMap::new(),
+                notice_period_days: 0,
+                early_termination_penalty_centi: 0,
+            },
+            NOW,
+        )
+        .unwrap();
+        let cid = hex(&contract.contract_id.to_bytes());
+        append_service_contract(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(contract, &buyer),
+            &station_pk,
+            &admit_all,
+            NOW,
+        )
+        .unwrap();
+
+        // Sixty days of downtime: every period is owed, but each sweep bills at
+        // most the cap and the backlog lands over successive sweeps.
+        core.clock.set(NOW + 60 * DAY);
+        assert_eq!(MAX_CHARGES_PER_CONTRACT_PER_SWEEP, 24);
+        assert_eq!(core.do_charge_contracts(), 24);
+        assert_eq!(core.do_charge_contracts(), 24);
+        assert_eq!(core.do_charge_contracts(), 12);
+        assert_eq!(core.do_charge_contracts(), 0);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["periods_charged"], 60);
+        assert_eq!(detail["state"], "ended");
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -60 * CONTRACT_PRICE
+        );
+    }
+
+    #[test]
+    fn negative_offers_and_agreed_prices_are_refused_on_goods_and_services() {
+        use rrn_marketplace::inquiry::{append_inquiry_message, InquiryError, InquiryMessage};
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let station_pk = core.station_pubkey();
+        let admit_all = |_: &Listing, _: &Address| true;
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+        let negative = |e: rrn_marketplace::Error| {
+            matches!(
+                e,
+                rrn_marketplace::Error::Inquiry(InquiryError::NegativeAmountNotAllowed {
+                    amount_centi: -2000,
+                    ..
+                })
+            )
+        };
+
+        // The audit's negotiable recurring services listing at +5.00 a week.
+        let listing = listing_with(
+            &provider,
+            CONTRACT_PRICE,
+            true,
+            RecurringTerms {
+                frequency: Frequency::Weekly,
+                duration_periods: CONTRACT_PERIODS,
+                notice_period_days: CONTRACT_NOTICE_DAYS,
+                early_termination_penalty_centi: CONTRACT_PENALTY,
+            },
+        );
+        append_listing_created(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
+
+        // An opening offer of −20.00 is refused.
+        let bad_open = InquiryOpened::new(
+            listing.id,
+            buyer_addr,
+            "Sign me up.".into(),
+            Some(-2000),
+            NOW,
+        )
+        .unwrap();
+        let err = append_inquiry_opened(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(bad_open.clone(), &buyer),
+            &listing,
+            0.0,
+            true,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(negative(err));
+
+        // So is a −20.00 counter-offer in an otherwise good inquiry…
+        let opened =
+            InquiryOpened::new(listing.id, buyer_addr, "Sign me up.".into(), None, NOW).unwrap();
+        let inquiry_id = opened.inquiry_id;
+        append_inquiry_opened(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(opened, &buyer),
+            &listing,
+            0.0,
+            true,
+            NOW,
+        )
+        .unwrap();
+        let err = append_inquiry_message(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                InquiryMessage {
+                    inquiry_id,
+                    sender: buyer_addr,
+                    body: "How about this?".into(),
+                    counter_offer_centi: Some(-2000),
+                    sent_at: NOW,
+                },
+                &buyer,
+            ),
+            &station_pk,
+            &admit_all,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(negative(err));
+
+        // …and an `Agreed` at −20.00.
+        let err = append_inquiry_closed(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                InquiryClosed {
+                    inquiry_id,
+                    outcome: InquiryOutcome::Agreed {
+                        final_price_centi: -2000,
+                    },
+                    closed_at: NOW,
+                },
+                &provider,
+            ),
+            &station_pk,
+            &admit_all,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(negative(err));
+
+        // The audit's whole chain appended raw — the negative open, the agreed
+        // close, and a contract at −20.00 a period: replay skips it, the sweep
+        // charges nothing, and the provider's balance stays at zero.
+        let bad_id = bad_open.inquiry_id;
+        append_raw(&core, bad_open, &buyer, NOW);
+        append_raw(
+            &core,
+            InquiryClosed {
+                inquiry_id: bad_id,
+                outcome: InquiryOutcome::Agreed {
+                    final_price_centi: -2000,
+                },
+                closed_at: NOW,
+            },
+            &provider,
+            NOW,
+        );
+        let mut terms = seed_contract_terms();
+        terms.commons_per_period_centi = -2000;
+        let contract = unvalidated_contract(bad_id, &listing, buyer_addr, terms, NOW);
+        append_raw(&core, contract, &buyer, NOW);
+        assert!(rrn_marketplace::contract::all_contract_records(
+            &AppendLog::new(&core.db),
+            &station_pk,
+            &admit_all,
+        )
+        .unwrap()
+        .is_empty());
+        core.clock.set(NOW + 3 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_subsidy_commons_listing_still_negotiates_below_zero() {
+        let core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let station_pk = core.station_pubkey();
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let mut listing = test_listing(&provider, "Water the commons garden", None);
+        listing.surface = Surface::Commons;
+        listing.pricing = Pricing {
+            amount_centi: -500,
+            model: PricingModel::Negotiable,
+            negotiable: true,
+        };
+        let listing = Listing::new(
+            listing.provider,
+            listing.community,
+            listing.surface,
+            listing.category,
+            listing.title,
+            listing.description,
+            listing.pricing,
+            listing.availability,
+            listing.requirements,
+            listing.oracle_tier,
+            listing.federation_visible,
+            listing.created_at,
+            listing.expires_at,
+        )
+        .unwrap();
+        append_listing_created(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
+
+        let opened = InquiryOpened::new(
+            listing.id,
+            buyer_addr,
+            "I can do most of it.".into(),
+            Some(-300),
+            NOW,
+        )
+        .unwrap();
+        let inquiry_id = opened.inquiry_id;
+        append_inquiry_opened(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(opened, &buyer),
+            &listing,
+            0.0,
+            true,
+            NOW,
+        )
+        .unwrap();
+        append_inquiry_closed(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                InquiryClosed {
+                    inquiry_id,
+                    outcome: InquiryOutcome::Agreed {
+                        final_price_centi: -300,
+                    },
+                    closed_at: NOW,
+                },
+                &provider,
+            ),
+            &station_pk,
+            &|_: &Listing, _: &Address| true,
+            NOW,
+        )
+        .unwrap();
+        let records = rrn_marketplace::inquiry::inquiry_records(
+            &AppendLog::new(&core.db),
+            &inquiry_id,
+            &station_pk,
+            &|_: &Listing, _: &Address| true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            records.closed.unwrap().outcome,
+            InquiryOutcome::Agreed {
+                final_price_centi: -300
+            }
+        );
+    }
+
+    #[test]
+    fn contract_schedule_runs_from_admission_not_started_at() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+
+        // The buyer claims the contract began ten weeks ago; the station admits it
+        // now. Only period 0 is due — the claim back-dates nothing.
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            buyer_addr,
+            listing.provider,
+            seed_contract_terms(),
+            NOW - 10 * WEEK_SECS,
+        )
+        .unwrap();
+        let cid = hex(&contract.contract_id.to_bytes());
+        append_service_contract(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(contract, &buyer),
+            &core.station_pubkey(),
+            &|_: &Listing, _: &Address| true,
+            NOW,
+        )
+        .unwrap();
+
+        assert_eq!(core.do_charge_contracts(), 1);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["periods_charged"], 1);
+        assert_eq!(detail["next_charge_due"], NOW + WEEK_SECS);
+        // The view reports the admission anchor, consistent with the schedule.
+        assert_eq!(detail["started_at"], NOW);
+        let rows = core.run_my_contracts(buyer_addr).unwrap();
+        assert_eq!(rows["contracts"][0]["started_at"], NOW);
+    }
+
+    #[test]
+    fn termination_notice_runs_from_admission_not_requested_at() {
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let contract_id = seed_contract(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let cid = hex(&contract_id.to_bytes());
+        assert_eq!(core.do_charge_contracts(), 1);
+
+        // A termination claiming the epoch, admitted at NOW: the notice window
+        // runs a week from NOW, not from 0.
+        append_contract_termination(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                ContractTermination {
+                    contract_id,
+                    terminated_by: TerminatedBy::Buyer,
+                    requested_at: 0,
+                },
+                &buyer,
+            ),
+            &core.station_pubkey(),
+            &|_: &Listing, _: &Address| true,
+            NOW,
+        )
+        .unwrap();
+        let effective_at = NOW + i64::from(CONTRACT_NOTICE_DAYS) * 86_400;
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["state"], "terminating");
+        assert_eq!(detail["terminating_effective_at"], effective_at);
+
+        // Still terminating just before the window closes.
+        core.clock.set(effective_at - 1);
+        assert_eq!(core.do_charge_contracts(), 0);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["state"], "terminating");
+
+        // Period 1 falls due inside the window (on its last moment) and still
+        // charges, alongside the early-exit penalty.
+        core.clock.set(effective_at);
+        assert_eq!(core.do_charge_contracts(), 2);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["periods_charged"], 2);
+        assert_eq!(detail["state"], "ended");
     }
 
     #[test]

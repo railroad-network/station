@@ -59,7 +59,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::inquiry::{inquiry_records, InquiryId, InquiryOutcome};
-use crate::listing::{Frequency, Listing, ListingId, RecurringTerms};
+use crate::listing::{
+    Frequency, Listing, ListingId, RecurringTerms, MAX_CONTRACT_CHARGE_CENTI, MAX_DURATION_PERIODS,
+    MAX_NOTICE_PERIOD_DAYS, MIN_CUSTOM_PERIOD_SECS,
+};
 use crate::Result;
 
 /// Discriminant strings carried in the `kind` field of each record's canonical
@@ -244,8 +247,9 @@ pub struct ServiceContract {
     pub provider: Address,
     /// The terms, snapshotted from the listing + agreement.
     pub terms: ContractTerms,
-    /// Unix seconds the contract began, from the buyer's own clock. Period `i`
-    /// falls due at `started_at + i * frequency.period_secs()`.
+    /// Unix seconds the buyer says the contract began, from their own clock.
+    /// Testimony only: scheduling runs from the contract's admission
+    /// (ADR-0022, [`ContractRecords::admitted_at`]), never from this.
     pub started_at: i64,
 }
 
@@ -296,19 +300,59 @@ impl ServiceContract {
         ContractId(Hash::of(&to_canonical_bytes(self.clone())))
     }
 
-    /// Checks the contract's own rules — that its terms are internally sane. That
-    /// they *match the listing and agreement* is the append path's, since that
-    /// needs the log the contract does not carry.
+    /// Checks the contract's own rules — that its terms are internally sane and
+    /// inside the bounds a station-executed direct debit may carry. That they
+    /// *match the listing and agreement* is the append path's, since that needs
+    /// the log the contract does not carry.
+    ///
+    /// The cadence bounds are the listing's own ([`Listing::validate`]), re-checked
+    /// here so a contract is bounded even if it cites a listing that was never
+    /// validated. The per-period amount must be positive — a free recurring
+    /// service needs no direct debit — and under the Tier-3 floor, because a
+    /// contract charge never passes the transaction engine's tier gate.
     pub fn validate(&self) -> std::result::Result<(), ContractError> {
-        if self.terms.duration_periods == 0 {
+        let terms = &self.terms;
+        if terms.duration_periods == 0 {
             return Err(ContractError::ZeroDuration);
         }
-        if matches!(self.terms.frequency, Frequency::Custom(0)) {
+        if terms.duration_periods > MAX_DURATION_PERIODS {
+            return Err(ContractError::RecurringDurationTooLong {
+                periods: terms.duration_periods,
+                max: MAX_DURATION_PERIODS,
+            });
+        }
+        if matches!(terms.frequency, Frequency::Custom(0)) {
             return Err(ContractError::ZeroPeriod);
         }
-        if self.terms.early_termination_penalty_centi < 0 {
+        if let Frequency::Custom(secs) = terms.frequency {
+            if secs < MIN_CUSTOM_PERIOD_SECS {
+                return Err(ContractError::RecurringPeriodTooShort {
+                    secs,
+                    min: MIN_CUSTOM_PERIOD_SECS,
+                });
+            }
+        }
+        if terms.notice_period_days > MAX_NOTICE_PERIOD_DAYS {
+            return Err(ContractError::RecurringNoticeTooLong {
+                days: terms.notice_period_days,
+                max: MAX_NOTICE_PERIOD_DAYS,
+            });
+        }
+        if !(1..=MAX_CONTRACT_CHARGE_CENTI).contains(&terms.commons_per_period_centi) {
+            return Err(ContractError::AmountOutOfRange {
+                amount_centi: terms.commons_per_period_centi,
+                max: MAX_CONTRACT_CHARGE_CENTI,
+            });
+        }
+        if terms.early_termination_penalty_centi < 0 {
             return Err(ContractError::NegativePenalty {
-                penalty_centi: self.terms.early_termination_penalty_centi,
+                penalty_centi: terms.early_termination_penalty_centi,
+            });
+        }
+        if terms.early_termination_penalty_centi > MAX_CONTRACT_CHARGE_CENTI {
+            return Err(ContractError::PenaltyTooLarge {
+                penalty_centi: terms.early_termination_penalty_centi,
+                max: MAX_CONTRACT_CHARGE_CENTI,
             });
         }
         Ok(())
@@ -402,8 +446,9 @@ pub struct ContractTermination {
     pub contract_id: ContractId,
     /// Which party asked. Must equal the signer's role.
     pub terminated_by: TerminatedBy,
-    /// Unix seconds the request was made, from the signer's own clock. Notice
-    /// runs from here.
+    /// Unix seconds the signer says the request was made, from their own clock.
+    /// Testimony only: notice runs from the termination's admission (ADR-0022,
+    /// [`ContractRecords::termination_admitted_at`]), never from this.
     pub requested_at: i64,
 }
 
@@ -458,14 +503,22 @@ pub struct ContractRecords {
     pub listing: Listing,
     /// The termination, if one has landed.
     pub terminated: Option<ContractTermination>,
+    /// When the station admitted the contract — the log entry's `created_at`.
+    /// The schedule's anchor: period 0 falls due here (ADR-0022).
+    pub admitted_at: i64,
+    /// When the station admitted the termination, set together with
+    /// [`terminated`](Self::terminated). The notice window runs from here.
+    pub termination_admitted_at: Option<i64>,
 }
 
 impl ContractRecords {
-    fn new(contract: ServiceContract, listing: Listing) -> Self {
+    fn new(contract: ServiceContract, listing: Listing, admitted_at: i64) -> Self {
         Self {
             contract,
             listing,
             terminated: None,
+            admitted_at,
+            termination_admitted_at: None,
         }
     }
 
@@ -484,10 +537,13 @@ impl ContractRecords {
         self.contract.terms.duration_periods
     }
 
-    /// When period `index` (0-based) falls due — `started_at + index * period`.
-    /// Period 0 is due at `started_at`, so the first charge is taken up front.
+    /// When period `index` (0-based) falls due — `admitted_at + index * period`.
+    /// Period 0 is due at admission, so the first charge is taken up front. The
+    /// buyer's `started_at` enters no arithmetic (ADR-0022). Saturating, so no
+    /// index or period can overflow it.
     pub fn period_due_at(&self, index: u32) -> i64 {
-        self.contract.started_at + i64::from(index) * self.contract.period_secs()
+        self.admitted_at
+            .saturating_add(i64::from(index).saturating_mul(self.contract.period_secs()))
     }
 
     /// When the contract would end of its own accord, had no one terminated it —
@@ -496,11 +552,14 @@ impl ContractRecords {
         self.period_due_at(self.total_periods())
     }
 
-    /// When a termination takes effect: the request time plus the notice period.
-    /// `None` if no termination has been requested.
+    /// When a termination takes effect: the termination's admission plus the
+    /// notice period. `None` if no termination has landed. The signer's
+    /// `requested_at` enters no arithmetic (ADR-0022).
     pub fn termination_effective_at(&self) -> Option<i64> {
-        self.terminated.map(|t| {
-            t.requested_at + i64::from(self.contract.terms.notice_period_days) * SECS_PER_DAY
+        self.termination_admitted_at.map(|admitted_at| {
+            admitted_at.saturating_add(
+                i64::from(self.contract.terms.notice_period_days).saturating_mul(SECS_PER_DAY),
+            )
         })
     }
 
@@ -572,7 +631,7 @@ impl ContractRecords {
         ContractState::Active {
             next_charge_due: self.period_due_at(periods_charged),
             periods_charged,
-            periods_remaining: self.total_periods() - periods_charged,
+            periods_remaining: self.total_periods().saturating_sub(periods_charged),
         }
     }
 }
@@ -787,7 +846,7 @@ fn scan(
                 // stated twice, and `append_service_contract` refuses one.
                 found
                     .entry(contract.contract_id)
-                    .or_insert_with(|| ContractRecords::new(contract, listing));
+                    .or_insert_with(|| ContractRecords::new(contract, listing, entry.created_at));
             }
             continue;
         }
@@ -799,6 +858,7 @@ fn scan(
                 && terminator_entitled(&term, &signer, &records.contract)
             {
                 records.terminated = Some(term);
+                records.termination_admitted_at = Some(entry.created_at);
             }
         }
     }
@@ -939,6 +999,47 @@ pub enum ContractError {
     NegativePenalty {
         /// The offending penalty.
         penalty_centi: i64,
+    },
+    /// A contract that runs for more than [`MAX_DURATION_PERIODS`].
+    #[error("a contract may run for at most {max} periods, not {periods}")]
+    RecurringDurationTooLong {
+        /// The declared duration.
+        periods: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// A `Frequency::Custom` period shorter than [`MIN_CUSTOM_PERIOD_SECS`].
+    #[error("a custom billing period must be at least {min} seconds, not {secs}")]
+    RecurringPeriodTooShort {
+        /// The declared period.
+        secs: u32,
+        /// The limit.
+        min: u32,
+    },
+    /// A notice period longer than [`MAX_NOTICE_PERIOD_DAYS`].
+    #[error("a notice period may be at most {max} days, not {days}")]
+    RecurringNoticeTooLong {
+        /// The declared notice.
+        days: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// A per-period amount that is not positive, or is over
+    /// [`MAX_CONTRACT_CHARGE_CENTI`].
+    #[error("a contract's per-period amount must be 1..={max} centicommons, not {amount_centi}")]
+    AmountOutOfRange {
+        /// The offending amount.
+        amount_centi: i64,
+        /// The limit.
+        max: i64,
+    },
+    /// An early-termination penalty above [`MAX_CONTRACT_CHARGE_CENTI`].
+    #[error("early-termination penalty {penalty_centi} is over the {max}-centicommon limit")]
+    PenaltyTooLarge {
+        /// The offending penalty.
+        penalty_centi: i64,
+        /// The limit.
+        max: i64,
     },
     /// No qualifying inquiry for the cited id — nothing to be born from.
     #[error("no inquiry {0} this contract could be born from")]
@@ -1584,13 +1685,14 @@ mod tests {
             }
         );
 
-        // Now terminate after the first week and re-derive.
+        // Now terminate after the first week and re-derive. Notice runs from the
+        // termination's admission (ADR-0022), so it is admitted a week in.
         append_contract_termination(
             &mut log,
             termination_of(&buyer, contract_id, TerminatedBy::Buyer, STARTED_AT + WEEK),
             &station.public_key(),
             &admit_all(),
-            NOW,
+            NOW + WEEK,
         )
         .unwrap();
         let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
@@ -1669,6 +1771,255 @@ mod tests {
         assert_eq!(records.next_due_charge(STARTED_AT + 100 * WEEK, 1), Some(1));
         // But period 2, a further week past the window, does not.
         assert_eq!(records.next_due_charge(STARTED_AT + 100 * WEEK, 2), None);
+    }
+
+    /// A contract built without `validate`, the way a hand-crafted gossiped
+    /// record would arrive: assembled field by field, its id recomputed by a
+    /// decode of its own bytes.
+    fn unvalidated_contract(
+        inquiry_id: InquiryId,
+        listing_id: ListingId,
+        buyer: Address,
+        provider: Address,
+        terms: ContractTerms,
+        started_at: i64,
+    ) -> ServiceContract {
+        let raw = ServiceContract {
+            contract_id: ContractId(Hash::from_bytes([0u8; 32])),
+            inquiry_id,
+            listing_id,
+            buyer,
+            provider,
+            terms,
+            started_at,
+        };
+        from_canonical_bytes(&to_canonical_bytes(raw)).unwrap()
+    }
+
+    #[test]
+    fn contract_validate_bounds_amount_penalty_period_duration_notice() {
+        let check = |t: ContractTerms| {
+            unvalidated_contract(
+                InquiryId(Hash::of(b"an inquiry")),
+                ListingId(Hash::of(b"a listing")),
+                Address::from_public_key(Keypair::generate().public_key()),
+                Address::from_public_key(Keypair::generate().public_key()),
+                t,
+                STARTED_AT,
+            )
+            .validate()
+        };
+        let max = MAX_CONTRACT_CHARGE_CENTI;
+        let at_limits = ContractTerms {
+            frequency: Frequency::Custom(MIN_CUSTOM_PERIOD_SECS),
+            duration_periods: MAX_DURATION_PERIODS,
+            notice_period_days: MAX_NOTICE_PERIOD_DAYS,
+            early_termination_penalty_centi: max,
+            ..terms(max)
+        };
+        assert_eq!(check(at_limits.clone()), Ok(()));
+
+        // The per-period amount: positive and under the Tier-3 floor.
+        assert_eq!(max, 4_999);
+        assert_eq!(check(terms(4_999)), Ok(()));
+        assert_eq!(check(terms(1)), Ok(()));
+        for amount_centi in [0, -1, -2_000, 5_000, i64::MAX, i64::MIN] {
+            assert_eq!(
+                check(terms(amount_centi)),
+                Err(ContractError::AmountOutOfRange { amount_centi, max }),
+                "{amount_centi}"
+            );
+        }
+
+        assert_eq!(
+            check(ContractTerms {
+                early_termination_penalty_centi: max + 1,
+                ..at_limits.clone()
+            }),
+            Err(ContractError::PenaltyTooLarge {
+                penalty_centi: max + 1,
+                max,
+            })
+        );
+        assert_eq!(
+            check(ContractTerms {
+                early_termination_penalty_centi: -1,
+                ..at_limits.clone()
+            }),
+            Err(ContractError::NegativePenalty { penalty_centi: -1 })
+        );
+        assert_eq!(
+            check(ContractTerms {
+                frequency: Frequency::Custom(MIN_CUSTOM_PERIOD_SECS - 1),
+                ..at_limits.clone()
+            }),
+            Err(ContractError::RecurringPeriodTooShort {
+                secs: MIN_CUSTOM_PERIOD_SECS - 1,
+                min: MIN_CUSTOM_PERIOD_SECS,
+            })
+        );
+        assert_eq!(
+            check(ContractTerms {
+                frequency: Frequency::Custom(0),
+                ..at_limits.clone()
+            }),
+            Err(ContractError::ZeroPeriod)
+        );
+        assert_eq!(
+            check(ContractTerms {
+                duration_periods: MAX_DURATION_PERIODS + 1,
+                ..at_limits.clone()
+            }),
+            Err(ContractError::RecurringDurationTooLong {
+                periods: MAX_DURATION_PERIODS + 1,
+                max: MAX_DURATION_PERIODS,
+            })
+        );
+        assert_eq!(
+            check(ContractTerms {
+                notice_period_days: MAX_NOTICE_PERIOD_DAYS + 1,
+                ..at_limits
+            }),
+            Err(ContractError::RecurringNoticeTooLong {
+                days: MAX_NOTICE_PERIOD_DAYS + 1,
+                max: MAX_NOTICE_PERIOD_DAYS,
+            })
+        );
+    }
+
+    #[test]
+    fn an_out_of_bounds_contract_is_refused_and_skipped_on_replay() {
+        // A listing priced at the Tier-3 floor is itself valid — a one-off sale
+        // at that size is blocked by the engine's tier gate — but a contract at
+        // that per-period amount would move it as a station-signed charge that
+        // never meets that gate. Refused at the front door, skipped on replay.
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let buyer = Keypair::generate();
+        let station = Keypair::generate();
+        let mut listing = recurring_listing(&provider);
+        listing.pricing.amount_centi = rrn_ledger::tier::TIER_3_FLOOR_CENTI;
+        let listing = listing.with_recurring(recurring_terms());
+        assert_eq!(listing.validate(), Ok(()));
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(listing.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
+        let inquiry_id = agree_inquiry(&mut log, &buyer, &provider, &station, &listing);
+
+        let price = rrn_ledger::tier::TIER_3_FLOOR_CENTI;
+        let contract = unvalidated_contract(
+            inquiry_id,
+            listing.id,
+            Address::from_public_key(buyer.public_key()),
+            Address::from_public_key(provider.public_key()),
+            terms(price),
+            STARTED_AT,
+        );
+        let err = append_service_contract(
+            &mut log,
+            SignedPayload::sign(contract.clone(), &buyer),
+            &station.public_key(),
+            &admit_all(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Contract(ContractError::AmountOutOfRange { .. })
+        ));
+
+        // Appended raw, as gossip would carry it: replay drops it.
+        log.append(SignedPayload::sign(contract.clone(), &buyer), NOW)
+            .unwrap();
+        assert!(contract_records(
+            &log,
+            &contract.contract_id,
+            &station.public_key(),
+            &admit_all()
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            all_contract_records(&log, &station.public_key(), &admit_all())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_schedule_and_notice_run_from_admission_not_party_timestamps() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let buyer = Keypair::generate();
+        let station = Keypair::generate();
+        let listing = publish(&mut log, &provider);
+        let inquiry_id = agree_inquiry(&mut log, &buyer, &provider, &station, &listing);
+
+        // The buyer claims the contract began at the epoch; the station admits it
+        // at `ADMITTED`.
+        const ADMITTED: i64 = NOW + 3 * WEEK;
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            Address::from_public_key(buyer.public_key()),
+            Address::from_public_key(provider.public_key()),
+            terms(PRICE),
+            0,
+        )
+        .unwrap();
+        let contract_id = contract.contract_id;
+        append_service_contract(
+            &mut log,
+            SignedPayload::sign(contract, &buyer),
+            &station.public_key(),
+            &admit_all(),
+            ADMITTED,
+        )
+        .unwrap();
+        let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
+            .unwrap()
+            .unwrap();
+        assert_eq!(records.admitted_at, ADMITTED);
+        assert_eq!(records.period_due_at(0), ADMITTED);
+        assert_eq!(records.period_due_at(1), ADMITTED + WEEK);
+        // Nothing is due before admission, whatever `started_at` says.
+        assert_eq!(records.next_due_charge(ADMITTED - 1, 0), None);
+        assert_eq!(records.next_due_charge(ADMITTED, 0), Some(0));
+        assert_eq!(records.next_due_charge(ADMITTED, 1), None);
+        // The schedule saturates rather than overflowing at extreme indices.
+        assert_eq!(
+            records.period_due_at(u32::MAX),
+            ADMITTED + i64::from(u32::MAX) * WEEK
+        );
+
+        // A termination claiming the epoch is admitted a week later: notice runs
+        // from that admission.
+        append_contract_termination(
+            &mut log,
+            termination_of(&buyer, contract_id, TerminatedBy::Buyer, 0),
+            &station.public_key(),
+            &admit_all(),
+            ADMITTED + WEEK,
+        )
+        .unwrap();
+        let records = contract_records(&log, &contract_id, &station.public_key(), &admit_all())
+            .unwrap()
+            .unwrap();
+        let effective_at = ADMITTED + WEEK + i64::from(NOTICE_DAYS) * 86_400;
+        assert_eq!(records.termination_admitted_at, Some(ADMITTED + WEEK));
+        assert_eq!(records.termination_effective_at(), Some(effective_at));
+        assert_eq!(
+            records.state(ADMITTED + WEEK, 1),
+            ContractState::Terminating {
+                effective_at,
+                periods_charged: 1,
+            }
+        );
     }
 
     #[test]
