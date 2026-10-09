@@ -2225,9 +2225,11 @@ credit and never delivers.
   below zero to above it makes past below-zero inquiries on it read as void;
   no credit moves, since Commons never recurs.
 - *Residual risk:* `Listing::validate` does not bound a recurring listing's
-  own price to the contract range, so a recurring listing priced at zero or at
-  the Tier-3 floor or above can be published and agreed, and every contract on
-  it is then refused. A dead end, not a credit path.
+  own price to the contract range, so a recurring listing that does not invite
+  offers (`negotiable: false`), priced at zero or at the Tier-3 floor or above,
+  can be published and agreed, and every contract on it is then refused. A dead
+  end, not a credit path. (A negotiable recurring listing is unaffected: its
+  price is an opening ask, and an agreed in-range offer contracts normally.)
 - *Residual risk:* charges already appended for a contract that the new bounds
   now invalidate stay on the log and in balances. Station-signed history is not
   rewritten; the sweep simply stops adding to it.
