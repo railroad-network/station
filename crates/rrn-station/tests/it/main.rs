@@ -6,6 +6,7 @@
 //! `cargo test -p rrn-station --test it <name>`.
 #[cfg(target_os = "linux")]
 mod at_rest_dmcrypt;
+mod audit_regressions;
 mod backup_recover;
 mod cross_platform_contract;
 mod cross_platform_inquiry;

@@ -118,7 +118,7 @@ pub fn events_since(
     };
 
     let mut out = Vec::new();
-    for entry in log.iter_from(after_seq + 1) {
+    for entry in log.iter_from(after_seq.saturating_add(1)) {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -350,6 +350,22 @@ mod tests {
             &db,
             &addr(&alice),
             0,
+            ALL,
+            &Keypair::generate().public_key()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_maximal_cursor_returns_nothing_without_panicking() {
+        // `after_seq` is the mobile's cursor; `u64::MAX + 1` must not overflow.
+        let db = fresh_db();
+        let (alice, bob) = (Keypair::generate(), Keypair::generate());
+        append_proposal(&db, &alice, &addr(&bob), 0);
+        assert!(events_since(
+            &db,
+            &addr(&bob),
+            u64::MAX,
             ALL,
             &Keypair::generate().public_key()
         )

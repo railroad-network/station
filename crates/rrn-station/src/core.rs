@@ -13,6 +13,8 @@
 //! oneshots — which can be fulfilled from any thread.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -313,6 +315,20 @@ pub enum SubscribeOutcome {
         nonce: u64,
     },
 }
+
+/// Why the core command loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreExit {
+    /// A [`Command::Shutdown`] arrived, or every handle was dropped.
+    Clean,
+    /// A command handler panicked; the panic was caught and the caller answered.
+    /// [`Core::spawn`] turns this into a process exit.
+    Panicked,
+}
+
+/// The process exit status after a core handler panic (`EX_SOFTWARE`): non-zero,
+/// so a supervisor configured to restart on failure brings the station back up.
+pub const CORE_PANIC_EXIT_CODE: i32 = 70;
 
 /// A cloneable handle the async tasks use to talk to the core.
 #[derive(Clone)]
@@ -759,184 +775,57 @@ impl Core {
     }
 
     /// Spawns the core on a dedicated thread and returns a handle to it.
+    ///
+    /// If a command handler panics, the core answers that caller, stops, and then
+    /// ends the **process** with [`CORE_PANIC_EXIT_CODE`]: the core owns the only
+    /// database handle and all in-flight state, a panic mid-handler may have left
+    /// either half-applied, and the log on disk is the source of truth — so the
+    /// safe recovery is a supervisor restart that re-derives everything from the
+    /// log, not a daemon that stays up with a dead command loop. A clean
+    /// [`Command::Shutdown`] never exits the process.
     pub fn spawn(self) -> CoreHandle {
         let (tx, rx) = mpsc::channel::<Command>();
         let log_tail = self.tail_tx.subscribe();
         std::thread::Builder::new()
             .name("rrn-core".into())
-            .spawn(move || self.run(rx))
+            .spawn(move || {
+                // `run` contains each command's panic itself; this outer guard
+                // catches one from outside the per-command guard (the startup
+                // index rebuild, the tail publish) so it is fatal too, never a
+                // live process with a dead core.
+                let exit = std::panic::catch_unwind(AssertUnwindSafe(|| self.run(rx)))
+                    .unwrap_or(CoreExit::Panicked);
+                if exit == CoreExit::Panicked {
+                    tracing::error!(
+                        code = CORE_PANIC_EXIT_CODE,
+                        "core hit an internal error; exiting so the supervisor restarts \
+                         the station from its log"
+                    );
+                    std::process::exit(CORE_PANIC_EXIT_CODE);
+                }
+            })
             .expect("spawn core thread");
         CoreHandle { tx, log_tail }
     }
 
-    /// The blocking command loop. Returns when a [`Command::Shutdown`] arrives or
-    /// all handles are dropped.
-    fn run(mut self, rx: mpsc::Receiver<Command>) {
+    /// The blocking command loop. Returns [`CoreExit::Clean`] when a
+    /// [`Command::Shutdown`] arrives or all handles are dropped, and
+    /// [`CoreExit::Panicked`] as soon as a command handler panics (the panic is
+    /// caught, the caller answered, and the loop stops — see [`Core::spawn`]).
+    fn run(mut self, rx: mpsc::Receiver<Command>) -> CoreExit {
         self.rebuild_listing_index();
         while let Ok(cmd) = rx.recv() {
-            match cmd {
-                Command::Call { request, reply } => {
-                    let _ = reply.send(self.handle_call(&request));
-                }
-                // The sweep timers admit station-signed records at the front door
-                // (settlement/cancellation, expiry, contract charges, governance
-                // enactment, dispute resolution), so on a read-replica they must
-                // do nothing (ADR-0020 §7): the daemon does not spawn these timers
-                // for a replica, and this guard also makes the public test hooks
-                // (`Station::sweep`/`charge_contracts`/…) inert on a replica, so a
-                // replica cannot fork its own chain by any path. A replica
-                // re-derives all of this by replay (ADR-0018).
-                Command::Sweep { reply } => {
-                    let n = if self.role.admits() {
-                        self.do_sweep()
-                    } else {
-                        0
-                    };
-                    let _ = reply.send(n);
-                }
-                Command::RefreshReputation { reply } => {
-                    // Reputation is a derived cache (ADR-0009), not a log append —
-                    // it runs on both roles.
-                    let n = self.do_refresh_reputation();
-                    let _ = reply.send(n);
-                }
-                Command::ExpireListings { reply } => {
-                    let n = if self.role.admits() {
-                        self.do_expire_listings()
-                    } else {
-                        0
-                    };
-                    let _ = reply.send(n);
-                }
-                Command::ExpireInquiries { reply } => {
-                    let n = if self.role.admits() {
-                        self.do_expire_inquiries()
-                    } else {
-                        0
-                    };
-                    let _ = reply.send(n);
-                }
-                Command::ChargeContracts { reply } => {
-                    let n = if self.role.admits() {
-                        self.do_charge_contracts()
-                    } else {
-                        0
-                    };
-                    let _ = reply.send(n);
-                }
-                Command::EnactGovernance { reply } => {
-                    let n = if self.role.admits() {
-                        self.do_enact_governance()
-                    } else {
-                        0
-                    };
-                    let _ = reply.send(n);
-                }
-                Command::ResolveDisputes { reply } => {
-                    let n = if self.role.admits() {
-                        self.do_resolve_disputes()
-                    } else {
-                        0
-                    };
-                    let _ = reply.send(n);
-                }
-                Command::PruneReceipts { reply } => {
-                    let n = self.do_prune_receipts();
-                    let _ = reply.send(n);
-                }
-                Command::IngestBundle { bytes, reply } => {
-                    // A read-replica admits nothing (ADR-0020 §7): a bundle that
-                    // arrives over a transport (Reticulum or SMS) is not ingested,
-                    // and no receipt is returned. Both carriers already treat a
-                    // `None` reply as "send nothing" — the bundle is a misroute
-                    // (bindings name the *writer*'s destination), so dropping it
-                    // silently is correct; the sender re-couriers to the writer.
-                    if self.role == crate::config::StationRole::Replica {
-                        tracing::warn!(
-                            "dropping a DTN bundle: this station is a read-replica and admits \
-                             nothing (ADR-0020 §7) — bundles belong to the community's writer"
-                        );
-                        let _ = reply.send(None);
-                        continue;
-                    }
-                    let now = self.clock.now();
-                    let receipt = match self.ingest_bundle(&bytes, now) {
-                        Ok(r) => Some(r),
-                        Err(e) => {
-                            // The peer has already been framing-acked, so a lost
-                            // bundle here is not re-driven — log it (a transient DB
-                            // error must not vanish silently).
-                            tracing::warn!(error = ?e, "DTN bundle ingest failed over Reticulum");
-                            None
-                        }
-                    };
-                    let _ = reply.send(receipt);
-                }
-                Command::SmsBoundSenders { reply } => {
-                    let _ = reply.send(sms_bound_senders(&AppendLog::new(&self.db)));
-                }
-                Command::DtnPendingPushes {
-                    ttl_secs,
-                    resend_gap,
-                    reply,
-                } => {
-                    let _ = reply.send(self.do_dtn_pending_pushes(ttl_secs, resend_gap));
-                }
-                Command::DtnReceipt {
-                    receipt,
-                    source,
-                    reply,
-                } => {
-                    let _ = reply.send(self.do_dtn_receipt(&receipt, &source));
-                }
-                Command::DtnAbandonPush { push_id, reply } => {
-                    if let Err(e) =
-                        PushStore::new(&self.db).mark_abandoned(&push_id, self.clock.now())
-                    {
-                        tracing::warn!(error = %e, "could not abandon a DTN push");
-                    }
-                    let _ = reply.send(());
-                }
-                Command::Handshake { reply } => {
-                    let tail = self.tail_seq();
-                    let _ = reply.send((self.wallet.address.to_string(), tail));
-                }
-                Command::LogTail { reply } => {
-                    let _ = reply.send(self.tail_seq());
-                }
-                Command::LogRange {
-                    from_seq,
-                    to_seq,
-                    reply,
-                } => {
-                    let _ = reply.send(self.do_log_range(from_seq, to_seq));
-                }
-                Command::AppendEntries { entries, reply } => {
-                    let _ = reply.send(self.do_append_entries(entries));
-                }
-                Command::PairRequest { request, reply } => {
-                    let _ = reply.send(self.do_pair_request(request));
-                }
-                Command::RpcRequest { sealed, reply } => {
-                    let _ = reply.send(self.do_rpc_request(sealed));
-                }
-                Command::Subscribe { sealed, reply } => {
-                    let _ = reply.send(self.do_subscribe(sealed));
-                }
-                Command::CollectEvents {
-                    member,
-                    member_pk,
-                    last_seen,
-                    nonce,
-                    force,
-                    reply,
-                } => {
-                    let _ = reply
-                        .send(self.do_collect_events(member, member_pk, last_seen, nonce, force));
-                }
-                Command::Shutdown => {
-                    tracing::info!("core shutting down");
-                    break;
+            match std::panic::catch_unwind(AssertUnwindSafe(|| self.dispatch(cmd))) {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(())) => return CoreExit::Clean,
+                Err(_) => {
+                    // The panic hook has already printed the message and location.
+                    // A command's reply sender was dropped with the unwound
+                    // closure, so its caller gets that handle's "unavailable"
+                    // answer rather than hanging (a `Call` was answered with an
+                    // internal error before the unwind continued).
+                    tracing::error!("a core command handler panicked; stopping the core");
+                    return CoreExit::Panicked;
                 }
             }
             // After any command that may have appended to the log (a mobile or
@@ -944,6 +833,191 @@ impl Core {
             // long-polls if the tail advanced. A no-op for read-only commands.
             self.publish_tail();
         }
+        CoreExit::Clean
+    }
+
+    /// Handles one command. `Break` means a clean [`Command::Shutdown`].
+    fn dispatch(&mut self, cmd: Command) -> ControlFlow<()> {
+        match cmd {
+            Command::Call { request, reply } => {
+                // Answer the operator/DTN caller with an explicit internal
+                // error before letting the panic reach the loop's guard, so
+                // the reply names what happened instead of "core dropped reply".
+                match std::panic::catch_unwind(AssertUnwindSafe(|| self.handle_call(&request))) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(payload) => {
+                        tracing::error!(method = %request.method, "RPC handler panicked");
+                        let _ = reply.send(Err(rpc::RpcError {
+                            code: rpc::INTERNAL_ERROR,
+                            message: "the station hit an internal error and is restarting".into(),
+                        }));
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
+            // The sweep timers admit station-signed records at the front door
+            // (settlement/cancellation, expiry, contract charges, governance
+            // enactment, dispute resolution), so on a read-replica they must
+            // do nothing (ADR-0020 §7): the daemon does not spawn these timers
+            // for a replica, and this guard also makes the public test hooks
+            // (`Station::sweep`/`charge_contracts`/…) inert on a replica, so a
+            // replica cannot fork its own chain by any path. A replica
+            // re-derives all of this by replay (ADR-0018).
+            Command::Sweep { reply } => {
+                let n = if self.role.admits() {
+                    self.do_sweep()
+                } else {
+                    0
+                };
+                let _ = reply.send(n);
+            }
+            Command::RefreshReputation { reply } => {
+                // Reputation is a derived cache (ADR-0009), not a log append —
+                // it runs on both roles.
+                let n = self.do_refresh_reputation();
+                let _ = reply.send(n);
+            }
+            Command::ExpireListings { reply } => {
+                let n = if self.role.admits() {
+                    self.do_expire_listings()
+                } else {
+                    0
+                };
+                let _ = reply.send(n);
+            }
+            Command::ExpireInquiries { reply } => {
+                let n = if self.role.admits() {
+                    self.do_expire_inquiries()
+                } else {
+                    0
+                };
+                let _ = reply.send(n);
+            }
+            Command::ChargeContracts { reply } => {
+                let n = if self.role.admits() {
+                    self.do_charge_contracts()
+                } else {
+                    0
+                };
+                let _ = reply.send(n);
+            }
+            Command::EnactGovernance { reply } => {
+                let n = if self.role.admits() {
+                    self.do_enact_governance()
+                } else {
+                    0
+                };
+                let _ = reply.send(n);
+            }
+            Command::ResolveDisputes { reply } => {
+                let n = if self.role.admits() {
+                    self.do_resolve_disputes()
+                } else {
+                    0
+                };
+                let _ = reply.send(n);
+            }
+            Command::PruneReceipts { reply } => {
+                let n = self.do_prune_receipts();
+                let _ = reply.send(n);
+            }
+            Command::IngestBundle { bytes, reply } => {
+                // A read-replica admits nothing (ADR-0020 §7): a bundle that
+                // arrives over a transport (Reticulum or SMS) is not ingested,
+                // and no receipt is returned. Both carriers already treat a
+                // `None` reply as "send nothing" — the bundle is a misroute
+                // (bindings name the *writer*'s destination), so dropping it
+                // silently is correct; the sender re-couriers to the writer.
+                if self.role == crate::config::StationRole::Replica {
+                    tracing::warn!(
+                        "dropping a DTN bundle: this station is a read-replica and admits \
+                             nothing (ADR-0020 §7) — bundles belong to the community's writer"
+                    );
+                    let _ = reply.send(None);
+                    return ControlFlow::Continue(());
+                }
+                let now = self.clock.now();
+                let receipt = match self.ingest_bundle(&bytes, now) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        // The peer has already been framing-acked, so a lost
+                        // bundle here is not re-driven — log it (a transient DB
+                        // error must not vanish silently).
+                        tracing::warn!(error = ?e, "DTN bundle ingest failed over Reticulum");
+                        None
+                    }
+                };
+                let _ = reply.send(receipt);
+            }
+            Command::SmsBoundSenders { reply } => {
+                let _ = reply.send(sms_bound_senders(&AppendLog::new(&self.db)));
+            }
+            Command::DtnPendingPushes {
+                ttl_secs,
+                resend_gap,
+                reply,
+            } => {
+                let _ = reply.send(self.do_dtn_pending_pushes(ttl_secs, resend_gap));
+            }
+            Command::DtnReceipt {
+                receipt,
+                source,
+                reply,
+            } => {
+                let _ = reply.send(self.do_dtn_receipt(&receipt, &source));
+            }
+            Command::DtnAbandonPush { push_id, reply } => {
+                if let Err(e) = PushStore::new(&self.db).mark_abandoned(&push_id, self.clock.now())
+                {
+                    tracing::warn!(error = %e, "could not abandon a DTN push");
+                }
+                let _ = reply.send(());
+            }
+            Command::Handshake { reply } => {
+                let tail = self.tail_seq();
+                let _ = reply.send((self.wallet.address.to_string(), tail));
+            }
+            Command::LogTail { reply } => {
+                let _ = reply.send(self.tail_seq());
+            }
+            Command::LogRange {
+                from_seq,
+                to_seq,
+                reply,
+            } => {
+                let _ = reply.send(self.do_log_range(from_seq, to_seq));
+            }
+            Command::AppendEntries { entries, reply } => {
+                let _ = reply.send(self.do_append_entries(entries));
+            }
+            Command::PairRequest { request, reply } => {
+                let _ = reply.send(self.do_pair_request(request));
+            }
+            Command::RpcRequest { sealed, reply } => {
+                let _ = reply.send(self.do_rpc_request(sealed));
+            }
+            Command::Subscribe { sealed, reply } => {
+                let _ = reply.send(self.do_subscribe(sealed));
+            }
+            Command::CollectEvents {
+                member,
+                member_pk,
+                last_seen,
+                nonce,
+                force,
+                reply,
+            } => {
+                let _ =
+                    reply.send(self.do_collect_events(member, member_pk, last_seen, nonce, force));
+            }
+            Command::Shutdown => {
+                tracing::info!("core shutting down");
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     /// Publishes the current log tail to `/subscribe` waiters, but only when it
@@ -977,6 +1051,10 @@ impl Core {
             return Err(read_replica_rpc_error(&req.method));
         }
         match req.method.as_str() {
+            // Test-only: a handler that panics, to exercise the core loop's
+            // panic containment. Never compiled into a station.
+            #[cfg(test)]
+            "test_panic" => panic!("test-only handler panic"),
             "whoami" => self.m_whoami(),
             "status" => self.m_status(),
             "balance" => self.m_balance(req),
@@ -5463,7 +5541,9 @@ impl Core {
         let verified = request.verify()?;
 
         let now = self.clock.now();
-        if (now - verified.requested_at).abs() > pairing::REQUESTED_AT_SKEW_SECS {
+        if now.saturating_sub(verified.requested_at).saturating_abs()
+            > pairing::REQUESTED_AT_SKEW_SECS
+        {
             return Err(PairError::StaleTimestamp);
         }
 
@@ -5547,7 +5627,9 @@ impl Core {
             return Err(ChannelError::NotPaired);
         }
         let now = self.clock.now();
-        if (now - envelope.timestamp).abs() > rpc_envelope::TIMESTAMP_SKEW_SECS {
+        if now.saturating_sub(envelope.timestamp).saturating_abs()
+            > rpc_envelope::TIMESTAMP_SKEW_SECS
+        {
             return Err(ChannelError::StaleTimestamp);
         }
         if !self.paired.accept_nonce(&signer, envelope.nonce) {
@@ -7588,15 +7670,25 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Decodes lowercase/uppercase hex, or `None` if it is not valid hex.
+/// Decodes lowercase/uppercase hex, or `None` if it is not an even-length run of
+/// ASCII hex digit pairs.
+///
+/// Reached with caller-supplied strings (pre-authentication from `/pair`), so it
+/// must never panic: it walks the *bytes* in pairs rather than slicing the `&str`
+/// (a byte-range slice panics when a multi-byte character straddles it), and a
+/// non-ASCII byte, whitespace, or a `+`/`-` sign fails the whole decode.
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    let s = s.as_bytes();
     if !s.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in s.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 /// Reconstructs a [`StoredPayload`] from its three byte fields (used by the
@@ -7699,6 +7791,88 @@ mod tests {
             0
         );
         assert_eq!(core.tail_seq(), 0);
+    }
+
+    #[test]
+    fn unhex_rejects_non_ascii_and_odd_and_sign() {
+        // Even byte length with a two-byte character at offset 1: a byte-range
+        // `&str` slice would land mid-character and panic. Must be a clean `None`.
+        assert_eq!(unhex("a\u{e9}b"), None);
+        assert_eq!(unhex("\u{e9}\u{e9}"), None);
+        // `from_str_radix` accepted a sign; strict hex does not.
+        assert_eq!(unhex("+f"), None);
+        assert_eq!(unhex("-0"), None);
+        assert_eq!(unhex("0g"), None);
+        assert_eq!(unhex("abc"), None);
+        assert_eq!(unhex(" a"), None);
+        assert_eq!(unhex("\0\0"), None);
+        assert_eq!(unhex(""), Some(vec![]));
+        assert_eq!(unhex("00ff"), Some(vec![0, 255]));
+        assert_eq!(unhex("ABcd"), Some(vec![0xab, 0xcd]));
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(unhex(&hex(&bytes)), Some(bytes));
+    }
+
+    #[test]
+    fn a_panicking_handler_is_contained_and_signals_not_clean() {
+        let core = test_core();
+        let (tx, rx) = mpsc::channel();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(Command::Call {
+            request: rpc::Request {
+                id: "1".into(),
+                method: "test_panic".into(),
+                params: serde_json::Value::Null,
+            },
+            reply,
+        })
+        .unwrap();
+        // A command queued behind the panic is never run: the loop stops at the
+        // panic, and its reply sender is dropped (the caller's "unavailable").
+        let (tail_reply, tail_rx) = oneshot::channel();
+        tx.send(Command::LogTail { reply: tail_reply }).unwrap();
+
+        // `run` reports the panic instead of unwinding out of the thread. In a
+        // station, `Core::spawn` maps `Panicked` to a process exit; the test
+        // asserts on the signal so it never exits the test runner.
+        assert_eq!(core.run(rx), CoreExit::Panicked);
+
+        // The waiting caller was answered, not left hanging.
+        let err = reply_rx
+            .blocking_recv()
+            .expect("caller answered")
+            .unwrap_err();
+        assert_eq!(err.code, rpc::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("restarting"),
+            "message: {}",
+            err.message
+        );
+        assert!(tail_rx.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn a_clean_shutdown_is_not_a_panic_exit() {
+        let core = test_core();
+        let (tx, rx) = mpsc::channel();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(Command::Call {
+            request: rpc::Request {
+                id: "1".into(),
+                method: "whoami".into(),
+                params: serde_json::Value::Null,
+            },
+            reply,
+        })
+        .unwrap();
+        tx.send(Command::Shutdown).unwrap();
+        assert_eq!(core.run(rx), CoreExit::Clean);
+        assert!(reply_rx.blocking_recv().unwrap().is_ok());
+
+        // Every handle dropped is also a clean stop.
+        let (tx, rx) = mpsc::channel::<Command>();
+        drop(tx);
+        assert_eq!(test_core().run(rx), CoreExit::Clean);
     }
 
     #[test]

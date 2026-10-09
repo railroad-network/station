@@ -244,7 +244,10 @@ pub fn parse_signed_request(frame: &[u8]) -> Result<RequestEnvelope, ChannelErro
     let payload_end = LEN_PREFIX
         .checked_add(payload_len)
         .ok_or(ChannelError::Malformed)?;
-    if frame.len() != payload_end + SIG_LEN {
+    let frame_len = payload_end
+        .checked_add(SIG_LEN)
+        .ok_or(ChannelError::Malformed)?;
+    if frame.len() != frame_len {
         return Err(ChannelError::Malformed);
     }
     let payload = &frame[LEN_PREFIX..payload_end];
@@ -306,7 +309,11 @@ where
     let payload_end = LEN_PREFIX
         .checked_add(payload_len)
         .ok_or(ChannelError::Malformed)?;
-    if bytes.len() != payload_end + PK_LEN + SIG_LEN {
+    let frame_len = payload_end
+        .checked_add(PK_LEN)
+        .and_then(|n| n.checked_add(SIG_LEN))
+        .ok_or(ChannelError::Malformed)?;
+    if bytes.len() != frame_len {
         return Err(ChannelError::Malformed);
     }
     let payload: T = from_canonical_bytes(&bytes[LEN_PREFIX..payload_end])
@@ -404,6 +411,23 @@ mod tests {
         frame[..LEN_PREFIX].copy_from_slice(&9999u32.to_be_bytes());
         assert_eq!(
             parse_signed_request(&frame).unwrap_err(),
+            ChannelError::Malformed
+        );
+    }
+
+    #[test]
+    fn frame_length_overflow_is_malformed() {
+        // A length prefix of `u32::MAX` must be refused as malformed framing, never
+        // overflow the frame-length arithmetic (it would on a 32-bit `usize`).
+        let mut frame = u32::MAX.to_be_bytes().to_vec();
+        frame.extend_from_slice(&[0u8; PK_LEN + SIG_LEN]);
+        assert_eq!(
+            parse_signed_request(&frame).unwrap_err(),
+            ChannelError::Malformed
+        );
+        assert_eq!(
+            parse_signed_record::<rrn_ledger::transaction::TransactionProposal>(&frame)
+                .unwrap_err(),
             ChannelError::Malformed
         );
     }

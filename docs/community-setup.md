@@ -235,6 +235,11 @@ an accepted pilot-grade trade-off so the station comes back by itself after a
 power cut. If that's not acceptable to your community, skip the service and
 start it by hand after each reboot.
 
+`Restart=on-failure` also matters while the station is up: if the station hits
+an internal error it stops on purpose (exit status 70) instead of carrying on
+half-working, and the restart brings it back from its log with nothing lost. A
+station you start by hand needs to be restarted by hand in that case too.
+
 **Check it's alive** (from the station machine):
 
 ```sh

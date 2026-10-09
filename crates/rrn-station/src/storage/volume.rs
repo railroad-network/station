@@ -156,6 +156,8 @@ fn unescape_mountinfo(s: &str) -> String {
         if bytes[i] == b'\\' && i + 4 <= bytes.len() {
             let oct = &bytes[i + 1..i + 4];
             if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                // Safe `&str` byte slice: the check above proved all three bytes
+                // are ASCII octal digits, so both ends sit on char boundaries.
                 if let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
                     out.push(code);
                     i += 4;
