@@ -79,6 +79,28 @@ pub const MAX_TITLE_BYTES: usize = 200;
 /// for why there is a bound at all.
 pub const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 
+/// Shortest billing period a [`Frequency::Custom`] cadence may declare, in
+/// seconds. One hour is the shortest cadence a human service plausibly bills
+/// at; a shorter one turns a contract into a tight loop of station-signed
+/// balance moves.
+pub const MIN_CUSTOM_PERIOD_SECS: u32 = 3_600;
+
+/// Most periods a recurring commitment may run for — a year of daily service,
+/// seven of weekly, thirty of monthly. A longer commitment is a new contract.
+/// This is the lifetime bound on how many period charges one contract can
+/// produce.
+pub const MAX_DURATION_PERIODS: u32 = 366;
+
+/// Longest notice period a recurring commitment may require, in days.
+pub const MAX_NOTICE_PERIOD_DAYS: u32 = 366;
+
+/// Largest single contract charge — a per-period amount or an early-termination
+/// penalty — in centicommons: just under the Tier-3 floor (ADR-0011). A
+/// contract charge is a station-signed balance move that never passes the
+/// transaction engine's tier gate, so the Phase-1 ceiling is enforced on the
+/// terms instead.
+pub const MAX_CONTRACT_CHARGE_CENTI: i64 = rrn_ledger::tier::TIER_3_FLOOR_CENTI - 1;
+
 /// The content address of a listing: the Blake3 hash of its canonical bytes.
 #[derive(Clone, Copy, PartialEq, Eq, std::hash::Hash, Debug, Serialize, Deserialize)]
 pub struct ListingId(pub Hash);
@@ -729,12 +751,38 @@ impl Listing {
             if terms.duration_periods == 0 {
                 return Err(ListingError::RecurringZeroDuration);
             }
+            if terms.duration_periods > MAX_DURATION_PERIODS {
+                return Err(ListingError::RecurringDurationTooLong {
+                    periods: terms.duration_periods,
+                    max: MAX_DURATION_PERIODS,
+                });
+            }
             if matches!(terms.frequency, Frequency::Custom(0)) {
                 return Err(ListingError::RecurringZeroPeriod);
+            }
+            if let Frequency::Custom(secs) = terms.frequency {
+                if secs < MIN_CUSTOM_PERIOD_SECS {
+                    return Err(ListingError::RecurringPeriodTooShort {
+                        secs,
+                        min: MIN_CUSTOM_PERIOD_SECS,
+                    });
+                }
+            }
+            if terms.notice_period_days > MAX_NOTICE_PERIOD_DAYS {
+                return Err(ListingError::RecurringNoticeTooLong {
+                    days: terms.notice_period_days,
+                    max: MAX_NOTICE_PERIOD_DAYS,
+                });
             }
             if terms.early_termination_penalty_centi < 0 {
                 return Err(ListingError::NegativePenalty {
                     penalty_centi: terms.early_termination_penalty_centi,
+                });
+            }
+            if terms.early_termination_penalty_centi > MAX_CONTRACT_CHARGE_CENTI {
+                return Err(ListingError::PenaltyTooLarge {
+                    penalty_centi: terms.early_termination_penalty_centi,
+                    max: MAX_CONTRACT_CHARGE_CENTI,
                 });
             }
         }
@@ -833,6 +881,38 @@ pub enum ListingError {
     NegativePenalty {
         /// The offending penalty.
         penalty_centi: i64,
+    },
+    /// A recurring listing that runs for more than [`MAX_DURATION_PERIODS`].
+    #[error("a recurring listing may run for at most {max} periods, not {periods}")]
+    RecurringDurationTooLong {
+        /// The declared duration.
+        periods: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// A `Frequency::Custom` period shorter than [`MIN_CUSTOM_PERIOD_SECS`].
+    #[error("a custom billing period must be at least {min} seconds, not {secs}")]
+    RecurringPeriodTooShort {
+        /// The declared period.
+        secs: u32,
+        /// The limit.
+        min: u32,
+    },
+    /// A notice period longer than [`MAX_NOTICE_PERIOD_DAYS`].
+    #[error("a notice period may be at most {max} days, not {days}")]
+    RecurringNoticeTooLong {
+        /// The declared notice.
+        days: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// An early-termination penalty above [`MAX_CONTRACT_CHARGE_CENTI`].
+    #[error("early-termination penalty {penalty_centi} is over the {max}-centicommon limit")]
+    PenaltyTooLarge {
+        /// The offending penalty.
+        penalty_centi: i64,
+        /// The limit.
+        max: i64,
     },
 }
 
@@ -1087,6 +1167,82 @@ mod tests {
         commons.surface = Surface::Commons;
         commons.pricing.amount_centi = -100;
         assert_eq!(commons.validate(), Ok(()));
+    }
+
+    #[test]
+    fn listing_validate_bounds_recurring_terms() {
+        let terms = RecurringTerms {
+            frequency: Frequency::Custom(MIN_CUSTOM_PERIOD_SECS),
+            duration_periods: MAX_DURATION_PERIODS,
+            notice_period_days: MAX_NOTICE_PERIOD_DAYS,
+            early_termination_penalty_centi: MAX_CONTRACT_CHARGE_CENTI,
+        };
+        let with = |t: RecurringTerms| valid_listing().with_recurring(t).validate();
+
+        // Every bound at its limit is accepted; an hour is the shortest custom period.
+        assert_eq!(with(terms), Ok(()));
+        assert_eq!(MIN_CUSTOM_PERIOD_SECS, 3_600);
+
+        assert_eq!(
+            with(RecurringTerms {
+                frequency: Frequency::Custom(3_599),
+                ..terms
+            }),
+            Err(ListingError::RecurringPeriodTooShort {
+                secs: 3_599,
+                min: MIN_CUSTOM_PERIOD_SECS,
+            })
+        );
+        // `Custom(0)` keeps its own error.
+        assert_eq!(
+            with(RecurringTerms {
+                frequency: Frequency::Custom(0),
+                ..terms
+            }),
+            Err(ListingError::RecurringZeroPeriod)
+        );
+        assert_eq!(
+            with(RecurringTerms {
+                duration_periods: MAX_DURATION_PERIODS + 1,
+                ..terms
+            }),
+            Err(ListingError::RecurringDurationTooLong {
+                periods: MAX_DURATION_PERIODS + 1,
+                max: MAX_DURATION_PERIODS,
+            })
+        );
+        assert_eq!(
+            with(RecurringTerms {
+                notice_period_days: MAX_NOTICE_PERIOD_DAYS + 1,
+                ..terms
+            }),
+            Err(ListingError::RecurringNoticeTooLong {
+                days: MAX_NOTICE_PERIOD_DAYS + 1,
+                max: MAX_NOTICE_PERIOD_DAYS,
+            })
+        );
+        assert_eq!(
+            with(RecurringTerms {
+                early_termination_penalty_centi: MAX_CONTRACT_CHARGE_CENTI + 1,
+                ..terms
+            }),
+            Err(ListingError::PenaltyTooLarge {
+                penalty_centi: MAX_CONTRACT_CHARGE_CENTI + 1,
+                max: MAX_CONTRACT_CHARGE_CENTI,
+            })
+        );
+        assert_eq!(
+            with(RecurringTerms {
+                early_termination_penalty_centi: -1,
+                ..terms
+            }),
+            Err(ListingError::NegativePenalty { penalty_centi: -1 })
+        );
+        // The penalty ceiling sits just under the Tier-3 floor (ADR-0011).
+        assert_eq!(
+            MAX_CONTRACT_CHARGE_CENTI,
+            rrn_ledger::tier::TIER_3_FLOOR_CENTI - 1
+        );
     }
 
     #[test]

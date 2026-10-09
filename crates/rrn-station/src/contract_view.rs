@@ -64,7 +64,9 @@ pub struct ContractDetailView {
     pub early_termination_penalty_centi: i64,
     /// The buyer's free-form notes recorded on the contract.
     pub performance_metrics: BTreeMap<String, String>,
-    /// Unix seconds the contract began; period 0 fell due here.
+    /// Unix seconds the station admitted the contract; period 0 fell due here.
+    /// The schedule runs from admission (ADR-0022), not from the buyer's own
+    /// `started_at` claim, so this and `next_charge_due` always agree.
     pub started_at: i64,
     /// `active`, `terminating`, or `ended`.
     pub state: &'static str,
@@ -118,7 +120,8 @@ pub struct ContractRow {
     /// When the next unbilled period falls due, while billing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_charge_due: Option<i64>,
-    /// Unix seconds the contract began — the rows sort by this, newest first.
+    /// Unix seconds the station admitted the contract — the schedule's anchor
+    /// (ADR-0022). The rows sort by this, newest first.
     pub started_at: i64,
 }
 
@@ -142,7 +145,7 @@ pub fn detail(records: &ContractRecords, periods_charged: u32, now: i64) -> Cont
         notice_period_days: terms.notice_period_days,
         early_termination_penalty_centi: terms.early_termination_penalty_centi,
         performance_metrics: terms.performance_metrics.clone(),
-        started_at: records.contract.started_at,
+        started_at: records.admitted_at,
         state: state.tag(),
         periods_charged,
         periods_remaining: records.total_periods().saturating_sub(periods_charged),
@@ -216,7 +219,7 @@ where
                 periods_charged,
                 periods_remaining: records.total_periods().saturating_sub(periods_charged),
                 next_charge_due,
-                started_at: records.contract.started_at,
+                started_at: records.admitted_at,
             })
         })
         .collect();

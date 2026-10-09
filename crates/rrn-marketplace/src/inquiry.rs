@@ -63,7 +63,7 @@ use rrn_storage::log::{AppendLog, LogEntry};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::listing::{Listing, ListingId, Requirements};
+use crate::listing::{Listing, ListingId, Requirements, Surface};
 use crate::Result;
 
 /// Discriminant strings carried in the `kind` field of each record's canonical
@@ -543,7 +543,9 @@ impl InquiryRecords {
     /// Whether the inquiry has gone quiet past [`INQUIRY_TTL_SECS`] and is not
     /// yet closed — what the station's expiry sweep looks for.
     pub fn is_stale(&self, now: i64) -> bool {
-        self.closed.is_none() && now - self.last_activity_at() > INQUIRY_TTL_SECS
+        // Saturating: both timestamps are party-asserted, so either can sit at
+        // an extreme of `i64`.
+        self.closed.is_none() && now.saturating_sub(self.last_activity_at()) > INQUIRY_TTL_SECS
     }
 
     /// Where the inquiry stands at `now`.
@@ -637,13 +639,40 @@ fn closer_is_entitled(
     }
 }
 
-/// Whether an `Agreed` price is one this listing will accept. A negotiable
-/// listing accepts any agreed price; a non-negotiable one only its listed price.
-/// Non-`Agreed` outcomes carry no price and always pass.
+/// Whether a negotiated amount — an opening offer, a counter-offer, or an agreed
+/// price — has a sign this listing allows (ADR-0010 "The three surfaces").
+///
+/// On Goods and Services an amount is never negative: a buyer offering a
+/// negative price would be asking the provider to pay them. On Commons a
+/// negative amount is a subsidy, but only the provider's own signed listing can
+/// make it one — a Commons listing priced below zero negotiates over size in
+/// either sign; one priced at or above zero negotiates like Goods. So a buyer
+/// can never flip who pays whom.
+///
+/// Context-dependent on purpose: an [`InquiryOpened`] or [`InquiryMessage`] does
+/// not carry its listing, so this runs on the append path and in [`scan`], not
+/// in their own `validate`.
+fn amount_sign_ok(listing: &Listing, amount_centi: i64) -> bool {
+    amount_centi >= 0 || (listing.surface == Surface::Commons && listing.pricing.amount_centi < 0)
+}
+
+/// The error for an amount [`amount_sign_ok`] refuses.
+fn negative_amount(listing: &Listing, amount_centi: i64) -> InquiryError {
+    InquiryError::NegativeAmountNotAllowed {
+        surface: listing.surface,
+        amount_centi,
+    }
+}
+
+/// Whether an `Agreed` price is one this listing will accept: it must have a
+/// sign the listing allows ([`amount_sign_ok`]), and a non-negotiable listing
+/// accepts only its listed price. Non-`Agreed` outcomes carry no price and
+/// always pass.
 fn agreed_price_ok(outcome: InquiryOutcome, listing: &Listing) -> bool {
     match outcome {
         InquiryOutcome::Agreed { final_price_centi } => {
-            listing.pricing.negotiable || final_price_centi == listing.pricing.amount_centi
+            amount_sign_ok(listing, final_price_centi)
+                && (listing.pricing.negotiable || final_price_centi == listing.pricing.amount_centi)
         }
         _ => true,
     }
@@ -728,6 +757,17 @@ fn scan(
             let Some(listing) = listing else {
                 continue;
             };
+            // The same refusals `append_inquiry_opened` makes, re-applied to an
+            // entry that arrived without passing through it.
+            if opened.buyer == listing.provider {
+                continue;
+            }
+            if opened
+                .initial_offer_centi
+                .is_some_and(|offer| !amount_sign_ok(&listing, offer))
+            {
+                continue;
+            }
             if admits(&listing, &opened.buyer) {
                 // First qualifying open wins; a duplicate id is the same
                 // inquiry stated twice, and `append_inquiry_opened` refuses one.
@@ -746,6 +786,9 @@ fn scan(
                 && (message.sender == records.opened.buyer
                     || message.sender == records.listing.provider)
                 && message.validate().is_ok()
+                && message
+                    .counter_offer_centi
+                    .is_none_or(|offer| amount_sign_ok(&records.listing, offer))
             {
                 records.messages.push(message);
             }
@@ -874,6 +917,16 @@ pub fn append_inquiry_opened(
         .into());
     }
     opened.validate()?;
+    // Before the requirements gate, so the error names the real reason: an
+    // inquiry against one's own listing is never a trade.
+    if opened.buyer == listing.provider {
+        return Err(InquiryError::BuyerIsProvider.into());
+    }
+    if let Some(offer) = opened.initial_offer_centi {
+        if !amount_sign_ok(listing, offer) {
+            return Err(negative_amount(listing, offer).into());
+        }
+    }
     check_requirements(
         &listing.requirements,
         &listing.community,
@@ -919,6 +972,11 @@ pub fn append_inquiry_message(
     if signer != records.buyer() && signer != records.provider() {
         return Err(InquiryError::SenderNotParty { sender: signer }.into());
     }
+    if let Some(offer) = message.counter_offer_centi {
+        if !amount_sign_ok(&records.listing, offer) {
+            return Err(negative_amount(&records.listing, offer).into());
+        }
+    }
 
     Ok(log.append(signed, now)?)
 }
@@ -960,6 +1018,11 @@ pub fn append_inquiry_closed(
             outcome: close.outcome,
         }
         .into());
+    }
+    if let InquiryOutcome::Agreed { final_price_centi } = close.outcome {
+        if !amount_sign_ok(&records.listing, final_price_centi) {
+            return Err(negative_amount(&records.listing, final_price_centi).into());
+        }
     }
     if !agreed_price_ok(close.outcome, &records.listing) {
         return Err(InquiryError::AgreedPriceNotAllowed {
@@ -1097,6 +1160,20 @@ pub enum InquiryError {
         /// The buyer's standing offer, the only price the provider may grant.
         expected: i64,
     },
+    /// A negative opening offer, counter-offer, or agreed price on a listing
+    /// whose surface and own price do not allow one — see the sign rule of
+    /// ADR-0010 "The three surfaces".
+    #[error("an amount of {amount_centi} centicommons is not allowed on this {surface:?} listing; only a subsidized Commons listing negotiates below zero")]
+    NegativeAmountNotAllowed {
+        /// The listing's surface.
+        surface: Surface,
+        /// The offending amount.
+        amount_centi: i64,
+    },
+    /// The buyer is the listing's own provider — an inquiry against one's own
+    /// listing is never a trade.
+    #[error("you cannot open an inquiry on your own listing")]
+    BuyerIsProvider,
 }
 
 #[cfg(test)]
@@ -1858,6 +1935,189 @@ mod tests {
             records.state(OPENED_AT + INQUIRY_TTL_SECS + 1),
             InquiryState::ExpiredPending
         );
+    }
+
+    #[test]
+    fn is_stale_saturates_on_extreme_timestamps() {
+        let provider = Keypair::generate();
+        let buyer = Keypair::generate();
+        let listing = listing_of(&provider, true);
+
+        // An opening dated at the far past: `now - opened_at` would overflow.
+        let mut opened = opened_of(&buyer, &listing, None).payload;
+        opened.opened_at = i64::MIN;
+        let records = InquiryRecords::new(opened.clone(), listing.clone());
+        assert!(records.is_stale(i64::MAX));
+        assert!(records.is_stale(0));
+
+        // A message dated at the far future: the gap is negative, never stale.
+        let mut records = InquiryRecords::new(opened, listing);
+        records
+            .messages
+            .push(message_of(&buyer, records.opened.inquiry_id, "hi", None, i64::MAX).payload);
+        assert!(!records.is_stale(i64::MIN));
+        assert!(!records.is_stale(i64::MAX));
+    }
+
+    // --- the sign rule and self-inquiry ------------------------------------
+
+    /// A listing on `surface` at `amount_centi`, negotiable. Only the sign rule
+    /// reads it, so its (now stale) id does not matter.
+    fn priced_listing(provider: &Keypair, surface: Surface, amount_centi: i64) -> Listing {
+        let mut listing = listing_of(provider, true);
+        listing.surface = surface;
+        listing.pricing.amount_centi = amount_centi;
+        assert_eq!(listing.validate(), Ok(()));
+        listing
+    }
+
+    #[test]
+    fn the_sign_rule_follows_the_listing_surface_and_its_own_price() {
+        let p = Keypair::generate();
+        for surface in [Surface::Goods, Surface::Services] {
+            let l = priced_listing(&p, surface, 300);
+            assert!(amount_sign_ok(&l, 0));
+            assert!(amount_sign_ok(&l, 300));
+            assert!(!amount_sign_ok(&l, -1));
+        }
+        // A Commons listing at or above zero negotiates like Goods.
+        let l = priced_listing(&p, Surface::Commons, 0);
+        assert!(!amount_sign_ok(&l, -1));
+        // A subsidized Commons listing allows either sign.
+        let l = priced_listing(&p, Surface::Commons, -500);
+        assert!(amount_sign_ok(&l, -300));
+        assert!(amount_sign_ok(&l, 300));
+    }
+
+    #[test]
+    fn replay_skips_negative_amounts_and_self_inquiries_a_gossiped_entry_could_carry() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let buyer = Keypair::generate();
+        let station = Keypair::generate();
+        let listing = publish(&mut log, &provider, true);
+        let scan_one = |log: &AppendLog, id: &InquiryId| {
+            inquiry_records(log, id, &station.public_key(), &admit_all()).unwrap()
+        };
+
+        // A negative opening offer, appended raw: replay drops the open.
+        let negative = opened_of(&buyer, &listing, Some(-2000));
+        let negative_id = negative.payload.inquiry_id;
+        log.append(negative, NOW).unwrap();
+        assert!(scan_one(&log, &negative_id).is_none());
+
+        // A self-inquiry, appended raw: replay drops it.
+        let own = opened_of(&provider, &listing, None);
+        let own_id = own.payload.inquiry_id;
+        log.append(own, NOW).unwrap();
+        assert!(scan_one(&log, &own_id).is_none());
+
+        // A real inquiry; then a raw negative counter-offer and a raw negative
+        // `Agreed`. Both are skipped, so the inquiry stays open with no messages.
+        let opened = opened_of(&buyer, &listing, None);
+        let inquiry_id = opened.payload.inquiry_id;
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
+        log.append(
+            message_of(&buyer, inquiry_id, "how about this", Some(-2000), OPENED_AT),
+            NOW,
+        )
+        .unwrap();
+        log.append(
+            close_of(
+                &provider,
+                inquiry_id,
+                InquiryOutcome::Agreed {
+                    final_price_centi: -2000,
+                },
+                OPENED_AT,
+            ),
+            NOW,
+        )
+        .unwrap();
+        let records = scan_one(&log, &inquiry_id).unwrap();
+        assert!(records.messages.is_empty());
+        assert!(records.closed.is_none());
+    }
+
+    #[test]
+    fn the_append_paths_refuse_negative_amounts_and_self_inquiries() {
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let buyer = Keypair::generate();
+        let station = Keypair::generate();
+        let listing = publish(&mut log, &provider, true);
+
+        // Self-inquiry is named as such, ahead of any requirements verdict: a
+        // reputation of 0 against an open listing would pass, so this is the
+        // only reason.
+        let err = append_inquiry_opened(
+            &mut log,
+            opened_of(&provider, &listing, None),
+            &listing,
+            0.0,
+            false,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Inquiry(InquiryError::BuyerIsProvider)));
+
+        let err = append_inquiry_opened(
+            &mut log,
+            opened_of(&buyer, &listing, Some(-1)),
+            &listing,
+            3.0,
+            true,
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            Error::Inquiry(InquiryError::NegativeAmountNotAllowed {
+                surface: Surface::Services,
+                amount_centi: -1,
+            })
+            .to_string()
+        );
+
+        let opened = opened_of(&buyer, &listing, None);
+        let inquiry_id = opened.payload.inquiry_id;
+        append_inquiry_opened(&mut log, opened, &listing, 3.0, true, NOW).unwrap();
+        // Neither party may counter below zero.
+        for sender in [&buyer, &provider] {
+            let err = append_inquiry_message(
+                &mut log,
+                message_of(sender, inquiry_id, "", Some(-1), OPENED_AT),
+                &station.public_key(),
+                &admit_all(),
+                NOW,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                Error::Inquiry(InquiryError::NegativeAmountNotAllowed { .. })
+            ));
+        }
+        let err = append_inquiry_closed(
+            &mut log,
+            close_of(
+                &provider,
+                inquiry_id,
+                InquiryOutcome::Agreed {
+                    final_price_centi: -1,
+                },
+                OPENED_AT,
+            ),
+            &station.public_key(),
+            &admit_all(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Inquiry(InquiryError::NegativeAmountNotAllowed { .. })
+        ));
     }
 
     // --- replay safety ----------------------------------------------------

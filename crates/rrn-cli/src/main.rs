@@ -216,14 +216,14 @@ enum Command {
         #[arg(long, value_parser = PossibleValuesParser::new(["daily", "weekly", "monthly"]))]
         every: Option<String>,
         /// How many periods a recurring commitment runs for (required with
-        /// `--every`).
+        /// `--every`; 1 to 366).
         #[arg(long)]
         periods: Option<u32>,
-        /// Days of notice to end a recurring contract early.
+        /// Days of notice to end a recurring contract early (at most 366).
         #[arg(long)]
         notice: Option<u32>,
         /// Early-termination penalty in Commons, charged to whoever ends a
-        /// recurring contract before its natural end.
+        /// recurring contract before its natural end (at most 49.99).
         #[arg(long)]
         penalty: Option<String>,
     },
