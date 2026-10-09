@@ -57,3 +57,9 @@ debug = "line-tables-only"
 [profile.test.package."*"]
 opt-level = 2
 debug = "line-tables-only"
+
+# Release keeps integer overflow checks on: an unexpected wrap in money-handling
+# code panics loudly instead of silently producing a wrong balance. Costs a few
+# per cent of CPU; nothing else about the release profile changes.
+[profile.release]
+overflow-checks = true

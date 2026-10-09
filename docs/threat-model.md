@@ -1686,6 +1686,11 @@ lifetime); the integrity of the local log under entries pulled from peers; the
 confidentiality and integrity of the CLI↔daemon channel; the availability of the
 daemon (one local user, one writer).
 
+Release builds compile with integer **overflow checks on** (`[profile.release]
+overflow-checks = true`): an unexpected wrap anywhere in station, ledger, or CLI
+code panics loudly instead of producing a silently wrong balance — and in the
+core, a panic restarts the station (see the denial-of-service entry below).
+
 > Populated with the daemon/CLI. The CLI and the gossip layer speak the same line-delimited
 > JSON envelope ([`rpc`]) over two different transports. The gossip stub is
 > deliberately minimal. Phase 2 **retired it in place** rather than
@@ -1778,10 +1783,26 @@ daemon (one local user, one writer).
   floods the gossip port; the single-writer core is starved.
 - *Mitigation:* a malformed request line is answered with an `INVALID_REQUEST`
   error and the connection kept open — one bad line never takes down the daemon
-  (covered by the `ipc` integration test). Each connection is handled on its own
-  task but funnels through the single-threaded core, so there is no data race;
-  the core processes commands serially. Peer reads are bounded by line framing,
-  and a peer that errors only fails *that* gossip round.
+  (covered by the `ipc` integration test). The same holds one layer in: a
+  malformed **hex field** inside an otherwise well-formed request — from the
+  operator socket, a paired mobile, or the unauthenticated `/pair` door — is
+  rejected as invalid input (`/pair` answers `400`), never a panic; the hex
+  decoder walks bytes and refuses anything but ASCII hex digit pairs
+  (RRN-A-013, covered by `audit_regressions`). Caller-supplied timestamps,
+  cursors, and frame lengths use checked or saturating arithmetic. Each
+  connection is handled on its own task but funnels through the single-threaded
+  core, so there is no data race; the core processes commands serially. Should a
+  command handler still panic, the core catches it, answers that caller with an
+  internal error, and **exits the process** (status 70) rather than staying up
+  with a dead command loop: a panic may have left the core's in-memory state or
+  an open SQLite transaction half-applied, and the log on disk is the source of
+  truth, so a supervisor restart that re-derives from the log is the recovery
+  (the runbook runs `station` under `systemd` with `Restart=on-failure`). Peer
+  reads are bounded by line framing, and a peer that errors only fails *that*
+  gossip round.
+- *Residual risk (panic → restart):* a request that reliably panics a handler
+  still costs a restart each time it is sent — availability, not integrity. No
+  such input is known; one found is a bug to fix, not a mitigation gap to accept.
 - *Residual risk:* there is no rate-limiting or connection cap on the socket,
   the peer port, or the mobile listener, and a **replica** still pulls the
   writer's whole log each round (`gossip::gossip_with_peer`; only a replica

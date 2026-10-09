@@ -395,6 +395,12 @@ impl<'a> AppendLog<'a> {
 
     /// Eagerly loads entries `seq >= from_seq` as `Result`s.
     fn collect_from(&self, from_seq: u64) -> Vec<Result<LogEntry>> {
+        // Seqs are SQLite integers (`i64`); no entry can sit past `i64::MAX`. Cast
+        // with `as`, a larger caller-supplied cursor would wrap negative and
+        // match the whole log.
+        let Ok(from_seq) = i64::try_from(from_seq) else {
+            return Vec::new();
+        };
         let conn = self.db.conn();
         let mut stmt = match conn.prepare(
             "SELECT seq, prev_hash, content_hash, payload, created_at \
@@ -403,7 +409,7 @@ impl<'a> AppendLog<'a> {
             Ok(stmt) => stmt,
             Err(e) => return vec![Err(e.into())],
         };
-        let rows = match stmt.query_map([from_seq as i64], row_to_raw) {
+        let rows = match stmt.query_map([from_seq], row_to_raw) {
             Ok(rows) => rows,
             Err(e) => return vec![Err(e.into())],
         };
@@ -587,6 +593,18 @@ mod tests {
         assert!(log.get(2).unwrap().unwrap().payload.verify().is_ok());
         assert_eq!(log.tail().unwrap().unwrap().seq, 3);
         assert_eq!(log.iter_from(2).count(), 2);
+    }
+
+    #[test]
+    fn iter_from_past_i64_max_is_empty() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+        append_note(&mut log, &kp, 10);
+        append_note(&mut log, &kp, 20);
+        assert_eq!(log.iter_from(i64::MAX as u64).count(), 0);
+        assert_eq!(log.iter_from(i64::MAX as u64 + 1).count(), 0);
+        assert_eq!(log.iter_from(u64::MAX).count(), 0);
     }
 
     #[test]
