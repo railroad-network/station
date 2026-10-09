@@ -336,6 +336,28 @@ implementation detail and may change freely — a rebuild is always available.
   `rrn-marketplace` section must state that boundary rather than imply the
   signature validates the offer.
 
+## Clarification (2026-10-09) — a fixed-price recurring Services listing is priced in the range a contract can carry
+
+The Services row of "The three surfaces" allows `pricing.amount_centi >= 0`. A
+listing that also carries recurring terms exists to be snapshotted into a
+service contract, whose per-period charge is a station-signed balance move
+that never passes the transaction engine's tier gate. `ServiceContract::validate`
+therefore bounds that charge to `1..=MAX_CONTRACT_CHARGE_CENTI`: one centicommon
+up to just under the Tier-3 floor (ADR-0011).
+
+When such a listing does not invite offers (`negotiable: false`), its listed
+price is the only price an agreement can carry, so a price outside that range
+can never produce a contract. `Listing::validate` therefore refuses it, with
+`ListingError::RecurringPriceOutOfRange`, both at publish and on replay (where
+an out-of-range creation record is skipped, never a halt). Otherwise a dead-end
+listing could be published, inquired on and agreed. Because no valid contract
+can exist on such a listing, the replay rule hides no working contract.
+
+A negotiable recurring listing is unchanged: its amount is an opening ask, the
+agreed offer is what a contract carries, and the contract validator bounds
+that. The `>= 0` rule for one-off Services and Goods listings, and the Commons
+subsidy rule, are unchanged.
+
 ## Alternatives Considered
 
 - **Listings in a mutable SQLite table, log only the transactions.** The obvious
