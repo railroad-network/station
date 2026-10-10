@@ -2224,12 +2224,21 @@ credit and never delivers.
   was admitted. A Commons provider who moves a subsidy listing's price from
   below zero to above it makes past below-zero inquiries on it read as void;
   no credit moves, since Commons never recurs.
-- *Residual risk:* `Listing::validate` does not bound a recurring listing's
-  own price to the contract range, so a recurring listing that does not invite
-  offers (`negotiable: false`), priced at zero or at the Tier-3 floor or above,
-  can be published and agreed, and every contract on it is then refused. A dead
-  end, not a credit path. (A negotiable recurring listing is unaffected: its
-  price is an opening ask, and an agreed in-range offer contracts normally.)
+- *Mitigation (shipped):* **a fixed-price recurring listing is priced in the
+  contract range** (ADR-0010, Clarification 2026-10-09). A recurring listing
+  that does not invite offers (`negotiable: false`) must be priced
+  `1..=MAX_CONTRACT_CHARGE_CENTI`, since its listed price is the only amount a
+  contract on it can carry. `Listing::validate` refuses anything else
+  (`RecurringPriceOutOfRange`) at publish and at every patch, and replay skips
+  an out-of-range creation record, so no inquiry or contract can attach to such
+  a listing. A negotiable recurring listing is unaffected: its price is an
+  opening ask, and the contract validator bounds the agreed amount.
+- *Residual risk:* that rule is checked on replay against the creation record
+  only. A listing admitted before the rule at an out-of-range fixed price and
+  later patched into range would have its creation record skipped, hiding any
+  contract agreed after the patch. No such listing existed on any log when the
+  rule shipped, and no pilot had started. Replay does not re-validate patches
+  for any listing rule; that is a standing residual, not specific to this one.
 - *Residual risk:* charges already appended for a contract that the new bounds
   now invalidate stay on the log and in balances. Station-signed history is not
   rewritten; the sweep simply stops adding to it.

@@ -1889,10 +1889,12 @@ mod tests {
 
     #[test]
     fn an_out_of_bounds_contract_is_refused_and_skipped_on_replay() {
-        // A listing priced at the Tier-3 floor is itself valid — a one-off sale
-        // at that size is blocked by the engine's tier gate — but a contract at
-        // that per-period amount would move it as a station-signed charge that
-        // never meets that gate. Refused at the front door, skipped on replay.
+        // A negotiable listing may ask, and agree, the Tier-3 floor — a one-off
+        // sale at that size is blocked by the engine's tier gate — but a
+        // contract at that per-period amount would move it as a station-signed
+        // charge that never meets that gate. Refused at the front door, skipped
+        // on replay. (A fixed-price listing at that size is refused at publish
+        // instead: ADR-0010, Clarification 2026-10-09.)
         let db = open_log_db();
         let mut log = AppendLog::new(&db);
         let provider = Keypair::generate();
@@ -1900,6 +1902,7 @@ mod tests {
         let station = Keypair::generate();
         let mut listing = recurring_listing(&provider);
         listing.pricing.amount_centi = rrn_ledger::tier::TIER_3_FLOOR_CENTI;
+        listing.pricing.negotiable = true;
         let listing = listing.with_recurring(recurring_terms());
         assert_eq!(listing.validate(), Ok(()));
         append_listing_created(

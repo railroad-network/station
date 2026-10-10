@@ -1454,6 +1454,104 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_price_recurring_listing_stays_in_the_contract_range() {
+        use crate::listing::{Frequency, RecurringTerms, MAX_CONTRACT_CHARGE_CENTI};
+
+        let db = open_log_db();
+        let mut log = AppendLog::new(&db);
+        let provider = Keypair::generate();
+        let station = Keypair::generate();
+        let recurring_at = |amount_centi: i64, negotiable: bool| {
+            let mut listing = listing_of(&provider);
+            listing.surface = Surface::Services;
+            listing.pricing = Pricing {
+                amount_centi,
+                model: PricingModel::Fixed,
+                negotiable,
+            };
+            listing.with_recurring(RecurringTerms {
+                frequency: Frequency::Weekly,
+                duration_periods: 4,
+                notice_period_days: 7,
+                early_termination_penalty_centi: 0,
+            })
+        };
+        let out_of_range = MAX_CONTRACT_CHARGE_CENTI + 1;
+
+        // Publishing a fixed price no contract could charge is refused.
+        let fixed = recurring_at(out_of_range, false);
+        let err =
+            append_listing_created(&mut log, SignedPayload::sign(fixed.clone(), &provider), NOW)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Listing(ListingError::RecurringPriceOutOfRange { .. })
+        ));
+
+        // Replication bypasses that door; replay skips the creation record, so
+        // nothing can attach to the listing.
+        log.append(SignedPayload::sign(fixed.clone(), &provider), NOW)
+            .unwrap();
+        let records = listing_records(&log, &fixed.id, &station.public_key()).unwrap();
+        assert_eq!(records.created, None);
+        assert_eq!(
+            compute_all_active(&log, &station.public_key(), NOW).unwrap(),
+            vec![]
+        );
+
+        // An in-range fixed listing cannot be patched out of range.
+        let in_range = recurring_at(MAX_CONTRACT_CHARGE_CENTI, false);
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(in_range.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
+        let err = append_listing_updated(
+            &mut log,
+            update_of(&provider, &in_range, price_patch(out_of_range)),
+            &station.public_key(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Listing(ListingError::RecurringPriceOutOfRange { .. })
+        ));
+
+        // A negotiable listing may ask more — the agreed offer is bounded by the
+        // contract instead — but cannot then stop inviting offers at that price.
+        let negotiable = recurring_at(out_of_range, true);
+        append_listing_created(
+            &mut log,
+            SignedPayload::sign(negotiable.clone(), &provider),
+            NOW,
+        )
+        .unwrap();
+        let err = append_listing_updated(
+            &mut log,
+            update_of(&provider, &negotiable, price_patch(out_of_range)),
+            &station.public_key(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Listing(ListingError::RecurringPriceOutOfRange { .. })
+        ));
+
+        let mut active: Vec<ListingId> = compute_all_active(&log, &station.public_key(), NOW)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        active.sort();
+        let mut expected = vec![in_range.id, negotiable.id];
+        expected.sort();
+        assert_eq!(active, expected);
+    }
+
+    #[test]
     fn an_empty_patch_is_refused() {
         let db = open_log_db();
         let mut log = AppendLog::new(&db);
