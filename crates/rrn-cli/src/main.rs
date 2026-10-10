@@ -176,7 +176,8 @@ enum Command {
         /// Short name for the offer.
         title: String,
         /// Price in Commons, e.g. `3`, `3.5`, or `3.50`. Only a `commons`
-        /// listing may be negative (a subsidy), written as `-3.50`.
+        /// listing may be negative (a subsidy), written as `-3.50`. With
+        /// `--every` and without `--negotiable`: 0.01 to 49.99.
         ///
         // `allow_hyphen_values` so a subsidy can be written `--price -3.50` and
         // not only `--price=-3.50`. Without it clap reads the leading `-` as the

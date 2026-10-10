@@ -10359,6 +10359,39 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_price_recurring_listing_must_be_priced_in_the_contract_range() {
+        let mut core = test_core();
+        // `rrn list services ... --every weekly --price 60`: no contract could
+        // charge 60 Commons a period, and nothing else could be agreed, so the
+        // listing is refused up front (ADR-0010, Clarification 2026-10-09).
+        let weekly_at = |amount_centi: i64| {
+            let mut params = create_params("Weekly house clean");
+            params["surface"] = serde_json::json!("services");
+            params["category"] = serde_json::json!("education");
+            params["amount_centi"] = serde_json::json!(amount_centi);
+            params["every"] = serde_json::json!("weekly");
+            params["periods"] = serde_json::json!(4);
+            params
+        };
+        let err = call_err(&mut core, "marketplace_create_listing", weekly_at(6_000));
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        assert!(
+            err.message.contains("fixed-price recurring"),
+            "{}",
+            err.message
+        );
+
+        // Inviting offers makes 60 Commons an opening ask, which is allowed; the
+        // contract bounds whatever is agreed.
+        let mut params = weekly_at(6_000);
+        params["negotiable"] = serde_json::json!(true);
+        call(&mut core, "marketplace_create_listing", params);
+
+        // Inside the range a fixed price is fine.
+        call(&mut core, "marketplace_create_listing", weekly_at(4_999));
+    }
+
+    #[test]
     fn availability_keeps_only_what_the_surface_means_by_it() {
         let mut core = test_core();
         // A Services listing's capacity is dropped and its slot kept; the Goods

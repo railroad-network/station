@@ -98,7 +98,10 @@ pub const MAX_NOTICE_PERIOD_DAYS: u32 = 366;
 /// penalty — in centicommons: just under the Tier-3 floor (ADR-0011). A
 /// contract charge is a station-signed balance move that never passes the
 /// transaction engine's tier gate, so the Phase-1 ceiling is enforced on the
-/// terms instead.
+/// terms instead. A recurring listing that does not invite offers is held to
+/// `1..=MAX_CONTRACT_CHARGE_CENTI` too, since its listed price is the only
+/// per-period amount a contract on it can carry (ADR-0010, Clarification
+/// 2026-10-09).
 pub const MAX_CONTRACT_CHARGE_CENTI: i64 = rrn_ledger::tier::TIER_3_FLOOR_CENTI - 1;
 
 /// The content address of a listing: the Blake3 hash of its canonical bytes.
@@ -482,7 +485,10 @@ impl TryFrom<CBOR> for Frequency {
 /// The recurring cadence a service listing declares: the provider's
 /// standing terms for a subscription, which a [`ServiceContract`](crate::contract::ServiceContract)
 /// snapshots when a buyer signs up. The per-period price is the listing's own
-/// [`Pricing`]; these are the *other* terms of the commitment.
+/// [`Pricing`]; these are the *other* terms of the commitment. When the
+/// listing does not invite offers, that price must lie in
+/// `1..=`[`MAX_CONTRACT_CHARGE_CENTI`], the range a contract can carry;
+/// a negotiable listing's price is only an opening ask and is not bounded here.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecurringTerms {
     /// How often a period falls due.
@@ -785,6 +791,19 @@ impl Listing {
                     max: MAX_CONTRACT_CHARGE_CENTI,
                 });
             }
+            // A listing that does not invite offers can only be agreed at its
+            // listed price, and a contract must charge exactly that, so a price
+            // the contract validator refuses would be a dead end (ADR-0010,
+            // Clarification 2026-10-09). Keyed on `negotiable`, as the agreed-
+            // price check is: a negotiable price is only an opening ask.
+            if !self.pricing.negotiable
+                && !(1..=MAX_CONTRACT_CHARGE_CENTI).contains(&self.pricing.amount_centi)
+            {
+                return Err(ListingError::RecurringPriceOutOfRange {
+                    amount_centi: self.pricing.amount_centi,
+                    max: MAX_CONTRACT_CHARGE_CENTI,
+                });
+            }
         }
         Ok(())
     }
@@ -911,6 +930,15 @@ pub enum ListingError {
     PenaltyTooLarge {
         /// The offending penalty.
         penalty_centi: i64,
+        /// The limit.
+        max: i64,
+    },
+    /// A recurring listing that does not invite offers, priced outside
+    /// `1..=`[`MAX_CONTRACT_CHARGE_CENTI`] — no contract could ever charge it.
+    #[error("a fixed-price recurring service must charge 1 to {max} centicommons a period, not {amount_centi}")]
+    RecurringPriceOutOfRange {
+        /// The listed per-period price.
+        amount_centi: i64,
         /// The limit.
         max: i64,
     },
@@ -1243,6 +1271,46 @@ mod tests {
             MAX_CONTRACT_CHARGE_CENTI,
             rrn_ledger::tier::TIER_3_FLOOR_CENTI - 1
         );
+
+        // A fixed price is the only per-period amount a contract on the listing
+        // can carry, so it must lie in the contract range (ADR-0010,
+        // Clarification 2026-10-09).
+        let priced = |amount_centi: i64, negotiable: bool, recurring: bool| {
+            let mut listing = valid_listing();
+            listing.pricing.amount_centi = amount_centi;
+            listing.pricing.negotiable = negotiable;
+            if recurring {
+                listing = listing.with_recurring(terms);
+            }
+            listing.validate()
+        };
+        for amount_centi in [0, MAX_CONTRACT_CHARGE_CENTI + 1, i64::MAX] {
+            assert_eq!(
+                priced(amount_centi, false, true),
+                Err(ListingError::RecurringPriceOutOfRange {
+                    amount_centi,
+                    max: MAX_CONTRACT_CHARGE_CENTI,
+                }),
+                "fixed recurring at {amount_centi}"
+            );
+        }
+        // A negative price keeps the sign rule's own error, which runs first.
+        assert_eq!(
+            priced(-1, false, true),
+            Err(ListingError::NegativeAmount {
+                surface: Surface::Services,
+                amount_centi: -1,
+            })
+        );
+        assert_eq!(priced(1, false, true), Ok(()));
+        assert_eq!(priced(MAX_CONTRACT_CHARGE_CENTI, false, true), Ok(()));
+        // A negotiable price is an opening ask; the agreed offer is bounded by
+        // the contract validator instead.
+        assert_eq!(priced(0, true, true), Ok(()));
+        assert_eq!(priced(6_000, true, true), Ok(()));
+        // A one-off Services listing keeps the plain `>= 0` rule.
+        assert_eq!(priced(0, false, false), Ok(()));
+        assert_eq!(priced(6_000, false, false), Ok(()));
     }
 
     #[test]
