@@ -281,3 +281,10 @@ later pass rather than widening this milestone.
   dispute layer; Phase-1 exit criteria (dispute system exercised at least once).
 - Threat model — `rrn-ledger` § "Oracle tiering and the reputation stake"
   (to gain a dispute-layer subsection).
+
+## Amended by ADR-0038 (Proposed, 2026-10-10)
+
+[ADR-0038](0038-enrollment-and-standing-accrual.md) adds to §2's recusal: a
+party's *vouchees* are recused along with its vouchers. Vouchee recusal is in
+the same soft tier, and §5 relaxes the two together, before party recusal
+(ADR-0038 §11).

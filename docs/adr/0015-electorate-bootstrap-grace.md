@@ -223,3 +223,11 @@ switch to throw.
   authorization, and the established-member electorate.
 - [ADR-0014](0014-phase-1-dispute-resolution.md) — sortition from the established
   pool, escalation, and the fail-open lapse grace widens but preserves.
+
+## Amended by ADR-0038 (Proposed, 2026-10-10)
+
+[ADR-0038](0038-enrollment-and-standing-accrual.md) redefines *established
+member* as enrolled, anchored through the founder chain of trust, effective
+composite ≥ 2.0, and not the station identity (§12). "Adds no sybil surface"
+stays true of seating founders, but grace *ending* was manipulable until
+ADR-0038. The predicate and threshold are unchanged.
