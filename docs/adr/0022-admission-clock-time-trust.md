@@ -157,3 +157,13 @@ Concretely:
   signed instants are testimony, and where two logs must agree on an outcome the
   home log is authoritative and the other mirrors it. No time beacon is introduced.
   This decision is unchanged.
+
+## Amended by ADR-0038 (Accepted, 2026-10-10)
+
+[ADR-0038](0038-enrollment-and-standing-accrual.md) fixes the times scoring
+reads: `settled_at` for trades and confirmations, so `confirmed_at` is no longer
+a scoring input, and `issued_at` for vouches. The live vouch doors will bound
+`issued_at` to within `CLOCK_SKEW_TOLERANCE_SECS` of admission, two-sided;
+neither door bounds it today. That bounded time is an exception to the
+Decision's "never arithmetic" and to §3, and the velocity walk's ordering by
+event time is the one place §5 yields to it (ADR-0038 §9, §10).

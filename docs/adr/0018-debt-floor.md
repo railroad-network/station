@@ -165,3 +165,11 @@ Concretely (`rrn-ledger::credit`, enforced by the `Engine` front door):
 - `docs/threat-model.md` — `rrn-ledger` § elevation of privilege; "Known
   limitations" (the bullet this ADR retires)
 - `crates/rrn-ledger/src/credit.rs`, `crates/rrn-ledger/src/engine.rs`
+
+## Amended by ADR-0038 (Accepted, 2026-10-10)
+
+[ADR-0038](0038-enrollment-and-standing-accrual.md) narrows the Decision's floor
+to identities enrolled by a station-signed `rrn.member.enrollment` record. Any
+other key's floor is `max(0, debt_floor_centi)`, which is not configurable and
+is refused as `Error::NotEnrolled` with the receipt slug `not-enrolled` (§4).
+The "−20 Commons per departing member" bound now holds per person.
