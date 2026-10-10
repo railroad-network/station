@@ -158,7 +158,7 @@ Concretely:
   home log is authoritative and the other mirrors it. No time beacon is introduced.
   This decision is unchanged.
 
-## Amended by ADR-0038 (Proposed, 2026-10-10)
+## Amended by ADR-0038 (Accepted, 2026-10-10)
 
 [ADR-0038](0038-enrollment-and-standing-accrual.md) fixes the times scoring
 reads: `settled_at` for trades and confirmations, so `confirmed_at` is no longer

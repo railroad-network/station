@@ -282,9 +282,9 @@ later pass rather than widening this milestone.
 - Threat model — `rrn-ledger` § "Oracle tiering and the reputation stake"
   (to gain a dispute-layer subsection).
 
-## Amended by ADR-0038 (Proposed, 2026-10-10)
+## Amended by ADR-0038 (Accepted, 2026-10-10)
 
 [ADR-0038](0038-enrollment-and-standing-accrual.md) adds to §2's recusal: a
 party's *vouchees* are recused along with its vouchers. Vouchee recusal is in
-the same soft tier, and §5 relaxes the two together, before party recusal
-(ADR-0038 §11).
+the same soft tier, and §5 relaxes the two together. Party recusal is still
+never relaxed (ADR-0038 §11).

@@ -2,23 +2,47 @@
 
 ## Status
 
-Proposed
+Accepted — ratified 2026-10-10 (the maintainer delegated the ratification
+review; it returned accept-with-changes and the changes are folded in — see the
+ratification note below)
 
 Date: 2026-10-10
 
-> **Ratification questions.** Each one has a recommended answer, and that answer
-> is what the Decision below says. Strike or change any answer and the Decision
-> is re-planned around it. The implementing changes do not start until this ADR
-> is ratified.
+> **Ratification note (2026-10-10).** The ADR was drafted from the audit and a
+> survey of the tree, reviewed twice, and then ratified at the maintainer's
+> delegation. The ratification review's changes are folded in:
+>
+> - An anchoring edge is judged once, at the vouch's admission, so founder decay
+>   cannot dissolve the anchored set (§11).
+> - Roots come only from the root founder charter, so an enacted amendment
+>   cannot mint new roots (§1).
+> - The station identity keeps any grace seat its charter gives it, and is
+>   carved out only of roots, the anchored set and the established set (§1,
+>   §12).
+> - Revocation does not cover the recurring contract-charge path (§3, §5).
+> - Party recusal is never relaxed (§11).
+> - Also disclosed, or pinned so no implementer has a choice to make:
+>   - the upgrade's loss of existing anchoring;
+>   - the portable-history contents;
+>   - the phone's clock under the vouch bound;
+>   - ADR-0031;
+>   - the Tier-2 allowance under permanent grace;
+>   - the 604,800-second window.
+>
+> **Ratification questions.** Each was ratified as answered here, and the
+> Decision below is what each answer means. The implementing changes are written
+> against this ratified text.
 >
 > - **Q1 — What "enrolled" means.** A station-signed `rrn.member.enrollment`
 >   record on the log. The writer appends it at `pair_confirm`, at
 >   `station enroll <address>`, and for the charter's founders. It is derived on
 >   replay, pinned to the community station key, and skipped (never a halt) when
->   the signer is wrong. A `founder` record upgrades an existing enrollment, so a
->   founder who paired first is still a root. The station's own identity is
->   enrolled by derivation, but it is never a founder, never established, and
->   never anchored. A revoked founder stops being a root for good. (§1, §5)
+>   the signer is wrong. Founders come only from the root founder charter. A
+>   `founder` record upgrades an existing enrollment, so a founder who paired
+>   first is still a root. The station's own identity is enrolled by derivation.
+>   It is never a root, never anchored and never established, but it keeps any
+>   grace seat its charter gives it. A revoked founder stops being a root for
+>   good. (§1, §5)
 > - **Q2 — Which doors it gates.** For ledger kinds, the check is inside the
 >   `rrn-ledger` `Engine`, so every door gets it by construction. Door-level
 >   checks exist only for the two binding kinds. A replica pull is not a door. (§2)
@@ -42,10 +66,10 @@ Date: 2026-10-10
 >   `issued_at` for vouches. A vouch's `issued_at` must be within
 >   `CLOCK_SKEW_TOLERANCE_SECS` of its admission. (§9, §10)
 > - **Q8 — Voucher anchoring.** Anchoring is a chain of trust from the
->   `founder`-basis roots, computed as a least fixed point over eligible vouches.
->   A revocation removes the identity from the anchored set, and any identity
->   anchored only through it becomes unanchored too. A party's vouchees are
->   recused from its jury along with its vouchers. (§11)
+>   `founder`-basis roots. Each anchoring edge is judged once, at the vouch's
+>   admission. A later revocation of either party voids the edge, so revocation
+>   cascades. Decay never unanchors anyone. A party's vouchees are recused from
+>   its jury along with its vouchers. (§11)
 > - **Q9 — Bootstrap grace.** The predicate and the threshold (3) are unchanged.
 >   *Established* now also requires being enrolled and anchored. Founders keep
 >   their grace seat from the charter. Grace lasts at least 49 days, and that is
@@ -55,9 +79,8 @@ Date: 2026-10-10
 >   `pairing` enrollments for every founder and paired address that has no
 >   enrollment record. No standing is credited retroactively. (§6)
 > - **Q11 — Wire impact.** One new station-signed kind (with a ledger fixture and
->   no mobile copy), one new receipt slug, two new ledger error variants and one new error enum,
->   and three
->   operator-socket methods. (Wire summary, below)
+>   no mobile copy), one new receipt slug, two new ledger error variants, one
+>   new error enum, and three operator-socket methods. (Wire summary, below)
 
 ## Context
 
@@ -149,10 +172,25 @@ already owns, and pins, every station-signed credit record:
 **Who appends it.** Only the writer appends it, and it is signed with the
 community station key. The writer appends one in these cases:
 
-- **Founder.** It appends a `founder` enrollment for every founder named by an
-  effective charter, other than the station's own identity, who has neither a
-  `founder`-basis record nor any `revoke` record. It does this in the same
-  `LogBatch` that admits the charter, and also at startup (§6). Founders
+- **Founder.** It appends a `founder` enrollment for every founder named by
+  the community's **root founder charter**, other than the station's own
+  identity, who has neither a `founder`-basis record nor any *effective*
+  `revoke` record.
+  - The root founder charter is the founder-signed charter that first cleared
+    its founder threshold (ADR-0012). It is the same set ADR-0015 seats in
+    grace.
+  - Founders who never co-signed are enrolled too.
+  - The writer does this in the same `LogBatch` as the append at which that
+    charter first clears its threshold: the console `charter-init` append, or
+    the ceremony's threshold-clearing co-signature. It does it again at startup
+    (§6).
+  - An enacted amendment's `founders` field is never an enrollment input:
+    ADR-0012 §4 makes `founders` a genesis fact. Today the code does apply an
+    amendment's `founders` to the effective charter, while grace is seated from
+    the root charter. That divergence predates this ADR, and the implementing
+    change closes it by refusing an amendment whose `founders` differ.
+  - The console doors already refuse to re-root a community that has a
+    charter. Founders
   usually pair before the founding ceremony so they can sign the charter from
   their phones (`docs/community-setup.md`, Part 3). So a founder is often
   already enrolled with basis `pairing`, and this record upgrades them (see the
@@ -186,6 +224,8 @@ configuration. The fold is in log order:
   original basis and position stand.
 - A `revoke` for an identity that is not enrolled is a no-op.
 - A `revoke` whose basis is not `operator` is malformed, and is skipped.
+- An `enroll` or `revoke` naming the station's own address is a no-op, because
+  the station is enrolled by derivation.
 
 **Enrolled at a position.** An identity is *enrolled at position p* when its
 most recent effective `enroll` or `revoke` with `seq < p` is an `enroll`. Its
@@ -195,10 +235,14 @@ upgrade was admitted after that record and before `p`.
 **The station's own identity.** The station identity is enrolled at every
 position by derivation, with no record, because the operator socket's `propose`,
 `confirm`, `vouch` and `dtn_bind` sign with the station key. It is not a person
-(ADR-0006). It is skipped when founder enrollments are appended, even when a
-charter names it, so a charter that names it has one fewer root. It is never in
-the anchored set (§11), and it is excluded from the established set (§12) and
-from every jury pool.
+(ADR-0006).
+
+- It is skipped when founder enrollments are appended, even when the charter
+  names it, so a charter that names it has one fewer root.
+- It is never in the anchored set (§11), and it is excluded from the
+  established set (§12). So it is never in a post-grace electorate or jury pool.
+- It keeps whatever grace seat its charter gives it, for governance and juries
+  alike, exactly as ADR-0015 §2 reads today (§12).
 
 **Routing.** The record is station-only. It is not a DTN-routable kind, so a
 carried one is refused `unroutable-kind`. A member-signed record of this kind
@@ -263,9 +307,13 @@ a door had checked something the engine did not.
 
 **Already gated elsewhere.** Governance is gated by the electorate.
 Member marketplace writes are channel-only, so they need a paired device, which §1 and
-§6 make an enrolled one. A revoked member who stays paired can still list and
-inquire. Listing creates no debt, and an operator who wants them off the channel
-also unpairs them.
+§6 make an enrolled one. A revoked member who stays paired can still list and inquire. Listing
+creates no debt.
+
+Agreeing a recurring contract *as buyer* is different. A contract charge is
+station-signed and is not floor-checked (ADR-0018's contract-charge residual, a
+separate decision). Until that decision lands, an operator who revokes an
+identity should also unpair it.
 
 *Why.* An unenrolled key is a stranger. The community can always take its money
 and let it spend that money, and it should not extend it credit, standing or
@@ -321,6 +369,9 @@ hole while tuning the member floor.
 - The revoked identity's floor is §4's unenrolled floor. Debits it signed
   earlier stay pending and settle as usual. It cannot sign a new debit that
   takes it below zero.
+- One path is outside this rule. A recurring contract charge is station-signed
+  and is not floor-checked (see §3), so a revoked identity that stays paired and
+  agrees a contract as buyer can still be charged below zero.
 - Its outstanding certificates are still honored. A cert-backed spend arriving
   within validity plus grace is admitted without a fresh floor check, because
   the headroom was reserved at issuance (ADR-0021 §4). Revocation does not void
@@ -334,8 +385,8 @@ charter grants and the operator does not (§12).
 
 **Root status is lost for good.** A revoked founder is no longer a root, and
 the operator cannot restore that. Re-pairing gives basis `pairing`, `station
-enroll` gives `operator`, and §1's founder rule skips any identity with a
-`revoke` record. That includes a founder whose lost key is replaced under §4:
+enroll` gives `operator`, and §1's founder rule skips any identity with an
+effective `revoke` record. That includes a founder whose lost key is replaced under §4:
 the new key was never a founder. No console form grants basis `founder`, because
 that would hand the operator the genesis lever ADR-0012 gives the charter.
 
@@ -347,21 +398,24 @@ anyone who relied on credit already granted.
 
 **At startup.** The writer appends, in one `LogBatch`:
 
-- a `founder` enrollment for every founder of the effective charter that §1's
-  founder rule covers (not the station, with no `founder`-basis record, never
-  revoked);
+- a `founder` enrollment for every founder of the root founder charter that
+  §1's founder rule covers (not the station, no `founder`-basis record, never
+  effectively revoked);
 - a `pairing` enrollment for every address in the paired list that has **no
   enrollment record at all**: never enrolled and never revoked.
 
 That makes the backfill idempotent. Because a founder record upgrades an
 existing enrollment, the order of the two lists in the batch does not matter. A
-revoked member who is still paired is not re-enrolled on every restart. The paired list is read here, as a one-time input on the writer's side.
-It is never an input to replay. A replica appends nothing.
+revoked member who is still paired is not re-enrolled on every restart. The
+paired list and the root charter are read here, as one-time inputs on the
+writer's side. They are never inputs to replay. A replica appends nothing.
 
 **No retroactive standing.** Every event already on a log precedes these
 records, so §8 makes all of it ineligible. On upgrade, every existing community
-starts standing from zero and returns to bootstrap grace. No pilot has started,
-so in practice no member loses standing they earned.
+starts standing from zero and returns to bootstrap grace. Every vouch already
+on a log is ineligible too, so all existing anchoring is lost. Each non-founder
+must be vouched for again, by an anchored member, after the upgrade. No pilot
+has started, so in practice no member loses standing they earned.
 
 *Why.* Existing communities must keep working on the day this lands. Paired
 members and founders keep their credit. Standing that may have been farmed does
@@ -435,6 +489,10 @@ a portable replay preserves:
   - The tolerance is the ledger's constant, passed in by the caller.
   - Vouches are live-only: the vouch kind is not DTN-routable. So the
     two-sided bound costs offline members nothing.
+  - It does affect an online phone whose clock is wrong. The phone stamps
+    `issued_at` from its own clock, so a phone more than the tolerance off
+    cannot vouch until its clock is corrected. The mobile app must render the
+    reason (ADR-0037 §3) as "check your phone's clock".
 
 No event time is a log entry's `created_at`. That is station-local, and
 ADR-0032's scratch replay re-stamps it, so it does not survive travel.
@@ -448,7 +506,8 @@ weeks.
 **The rule.** For each identity and each dimension, the scorer walks the
 eligible positive events in ascending `(event time, log order)`. An event at
 time `t` is **credited** only if the credited increments already falling in
-`(t − 7 days, t]`, plus this event's `EVENT_INCREMENT`, total no more than
+`(t − 604800, t]` (seconds, half-open: exactly seven days of 86,400 seconds,
+never a calendar week), plus this event's `EVENT_INCREMENT`, total no more than
 `VELOCITY_CAP_PER_WEEK`. With the current constants (0.5 and 0.5), that is at
 most one credited event per dimension in any trailing seven days.
 
@@ -465,9 +524,8 @@ penalties do not change.
 credited events in one of the two live dimensions: seven and seven give only
 0.30·3.5 + 0.25·3.5 = 1.925. Eight and seven (2.075) is one way to get there;
 so is ten and four (2.00). The cap spaces those eight events at least seven days
-apart. So no identity
-is established sooner than 49 days after its first credited event: about eight
-weeks of steady activity.
+apart. So no identity is established sooner than 49 days (seven weeks) after
+its first credited event.
 
 **The review flag.** `sybil::check_velocity` has no positive gain left to flag.
 It stops being the defense, and it may be retired.
@@ -480,38 +538,61 @@ weeks, has no boundary at which two weeks' credit can be taken back to back.
 
 #### 11. Anchoring is a chain of trust from the founders
 
-**The roots.** The **roots** are the identities whose current enrollment has
-basis `founder`.
+**The roots.** The roots at prefix `P` are the identities enrolled at `P`
+whose current basis is `founder`.
 
-**The anchored set** is the least fixed point, at the evaluation instant and
-prefix, of:
+**An anchoring edge is judged once, at the vouch.** Take an eligible vouch (§8)
+from voucher `W` to subject `S`, admitted at position `v`. It **forms an
+anchoring edge** if, over the prefix before `v`, both of these hold:
 
-- every root (anchored by definition); and
-- every subject of an *eligible* vouch (§8) whose voucher is already anchored,
-  is enrolled at the prefix, and has a **raw** composite of at least
-  `ANCHOR_VOUCHER_MIN_COMPOSITE` (2.0, unchanged) at the evaluation instant.
+- `W` was anchored, by this same rule applied to that shorter prefix;
+- `W`'s **raw** composite at the vouch's `issued_at` was at least
+  `ANCHOR_VOUCHER_MIN_COMPOSITE` (2.0, unchanged).
 
-**Two boundary rules.** The station identity is never in the anchored set. A
-vouch is considered once its entry is in the prefix and its `issued_at` is no
-later than the evaluation instant, as `anchoring_voucher` reads it today.
+`issued_at` is signed, and §9 bounds it to within the skew tolerance of
+admission. So the edge is judged, in effect, at admission time, and a portable
+replay judges it the same way.
 
-**Roots anchor only once they have standing.** A root anchors others only once
-its own raw composite reaches 2.0. Founders earn standing like everyone else
-before they can extend it.
+An edge is **void** from the first effective revocation of either party after
+`v`, even if that identity is later re-enrolled.
 
-**Revocation cascades.** A revoked identity leaves the anchored set from its
-revocation onward. A subject that only it anchored becomes unanchored, and one
-vouch from any anchored member re-anchors an honest one.
+A vouch that forms no edge is never judged again: one made before the voucher
+qualified anchors nobody. The remedy is a fresh vouch once the voucher
+qualifies.
 
-**Computability.** The raw composite still does not depend on anchoring. So the
-computation is well-founded and terminates, for the same reason ADR-0009 gives.
-The anchoring cap (1.0 per dimension until anchored) is unchanged.
+**The anchored set** at prefix `P` is the least fixed point of:
+
+- every root at `P` (anchored by definition); and
+- every `S` enrolled at `P` with a non-void edge, formed in `P`, from a `W`
+  already in the set.
+
+The station identity is never in the anchored set.
+
+**Roots anchor only once they have standing.** A founder's vouch forms an edge
+only if the founder's own raw composite is at least 2.0 when they vouch.
+Founders earn standing like everyone else before they can extend it.
+
+**Decay never unanchors.** An edge is a fact fixed at the vouch. A voucher, a
+founder included, whose standing later decays below 2.0 stops forming *new*
+edges, but every edge they formed stands. Decay therefore affects only a
+member's own standing, never the chain behind others.
+
+**Revocation cascades.** A revoked identity is no longer enrolled, so it leaves
+the anchored set, and every edge into or out of it is void. A subject anchored
+only through it becomes unanchored. One fresh vouch from any qualifying
+anchored member re-anchors an honest one.
+
+**Computability.** Whether an edge forms at `v` depends only on the strictly
+shorter prefix before `v`. The raw composite still does not depend on
+anchoring. The fixed point at `P` is monotone over a finite set of identities.
+So the computation is well-founded and terminates. The anchoring cap (1.0 per
+dimension until anchored) is unchanged.
 
 **Recusal.** A dispute's jury recuses the parties, the parties' vouchers, and
 now also the parties' **vouchees**: every identity a party vouched for in the
-dispute's prefix, whether the vouch was eligible or not. Vouchee recusal is soft
-and sits in the same tier as voucher recusal. It relaxes with voucher recusal,
-before party recusal, when that is what seats a panel (ADR-0014 §5).
+dispute's prefix, whether the vouch was eligible or not. Vouchee recusal is
+soft and sits in the same tier as voucher recusal. The two relax together when
+that is what seats a panel. Party recusal is never relaxed (ADR-0014 §5).
 
 *Why.* This is the variant ADR-0009's 2026-07-27 amendment named as "the one
 variant a Sybil pair cannot self-bootstrap", and §1 now supplies the genesis
@@ -523,7 +604,8 @@ used: a party's own sybils were drawn as its jury.
 
 ADR-0015's grace predicate is unchanged in form: established count below
 `BOOTSTRAP_GRACE_THRESHOLD = 3`. The threshold is unchanged too, and so is the
-Tier-2 grace allowance.
+Tier-2 grace allowance. In a community that never leaves grace, that allowance
+never closes.
 
 **Established** now means all of:
 
@@ -533,23 +615,34 @@ Tier-2 grace allowance.
 - not the station's own identity.
 
 **The founders' grace seat.** In grace, founders are still seated from the
-effective charter's `founders`, not from enrollment. The genesis trust behind
+root founder charter's `founders`, as the code reads them today, not from
+enrollment. The genesis trust behind
 that seat is the charter's, so an operator's revocation does not unseat a
 founder from the grace electorate. It only removes the founder's credit (§5)
 and root status (§11).
 
+**The station's seat.** A station identity that the charter names keeps its
+grace seat, for governance and juries alike. It is never established, so it
+leaves the electorate when grace ends.
+
 **Disclosure.** Under §10 nobody is established in under 49 days. So every
 community spends at least that long in grace, and the founders' grace power
-lasts as long. If no founder ever reaches raw 2.0, nobody can be anchored and
-grace never ends. The same holds for a community whose only founder is the
-station, which is the runbook's solo bootstrap (`docs/community-setup.md`,
-Part 3, Option A). The implementing change must re-describe or retire that
-option. That is disclosed in the same banner ADR-0015 §5 already
-shows.
+lasts as long.
 
-*Why.* Grace ending was the manipulable step. With enrollment and the
-chain of trust, grace ends only when three enrolled, anchored people have each
-earned standing at a bounded rate.
+If no founder ever reaches raw 2.0 and vouches, nobody can be anchored and grace
+never ends. The same holds for a community whose only founder is the station,
+which is the runbook's solo bootstrap (`docs/community-setup.md`, Part 3,
+Option A). That community keeps an operator-only grace electorate
+indefinitely. The implementing change must re-describe or retire that option.
+
+All of this is disclosed in the same banner ADR-0015 §5 already shows.
+
+*Why.* Grace ending was the manipulable step. With enrollment and the chain
+of trust, grace ends only when three enrolled, anchored people have each earned
+standing at a bounded rate. Grace re-enters only if the established set really
+falls below three: through revocation, through decay of members' *own*
+standing, or through penalties. It never re-enters because a founder went
+quiet.
 
 ### Interactions
 
@@ -557,15 +650,17 @@ earned standing at a bounded rate.
   still holds the only key, and the station still holds no member key.
 - **ADR-0009.** Parts of it are superseded:
   - the velocity flag becomes a credit cap (§10);
-  - raw-composite anchoring becomes the chain of trust (§11);
+  - raw-composite anchoring, judged at the scoring instant, becomes a chain of
+    trust whose edges are judged at the vouch (§11);
   - event eligibility (§7, §8) and event times (§9) are new.
   The weights, dimensions, bands, decay, increment, ceiling and full divisor are
   unchanged.
-- **ADR-0014.** Vouchee recusal joins voucher recusal in §2's soft tier (§11).
-  Juror weights still use the raw composite, now under §8's eligibility.
+- **ADR-0014.** Vouchee recusal joins voucher recusal in §2's soft tier, and
+  party recusal is still never relaxed (§11). Juror weights still use the raw
+  composite, now under §8's eligibility.
 - **ADR-0015.** *Established* is redefined, and "adds no sybil surface" is
-  corrected to cover the end of grace. Founders keep their grace seat from the
-  charter (§12).
+  corrected to cover the end of grace. Founders, including a station the
+  charter names, keep their grace seat from the root founder charter (§12).
 - **ADR-0018.** The floor applies per enrolled identity, and an unenrolled key's
   floor is zero (§4). The "−20 Commons per departing member" worst case now
   holds per person, up to the residual of one person enrolled twice.
@@ -582,14 +677,22 @@ earned standing at a bounded rate.
   vouch's `issued_at`, which gains a two-sided bound at admission (§9). This is
   the one place a party-asserted time enters arithmetic, and the bound is what
   admits it.
+- **ADR-0031.** A cross-community export debit is floor-checked on the
+  sender's *home* log, so enrollment is judged there. The import side debits
+  the treaty position, never a foreign key, so a foreign member is never
+  refused `not-enrolled` here.
 - **ADR-0028.** A CLI wallet that pairs is enrolled at `pair_confirm`. A wallet
   that never pairs needs `station enroll` before it can go below zero.
-- **ADR-0032.** A portable history must carry:
-  - the enrollment records of its subject and of every counterparty whose events
-    it counts (§8);
-  - the whole anchor chain back to a root: each voucher's evidence, plus the
-    root's `founder` enrollment.
-  This discloses more than the first-voucher rule does today. A foreign member
+- **ADR-0032.** A portable history must let the verifier reach the same
+  verdict, so it must carry:
+  - the enrollment records, and any revocations, of the subject and of every
+    voucher on its anchor chain;
+  - the enrollment records of every counterparty whose events any of them
+    counts (§8);
+  - each voucher's evidence up to their vouch, which is what forms the edge;
+  - the root's `founder` enrollment and the root's own evidence up to its vouch.
+  Today's export selection (the subject plus the first anchoring voucher) must
+  be rewritten, not just widened, and it discloses more. A foreign member
   is unenrolled here, which is consistent with ADR-0032 §5: no residency, and
   no standing earned here.
 - **ADR-0035.** The enrollment pin becomes lineage-aware (`writer_at(seq)`)
@@ -603,7 +706,8 @@ earned standing at a bounded rate.
 
 - **New station-signed kind `rrn.member.enrollment`** (§1). It has a canonical
   CBOR fixture under `crates/rrn-ledger/tests/fixtures/`. No member device signs
-  or verifies it, so there is no copy in the mobile repo and no mobile change.
+  or verifies it, so there is no copy in the mobile repo. The one mobile-app
+  change is rendering the new vouch refusal (§9).
 - **New receipt refusal slug `not-enrolled`.** It goes in `RefusalReason`, with
   its encode and decode arms, and in the registry in `docs/spec/dtn-bundles.md`
   §3. Older receipt decoders reject an unknown slug. The phone shows no
@@ -622,7 +726,7 @@ earned standing at a bounded rate.
 
 ## Consequences
 
-- **Honest onboarding costs one ceremony and about eight weeks.** A new member
+- **Honest onboarding costs one ceremony and at least seven weeks.** A new member
   pairs or is enrolled by the operator, and can then run the ADR-0018 floor.
   Establishment takes at least 49 days of steady activity with other enrolled
   members. A member who trades heavily accrues standing at the same rate as one
@@ -635,7 +739,8 @@ earned standing at a bounded rate.
   That is a transparency gain over the local paired list. The privacy cost is
   small: addresses are already on the log, and this adds when each was enrolled.
 - **Communities start standing again at upgrade** (§6), and each returns to
-  grace for at least 49 days.
+  grace for at least 49 days. Every non-founder must be vouched for again,
+  because pre-upgrade vouches are ineligible.
 - **Residual: an operator can enroll one person twice.** Two keys for one person
   double that person's walk-away exposure. The only control is social: the log
   shows every enrollment. That is the same posture as a corrupt operator
@@ -650,15 +755,18 @@ earned standing at a bounded rate.
 - **Residual: the operator can drive standing for a member.** Trades between
   the station identity (operator-socket `propose`/`confirm`) and an enrolled
   member are eligible events for the member. The velocity cap bounds this, and
-  the operator already holds the enrollment authority.
+  the operator already holds the enrollment authority. The operator cannot,
+  alone, make anyone established: the station is never anchored, so an edge
+  needs a human anchored voucher at raw ≥ 2.0.
 - **Residual: a founder who is revoked, or whose key is replaced, stops being a
   root for good** (§5). A small community can be left one root short of ever
   anchoring anyone.
 - **Residual: a community whose founders never reach raw 2.0 stays in grace
-  indefinitely** (§12). So does one whose only founder is the station. The founders then govern until they do. This is
-  disclosed and not mitigated.
+  indefinitely** (§12). So does one whose only founder is the station. The
+  founders then govern until one does, and the Tier-2 grace allowance stays
+  open meanwhile. This is disclosed and not mitigated.
 - **Unchanged and out of scope here:** the contract-charge floor path
-  (ADR-0018's residual), what the floor reads, member-writable field bounds, and
+  (ADR-0018's residual, which also bypasses revocation — §3, §5), what the floor reads, member-writable field bounds, and
   the jury seed. Each is a separate decision.
 
 ## Alternatives Considered
@@ -704,8 +812,14 @@ earned standing at a bounded rate.
   enrolled pair still anchors itself: the cost ADR-0009 named, left unpaid.
 - **Require k distinct anchored vouchers** (Q8). It is stronger, but it slows
   honest onboarding in a small community. Deferred.
-- **Anchoring that never lapses once given** (Q8). Revoking a sybil source would
-  leave every identity it anchored anchored.
+- **Judge each voucher at the scoring instant** (Q8, today's rule extended to
+  a chain). Once every root's standing decayed below 2.0, the whole anchored
+  set would empty at once. Grace would re-enter with absent founders as the
+  electorate, and no non-root could repair it.
+- **Let an enacted amendment's `founders` add roots** (Q1). That gives the
+  electorate a genesis lever that ADR-0012 §4 fixes at genesis.
+- **Edges that survive revocation** (Q8). Revoking a sybil source would leave
+  every identity it anchored still anchored.
 - **Seat founders from enrollment in grace** (Q9). That would give the operator
   a lever over the genesis electorate, which ADR-0012 places with the charter.
 

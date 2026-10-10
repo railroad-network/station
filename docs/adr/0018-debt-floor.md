@@ -166,7 +166,7 @@ Concretely (`rrn-ledger::credit`, enforced by the `Engine` front door):
   limitations" (the bullet this ADR retires)
 - `crates/rrn-ledger/src/credit.rs`, `crates/rrn-ledger/src/engine.rs`
 
-## Amended by ADR-0038 (Proposed, 2026-10-10)
+## Amended by ADR-0038 (Accepted, 2026-10-10)
 
 [ADR-0038](0038-enrollment-and-standing-accrual.md) narrows the Decision's floor
 to identities enrolled by a station-signed `rrn.member.enrollment` record. Any
