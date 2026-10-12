@@ -89,6 +89,11 @@ pub enum Error {
     /// propose a transaction that debits the sender.
     #[error("proposal signer does not match the named sender")]
     SenderMismatch,
+    /// A proposal names its sender as its receiver (ADR-0038 §7). A payment to
+    /// oneself moves nothing and has no economic meaning, so it is refused at
+    /// the front door rather than admitted and left unscored.
+    #[error("a payment to yourself is not a transaction")]
+    SelfPayment,
     /// A confirmation was not signed by, or does not name, the proposal's
     /// receiver — only the receiver may confirm.
     #[error("confirmer does not match the proposal's receiver")]

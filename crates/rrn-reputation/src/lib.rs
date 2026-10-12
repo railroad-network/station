@@ -40,6 +40,8 @@ pub mod scoring;
 pub mod snapshot;
 pub mod staking;
 pub mod sybil;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testutil;
 
 /// Something went wrong reading the evidence a reputation score is derived from.
 ///

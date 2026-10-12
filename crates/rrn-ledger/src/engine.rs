@@ -180,7 +180,7 @@ impl<'db> Engine<'db> {
     /// Submits a sender-signed proposal, enforcing replay protection.
     ///
     /// Errors (without writing) on a bad signature, a sender/signer mismatch, a
-    /// time window violation, an out-of-order nonce, or a duplicate id.
+    /// self-payment, a time window violation, an out-of-order nonce, or a duplicate id.
     pub fn submit_proposal(&mut self, proposal: SignedProposal, now: i64) -> Result<()> {
         proposal.verify().map_err(|_| Error::BadSignature)?;
         let p = &proposal.payload;
@@ -189,6 +189,11 @@ impl<'db> Engine<'db> {
         // author a debit against someone else's account.
         if &proposal.signer != p.sender.public_key() {
             return Err(Error::SenderMismatch);
+        }
+
+        // A payment to oneself is not a transaction (ADR-0038 §7).
+        if p.sender == p.receiver {
+            return Err(Error::SelfPayment);
         }
 
         // Front-door memo bound: an admitted spend must stay small enough to embed
@@ -756,6 +761,25 @@ mod tests {
             expires_at,
         );
         SignedProposal::sign(p, sender)
+    }
+
+    #[test]
+    fn a_self_payment_is_refused() {
+        let db = fresh_db();
+        let (alice, station) = (Keypair::generate(), Keypair::generate());
+        let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+
+        // Enrolled, well-formed, within the floor — refused only because the
+        // sender pays itself (ADR-0038 §7), and nothing is written.
+        let p = signed_proposal(&alice, &alice, 0, 100, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(p, 100),
+            Err(Error::SelfPayment)
+        ));
+        let log = AppendLog::new(&db);
+        let snapshot = LedgerSnapshot::derive(&log, &engine.station.public_key()).unwrap();
+        assert_eq!(snapshot.iter().count(), 0);
     }
 
     #[test]

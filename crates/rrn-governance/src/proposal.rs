@@ -1048,10 +1048,7 @@ mod tests {
     use super::*;
     use crate::charter::{AmendmentRules, GovernanceStructure};
     use rrn_crypto::keypair::Keypair;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_reputation::testutil::establish_members;
     use rrn_storage::migrations;
 
     const MONTH: i64 = 30 * 86_400;
@@ -1065,96 +1062,6 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         db
-    }
-
-    // --- Reputation seeding (mirrors rrn-reputation's own test helpers) -------
-
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        log.append(
-            SignedPayload::sign(
-                TransactionConfirmation {
-                    proposal_id: pid,
-                    confirmer: addr(receiver),
-                    confirmed_at: at,
-                },
-                receiver,
-            ),
-            0,
-        )
-        .unwrap();
-        log.append(
-            SignedPayload::sign(
-                SettlementRecord {
-                    proposal_id: pid,
-                    sender: addr(sender),
-                    receiver: addr(receiver),
-                    amount_centi: 300,
-                    settled_at: at,
-                },
-                station,
-            ),
-            0,
-        )
-        .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, who, station, &test_station(), nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, who, &addr(&Keypair::generate()), at);
-        }
-    }
-
-    /// Builds `n` established members: each earns raw standing over the Member
-    /// band, then is anchored by a vouch from the next in a ring (anchoring needs
-    /// only the voucher's *raw* composite, so the ring is not circular).
-    fn established_members(db: &Database, station: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            earn_raw_standing(db, m, station, at);
-        }
-        for i in 0..n {
-            append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
-        }
-        members
     }
 
     fn test_charter() -> Charter {
@@ -1253,8 +1160,7 @@ mod tests {
     #[test]
     fn an_established_member_may_propose() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let author = established_members(&db, &station, 2, NOW)[0].clone();
+        let author = establish_members(&db, &test_station(), 2, NOW)[0].clone();
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
@@ -1292,8 +1198,7 @@ mod tests {
     #[test]
     fn a_proposal_signed_by_someone_other_than_its_author_is_refused() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 2, NOW);
+        let members = establish_members(&db, &test_station(), 2, NOW);
         let mut log = AppendLog::new(&db);
 
         // Honestly authored by members[0] but signed by members[1].
@@ -1312,9 +1217,8 @@ mod tests {
     #[test]
     fn a_proposal_needs_the_cosign_threshold_to_publish() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Author plus three eligible co-signers.
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
 
@@ -1361,8 +1265,7 @@ mod tests {
     #[test]
     fn the_lifecycle_is_linear() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
 
@@ -1399,8 +1302,7 @@ mod tests {
     #[test]
     fn a_proposal_that_never_reaches_threshold_lapses() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let author = established_members(&db, &station, 2, NOW)[0].clone();
+        let author = establish_members(&db, &test_station(), 2, NOW)[0].clone();
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
@@ -1426,8 +1328,7 @@ mod tests {
     #[test]
     fn the_author_may_not_cosign_their_own_proposal() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let author = established_members(&db, &station, 2, NOW)[0].clone();
+        let author = establish_members(&db, &test_station(), 2, NOW)[0].clone();
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
@@ -1446,8 +1347,7 @@ mod tests {
     #[test]
     fn a_member_may_not_cosign_twice() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 2, NOW);
+        let members = establish_members(&db, &test_station(), 2, NOW);
         let (author, cosigner) = (members[0].clone(), members[1].clone());
         let mut log = AppendLog::new(&db);
 
@@ -1468,8 +1368,7 @@ mod tests {
     #[test]
     fn a_below_band_member_may_not_cosign() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let author = established_members(&db, &station, 2, NOW)[0].clone();
+        let author = establish_members(&db, &test_station(), 2, NOW)[0].clone();
         let outsider = Keypair::generate(); // no standing
         let mut log = AppendLog::new(&db);
 
@@ -1489,8 +1388,7 @@ mod tests {
     #[test]
     fn cosigning_an_unknown_proposal_is_refused() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 2, NOW);
+        let members = establish_members(&db, &test_station(), 2, NOW);
         let mut log = AppendLog::new(&db);
 
         // A proposal that was never appended.
@@ -1503,8 +1401,7 @@ mod tests {
     #[test]
     fn a_proposal_cannot_be_filed_twice() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let author = established_members(&db, &station, 2, NOW)[0].clone();
+        let author = establish_members(&db, &test_station(), 2, NOW)[0].clone();
         let mut log = AppendLog::new(&db);
 
         let proposal = statute(&author, NOW);
@@ -1522,8 +1419,7 @@ mod tests {
     #[test]
     fn replay_ignores_records_a_gossiped_entry_could_carry() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 2, NOW);
+        let members = establish_members(&db, &test_station(), 2, NOW);
         let (author, cosigner) = (members[0].clone(), members[1].clone());
         let outsider = Keypair::generate();
         let mut log = AppendLog::new(&db);

@@ -64,7 +64,9 @@ use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
 use crate::panel::{resolve_panel, tally, DisputeOutcome, Panel};
-use crate::sortition::{draw_sequence, eligible_pool_excluding, vouchers_of_until};
+use crate::sortition::{
+    draw_sequence, eligible_pool_excluding, vouchees_of_until, vouchers_of_until,
+};
 use crate::{DisputeParams, Error, Result};
 
 /// Domain-separation tag mixed into an equivocation case's sortition seed, kept
@@ -542,7 +544,9 @@ fn round_panel(
     station: &PublicKey,
 ) -> Result<Panel> {
     let hard = case.hard_excluded();
-    let soft = vouchers_of_until(db, &case.subject, round.anchor_seq)?;
+    // The subject's vouchers and vouchees, one soft tier (ADR-0038 §11).
+    let mut soft = vouchers_of_until(db, &case.subject, round.anchor_seq)?;
+    soft.extend(vouchees_of_until(db, &case.subject, round.anchor_seq)?);
     // The pool's electorate and weights are bounded to the round's own anchoring
     // admission position — the same prefix the recusal graph above is read at
     // (ADR-0022 §5 / ADR-0025 §2) — so a juror established, or a weight lifted, by

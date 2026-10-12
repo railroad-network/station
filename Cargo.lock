@@ -2009,6 +2009,7 @@ dependencies = [
  "rrn-crypto",
  "rrn-identity",
  "rrn-ledger",
+ "rrn-reputation",
  "rrn-storage",
  "serde",
  "thiserror 1.0.69",

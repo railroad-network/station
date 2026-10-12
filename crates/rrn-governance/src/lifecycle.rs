@@ -85,10 +85,7 @@ mod tests {
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::signed::SignedPayload;
     use rrn_identity::address::Address;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_reputation::testutil::establish_members;
     use rrn_storage::migrations;
 
     const MONTH: i64 = 30 * 86_400;
@@ -102,93 +99,6 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         db
-    }
-
-    // --- Reputation seeding (mirrors rrn-reputation's own test helpers) -------
-
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        log.append(
-            SignedPayload::sign(
-                TransactionConfirmation {
-                    proposal_id: pid,
-                    confirmer: addr(receiver),
-                    confirmed_at: at,
-                },
-                receiver,
-            ),
-            0,
-        )
-        .unwrap();
-        log.append(
-            SignedPayload::sign(
-                SettlementRecord {
-                    proposal_id: pid,
-                    sender: addr(sender),
-                    receiver: addr(receiver),
-                    amount_centi: 300,
-                    settled_at: at,
-                },
-                station,
-            ),
-            0,
-        )
-        .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, who, station, &test_station(), nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, who, &addr(&Keypair::generate()), at);
-        }
-    }
-
-    fn established_members(db: &Database, station: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            earn_raw_standing(db, m, station, at);
-        }
-        for i in 0..n {
-            append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
-        }
-        members
     }
 
     fn charter_body(version: u32, previous_hash: Option<rrn_crypto::hash::Hash>) -> Charter {
@@ -347,7 +257,7 @@ mod tests {
     fn a_passed_statute_is_deferred_until_its_time_then_enacted() {
         let db = fresh_db();
         let station = test_station();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
         let proposal = statute(&members[0], &charter);
@@ -386,7 +296,7 @@ mod tests {
     fn an_emergency_is_enacted_the_moment_it_passes() {
         let db = fresh_db();
         let station = test_station();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
         let emergency = with_window(
@@ -416,7 +326,7 @@ mod tests {
     fn a_failed_proposal_is_never_enacted() {
         let db = fresh_db();
         let station = test_station();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
         let proposal = statute(&members[0], &charter);
@@ -447,7 +357,7 @@ mod tests {
     fn the_guard_refuses_an_early_enactment() {
         let db = fresh_db();
         let station = test_station();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         publish_genesis(&db, &members);
         let charter = charter_body(1, None);
         let proposal = statute(&members[0], &charter);
@@ -471,7 +381,7 @@ mod tests {
     fn an_enacted_amendment_supersedes_the_charter() {
         let db = fresh_db();
         let station = test_station();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         let v1_hash = publish_genesis(&db, &members);
         let v1 = charter_body(1, None);
 
@@ -513,7 +423,7 @@ mod tests {
     fn a_failed_amendment_does_not_supersede_even_if_a_record_is_forged() {
         let db = fresh_db();
         let station = test_station();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         let v1_hash = publish_genesis(&db, &members);
         let v1 = charter_body(1, None);
 

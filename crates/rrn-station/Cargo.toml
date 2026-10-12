@@ -87,3 +87,5 @@ nix = { version = "0.29", features = ["signal"] }
 # bytes as the typed encoder before committing the vector. No dependency cycle —
 # rrn-mobile-ffi does not depend on rrn-station.
 rrn-mobile-ffi = { path = "../rrn-mobile-ffi", version = "0.1" }
+# The shared ADR-0038 standing helpers (`establish_members`, ...).
+rrn-reputation = { path = "../rrn-reputation", version = "0.1", features = ["test-util"] }

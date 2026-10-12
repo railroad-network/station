@@ -8,15 +8,18 @@ use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
-use rrn_identity::attestation::Attestation;
-use rrn_identity::vouch::{VouchBody, VouchKind};
 use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
-use rrn_ledger::settlement::{BalanceView, SettlementRecord};
+use rrn_ledger::settlement::BalanceView;
 use rrn_ledger::state::{CancelReason, LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::{TransactionConfirmation, TransactionId, TransactionProposal};
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
+
+use rrn_ledger::enrollment::EnrollmentBasis;
+use rrn_reputation::testutil::{
+    earn_standing, enroll, establish, establish_members, settle_trade, vouch,
+};
 
 use rrn_dispute::escalation::{
     escalation_electorate, escalation_of, EscalationBallot, EscalationReason, EscalationRecord,
@@ -46,65 +49,7 @@ fn addr(kp: &Keypair) -> Address {
     Address::from_public_key(kp.public_key())
 }
 
-// --- Reputation seeding (mirrors rrn-reputation's own test helpers) -----------
-
-fn append_settled(db: &Database, sender: &Keypair, receiver: &Keypair, nonce: u64, at: i64) {
-    let mut log = AppendLog::new(db);
-    let proposal = TransactionProposal::new(
-        addr(sender),
-        addr(receiver),
-        300,
-        None,
-        nonce,
-        1,
-        i64::MAX / 2,
-    );
-    let pid = proposal.id;
-    log.append(SignedPayload::sign(proposal, sender), 0)
-        .unwrap();
-    log.append(
-        SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: addr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ),
-        0,
-    )
-    .unwrap();
-    log.append(
-        SignedPayload::sign(
-            SettlementRecord {
-                proposal_id: pid,
-                sender: addr(sender),
-                receiver: addr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            receiver, // any signer works for the test log; the station is not modeled here
-        ),
-        0,
-    )
-    .unwrap();
-}
-
-fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-    let mut log = AppendLog::new(db);
-    let vouch = Attestation {
-        kind: VouchKind,
-        body: VouchBody {
-            community: "commons".into(),
-            statement: "trustworthy".into(),
-            reputation_stake_centi: 0,
-        },
-        subject: *subject,
-        issued_at: at,
-        expires_at: None,
-    };
-    log.append(vouch.sign(voucher), 0).unwrap();
-}
+// --- Reputation seeding (the shared ADR-0038 helpers) ---------------------------
 
 /// The one community station key every test in this file shares: standing-earning
 /// settlements, the resolution settlement, and every derivation pin against the
@@ -112,29 +57,6 @@ fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
 /// before (invariant 2 — the genuine path is unchanged).
 fn test_station() -> Keypair {
     Keypair::from_secret(rrn_crypto::keypair::SecretKey::from_bytes([7u8; 32]))
-}
-
-fn earn_raw_standing(db: &Database, who: &Keypair, at: i64) {
-    let station = test_station();
-    for nonce in 0..10 {
-        append_settled(db, who, &station, nonce, at);
-    }
-    for _ in 0..10 {
-        append_vouch(db, who, &addr(&Keypair::generate()), at);
-    }
-}
-
-/// `n` established members anchored in a ring, so exactly `n` count toward the
-/// electorate as of `at`.
-fn established_members(db: &Database, n: usize, at: i64) -> Vec<Keypair> {
-    let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-    for m in &members {
-        earn_raw_standing(db, m, at);
-    }
-    for i in 0..n {
-        append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
-    }
-    members
 }
 
 // --- Dispute setup ------------------------------------------------------------
@@ -300,7 +222,7 @@ fn signed_ballot(
 /// members, two of whom are the parties, leaving a single eligible member. Returns
 /// the parties, the lone eligible member, and the disputed transaction id.
 fn cannot_seat_setup(db: &Database) -> (Keypair, Keypair, Keypair, TransactionId) {
-    let members = established_members(db, 3, T);
+    let members = establish_members(db, &test_station(), 3, T);
     let [alice, bob, lone] = <[Keypair; 3]>::try_from(members).ok().unwrap();
     let tx = append_disputed(db, &alice, &bob, 300, T);
     (alice, bob, lone, tx)
@@ -311,7 +233,7 @@ fn cannot_seat_setup(db: &Database) -> (Keypair, Keypair, Keypair, TransactionId
 #[test]
 fn the_draw_is_deterministic_and_covers_the_pool() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
@@ -338,12 +260,7 @@ fn party_opened_at_is_ignored_for_the_draw_and_window() {
         let liar = fresh_db();
         let members: Vec<Keypair> = (0..5).map(|_| Keypair::generate()).collect();
         for db in [&honest, &liar] {
-            for m in &members {
-                earn_raw_standing(db, m, T);
-            }
-            for i in 0..members.len() {
-                append_vouch(db, &members[(i + 1) % members.len()], &addr(&members[i]), T);
-            }
+            establish(db, &test_station(), &members, T);
         }
         let (alice, bob) = (Keypair::generate(), Keypair::generate());
 
@@ -371,11 +288,11 @@ fn party_opened_at_is_ignored_for_the_draw_and_window() {
 #[test]
 fn parties_and_their_vouchers_are_recused() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     // Make one established member a party, and have another vouch for that party.
     let alice = members[0].clone(); // sender is an established member
     let bob = Keypair::generate();
-    append_vouch(&db, &members[1], &addr(&alice), T); // members[1] vouches for the party
+    vouch(&db, &members[1], &addr(&alice), T); // members[1] vouches for the party
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
 
@@ -404,13 +321,13 @@ fn voucher_recusal_relaxes_before_the_panel_goes_unseated() {
     let db = fresh_db();
     // Exactly enough established members that recusing a party's voucher would
     // drop the pool below the panel size, forcing the relaxation.
-    let members = established_members(&db, 4, T);
+    let members = establish_members(&db, &test_station(), 4, T);
     let alice = members[0].clone();
     let bob = Keypair::generate();
     // Everyone else vouches for the party, so strict recusal leaves 0 eligible.
-    append_vouch(&db, &members[1], &addr(&alice), T);
-    append_vouch(&db, &members[2], &addr(&alice), T);
-    append_vouch(&db, &members[3], &addr(&alice), T);
+    vouch(&db, &members[1], &addr(&alice), T);
+    vouch(&db, &members[2], &addr(&alice), T);
+    vouch(&db, &members[3], &addr(&alice), T);
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
 
@@ -434,7 +351,7 @@ fn voucher_recusal_relaxes_before_the_panel_goes_unseated() {
 #[test]
 fn two_uphold_verdicts_void_the_transfer() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
@@ -480,7 +397,7 @@ fn two_uphold_verdicts_void_the_transfer() {
 #[test]
 fn two_reject_verdicts_settle_the_transaction() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
@@ -526,7 +443,7 @@ fn two_reject_verdicts_settle_the_transaction() {
 #[test]
 fn a_silent_juror_is_redrawn_around() {
     let db = fresh_db();
-    let members = established_members(&db, 6, T);
+    let members = establish_members(&db, &test_station(), 6, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     // Short juror deadline so a no-show is quick; long overall window.
@@ -586,7 +503,7 @@ fn a_silent_juror_is_redrawn_around() {
 #[test]
 fn an_unresolved_dispute_lapses_and_settles() {
     let db = fresh_db();
-    let _members = established_members(&db, 5, T);
+    let _members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
@@ -611,7 +528,7 @@ fn an_unresolved_dispute_lapses_and_settles() {
 #[test]
 fn a_non_juror_verdict_is_refused() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
@@ -646,7 +563,7 @@ fn a_non_juror_verdict_is_refused() {
 #[test]
 fn a_second_verdict_from_a_juror_is_refused() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = params();
@@ -850,7 +767,7 @@ fn an_escalation_without_quorum_lapses_open_and_settles() {
 #[test]
 fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = esc_params();
@@ -922,7 +839,7 @@ fn a_party_appeals_a_jury_ruling_and_the_electorate_overturns_it() {
 #[test]
 fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
     let db = fresh_db();
-    let members = established_members(&db, 5, T);
+    let members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = esc_params();
@@ -972,7 +889,7 @@ fn an_unappealed_jury_ruling_enacts_once_the_appeal_window_closes() {
 fn escalation_and_ballot_gates_refuse_the_illegitimate() {
     let db = fresh_db();
     // Five established members: the pool can seat a panel, so CannotSeat is invalid.
-    let _members = established_members(&db, 5, T);
+    let _members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let p = esc_params();
@@ -1135,7 +1052,7 @@ fn the_escalation_window_is_clamped_to_the_main_window() {
 #[test]
 fn find_disputed_lists_the_frozen_transaction() {
     let db = fresh_db();
-    let _members = established_members(&db, 5, T);
+    let _members = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     assert_eq!(
@@ -1266,11 +1183,11 @@ fn a_back_dated_vouch_cannot_pack_the_jury_pool() {
     // dispute's pool, and the drawn panel is byte-identical to the one drawn before
     // the vouch landed.
     let db = fresh_db();
-    let jurors = established_members(&db, 4, T);
+    let jurors = establish_members(&db, &test_station(), 4, T);
     // A would-be juror with raw standing over the band but *unanchored* (nobody has
     // vouched for them): capped below the band, so not yet in the electorate.
     let newcomer = Keypair::generate();
-    earn_raw_standing(&db, &newcomer, T);
+    earn_standing(&db, &test_station(), &newcomer, &Keypair::generate(), T);
 
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
@@ -1298,7 +1215,7 @@ fn a_back_dated_vouch_cannot_pack_the_jury_pool() {
     // A back-dated anchoring vouch for the newcomer, admitted *after* the dispute's
     // seq: legal old testimony (ADR-0022 §3) that anchors them and reveals their
     // over-band raw composite.
-    append_vouch(&db, &jurors[0], &addr(&newcomer), T);
+    vouch(&db, &jurors[0], &addr(&newcomer), T);
 
     // Bounded at the dispute's admission seq, the pool and the draw are unchanged.
     let pool_after = eligible_pool(
@@ -1346,6 +1263,14 @@ fn a_back_dated_settlement_does_not_shift_a_draw_weight() {
     let db = fresh_db();
     let founders: Vec<Keypair> = (0..4).map(|_| Keypair::generate()).collect();
     let founder_addrs: Vec<Address> = founders.iter().map(addr).collect();
+    // Enrolled, so the later trades are eligible events (ADR-0038 §8).
+    enroll(
+        &db,
+        &test_station(),
+        &founder_addrs[0],
+        EnrollmentBasis::Pairing,
+        0,
+    );
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
@@ -1374,7 +1299,14 @@ fn a_back_dated_settlement_does_not_shift_a_draw_weight() {
         // The settlement is signed by the community station so it counts under the
         // ledger station-signer pin; a non-station signer would be discarded and the
         // unbounded weight would never rise, hiding the vector this test proves bites.
-        append_settled(&db, &founders[0], &test_station(), nonce, T);
+        settle_trade(
+            &db,
+            &test_station(),
+            &founders[0],
+            &test_station(),
+            nonce,
+            T,
+        );
     }
 
     let pool_after = eligible_pool(
@@ -1420,7 +1352,7 @@ fn a_voucher_admitted_after_the_open_neither_recuses_nor_seats() {
     // Invariant 5: recusal graph and pool agree on one prefix. A vouch from a juror
     // for a party, admitted after the dispute opened, must not recuse that juror.
     let db = fresh_db();
-    let jurors = established_members(&db, 4, T);
+    let jurors = establish_members(&db, &test_station(), 4, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T);
     let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
@@ -1439,7 +1371,7 @@ fn a_voucher_admitted_after_the_open_neither_recuses_nor_seats() {
     assert!(pool_has(&pool_before, &addr(&jurors[0])));
 
     // jurors[0] vouches for a party (alice) *after* the dispute opened, back-dated.
-    append_vouch(&db, &jurors[0], &addr(&alice), T);
+    vouch(&db, &jurors[0], &addr(&alice), T);
 
     // Bounded at the dispute seq, jurors[0] is still eligible (not recused).
     let pool_after = eligible_pool(
@@ -1486,18 +1418,13 @@ fn two_replicas_with_post_open_back_dated_evidence_draw_the_same_panel() {
     let build = || {
         let db = fresh_db();
         let jurors: Vec<Keypair> = (0..4).map(|i| kp(&format!("juror:{i}"))).collect();
-        for m in &jurors {
-            earn_raw_standing(&db, m, T);
-        }
-        for i in 0..jurors.len() {
-            append_vouch(&db, &jurors[(i + 1) % jurors.len()], &addr(&jurors[i]), T);
-        }
+        establish(&db, &test_station(), &jurors, T);
         let newcomer = kp("newcomer");
-        earn_raw_standing(&db, &newcomer, T);
+        earn_standing(&db, &test_station(), &newcomer, &kp("partner:newcomer"), T);
         let (alice, bob) = (kp("alice"), kp("bob"));
         let tx = append_disputed(&db, &alice, &bob, 300, T);
         // Post-open, back-dated anchoring vouch — inert under the bound on both.
-        append_vouch(&db, &jurors[0], &addr(&newcomer), T);
+        vouch(&db, &jurors[0], &addr(&newcomer), T);
         sequence(&db, &tx, &params())
     };
     let (a, b) = (build(), build());
@@ -1543,8 +1470,8 @@ fn a_back_dated_vouch_cannot_pack_the_escalation_electorate() {
     // A newcomer earns over-band raw standing, then is anchored by a back-dated vouch
     // admitted *after* the escalation opened.
     let newcomer = Keypair::generate();
-    earn_raw_standing(&db, &newcomer, T);
-    append_vouch(&db, &lone, &addr(&newcomer), T);
+    earn_standing(&db, &test_station(), &newcomer, &Keypair::generate(), T);
+    vouch(&db, &lone, &addr(&newcomer), T);
 
     // Bounded at the escalation's seq the newcomer never joins the electorate.
     let after = escalation_electorate(
@@ -1593,7 +1520,7 @@ fn a_tail_anchored_dispute_bounds_to_the_whole_log() {
     // the whole log, so the bounded pool, weights, and draw equal the unbounded
     // (time-only) computation — a guard against an off-by-one in the bound.
     let db = fresh_db();
-    let _jurors = established_members(&db, 5, T);
+    let _jurors = establish_members(&db, &test_station(), 5, T);
     let (alice, bob) = (Keypair::generate(), Keypair::generate());
     let tx = append_disputed(&db, &alice, &bob, 300, T); // the dispute is the tail
     let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();

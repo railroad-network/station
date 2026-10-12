@@ -18,14 +18,16 @@
 //!
 //! # Who may confirm — the bootstrap grace
 //!
-//! Steady state: only an **established** member — effective composite at or above
-//! the Member band ([`BAND_MEMBER_MIN`]) — may confirm a Tier-2 transaction, so
-//! there is real reputation behind the attestation.
+//! Steady state: only an **established** member — enrolled, anchored, effective
+//! composite at or above the Member band ([`BAND_MEMBER_MIN`]), and not the
+//! station identity (ADR-0038 §12) — may confirm a Tier-2 transaction, so there
+//! is real reputation behind the attestation.
 //!
 //! But a brand-new community has no established members yet: anchoring caps every
-//! unanchored identity's composite far below the Member band, so a strict floor
-//! would make Tier-2 impossible until reputation somehow bootstrapped — the same
-//! deadlock [`crate::sybil::anchoring_voucher`] documents for the *first* anchor.
+//! unanchored identity's composite far below the Member band, and even the
+//! founders — the roots of the anchoring chain — must first earn standing at the
+//! capped rate (at least 49 days, ADR-0038 §10), so a strict floor would make
+//! Tier-2 impossible until reputation bootstrapped.
 //! The escape hatch is a **grace period**: while fewer than
 //! [`BOOTSTRAP_GRACE_THRESHOLD`] members have reached the Member band, *any*
 //! member may confirm a Tier-2 transaction (staking whatever raw composite they
@@ -293,13 +295,11 @@ pub fn evaluate_tier2_confirmation(
 mod tests {
     use super::*;
     use rrn_crypto::keypair::Keypair;
-    use rrn_crypto::signed::SignedPayload;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_ledger::enrollment::EnrollmentBasis;
     use rrn_storage::log::AppendLog;
     use rrn_storage::migrations;
+
+    use crate::testutil::{enroll, establish_members, settle_trade, vouch, WEEK};
 
     const MONTH: i64 = 30 * 86_400;
 
@@ -313,75 +313,6 @@ mod tests {
         Address::from_public_key(kp.public_key())
     }
 
-    /// Appends a proposal → confirmation → settlement chain, so `sender` and
-    /// `receiver` both accrue trade reliability and `receiver` an attestation.
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        let confirmation = TransactionConfirmation {
-            proposal_id: pid,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        };
-        log.append(SignedPayload::sign(confirmation, receiver), 0)
-            .unwrap();
-        let settlement = SettlementRecord {
-            proposal_id: pid,
-            sender: addr(sender),
-            receiver: addr(receiver),
-            amount_centi: 300,
-            settled_at: at,
-        };
-        log.append(SignedPayload::sign(settlement, station), 0)
-            .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    /// Raises `who`'s **raw** composite over the Member band — ten settled trades
-    /// plus ten vouches written, the recipe `scoring`'s own tests use to mint a
-    /// member established enough to anchor others.
-    fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, who, station, station, nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, who, &addr(&Keypair::generate()), at);
-        }
-    }
-
     #[test]
     fn position_bound_excludes_evidence_admitted_after_it() {
         // The back-dating vector: a voucher earns real standing, then —
@@ -390,16 +321,16 @@ mod tests {
         // a position-bounded scorer pinned before its admission must not.
         let db = fresh_db();
         let station = Keypair::generate();
-        let voucher = Keypair::generate();
         let subject = Keypair::generate();
         let t = 10 * MONTH;
 
-        earn_raw_standing(&db, &voucher, &station, t);
+        let voucher = establish_members(&db, &station, 2, t).remove(0);
+        enroll(&db, &station, &addr(&subject), EnrollmentBasis::Pairing, t);
         let bound_before = AppendLog::new(&db).tail().unwrap().unwrap().seq;
 
         // The anchoring vouch is admitted *after* the bound, but claims an old
         // `issued_at` (<= t) — legal testimony under ADR-0022 §3.
-        append_vouch(&db, &voucher, &addr(&subject), t);
+        vouch(&db, &voucher, &addr(&subject), t);
 
         // Unbounded: the subject is anchored. Bounded before the vouch's admission:
         // it is not, however old the vouch claims to be.
@@ -483,8 +414,10 @@ mod tests {
         let t = 10 * MONTH;
         // The newcomer receives (and confirms) a couple of trades: some raw
         // standing, but nowhere near the Member band, and nobody has anchored them.
-        append_settled(&db, &buyer, &newcomer, &station, 0, t);
-        append_settled(&db, &buyer, &newcomer, &station, 1, t);
+        enroll(&db, &station, &addr(&buyer), EnrollmentBasis::Pairing, 0);
+        enroll(&db, &station, &addr(&newcomer), EnrollmentBasis::Pairing, 0);
+        settle_trade(&db, &station, &buyer, &newcomer, 0, t - WEEK);
+        settle_trade(&db, &station, &buyer, &newcomer, 1, t);
 
         // No member is established, so the bootstrap grace is open.
         assert_eq!(
@@ -517,28 +450,30 @@ mod tests {
     #[test]
     fn established_member_count_counts_anchored_members_over_the_band() {
         let db = fresh_db();
-        let (patron_a, patron_b, station) = (
-            Keypair::generate(),
-            Keypair::generate(),
-            Keypair::generate(),
-        );
+        let station = Keypair::generate();
         let t = 10 * MONTH;
 
-        // Two members earn raw standing over the band, then anchor each other, so
-        // each reads at its true (uncapped) composite rather than the anchor cap.
-        earn_raw_standing(&db, &patron_a, &station, t);
-        earn_raw_standing(&db, &patron_b, &station, t);
-        // Before anchoring, neither is *effectively* established (both capped).
+        // Two enrolled members earn raw standing over the band trading with each
+        // other, and vouch for each other: neither is a root, so neither is
+        // anchored, and neither is established (ADR-0038 §11–§12).
+        let pair: Vec<Keypair> = (0..2).map(|_| Keypair::generate()).collect();
+        for m in &pair {
+            enroll(&db, &station, &addr(m), EnrollmentBasis::Pairing, 0);
+        }
+        for w in 0..10 {
+            let at = t - (10 - w) * WEEK;
+            settle_trade(&db, &station, &pair[0], &pair[1], w as u64, at);
+            settle_trade(&db, &station, &pair[1], &pair[0], w as u64, at);
+        }
+        vouch(&db, &pair[0], &addr(&pair[1]), t);
+        vouch(&db, &pair[1], &addr(&pair[0]), t);
         assert_eq!(
             established_member_count(&db, t, &station.public_key()).unwrap(),
             0
         );
 
-        append_vouch(&db, &patron_a, &addr(&patron_b), t);
-        append_vouch(&db, &patron_b, &addr(&patron_a), t);
-
-        // Now both clear the Member band on their effective (anchored) composite;
-        // the many trade counterparties and vouch subjects stay well below it.
+        // Two founders with the same standing are roots: both established.
+        establish_members(&db, &station, 2, t);
         assert_eq!(
             established_member_count(&db, t, &station.public_key()).unwrap(),
             2
@@ -548,20 +483,12 @@ mod tests {
     #[test]
     fn an_established_confirmer_stakes_without_grace() {
         let db = fresh_db();
-        let (patron_a, patron_b, station) = (
-            Keypair::generate(),
-            Keypair::generate(),
-            Keypair::generate(),
-        );
+        let station = Keypair::generate();
         let t = 10 * MONTH;
-        earn_raw_standing(&db, &patron_a, &station, t);
-        earn_raw_standing(&db, &patron_b, &station, t);
-        append_vouch(&db, &patron_a, &addr(&patron_b), t);
-        append_vouch(&db, &patron_b, &addr(&patron_a), t);
+        let patron = establish_members(&db, &station, 2, t).remove(0);
 
-        // patron_a is established, so confirming is allowed on their own standing.
-        match evaluate_tier2_confirmation(&db, &addr(&patron_a), t, &station.public_key()).unwrap()
-        {
+        // The patron is established, so confirming is allowed on their own standing.
+        match evaluate_tier2_confirmation(&db, &addr(&patron), t, &station.public_key()).unwrap() {
             Tier2Eligibility::Allowed {
                 stake_centi,
                 via_grace,
@@ -573,27 +500,8 @@ mod tests {
         }
     }
 
-    /// Anchors `n` members over the Member band by minting raw standing for each
-    /// and cross-vouching them, the recipe the two-member test above uses,
-    /// generalized. Returns the established keypairs.
-    fn establish_members(db: &Database, station: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            earn_raw_standing(db, m, station, at);
-        }
-        // Every member vouches for every other, so each is anchored by a peer.
-        for voucher in &members {
-            for subject in &members {
-                if addr(voucher) != addr(subject) {
-                    append_vouch(db, voucher, &addr(subject), at);
-                }
-            }
-        }
-        members
-    }
-
     #[test]
-    fn in_grace_until_the_threshold_is_reached() {
+    fn in_grace_until_three_enrolled_anchored_members_establish() {
         let station = Keypair::generate();
         let t = 10 * MONTH;
 
@@ -612,12 +520,17 @@ mod tests {
 
         // Three established tips the community out of grace.
         let db3 = fresh_db();
-        establish_members(&db3, &station, 3, t);
+        let three = establish_members(&db3, &station, 3, t);
         assert_eq!(
             established_member_count(&db3, t, &station.public_key()).unwrap(),
             3
         );
         assert!(!in_grace(&db3, t, &station.public_key()).unwrap());
+
+        // Revoking one of the three returns the community to grace: established
+        // requires current enrollment (ADR-0038 §12).
+        crate::testutil::revoke(&db3, &station, &addr(&three[0]), t);
+        assert!(in_grace(&db3, t, &station.public_key()).unwrap());
     }
 
     #[test]

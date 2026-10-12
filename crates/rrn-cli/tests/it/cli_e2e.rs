@@ -75,10 +75,43 @@ async fn cli_drives_daemon() {
         let j = rrn(&socket, &["--format", "json", "balance"]);
         let _: serde_json::Value = serde_json::from_str(&j).expect("valid json");
 
-        // pay to self (sender == receiver nets to zero), then confirm.
-        let tx = rrn(&socket, &["pay", &me, "1.50"]);
+        // A payment to yourself is refused at the engine (ADR-0038 §7).
+        let refused = Command::new(RRN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["pay", &me, "1.50"])
+            .output()
+            .expect("spawn rrn");
+        assert!(!refused.status.success(), "a self-payment must be refused");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("a payment to yourself is not a transaction"),
+            "self-pay stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+
+        // pay someone else: a proposal, awaiting their confirmation.
+        let payee = rrn_identity::address::Address::from_public_key(
+            rrn_crypto::keypair::Keypair::generate().public_key(),
+        )
+        .to_string();
+        let tx = rrn(&socket, &["pay", &payee, "1.50"]);
         assert_eq!(tx.len(), 64, "tx id should be 32-byte hex: {tx}");
-        assert_eq!(rrn(&socket, &["confirm", &tx]), "Confirmed");
+        // Only the payee may confirm it: the operator's `confirm` reaches the
+        // engine and is refused as the wrong confirmer.
+        let confirm = Command::new(RRN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["confirm", &tx])
+            .output()
+            .expect("spawn rrn");
+        assert!(!confirm.status.success(), "the station is not the payee");
+        assert!(
+            String::from_utf8_lossy(&confirm.stderr)
+                .contains("confirmer does not match the proposal's receiver"),
+            "confirm stderr: {}",
+            String::from_utf8_lossy(&confirm.stderr)
+        );
 
         // history (text) has rows; (json) is a valid array of entries.
         let h = rrn(&socket, &["history"]);

@@ -398,10 +398,7 @@ mod tests {
     use crate::proposal::{append_proposal, Proposal, ProposalCosign, ProposalKind};
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::serialize::to_canonical_bytes;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_reputation::testutil::establish_members;
     use rrn_storage::migrations;
 
     const MONTH: i64 = 30 * 86_400;
@@ -415,95 +412,6 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         db
-    }
-
-    // --- Reputation seeding (mirrors rrn-reputation's own test helpers) -------
-
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        log.append(
-            SignedPayload::sign(
-                TransactionConfirmation {
-                    proposal_id: pid,
-                    confirmer: addr(receiver),
-                    confirmed_at: at,
-                },
-                receiver,
-            ),
-            0,
-        )
-        .unwrap();
-        log.append(
-            SignedPayload::sign(
-                SettlementRecord {
-                    proposal_id: pid,
-                    sender: addr(sender),
-                    receiver: addr(receiver),
-                    amount_centi: 300,
-                    settled_at: at,
-                },
-                station,
-            ),
-            0,
-        )
-        .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, who, station, &test_station(), nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, who, &addr(&Keypair::generate()), at);
-        }
-    }
-
-    /// Builds `n` established members: each earns raw standing over the Member
-    /// band, then is anchored by a vouch from the next in a ring.
-    fn established_members(db: &Database, station: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            earn_raw_standing(db, m, station, at);
-        }
-        for i in 0..n {
-            append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
-        }
-        members
     }
 
     fn test_charter() -> Charter {
@@ -606,12 +514,8 @@ mod tests {
     /// A published statute plus the members: `[0]` authored it, `[1..=3]`
     /// co-signed it to publication, and every member is established and eligible
     /// to vote. Returns `(log, members, proposal)`.
-    fn published_statute(
-        db: &Database,
-        station: &Keypair,
-        extra_voters: usize,
-    ) -> (Vec<Keypair>, Proposal) {
-        let members = established_members(db, station, 4 + extra_voters, NOW);
+    fn published_statute(db: &Database, extra_voters: usize) -> (Vec<Keypair>, Proposal) {
+        let members = establish_members(db, &test_station(), 4 + extra_voters, NOW);
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
         let proposal = statute(&author, NOW);
@@ -633,8 +537,7 @@ mod tests {
     #[test]
     fn a_member_can_cast_a_vote_and_it_lands_in_the_log() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -653,8 +556,7 @@ mod tests {
     #[test]
     fn every_choice_round_trips_through_the_ballots() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -690,8 +592,7 @@ mod tests {
         // Unlike co-signing, voting by the author is allowed — a ballot is a
         // choice, not an endorsement that publishes the motion.
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -711,8 +612,7 @@ mod tests {
     #[test]
     fn a_vote_signed_by_someone_other_than_its_voter_is_refused() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         // Ballot names members[1] as voter but is signed by members[2].
@@ -732,8 +632,7 @@ mod tests {
     #[test]
     fn a_double_vote_is_rejected() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -759,8 +658,7 @@ mod tests {
         // The window runs on *admission*: a ballot admitted after the
         // proposal's close is refused, whatever its `cast_at` claims.
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         let err = append_vote(
@@ -780,8 +678,7 @@ mod tests {
         // existed) is still counted when *admitted* inside the window: `cast_at`
         // is testimony, never the gate (ADR-0022).
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -806,8 +703,7 @@ mod tests {
     #[test]
     fn a_non_member_may_not_vote() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (_members, proposal) = published_statute(&db, &station, 0);
+        let (_members, proposal) = published_statute(&db, 0);
         let outsider = Keypair::generate(); // no standing
         let mut log = AppendLog::new(&db);
 
@@ -824,8 +720,7 @@ mod tests {
     #[test]
     fn voting_on_an_unknown_proposal_is_refused() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 2, NOW);
+        let members = establish_members(&db, &test_station(), 2, NOW);
         let mut log = AppendLog::new(&db);
 
         // A proposal that was never appended.
@@ -843,9 +738,8 @@ mod tests {
     #[test]
     fn voting_on_a_proposal_still_deliberating_is_refused() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Enough members to vote, but the proposal is never co-signed to publication.
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
@@ -874,8 +768,7 @@ mod tests {
     #[test]
     fn replay_ignores_ballots_a_gossiped_entry_could_carry() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let outsider = Keypair::generate();
         let mut log = AppendLog::new(&db);
 
@@ -930,8 +823,7 @@ mod tests {
         // residual noted in the module docs and threat model: a raw-replicated ballot
         // is trusted to have been window-gated by the station that first took it.
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 0);
+        let (members, proposal) = published_statute(&db, 0);
         let mut log = AppendLog::new(&db);
 
         // Raw-appended (as replication does, bypassing `append_vote`) and re-stamped

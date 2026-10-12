@@ -7,15 +7,12 @@ use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
-use rrn_identity::attestation::Attestation;
-use rrn_identity::vouch::{VouchBody, VouchKind};
 use rrn_ledger::escrow::{
     CertId, CertificateRequest, EquivocationBasis, EquivocationId, EquivocationRecord,
     EvidenceItem, HeadroomCertificate, VerdictDecision,
 };
-use rrn_ledger::settlement::SettlementRecord;
 use rrn_ledger::state::LedgerSnapshot;
-use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+use rrn_ledger::transaction::TransactionProposal;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
@@ -27,6 +24,7 @@ use rrn_dispute::equivocation::{
 };
 use rrn_dispute::{DisputeParams, Error};
 use rrn_reputation::scoring::ReputationScorer;
+use rrn_reputation::testutil::{earn_standing, establish, vouch};
 
 const ANCHOR: &[u8] = b"commons";
 /// Ten 30-day months in, so seeded standing is decay-free at scoring time.
@@ -66,99 +64,6 @@ fn params() -> DisputeParams {
         escalation_window_seconds: 1000,
         escalation_quorum_pct: 30,
         escalation_approval_pct: 50,
-    }
-}
-
-// --- reputation seeding (mirrors rrn-reputation / jury.rs helpers) -------------
-
-fn append_settled(db: &Database, sender: &Keypair, receiver: &Keypair, nonce: u64, at: i64) {
-    let mut log = AppendLog::new(db);
-    let proposal = TransactionProposal::new(
-        addr(sender),
-        addr(receiver),
-        300,
-        None,
-        nonce,
-        1,
-        i64::MAX / 2,
-    );
-    let pid = proposal.id;
-    log.append(SignedPayload::sign(proposal, sender), 0)
-        .unwrap();
-    log.append(
-        SignedPayload::sign(
-            TransactionConfirmation {
-                proposal_id: pid,
-                confirmer: addr(receiver),
-                confirmed_at: at,
-            },
-            receiver,
-        ),
-        0,
-    )
-    .unwrap();
-    log.append(
-        SignedPayload::sign(
-            SettlementRecord {
-                proposal_id: pid,
-                sender: addr(sender),
-                receiver: addr(receiver),
-                amount_centi: 300,
-                settled_at: at,
-            },
-            // Station-signed, as in production (ADR-0005): the station-signer pin counts
-            // a settlement only when the community station signed it.
-            &test_station(),
-        ),
-        0,
-    )
-    .unwrap();
-}
-
-fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-    let mut log = AppendLog::new(db);
-    let vouch = Attestation {
-        kind: VouchKind,
-        body: VouchBody {
-            community: "commons".into(),
-            statement: "trustworthy".into(),
-            reputation_stake_centi: 0,
-        },
-        subject: *subject,
-        issued_at: at,
-        expires_at: None,
-    };
-    log.append(vouch.sign(voucher), 0).unwrap();
-}
-
-/// Gives `who` a raw standing baseline. The receiving sink and the vouch subjects
-/// are unique per `tag`, so — like the `Keypair::generate()` in the reputation
-/// helpers — no shared counterparty accumulates enough standing to leak into the
-/// electorate.
-fn earn_raw_standing(db: &Database, who: &Keypair, tag: &str, at: i64) {
-    let sink = kp(&format!("equiv:sink:{tag}"));
-    for nonce in 0..10 {
-        append_settled(db, who, &sink, nonce, at);
-    }
-    for i in 0..10 {
-        append_vouch(
-            db,
-            who,
-            &addr(&kp(&format!("equiv:randsubj:{tag}:{i}"))),
-            at,
-        );
-    }
-}
-
-/// `members`, each with raw standing and anchored in a ring, so all count toward
-/// the established electorate as of `at`.
-fn establish_ring(db: &Database, members: &[Keypair], at: i64) {
-    for (i, m) in members.iter().enumerate() {
-        earn_raw_standing(db, m, &format!("m{i}"), at);
-    }
-    let n = members.len();
-    for i in 0..n {
-        append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
     }
 }
 
@@ -279,10 +184,16 @@ fn setup() -> Fixture {
     // anchored by members[0] — so zeroing the subject's reputation does not
     // de-anchor any juror (the anchoring cascade flows voucher → subject, ADR-0009).
     let members: Vec<Keypair> = (0..5).map(|i| kp(&format!("equiv:member:{i}"))).collect();
-    establish_ring(&db, &members, T);
+    establish(&db, &test_station(), &members, T);
     let subject = kp("equiv:subject");
-    earn_raw_standing(&db, &subject, "subject", T);
-    append_vouch(&db, &members[0], &addr(&subject), T);
+    earn_standing(
+        &db,
+        &test_station(),
+        &subject,
+        &kp("equiv:partner:subject"),
+        T,
+    );
+    vouch(&db, &members[0], &addr(&subject), T);
     let payee = members[1].clone();
     let cert = append_certificate(&db, &subject, &station, T);
     let id = append_overspend(
@@ -637,8 +548,14 @@ fn two_identical_logs_reach_identical_outcomes() {
         // under round 0's bound on both replicas (its seq is past the round's anchor),
         // so it can neither desync the seated jury nor the outcome (ADR-0022 §5).
         let latecomer = kp("equiv:det:latecomer");
-        earn_raw_standing(&fx.db, &latecomer, "det-latecomer", T);
-        append_vouch(&fx.db, &fx.members[0], &addr(&latecomer), T);
+        earn_standing(
+            &fx.db,
+            &test_station(),
+            &latecomer,
+            &kp("equiv:partner:det-latecomer"),
+            T,
+        );
+        vouch(&fx.db, &fx.members[0], &addr(&latecomer), T);
         for m in &fx.members[2..5] {
             cast(
                 &fx.db,
@@ -712,10 +629,16 @@ fn a_small_pool_relaxes_voucher_recusal() {
     // certificate and equivocation record this test writes pin consistently.
     let station = test_station();
     let members: Vec<Keypair> = (0..4).map(|i| kp(&format!("relax:member:{i}"))).collect();
-    establish_ring(&db, &members, T);
+    establish(&db, &test_station(), &members, T);
     let subject = kp("relax:subject");
-    earn_raw_standing(&db, &subject, "relaxsubject", T);
-    append_vouch(&db, &members[1], &addr(&subject), T); // members[1] vouches the subject
+    earn_standing(
+        &db,
+        &test_station(),
+        &subject,
+        &kp("equiv:partner:relaxsubject"),
+        T,
+    );
+    vouch(&db, &members[1], &addr(&subject), T); // members[1] vouches the subject
     let cert = append_certificate(&db, &subject, &station, T);
     let id = append_overspend(
         &db,
@@ -763,9 +686,15 @@ fn a_juror_established_after_a_round_opens_is_not_on_its_panel() {
     // untouched.
     let fx = setup();
     let latecomer = kp("equiv:latecomer");
-    earn_raw_standing(&fx.db, &latecomer, "latecomer", T);
+    earn_standing(
+        &fx.db,
+        &test_station(),
+        &latecomer,
+        &kp("equiv:partner:latecomer"),
+        T,
+    );
     // Anchored *after* the overspend (round 0's anchor), back-dated to T.
-    append_vouch(&fx.db, &fx.members[0], &addr(&latecomer), T);
+    vouch(&fx.db, &fx.members[0], &addr(&latecomer), T);
 
     // Round 0's panel excludes the latecomer, whatever the vouch's timestamp claims.
     assert!(matches!(
@@ -825,9 +754,15 @@ fn a_back_dated_vouch_cannot_retroactively_validate_a_reseat() {
         // A requester with over-band raw standing but unanchored: not established
         // until an anchoring vouch reveals their composite.
         let newreq = kp("equiv:newreq");
-        earn_raw_standing(&fx.db, &newreq, "newreq", T);
+        earn_standing(
+            &fx.db,
+            &test_station(),
+            &newreq,
+            &kp("equiv:partner:newreq"),
+            T,
+        );
 
-        let vouch = |db: &Database| append_vouch(db, &fx.members[0], &addr(&newreq), T);
+        let vouch = |db: &Database| vouch(db, &fx.members[0], &addr(&newreq), T);
         let reseat = |db: &Database| {
             let signed = SignedPayload::sign(
                 EquivocationReseat {

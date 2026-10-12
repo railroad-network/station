@@ -11,13 +11,18 @@
 //! Only two dimensions have live inputs (ADR-0009); the other three are
 //! structurally zero until later milestones.
 //!
+//! Only events between enrolled identities count, and a self-send counts for no
+//! one (ADR-0038 §7–§8; see [`crate::context`]).
+//!
 //! - **Trade reliability** — each settled transaction the address is a party to
-//!   (sender or receiver) is one positive event. Cancelled proposals are neutral
+//!   (sender or receiver) is one positive event, at its station-signed
+//!   `settled_at`. Cancelled proposals are neutral
 //!   (they contribute nothing). Its reserved negative slot is now populated by a
 //!   proven equivocation (a false headroom claim; ADR-0021 §5), which zeroes it.
 //! - **Attestation accuracy** — each signed statement the address made about a
-//!   transaction or another member: the vouches it signed, plus the transaction
-//!   confirmations it signed as a receiver. Each counts as accurate *unless later
+//!   transaction or another member: the vouches it signed (at `issued_at`), plus
+//!   the confirmations it signed as a receiver, credited once the transaction
+//!   settles (at `settled_at`). Each counts as accurate *unless later
 //!   proven wrong*: a dispute upheld against a confirmation (ADR-0014) both strips
 //!   its positive credit and levies a penalty, dragging the dimension below
 //!   neutral — the "proven wrong" negative event ADR-0009 always reserved for this
@@ -26,10 +31,12 @@
 //!
 //! # The count-to-score mapping
 //!
-//! A dimension's raw value is `EVENT_INCREMENT` (0.5) per qualifying event,
-//! capped at
+//! A dimension's raw value is `EVENT_INCREMENT` (0.5) per *credited* event —
+//! at most one per trailing week (ADR-0038 §10,
+//! [`crate::sybil::credited_events`]) — capped at
 //! [`DIMENSION_MAX`](crate::model::DIMENSION_MAX); [`crate::decay`] then subtracts
-//! its monthly rate per 30-day month since that dimension's most recent event.
+//! its monthly rate per 30-day month since that dimension's most recent eligible
+//! event.
 //! These constants are protocol-locked alongside the ADR-0009 weights: they must
 //! be identical on every station, or a reputation exported from one would not
 //! reconcile on another.
@@ -39,8 +46,7 @@
 //! [`ReputationScorer`] now builds a [`ScoringContext`](crate::context::ScoringContext)
 //! per call and delegates: the actual replay-and-fold lives there, once, indexed
 //! by address so a whole scoring query costs `O(N + A)` rather than one full
-//! replay per address (see the context module for the algorithm and its
-//! equivalence proof). A caller making several queries at the same
+//! replay per address (see the context module for the algorithm). A caller making several queries at the same
 //! `(at_time, max_seq)` should build one `ScoringContext` and reuse it instead of
 //! calling these wrappers repeatedly.
 
@@ -97,10 +103,10 @@ impl<'db> ReputationScorer<'db> {
     /// and decay is measured to `at_time` — so a historical profile is exactly
     /// what this station would have computed then, which is what makes portability
     /// and dispute review replayable. Timestamps come from the signed payloads
-    /// (`settled_at`, `confirmed_at`, `issued_at`), never the log's per-replica
-    /// append time, so two stations with the same log agree byte-for-byte.
+    /// (`settled_at`, `issued_at`), never the log's per-replica append time, so
+    /// two stations with the same log agree byte-for-byte.
     ///
-    /// An identity no established member has vouched for is held to
+    /// An identity that is not anchored (ADR-0038 §11) is held to
     /// [`ANCHOR_DIMENSION_CAP`](crate::sybil::ANCHOR_DIMENSION_CAP) — the
     /// evidence still accrues underneath, so being anchored later reveals the
     /// score rather than starting it.
@@ -126,10 +132,9 @@ impl<'db> ReputationScorer<'db> {
     }
 
     /// The address's reputation from evidence alone, before identity anchoring —
-    /// the uncapped score [`crate::sybil::anchoring_voucher`] judges a prospective
-    /// voucher on (production reads it through [`ScoringContext::score_raw`], which
-    /// is where the anchoring rule now lives; this thin wrapper is retained for the
-    /// crate's own tests).
+    /// the uncapped score an anchoring edge judges a voucher on (production reads
+    /// it through [`ScoringContext::score_raw`], which is where the anchoring rule
+    /// lives; this thin wrapper is retained for the crate's own tests).
     #[cfg(test)]
     pub(crate) fn score_raw_at(
         &self,
@@ -159,21 +164,21 @@ mod tests {
     use super::*;
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::signed::SignedPayload;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
     use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
     use rrn_ledger::escrow::{
         EquivocationBasis, EquivocationId, EquivocationRecord, EquivocationVerdictRecord,
         VerdictDecision,
     };
-    use rrn_ledger::settlement::SettlementRecord;
     use rrn_ledger::state::{CancelReason, CancellationRecord};
     use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
     use rrn_storage::log::AppendLog;
     use rrn_storage::migrations;
 
+    use rrn_ledger::enrollment::EnrollmentBasis;
+
     use crate::model::{ReputationBand, DIMENSION_MAX};
     use crate::sybil::ANCHOR_DIMENSION_CAP;
+    use crate::testutil::WEEK;
 
     const MONTH: i64 = 30 * 86_400;
 
@@ -187,8 +192,14 @@ mod tests {
         Address::from_public_key(kp.public_key())
     }
 
-    /// Appends a proposal → confirmation → settlement chain for one transaction,
-    /// fully controlling `settled_at` (and the confirmer's `confirmed_at`).
+    /// Enrolls `who` under `station` (basis `pairing`), so its events are
+    /// eligible (ADR-0038 §8). Re-enrolling an enrolled member is a no-op.
+    fn enroll(db: &Database, station: &Keypair, who: &Address) {
+        crate::testutil::enroll(db, station, who, EnrollmentBasis::Pairing, 0);
+    }
+
+    /// Appends a proposal → confirmation → settlement chain for one transaction
+    /// settled at `at`, between two parties this helper enrolls first.
     fn append_settled(
         db: &Database,
         sender: &Keypair,
@@ -197,35 +208,9 @@ mod tests {
         nonce: u64,
         at: i64,
     ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        let confirmation = TransactionConfirmation {
-            proposal_id: pid,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        };
-        log.append(SignedPayload::sign(confirmation, receiver), 0)
-            .unwrap();
-        let settlement = SettlementRecord {
-            proposal_id: pid,
-            sender: addr(sender),
-            receiver: addr(receiver),
-            amount_centi: 300,
-            settled_at: at,
-        };
-        log.append(SignedPayload::sign(settlement, station), 0)
-            .unwrap();
+        enroll(db, station, &addr(sender));
+        enroll(db, station, &addr(receiver));
+        crate::testutil::settle_trade(db, station, sender, receiver, nonce, at);
     }
 
     /// Appends a proposal that is then cancelled (never confirmed or settled).
@@ -309,21 +294,18 @@ mod tests {
             .unwrap();
     }
 
-    /// Appends a vouch from `voucher` for `subject`, issued at `at`.
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
+    /// Appends a vouch from `voucher` for `subject`, issued at `at`, between two
+    /// parties this helper enrolls first.
+    fn append_vouch(
+        db: &Database,
+        station: &Keypair,
+        voucher: &Keypair,
+        subject: &Address,
+        at: i64,
+    ) {
+        enroll(db, station, &addr(voucher));
+        enroll(db, station, subject);
+        crate::testutil::vouch(db, voucher, subject, at);
     }
 
     fn approx(a: f32, b: f32) -> bool {
@@ -409,16 +391,22 @@ mod tests {
             .unwrap();
     }
 
-    /// Gives `member` three vouch attestations (raw 1.5) as a clean baseline the
-    /// equivocation penalty can visibly erode.
-    fn seed_attestation_baseline(db: &Database, member: &Keypair, at: i64) {
-        for _ in 0..3 {
-            append_vouch(db, member, &addr(&Keypair::generate()), at);
+    /// Gives `member` three vouch attestations a week apart, the last at `at`
+    /// (raw 1.5), as a clean baseline the equivocation penalty can visibly erode.
+    fn seed_attestation_baseline(db: &Database, member: &Keypair, station: &Keypair, at: i64) {
+        for w in 0..3 {
+            append_vouch(
+                db,
+                station,
+                member,
+                &addr(&Keypair::generate()),
+                at - (2 - w) * WEEK,
+            );
         }
     }
 
-    /// Gives `member` a two-trade, three-vouch baseline (trade 1.0, attestation
-    /// 1.5) so the equivocation penalty can be seen to zero **both** live
+    /// Gives `member` a two-trade, three-vouch baseline a week apart (trade 1.0,
+    /// attestation 1.5) so the equivocation penalty can be seen to zero **both** live
     /// dimensions. `member` is the *sender* of both trades, so the trades give no
     /// attestation credit (the receiver confirms), keeping the two dimensions
     /// independent.
@@ -431,9 +419,9 @@ mod tests {
         let other = Keypair::generate();
         // Settlements must be signed by the same `station` the test scores against,
         // or the signer pin skips them and the trade baseline reads zero.
-        append_settled(db, member, &other, station, 0, at);
+        append_settled(db, member, &other, station, 0, at - WEEK);
         append_settled(db, member, &other, station, 1, at);
-        seed_attestation_baseline(db, member, at);
+        seed_attestation_baseline(db, member, station, at);
     }
 
     #[test]
@@ -724,12 +712,13 @@ mod tests {
         );
         let t = 10 * MONTH;
 
-        // Trade: alice sends one, receives one → 2 settled → raw 1.0.
+        // Trade: alice receives one, then sends one a week later → 2 credited
+        // → raw 1.0 (one event per week per dimension, ADR-0038 §10).
+        append_settled(&db, &bob, &alice, &station, 0, t - WEEK);
         append_settled(&db, &alice, &bob, &station, 0, t);
-        append_settled(&db, &bob, &alice, &station, 0, t);
         // Attestation: alice confirmed the one she received (1) + one vouch (1)
         // → 2 attestations → raw 1.0.
-        append_vouch(&db, &alice, &addr(&bob), t);
+        append_vouch(&db, &station, &alice, &addr(&bob), t);
 
         // Scored exactly at the activity instant, so no decay applies.
         let p = ReputationScorer::new(&db, &station.public_key())
@@ -779,8 +768,9 @@ mod tests {
         );
         let t = 10 * MONTH;
 
-        // Bob confirms two clean settled trades → 2 attestations, raw 1.0.
-        append_settled(&db, &alice, &bob, &station, 0, t);
+        // Bob confirms two clean settled trades a week apart → 2 attestations,
+        // raw 1.0.
+        append_settled(&db, &alice, &bob, &station, 0, t - WEEK);
         append_settled(&db, &alice, &bob, &station, 1, t);
         let base = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&bob), t)
@@ -861,9 +851,16 @@ mod tests {
             Keypair::generate(),
         );
         let t = 10 * MONTH;
-        // 12 settled sends → raw 6.0 before the cap → clamped to 5.0.
+        // 12 settled sends a week apart → raw 6.0 before the cap → clamped to 5.0.
         for nonce in 0..12 {
-            append_settled(&db, &alice, &bob, &station, nonce, t);
+            append_settled(
+                &db,
+                &alice,
+                &bob,
+                &station,
+                nonce,
+                t - (11 - nonce as i64) * WEEK,
+            );
         }
         let p = ReputationScorer::new(&db, &station.public_key())
             .score_raw_at(&addr(&alice), t)
@@ -885,7 +882,14 @@ mod tests {
         );
         let t = 10 * MONTH;
         for nonce in 0..12 {
-            append_settled(&db, &alice, &bob, &station, nonce, t);
+            append_settled(
+                &db,
+                &alice,
+                &bob,
+                &station,
+                nonce,
+                t - (11 - nonce as i64) * WEEK,
+            );
         }
 
         // Nobody has vouched for alice, so the evidence accrues but does not show.
@@ -908,24 +912,25 @@ mod tests {
     #[test]
     fn an_anchoring_vouch_reveals_the_score_already_earned() {
         let db = fresh_db();
-        let (alice, bob, patron, station) = (
-            Keypair::generate(),
+        let (alice, bob, station) = (
             Keypair::generate(),
             Keypair::generate(),
             Keypair::generate(),
         );
         let t = 10 * MONTH;
         for nonce in 0..12 {
-            append_settled(&db, &alice, &bob, &station, nonce, t);
+            append_settled(
+                &db,
+                &alice,
+                &bob,
+                &station,
+                nonce,
+                t - (11 - nonce as i64) * WEEK,
+            );
         }
-        // The patron earns enough standing to anchor: ten settled trades plus ten
-        // vouches written puts their composite over the Member-band threshold.
-        for nonce in 0..10 {
-            append_settled(&db, &patron, &station, &station, nonce, t);
-        }
-        for _ in 0..10 {
-            append_vouch(&db, &patron, &addr(&Keypair::generate()), t);
-        }
+        // The patron is an established founder — a root with standing, so their
+        // vouch forms an anchoring edge (ADR-0038 §11).
+        let patron = crate::testutil::establish_members(&db, &station, 2, t).remove(0);
 
         let scorer = ReputationScorer::new(&db, &station.public_key());
         assert!(approx(
@@ -935,7 +940,7 @@ mod tests {
 
         // One vouch, and the history alice already had reads at full value —
         // the cap hid it, it did not erase it.
-        append_vouch(&db, &patron, &addr(&alice), t);
+        append_vouch(&db, &station, &patron, &addr(&alice), t);
         assert!(approx(
             scorer.score(&addr(&alice), t).unwrap().trade_reliability,
             DIMENSION_MAX
@@ -951,8 +956,8 @@ mod tests {
             Keypair::generate(),
         );
         let t = 10 * MONTH;
-        // 2 settled sends → raw 1.0.
-        append_settled(&db, &alice, &bob, &station, 0, t);
+        // 2 settled sends a week apart → raw 1.0.
+        append_settled(&db, &alice, &bob, &station, 0, t - WEEK);
         append_settled(&db, &alice, &bob, &station, 1, t);
 
         let scorer = ReputationScorer::new(&db, &station.public_key());
@@ -1002,9 +1007,9 @@ mod tests {
 
         // Same keypairs and fields → identical signed bytes on both databases.
         let build = |db: &Database| {
-            append_settled(db, &alice, &bob, &station, 0, t);
+            append_settled(db, &alice, &bob, &station, 0, t - WEEK);
             append_settled(db, &bob, &alice, &station, 0, t);
-            append_vouch(db, &alice, &addr(&bob), t);
+            append_vouch(db, &station, &alice, &addr(&bob), t);
         };
         let db_a = fresh_db();
         let db_b = fresh_db();

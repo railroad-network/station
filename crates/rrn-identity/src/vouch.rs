@@ -95,16 +95,65 @@ impl TryFrom<CBOR> for VouchBody {
     }
 }
 
+/// Why a live vouch door refused a vouch (ADR-0038 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VouchError {
+    /// The vouch's `issued_at` is further from the admitting station's clock
+    /// than the clock-skew tolerance, in either direction. A vouch is scored at
+    /// its `issued_at`, so an unbounded one could spread a farm's credit across
+    /// fictitious weeks.
+    #[error("the vouch's issued_at ({issued_at}) is not within the clock-skew tolerance of the station clock ({now})")]
+    IssuedAtOutOfBounds {
+        /// The vouch's signed issue time.
+        issued_at: i64,
+        /// The admitting station's clock.
+        now: i64,
+    },
+}
+
+/// The live vouch doors' plausibility bound (ADR-0038 §9): a vouch's
+/// `issued_at` must be within `tolerance_secs` of the admitting station's
+/// clock `now`, on either side. The caller passes the ledger's clock-skew
+/// tolerance; vouches are live-only, so the two-sided bound costs offline
+/// members nothing.
+pub fn check_issued_at(issued_at: i64, now: i64, tolerance_secs: i64) -> Result<(), VouchError> {
+    if issued_at.abs_diff(now) > tolerance_secs.unsigned_abs() {
+        return Err(VouchError::IssuedAtOutOfBounds { issued_at, now });
+    }
+    Ok(())
+}
+
 /// Creates and signs a vouch from `voucher` for the `vouched` address.
 ///
 /// `issued_at` is the current Unix time; the vouch does not expire
-/// (`expires_at = None`).
+/// (`expires_at = None`). A station stamps with its injected clock through
+/// [`create_vouch_at`] instead, so the instant it stamps is the one it checks.
 pub fn create_vouch(
     voucher: &Keypair,
     vouched: &Address,
     community: &str,
     statement: &str,
     stake_centi: u64,
+) -> SignedVouch {
+    create_vouch_at(
+        voucher,
+        vouched,
+        community,
+        statement,
+        stake_centi,
+        now_secs(),
+    )
+}
+
+/// [`create_vouch`] with the issue time given rather than read from the
+/// system clock.
+pub fn create_vouch_at(
+    voucher: &Keypair,
+    vouched: &Address,
+    community: &str,
+    statement: &str,
+    stake_centi: u64,
+    issued_at: i64,
 ) -> SignedVouch {
     let vouch = Attestation {
         kind: VouchKind,
@@ -114,7 +163,7 @@ pub fn create_vouch(
             reputation_stake_centi: stake_centi,
         },
         subject: *vouched,
-        issued_at: now_secs(),
+        issued_at,
         expires_at: None,
     };
     vouch.sign(voucher)
@@ -146,6 +195,28 @@ mod tests {
     use super::*;
     use rrn_crypto::serialize::from_canonical_bytes;
     use rrn_storage::db::Database;
+
+    #[test]
+    fn issued_at_is_bounded_on_both_sides() {
+        let now = 1_000_000;
+        for at in [now - 300, now, now + 300] {
+            assert_eq!(check_issued_at(at, now, 300), Ok(()));
+        }
+        for at in [now - 301, now + 301, i64::MIN, i64::MAX] {
+            assert_eq!(
+                check_issued_at(at, now, 300),
+                Err(VouchError::IssuedAtOutOfBounds { issued_at: at, now })
+            );
+        }
+    }
+
+    #[test]
+    fn create_vouch_at_stamps_the_given_instant() {
+        let kp = Keypair::generate();
+        let subject = Address::from_public_key(Keypair::generate().public_key());
+        let v = create_vouch_at(&kp, &subject, "c", "s", 0, 42);
+        assert_eq!(v.payload.issued_at, 42);
+    }
 
     fn fresh_log_db() -> Database {
         let db = Database::open_in_memory().unwrap();

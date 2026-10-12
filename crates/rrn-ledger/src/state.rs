@@ -344,6 +344,13 @@ pub struct AdmissionTimes {
     pub dispute_seq: Option<u64>,
     /// Admission-clock reading of the dispute entry, once disputed.
     pub dispute_admitted_at: Option<i64>,
+    /// Log seq of the station-signed settlement entry that closed the
+    /// transaction to `Settled`, once settled. Reputation reads it to score a
+    /// member over a shorter prefix than the snapshot's (ADR-0038 §11).
+    pub settlement_seq: Option<u64>,
+    /// Log seq of the station-signed cancellation entry that closed the
+    /// transaction to `Cancelled`, once cancelled.
+    pub cancellation_seq: Option<u64>,
 }
 
 /// One *effective* enrollment event for a member (ADR-0038 §1): an enrollment
@@ -828,6 +835,9 @@ impl LedgerSnapshot {
                     settled_at: settlement.settled_at,
                 },
             );
+            if let Some(admission) = self.admissions.get_mut(&settlement.proposal_id) {
+                admission.settlement_seq = Some(entry.seq);
+            }
         }
         Ok(())
     }
@@ -873,6 +883,9 @@ impl LedgerSnapshot {
                     reason: cancellation.reason,
                 },
             );
+            if let Some(admission) = self.admissions.get_mut(&cancellation.proposal_id) {
+                admission.cancellation_seq = Some(entry.seq);
+            }
         }
         Ok(())
     }
@@ -1734,8 +1747,8 @@ mod tests {
             let mut log = AppendLog::new(&db);
             log.append(p, 100).unwrap();
             log.append(c, 250).unwrap();
-            // Settlement admitted later (seq 3); it captures no admission of its
-            // own — its signed `settled_at` carries the reading outward.
+            // Settlement admitted later (seq 3); it captures only its seq — its
+            // signed `settled_at` carries the reading outward.
             log.append(
                 rrn_crypto::signed::SignedPayload::sign(settlement, &station),
                 9_000,
@@ -1753,6 +1766,8 @@ mod tests {
         assert_eq!(admission.proposal_admitted_at, 100);
         assert_eq!(admission.confirmation_seq, Some(2));
         assert_eq!(admission.confirmation_admitted_at, Some(250));
+        assert_eq!(admission.settlement_seq, Some(3));
+        assert_eq!(admission.cancellation_seq, None);
     }
 
     #[test]
