@@ -304,6 +304,9 @@ impl ScoringContext {
                         .or_default()
                         .push(Event {
                             time: *cancelled_at,
+                            // Always set by the cancellation that produced this
+                            // state; were it missing, counting the penalty in
+                            // every prefix errs toward lower standing.
                             seq: admission.cancellation_seq.unwrap_or(0),
                         });
                 }

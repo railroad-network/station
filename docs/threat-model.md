@@ -2440,8 +2440,16 @@ inherited standing.
   enrollment records of everyone those entries name, since the verifier must form
   each edge itself. That exposes several members' trade histories inside another
   member's bundle. A succinct proof of a voucher's standing is the later
-  improvement. An exported history does not carry equivocation records, so a
-  verifier can read a convicted equivocator higher than the exporter does.
+  improvement.
+- *Residual risk (portable penalties):* an exported history carries no
+  equivocation records, and upheld-dispute cancellations only for the selected
+  transactions, so a verifier can read an identity whose history is only partly
+  selected higher than the exporter does — a convicted equivocator, or a voucher
+  off the anchor chain whose penalties came from other trades — and can then
+  form an anchoring edge the exporter did not, reading the subject uncapped.
+  Nothing consumes an exported history yet; the portable-standing work
+  (ADR-0032) must carry the penalty evidence of every voucher a bundle names
+  before it is relied on.
 
 #### Reading a score over the mobile channel
 

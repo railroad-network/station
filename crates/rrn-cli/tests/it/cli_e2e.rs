@@ -97,6 +97,21 @@ async fn cli_drives_daemon() {
         .to_string();
         let tx = rrn(&socket, &["pay", &payee, "1.50"]);
         assert_eq!(tx.len(), 64, "tx id should be 32-byte hex: {tx}");
+        // Only the payee may confirm it: the operator's `confirm` reaches the
+        // engine and is refused as the wrong confirmer.
+        let confirm = Command::new(RRN)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["confirm", &tx])
+            .output()
+            .expect("spawn rrn");
+        assert!(!confirm.status.success(), "the station is not the payee");
+        assert!(
+            String::from_utf8_lossy(&confirm.stderr)
+                .contains("confirmer does not match the proposal's receiver"),
+            "confirm stderr: {}",
+            String::from_utf8_lossy(&confirm.stderr)
+        );
 
         // history (text) has rows; (json) is a valid array of entries.
         let h = rrn(&socket, &["history"]);

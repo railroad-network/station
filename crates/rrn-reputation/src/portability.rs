@@ -272,8 +272,16 @@ fn replay_into_profile(
 ///   ([`ScoringContext::anchor_chain`]), down to the roots, whose `founder`
 ///   enrollments come with the enrollment records.
 ///
-/// Absent evidence can only lower a raw composite, so a verifier given less than
-/// this computes a capped profile, never an inflated one. The cost is
+/// Withholding *positive* evidence can only lower a raw composite, so a verifier
+/// given less than this computes a capped profile rather than the exporter's.
+/// Penalties are a different matter: the bundle carries no equivocation
+/// records, and only the cancellations of the selected transactions. So for an
+/// identity whose history is only partly selected — a voucher off the chain who
+/// vouched for a chain member — a penalty the exporter counted can be missing,
+/// and the verifier can read that identity higher, and may then form an
+/// anchoring edge the exporter did not. Closing that needs the penalty evidence
+/// of every voucher the bundle names; it is recorded as a residual for the
+/// portable-standing work (ADR-0032). The cost of what is carried is
 /// disclosure: the chain members' trade histories travel inside someone else's
 /// bundle. A succinct proof of a voucher's standing is the later improvement.
 fn exportable_entries(
