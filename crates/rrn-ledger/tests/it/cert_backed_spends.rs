@@ -554,10 +554,9 @@ proptest! {
         // iteration — the nonce lookups and `open_proposals` as the pre-op view.
         // So each op costs the engine's own internal derive plus this one, not a
         // fresh derive inside every helper.
-        let assert_floor = |snap: &LedgerSnapshot, db: &Database, now: i64| {
-            let balances = BalanceView::new(db, station.public_key());
+        let assert_floor = |snap: &LedgerSnapshot, _db: &Database, now: i64| {
             for m in &members {
-                let settled = balances.balance_of(m).unwrap();
+                let settled = snap.balance_of(m);
                 let committed = committed_debits_centi(snap, m, now, &cfg);
                 prop_assert!(
                     settled - committed >= cfg.debt_floor_centi,

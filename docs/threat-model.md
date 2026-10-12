@@ -1020,7 +1020,7 @@ transition; the derivability of all state from the log.
   would be committed below the floor, evaluated against the *committed
   position*: settled balance — derived from the log, counting contract
   charges against the buyer and contract income toward the provider
-  (ADR-0018 Clarification 1) — minus every pending
+  (ADR-0018 Clarification (2026-10-12) point 1) — minus every pending
   (`Proposed`/`Confirmed`/`Disputed`) debit they already signed. Enforcement
   follows the debtor's signature — proposal time for a sender, confirmation
   time for a payment request's receiver — and pending inflows never add
@@ -1031,12 +1031,12 @@ transition; the derivability of all state from the log.
 - *Residual risk:* the floor now *counts* contract charges, but the charge
   itself (`ContractCharge`) is not yet floor-checked, so a sweep can still land
   a buyer below the floor (the buyer did sign the contract). What a charge that
-  would cross the floor does is ADR-0018 Clarification 2, pending
+  would cross the floor does is ADR-0018 Clarification (2026-10-12) point 2, pending
   ratification. Contract terms are now bounded
   — at most 366 periods, each in 1..=49.99 Commons, so under the Tier-3 floor,
   and at most 24 period charges per contract per sweep (see
-  [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep));
-  the floor check itself is unchanged. The floor is per-station
+  [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep)).
+  The floor is per-station
   config until a governance surface exists, so an operator can weaken it. What
   a community does about a *departed* member's bounded debt remains a
   governance question the floor caps but does not answer.
@@ -2280,7 +2280,7 @@ credit and never delivers.
   requirements gate, so the error names the reason) and skipped on replay. One
   identity can no longer agree a contract with itself.
 - *Residual risk:* contract charges count toward the debt floor but are not
-  yet floor-checked themselves (ADR-0018 Clarification 2, pending; see
+  yet floor-checked themselves (ADR-0018 Clarification (2026-10-12) point 2, pending; see
   [unbounded debt](#elevation-of-privilege--unbounded-debt-adr-0018)). The
   bounds above cap what one contract can move per period and over its
   lifetime; they do not stop a buyer who signs several contracts from being
@@ -4505,7 +4505,7 @@ entry citing its ADR or the section that owns it.
   surface, so in Phase 2 the operator wallet is the only juror that can act.
 - **Debt is bounded, not managed.** The debt floor (ADR-0018) caps how far a
   member can sign themselves into debt and counts contract charges, but a
-  contract charge is not yet floor-checked itself (ADR-0018 Clarification 2,
+  contract charge is not yet floor-checked itself (ADR-0018 Clarification (2026-10-12) point 2,
   pending), the floor and the certificate caps are operator config rather
   than governance (ADR-0021), and exit-with-debt policy is unanswered.
 
