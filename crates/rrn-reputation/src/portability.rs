@@ -42,6 +42,7 @@ use rrn_crypto::serialize::{decode_kinded, from_canonical_bytes_if_kind, KindedC
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_identity::vouch::{Vouch, VOUCH_KIND_TAG};
+use rrn_ledger::enrollment::{EnrollmentRecord, ENROLLMENT_KIND};
 use rrn_ledger::settlement::{SettlementRecord, SETTLEMENT_KIND};
 use rrn_ledger::state::{CancellationRecord, CANCELLATION_KIND};
 use rrn_ledger::transaction::{
@@ -51,9 +52,9 @@ use rrn_storage::db::Database;
 use rrn_storage::log::{AppendLog, LogEntry};
 use rrn_storage::migrations;
 
+use crate::context::ScoringContext;
 use crate::model::ReputationProfile;
 use crate::scoring::ReputationScorer;
-use crate::sybil::anchoring_voucher;
 use crate::Result;
 
 /// Discriminant string carried in a history root's canonical CBOR, and its
@@ -253,45 +254,46 @@ fn replay_into_profile(
     ReputationScorer::new(&db, &history.signed_root.signer).score_at(&history.address, computed_at)
 }
 
-/// Everything a remote verifier needs to reach the exporter's profile: the
-/// entries concerning `address`, plus the entries concerning whichever member
-/// anchored it.
+/// Everything a remote verifier needs to reach the exporter's profile
+/// (ADR-0038 Interactions, ADR-0032 §1): the entries concerning `address`, the
+/// entries concerning every identity on its anchor chain, and every enrollment
+/// record — revocations included — naming anyone those entries name.
 ///
-/// The anchoring voucher's own evidence has to travel too. A verifier judges an
-/// anchor by recomputing the voucher's composite
-/// ([`crate::sybil::anchoring_voucher`]), and the vouch alone says nothing about
-/// whether its author was established — without their history the verifier would
-/// score them at zero, conclude the subject is unanchored, and derive a
-/// capped profile the exporter never computed.
+/// A verifier replays the bundle and must reach the same verdicts the exporter
+/// did:
 ///
-/// Only the *first qualifying* voucher is included, which is both sufficient and
-/// the least disclosure that works: their evidence is what proves the anchor, and
-/// a verifier who receives no such evidence computes the same unanchored profile
-/// the exporter did, since absent evidence can only lower a composite. That is
-/// still a real privacy cost — the voucher's trade history travels inside someone
-/// else's bundle — and a succinct proof of the voucher's standing, rather than
-/// their raw evidence, is the Phase 2 improvement.
+/// - **Eligibility (ADR-0038 §8)** is judged from enrollment records, so the
+///   records of every party, voucher and subject in the selection travel too.
+///   Eligibility is judged by log order, which the bundle preserves.
+/// - **Anchoring (ADR-0038 §11)** is a chain of edges from a founder root, each
+///   judged at its vouch over the shorter prefix before it. So the bundle carries
+///   the evidence of each voucher on the chain, and — for each edge — of the
+///   chain that anchored its voucher when the edge formed
+///   ([`ScoringContext::anchor_chain`]), down to the roots, whose `founder`
+///   enrollments come with the enrollment records.
+///
+/// Absent evidence can only lower a raw composite, so a verifier given less than
+/// this computes a capped profile, never an inflated one. The cost is
+/// disclosure: the chain members' trade histories travel inside someone else's
+/// bundle. A succinct proof of a voucher's standing is the later improvement.
 fn exportable_entries(
     db: &Database,
     address: &Address,
     at_time: i64,
     station: &PublicKey,
 ) -> Result<Vec<LogEntry>> {
-    let mut entries = entries_concerning(db, address, station)?;
-
-    if let Some(voucher) = anchoring_voucher(db, address, at_time, station)? {
-        entries.extend(entries_concerning(db, &voucher, station)?);
-        // Both sets can name the same entry (the anchoring vouch itself, or a
-        // trade between the two); the log's order is the one the verifier checks.
-        entries.sort_by_key(|entry| entry.seq);
-        entries.dedup_by_key(|entry| entry.seq);
-    }
-    Ok(entries)
+    let ctx = ScoringContext::unbounded(db, station)?;
+    let mut people: HashSet<Address> = HashSet::new();
+    people.insert(*address);
+    people.extend(ctx.anchor_chain(address, at_time));
+    entries_concerning(db, &people, station)
 }
 
-/// Every log entry bearing on `address`: the transactions it is a party to — with
-/// the confirmation, settlement or cancellation that completed them — and the
-/// vouches it wrote or received.
+/// Every log entry bearing on any of `people`: the transactions one of them is a
+/// party to — with the confirmation, settlement or cancellation that completed
+/// them — the vouches one of them wrote or received, and every station-signed
+/// enrollment record naming any party, voucher or subject of those entries. In
+/// log order.
 ///
 /// Transaction records are pulled in by proposal id rather than by signer,
 /// because a settlement is signed by the station and a confirmation by the
@@ -299,7 +301,7 @@ fn exportable_entries(
 /// incomplete lifecycle, which replays to a different profile.
 fn entries_concerning(
     db: &Database,
-    address: &Address,
+    people: &HashSet<Address>,
     station: &PublicKey,
 ) -> Result<Vec<LogEntry>> {
     let log = AppendLog::new(db);
@@ -312,66 +314,101 @@ fn entries_concerning(
         if let Ok(Some(proposal)) =
             from_canonical_bytes_if_kind::<TransactionProposal>(&entry.payload.bytes, PROPOSAL_KIND)
         {
-            if proposal.sender == *address || proposal.receiver == *address {
+            if people.contains(&proposal.sender) || people.contains(&proposal.receiver) {
                 transactions.insert(proposal.id);
             }
         }
     }
 
+    // Everyone the selection names: an event's eligibility turns on each of
+    // their enrollments.
+    let mut named: HashSet<Address> = people.clone();
     let mut selected = Vec::new();
+    let mut enrollments = Vec::new();
     for entry in log.iter_from(1) {
         let entry = entry?;
-        if concerns(&entry, address, &transactions, station) {
-            selected.push(entry);
+        match concerns(&entry, people, &transactions, station) {
+            Some(Concern::Names(addresses)) => {
+                named.extend(addresses);
+                selected.push(entry);
+            }
+            Some(Concern::Enrollment(member)) => enrollments.push((member, entry)),
+            None => {}
         }
     }
+    selected.extend(
+        enrollments
+            .into_iter()
+            .filter(|(member, _)| named.contains(member))
+            .map(|(_, entry)| entry),
+    );
+    selected.sort_by_key(|entry| entry.seq);
     Ok(selected)
 }
 
-/// Whether one entry belongs in `address`'s bundle. A settlement or cancellation
-/// is included only when signed by the community `station`: a forged
-/// station-kind record is never shipped in a bundle, and the verifier's replay
-/// pins the same key, so the two agree.
+/// How one log entry bears on a bundle.
+enum Concern {
+    /// It belongs in the bundle; these are the addresses it names.
+    Names(Vec<Address>),
+    /// A station-signed enrollment record for this member — included only if
+    /// the selection names the member.
+    Enrollment(Address),
+}
+
+/// Whether one entry belongs in a bundle about `people`. A settlement,
+/// cancellation or enrollment record is considered only when signed by the
+/// community `station`: a forged station-kind record is never shipped in a
+/// bundle, and the verifier's replay pins the same key, so the two agree.
 fn concerns(
     entry: &LogEntry,
-    address: &Address,
+    people: &HashSet<Address>,
     transactions: &HashSet<TransactionId>,
     station: &PublicKey,
-) -> bool {
-    // Parse once and dispatch on the `kind` discriminator, instead of
-    // trial-decoding proposal → confirmation → settlement → cancellation → vouch
-    // in turn. A malformed or unrelated-kind entry does not belong in the bundle.
+) -> Option<Concern> {
+    // Parse once and dispatch on the `kind` discriminator. A malformed or
+    // unrelated-kind entry does not belong in the bundle.
     let Ok(KindedCbor {
         kind: Some(kind),
         cbor,
     }) = decode_kinded(&entry.payload.bytes)
     else {
-        return false;
+        return None;
     };
-    match kind.as_str() {
+    let from_station = entry.payload.signer == *station;
+    let names = match kind.as_str() {
         PROPOSAL_KIND => TransactionProposal::try_from(cbor)
-            .map(|p| transactions.contains(&p.id))
-            .unwrap_or(false),
+            .ok()
+            .filter(|p| transactions.contains(&p.id))
+            .map(|p| vec![p.sender, p.receiver]),
         CONFIRMATION_KIND => TransactionConfirmation::try_from(cbor)
-            .map(|c| transactions.contains(&c.proposal_id))
-            .unwrap_or(false),
+            .ok()
+            .filter(|c| transactions.contains(&c.proposal_id))
+            .map(|c| vec![c.confirmer]),
         SETTLEMENT_KIND => SettlementRecord::try_from(cbor)
-            .map(|s| entry.payload.signer == *station && transactions.contains(&s.proposal_id))
-            .unwrap_or(false),
+            .ok()
+            .filter(|s| from_station && transactions.contains(&s.proposal_id))
+            .map(|s| vec![s.sender, s.receiver]),
         CANCELLATION_KIND => CancellationRecord::try_from(cbor)
-            .map(|c| entry.payload.signer == *station && transactions.contains(&c.proposal_id))
-            .unwrap_or(false),
-        // Vouches in both directions: the ones the member signed feed its own
+            .ok()
+            .filter(|c| from_station && transactions.contains(&c.proposal_id))
+            .map(|_| Vec::new()),
+        // Vouches in both directions: the ones a member signed feed its own
         // attestation accuracy, and the ones it received are what a receiving
         // station needs in order to judge how it was anchored.
-        VOUCH_KIND_TAG => Vouch::try_from(cbor)
-            .map(|v| {
-                let voucher = Address::from_public_key(entry.payload.signer);
-                v.subject == *address || voucher == *address
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
+        VOUCH_KIND_TAG => Vouch::try_from(cbor).ok().and_then(|v| {
+            let voucher = Address::from_public_key(entry.payload.signer);
+            (people.contains(&v.subject) || people.contains(&voucher))
+                .then(|| vec![voucher, v.subject])
+        }),
+        ENROLLMENT_KIND => {
+            return EnrollmentRecord::try_from(cbor)
+                .ok()
+                .filter(|_| from_station)
+                .map(|r| Concern::Enrollment(r.member));
+        }
+        _ => None,
+    };
+    names.map(Concern::Names)
 }
 
 /// The Merkle root over the entries' content hashes, in order.
@@ -471,9 +508,10 @@ fn now_secs() -> i64 {
 mod tests {
     use super::*;
     use rrn_crypto::serialize::to_canonical_bytes;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
+    use rrn_ledger::enrollment::EnrollmentBasis;
     use rrn_storage::log::StoredPayload;
+
+    use crate::testutil::{establish_members, settle_trade, vouch, WEEK};
 
     const MONTH: i64 = 30 * 86_400;
 
@@ -487,75 +525,27 @@ mod tests {
         Address::from_public_key(kp.public_key())
     }
 
-    /// Appends a full proposal → confirmation → settlement chain.
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        let confirmation = TransactionConfirmation {
-            proposal_id: pid,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        };
-        log.append(SignedPayload::sign(confirmation, receiver), 0)
-            .unwrap();
-        let settlement = SettlementRecord {
-            proposal_id: pid,
-            sender: addr(sender),
-            receiver: addr(receiver),
-            amount_centi: 300,
-            settled_at: at,
-        };
-        log.append(SignedPayload::sign(settlement, station), 0)
-            .unwrap();
+    fn enroll(db: &Database, station: &Keypair, who: &Keypair) {
+        crate::testutil::enroll(db, station, &addr(who), EnrollmentBasis::Pairing, 0);
     }
 
-    /// Appends a vouch from `voucher` for `subject`.
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    /// A station log where alice trades with bob both ways and vouches for him,
-    /// while two strangers transact and vouch among themselves.
+    /// A station log where alice (enrolled) trades with bob both ways a week
+    /// apart and vouches for him, while two other enrolled members transact and
+    /// vouch among themselves.
     fn populated_db(alice: &Keypair, bob: &Keypair, station: &Keypair) -> Database {
         let db = fresh_db();
         let t = 6 * MONTH;
-        append_settled(&db, alice, bob, station, 0, t);
-        append_settled(&db, bob, alice, station, 0, t);
-        append_vouch(&db, alice, &addr(bob), t);
+        enroll(&db, station, alice);
+        enroll(&db, station, bob);
+        settle_trade(&db, station, alice, bob, 0, t - WEEK);
+        settle_trade(&db, station, bob, alice, 0, t);
+        vouch(&db, alice, &addr(bob), t);
 
         let (carol, dave) = (Keypair::generate(), Keypair::generate());
-        append_settled(&db, &carol, &dave, station, 0, t);
-        append_vouch(&db, &carol, &addr(&dave), t);
+        enroll(&db, station, &carol);
+        enroll(&db, station, &dave);
+        settle_trade(&db, station, &carol, &dave, 0, t);
+        vouch(&db, &carol, &addr(&dave), t);
         db
     }
 
@@ -599,48 +589,82 @@ mod tests {
         let db = populated_db(&alice, &bob, &station);
         let bundle = export_history_at(&db, &addr(&alice), &station, 9 * MONTH).unwrap();
 
-        // Two transactions × (proposal, confirmation, settlement) + one vouch.
-        // The strangers' four entries are not alice's business.
-        assert_eq!(bundle.log_entries.len(), 7);
+        // Alice's and bob's enrollments (each event's eligibility turns on them),
+        // two transactions × (proposal, confirmation, settlement), and one vouch.
+        // The other members' six entries are not alice's business.
+        assert_eq!(bundle.log_entries.len(), 9);
         assert_eq!(bundle.signed_root.payload.from_seq, 1);
-        assert_eq!(bundle.signed_root.payload.to_seq, 7);
+        assert_eq!(bundle.signed_root.payload.to_seq, 9);
     }
 
     #[test]
-    fn an_anchored_members_bundle_carries_what_proves_the_anchor() {
-        let (alice, bob, patron, station) = (
-            Keypair::generate(),
-            Keypair::generate(),
-            Keypair::generate(),
-            Keypair::generate(),
-        );
+    fn export_carries_enrollments_and_the_anchor_chain() {
+        // A two-link chain: root → link → subject (ADR-0038 §11). A verifier
+        // holding only the subject's bundle must be able to form both edges,
+        // which takes the link's and the root's evidence and enrollments too.
         let db = fresh_db();
-        let t = 6 * MONTH;
-        for nonce in 0..12 {
-            append_settled(&db, &alice, &bob, &station, nonce, t);
-        }
-        // A patron established enough to anchor, who then vouches for alice.
-        for nonce in 0..10 {
-            append_settled(&db, &patron, &station, &station, nonce, t);
-        }
-        for _ in 0..10 {
-            append_vouch(&db, &patron, &addr(&Keypair::generate()), t);
-        }
-        append_vouch(&db, &patron, &addr(&alice), t);
-
-        let now = 6 * MONTH;
-        let expected = ReputationScorer::new(&db, &station.public_key())
-            .score_at(&addr(&alice), now)
-            .unwrap();
-        assert!(expected.trade_reliability > 1.0, "alice must be anchored");
-
-        // A verifier holding only the bundle has to be able to establish that the
-        // voucher was established enough to anchor — which takes the voucher's own
-        // evidence, not just the vouch itself.
-        assert_eq!(
-            verify_history(&export_history_at(&db, &addr(&alice), &station, now).unwrap()).unwrap(),
-            expected
+        let station = Keypair::generate();
+        let (link, subject, bob) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
         );
+        let t0 = 20 * WEEK;
+        let root = establish_members(&db, &station, 2, t0).remove(0);
+        for who in [&link, &subject, &bob] {
+            enroll(&db, &station, who);
+        }
+        // The root, established, vouches for the link.
+        vouch(&db, &root, &addr(&link), t0);
+        // The link earns standing over ten weeks, then vouches for the subject.
+        for w in 0..10 {
+            settle_trade(&db, &station, &bob, &link, w, t0 + w as i64 * WEEK);
+            settle_trade(&db, &station, &bob, &subject, 10 + w, t0 + w as i64 * WEEK);
+        }
+        let now = t0 + 10 * WEEK;
+        vouch(&db, &link, &addr(&subject), now);
+
+        let expected = ReputationScorer::new(&db, &station.public_key())
+            .score_at(&addr(&subject), now)
+            .unwrap();
+        assert!(
+            expected.trade_reliability > 1.0,
+            "the subject must be anchored"
+        );
+
+        let bundle = export_history_at(&db, &addr(&subject), &station, now).unwrap();
+        assert_eq!(verify_history(&bundle).unwrap(), expected);
+
+        // Withholding a link — here the root's founder enrollment, so the root is
+        // no root to the verifier — yields the capped profile, never more.
+        let is_roots_enrollment = |entry: &LogEntry| {
+            from_canonical_bytes_if_kind::<EnrollmentRecord>(&entry.payload.bytes, ENROLLMENT_KIND)
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.member == addr(&root))
+        };
+        assert!(bundle.log_entries.iter().any(is_roots_enrollment));
+        let withheld: Vec<LogEntry> = bundle
+            .log_entries
+            .iter()
+            .filter(|e| !is_roots_enrollment(e))
+            .cloned()
+            .collect();
+        let root_claim = HistoryRoot {
+            address: addr(&subject),
+            from_seq: withheld.first().map_or(0, |e| e.seq),
+            to_seq: withheld.last().map_or(0, |e| e.seq),
+            computed_at: now,
+            merkle_root: merkle_root(&withheld),
+        };
+        let short = PortableReputationHistory {
+            address: addr(&subject),
+            log_entries: withheld,
+            signed_root: SignedPayload::sign(root_claim, &station),
+        };
+        let capped = verify_history(&short).unwrap();
+        assert!(capped.trade_reliability <= crate::sybil::ANCHOR_DIMENSION_CAP);
+        assert!(capped.composite() < expected.composite());
     }
 
     #[test]

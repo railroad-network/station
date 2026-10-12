@@ -1353,95 +1353,7 @@ fn a_ballot_admitted_after_the_compressed_close_is_refused() {
 
 mod reputation {
     use super::*;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
-
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        st: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        log.append(
-            SignedPayload::sign(
-                TransactionConfirmation {
-                    proposal_id: pid,
-                    confirmer: addr(receiver),
-                    confirmed_at: at,
-                },
-                receiver,
-            ),
-            0,
-        )
-        .unwrap();
-        log.append(
-            SignedPayload::sign(
-                SettlementRecord {
-                    proposal_id: pid,
-                    sender: addr(sender),
-                    receiver: addr(receiver),
-                    amount_centi: 300,
-                    settled_at: at,
-                },
-                st,
-            ),
-            0,
-        )
-        .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    fn earn_raw_standing(db: &Database, who: &Keypair, st: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, who, st, st, nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, who, &addr(&Keypair::generate()), at);
-        }
-    }
-
-    fn established_members(db: &Database, st: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            earn_raw_standing(db, m, st, at);
-        }
-        for i in 0..n {
-            append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
-        }
-        members
-    }
+    use rrn_reputation::testutil::{establish_members, establish_newcomer};
 
     #[test]
     fn a_member_established_after_activation_cannot_vote_in_the_emergency() {
@@ -1449,7 +1361,7 @@ mod reputation {
         let st = station();
         const AT: i64 = 300 * DAY;
         // Four established members (grace off). They are the electorate.
-        let members = established_members(&db, &st, 4, AT);
+        let members = establish_members(&db, &st, 4, AT);
         publish_charter(&db, &members);
 
         // Activate: author + 2 co-signs cross ceil(2*4/3) = 3.
@@ -1474,8 +1386,7 @@ mod reputation {
 
         // AFTER activation, manufacture a fifth established member.
         let newcomer = Keypair::generate();
-        earn_raw_standing(&db, &newcomer, &st, AT + 10);
-        append_vouch(&db, &members[0], &addr(&newcomer), AT + 10);
+        establish_newcomer(&db, &st, &newcomer, &members[0], AT + 10);
         assert_eq!(
             rrn_reputation::staking::established_member_count(&db, AT + 20, &st.public_key())
                 .unwrap(),

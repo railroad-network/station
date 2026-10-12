@@ -30,12 +30,14 @@ thiserror = "1"
 tracing = "0.1"
 
 [dev-dependencies]
-# Tests seed established-member reputation the way `rrn-reputation`'s own tests
-# do — settled transactions plus vouches — which needs the ledger record types.
+# Tests seed established-member reputation through `rrn-reputation`'s shared
+# helpers, and some tests build ledger records directly.
 # This is a test-only dependency: the crate itself does not depend on
 # `rrn-ledger` (ADR-0012), since governance decides policy, it does not move
 # credit.
 rrn-ledger = { path = "../rrn-ledger", version = "0.1" }
+# The shared ADR-0038 standing helpers (`establish_members`, ...).
+rrn-reputation = { path = "../rrn-reputation", version = "0.1", features = ["test-util"] }
 hex = "0.4"
 serde_json = "1"
 proptest = "1"

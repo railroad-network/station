@@ -1,27 +1,31 @@
 //! Sybil resistance — the velocity cap and identity anchoring that stop fake
 //! identities from fast-building reputation.
 //!
-//! Per ADR-0009 (design doc Section 5.4), Phase 1 leans on two local,
+//! Per ADR-0009, as superseded in part by ADR-0038, Phase 1 leans on local,
 //! deterministic defenses rather than the graph analysis a federation could
 //! afford:
 //!
-//! - **Velocity limiting** — no dimension may gain more than
-//!   [`VELOCITY_CAP_PER_WEEK`] in a week. A fake identity can only manufacture
-//!   evidence so fast, so farming shows up as an implausible rate of gain.
+//! - **The velocity cap** — the scorer credits at most
+//!   [`CREDITED_EVENTS_PER_WINDOW`] event per dimension in any trailing
+//!   [`VELOCITY_WINDOW_SECS`], which is [`VELOCITY_CAP_PER_WEEK`] of gain
+//!   ([`credited_events`], ADR-0038 §10). However many events an identity
+//!   generates, its standing grows at the same bounded rate, so establishment
+//!   takes at least seven weeks of activity with enrolled counterparties.
 //! - **Identity anchoring** — a fresh identity's dimensions are capped at
-//!   [`ANCHOR_DIMENSION_CAP`] until an established member vouches for it, so a
-//!   Sybil cluster cannot bootstrap standing purely among itself. It has to
-//!   corrupt someone real, which is the cost the vouching chain is meant to
-//!   impose.
+//!   [`ANCHOR_DIMENSION_CAP`] until it is anchored: reached by a chain of
+//!   vouches from the founders, each judged once at the vouch (ADR-0038 §11). A
+//!   Sybil cluster cannot bootstrap standing purely among itself; it has to
+//!   corrupt an anchored member.
 //!
-//! # Flag, do not punish
+//! # Credit is capped; penalties are never automatic
 //!
-//! [`check_velocity`] *reports*; it never edits a profile. An automatic penalty
-//! would be a griefing vector — anyone who can drive transactions at a member
-//! could push them over the cap — and the cap's own honest false positives (a
-//! member who legitimately trades a lot in one week) are exactly the cases a
-//! human should look at. The station logs violations for operator review
-//! ([`crate::snapshot`]) and scoring proceeds unchanged.
+//! The cap limits *credit*: it only slows the identity whose own activity is
+//! being counted, so it cannot be pushed at anyone. ADR-0009's "flag, never
+//! punish" still holds for penalties — nothing about a fast rate of activity
+//! subtracts standing. [`check_velocity`] remains as an operator signal between
+//! consecutive snapshots ([`crate::snapshot`]); with the cap in the scorer it
+//! has no positive gain left to catch beyond decay arithmetic, and it never
+//! edits a profile.
 
 use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
@@ -37,6 +41,39 @@ pub const VELOCITY_CAP_PER_WEEK: f32 = 0.5;
 
 /// Seconds in the velocity cap's week.
 const SECONDS_PER_WEEK: f32 = 7.0 * 86_400.0;
+
+/// The velocity cap's trailing window: exactly seven days of 86,400 seconds,
+/// never a calendar week (ADR-0038 §10). Protocol-locked.
+pub const VELOCITY_WINDOW_SECS: i64 = 7 * 86_400;
+
+/// How many events one dimension credits within any trailing
+/// [`VELOCITY_WINDOW_SECS`] — [`VELOCITY_CAP_PER_WEEK`] over the per-event
+/// increment (ADR-0038 §10). Protocol-locked.
+pub const CREDITED_EVENTS_PER_WINDOW: u32 = 1;
+
+/// The credited subset of a dimension's eligible event times (ADR-0038 §10),
+/// ascending. Walking the times in ascending order, an event at `t` is credited
+/// only if fewer than [`CREDITED_EVENTS_PER_WINDOW`] credited events already fall
+/// in the half-open window `(t − VELOCITY_WINDOW_SECS, t]`.
+///
+/// A pure function of the multiset of times: the input order does not matter.
+pub fn credited_events(times: &[i64]) -> Vec<i64> {
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    let mut credited: Vec<i64> = Vec::new();
+    // Index of the oldest credited event still inside the current window.
+    let mut window_start = 0;
+    for t in sorted {
+        let floor = t.saturating_sub(VELOCITY_WINDOW_SECS);
+        while window_start < credited.len() && credited[window_start] <= floor {
+            window_start += 1;
+        }
+        if credited.len() - window_start < CREDITED_EVENTS_PER_WINDOW as usize {
+            credited.push(t);
+        }
+    }
+    credited
+}
 
 /// Ceiling on every dimension of an identity nobody established has vouched for
 /// (ADR-0009). Protocol-locked.
@@ -157,8 +194,8 @@ fn allowance(from_time: i64, to_time: i64) -> f32 {
     VELOCITY_CAP_PER_WEEK * weeks.max(1.0)
 }
 
-/// Whether `address` has been vouched for by a member established enough to
-/// anchor it.
+/// Whether `address` is anchored: a founder-basis root, or reached from one by
+/// a chain of anchoring edges (ADR-0038 §11).
 pub fn is_anchored(
     db: &Database,
     address: &Address,
@@ -182,28 +219,22 @@ pub fn is_anchored_bounded(
     Ok(ScoringContext::new(db, station, max_seq)?.is_anchored(address, at_time))
 }
 
-/// The member whose vouch anchors `address`, if any: the first, in log order, to
-/// have vouched for it at or before `at_time` while holding a composite of at
-/// least [`ANCHOR_VOUCHER_MIN_COMPOSITE`].
+/// The member whose vouch anchors `address` on its chain to a root, if any.
+/// `None` for a root — anchored by definition, with no voucher — and for an
+/// unanchored identity, so a yes/no question wants [`is_anchored`].
 ///
-/// Callers that only need a yes/no want [`is_anchored`]; the address itself is
-/// what [`crate::portability`] needs, to ship the evidence a remote verifier must
-/// replay in order to reach the same conclusion.
+/// # How an anchoring edge is judged
 ///
-/// # Why the voucher is judged uncapped
-///
-/// The voucher's composite is read raw (the context's `score_raw`) —
-/// their score *before* anchoring is applied. This is not a shortcut; it is what
-/// makes the rule computable. Judging a voucher by their anchored profile would
-/// make two members who vouch for each other mutually undecidable, and no member
-/// could ever be the first anchor, since an unanchored member's composite cannot
-/// exceed `0.55` — below any usable threshold.
-///
-/// The cost is that anchoring stops a lone fake identity but not a patient pair:
-/// two colluding identities trading with each other raise their *uncapped*
-/// composites on real-looking evidence and can then anchor each other. Velocity
-/// flagging and human review are what stand against that in Phase 1; see the
-/// threat model, "Sybil clusters and manufactured standing".
+/// An eligible vouch forms an edge once, at the vouch: its voucher must have
+/// been anchored, and held a **raw** composite of at least
+/// [`ANCHOR_VOUCHER_MIN_COMPOSITE`] at the vouch's `issued_at`, over the prefix
+/// strictly before the vouch (ADR-0038 §11). The raw composite keeps the rule
+/// computable — it does not depend on anchoring — and judging on the shorter
+/// prefix makes it well-founded. An edge is never re-judged: decay never
+/// unanchors anyone, and a vouch that formed no edge never forms one later. A
+/// revocation of either party voids the edge for good. Because a voucher must
+/// itself be anchored, a colluding pair of enrolled members cannot anchor each
+/// other; see the threat model, "Sybil clusters and manufactured standing".
 pub fn anchoring_voucher(
     db: &Database,
     address: &Address,
@@ -214,8 +245,8 @@ pub fn anchoring_voucher(
 }
 
 /// Like [`anchoring_voucher`], but only vouches admitted within the log prefix
-/// `[1, max_seq]` are considered, and the voucher's composite is judged from the
-/// same bounded prefix. `max_seq == u64::MAX` is the unbounded form.
+/// `[1, max_seq]` are considered, and every voucher is judged from the same
+/// bounded prefix. `max_seq == u64::MAX` is the unbounded form.
 pub fn anchoring_voucher_bounded(
     db: &Database,
     address: &Address,
@@ -259,17 +290,13 @@ pub fn anchored_profile(profile: &ReputationProfile, anchored: bool) -> Reputati
 mod tests {
     use super::*;
     use rrn_crypto::keypair::Keypair;
-    use rrn_crypto::signed::SignedPayload;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
-    use rrn_storage::log::AppendLog;
+    use rrn_ledger::enrollment::EnrollmentBasis;
     use rrn_storage::migrations;
 
+    use crate::context::EVENT_INCREMENT;
     use crate::scoring::ReputationScorer;
+    use crate::testutil::{enroll, establish_members, vouch, WEEK};
 
-    const WEEK: i64 = 7 * 86_400;
     const MONTH: i64 = 30 * 86_400;
 
     fn fresh_db() -> Database {
@@ -288,61 +315,6 @@ mod tests {
         p.trade_reliability = trade;
         p.last_updated = at;
         p
-    }
-
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        let confirmation = TransactionConfirmation {
-            proposal_id: pid,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        };
-        log.append(SignedPayload::sign(confirmation, receiver), 0)
-            .unwrap();
-        let settlement = SettlementRecord {
-            proposal_id: pid,
-            sender: addr(sender),
-            receiver: addr(receiver),
-            amount_centi: 300,
-            settled_at: at,
-        };
-        log.append(SignedPayload::sign(settlement, station), 0)
-            .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
     }
 
     #[test]
@@ -440,49 +412,70 @@ mod tests {
         assert_eq!(anchored_profile(&full, true), full);
     }
 
-    /// A member with the most history Phase 1 can produce: ten settled trades
-    /// (trade reliability 5.0) and ten vouches written (attestation accuracy
-    /// 5.0), which is every live dimension at its ceiling.
-    fn maxed_out_member(db: &Database, member: &Keypair, station: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, member, station, station, nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, member, &addr(&Keypair::generate()), at);
-        }
+    #[test]
+    fn credited_events_per_window_matches_the_cap() {
+        assert_eq!(
+            CREDITED_EVENTS_PER_WINDOW as f32 * EVENT_INCREMENT,
+            VELOCITY_CAP_PER_WEEK
+        );
+        assert_eq!(VELOCITY_WINDOW_SECS, 604_800);
+    }
+
+    #[test]
+    fn the_window_is_trailing_and_half_open() {
+        // Exactly a week apart: both credited (the earlier one sits on the
+        // window's open end). A second less: only the first.
+        assert_eq!(credited_events(&[0, WEEK]), vec![0, WEEK]);
+        assert_eq!(credited_events(&[0, WEEK - 1]), vec![0]);
+        // Credit is greedy from the earliest: an uncredited event never blocks
+        // a later one.
+        assert_eq!(credited_events(&[0, WEEK - 1, WEEK]), vec![0, WEEK]);
+        // Order-independent, and a burst on one day credits once.
+        assert_eq!(credited_events(&[WEEK, 0, 5, 3]), vec![0, WEEK]);
+        assert!(credited_events(&[]).is_empty());
+    }
+
+    /// An established founder: a root (anchored by definition) with standing
+    /// over the Member band, so their vouch forms an anchoring edge.
+    fn established_patron(db: &Database, station: &Keypair, at: i64) -> Keypair {
+        establish_members(db, station, 2, at).remove(0)
     }
 
     #[test]
     fn a_vouch_from_an_established_member_anchors() {
         let db = fresh_db();
-        let (patron, newcomer, station) = (
-            Keypair::generate(),
-            Keypair::generate(),
-            Keypair::generate(),
-        );
+        let (newcomer, station) = (Keypair::generate(), Keypair::generate());
         let t = 6 * MONTH;
-        maxed_out_member(&db, &patron, &station, t);
-        append_vouch(&db, &patron, &addr(&newcomer), t);
+        let patron = established_patron(&db, &station, t);
+        enroll(&db, &station, &addr(&newcomer), EnrollmentBasis::Pairing, t);
+        vouch(&db, &patron, &addr(&newcomer), t);
 
         assert!(is_anchored(&db, &addr(&newcomer), t, &station.public_key()).unwrap());
         assert_eq!(
             anchoring_voucher(&db, &addr(&newcomer), t, &station.public_key()).unwrap(),
             Some(addr(&patron))
         );
+        // A root is anchored by definition and has no anchoring voucher.
+        assert!(is_anchored(&db, &addr(&patron), t, &station.public_key()).unwrap());
+        assert_eq!(
+            anchoring_voucher(&db, &addr(&patron), t, &station.public_key()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn the_threshold_is_reachable_in_phase_one() {
         let db = fresh_db();
-        let (patron, station) = (Keypair::generate(), Keypair::generate());
+        let station = Keypair::generate();
         let t = 6 * MONTH;
-        maxed_out_member(&db, &patron, &station, t);
+        let patron = established_patron(&db, &station, t);
 
         // The ceiling with three of five dimensions structurally zero is
-        // 0.55·5.0 = 2.75. The band-relative threshold sits under it, which the
-        // original 3.0 did not — the whole reason ADR-0009 was amended.
+        // 0.55·5.0 = 2.75 (scored at the last event, so no decay). The
+        // band-relative threshold sits under it, which the original 3.0 did not —
+        // the whole reason ADR-0009 was amended.
         let composite = ReputationScorer::new(&db, &station.public_key())
-            .score_raw_at(&addr(&patron), t)
+            .score_raw_at(&addr(&patron), t - WEEK)
             .unwrap()
             .composite();
         assert!(
@@ -498,8 +491,9 @@ mod tests {
         let alice = Keypair::generate();
         let station = Keypair::generate();
         let t = 6 * MONTH;
+        enroll(&db, &station, &addr(&alice), EnrollmentBasis::Pairing, t);
 
-        append_vouch(&db, &alice, &addr(&alice), t);
+        vouch(&db, &alice, &addr(&alice), t);
         assert!(!is_anchored(&db, &addr(&alice), t, &station.public_key()).unwrap());
     }
 
@@ -509,20 +503,24 @@ mod tests {
         let (stranger, newcomer) = (Keypair::generate(), Keypair::generate());
         let station = Keypair::generate();
         let t = 6 * MONTH;
+        enroll(&db, &station, &addr(&stranger), EnrollmentBasis::Pairing, t);
+        enroll(&db, &station, &addr(&newcomer), EnrollmentBasis::Pairing, t);
 
-        // A fresh identity with no history vouches: the cheapest Sybil move.
-        append_vouch(&db, &stranger, &addr(&newcomer), t);
+        // An enrolled identity with no standing vouches: the cheapest Sybil move.
+        vouch(&db, &stranger, &addr(&newcomer), t);
         assert!(!is_anchored(&db, &addr(&newcomer), t, &station.public_key()).unwrap());
     }
 
     #[test]
     fn a_vouch_issued_later_does_not_anchor_yet() {
         let db = fresh_db();
-        let (patron, newcomer) = (Keypair::generate(), Keypair::generate());
-        let station = Keypair::generate();
+        let (newcomer, station) = (Keypair::generate(), Keypair::generate());
         let t = 6 * MONTH;
+        let patron = established_patron(&db, &station, t);
+        enroll(&db, &station, &addr(&newcomer), EnrollmentBasis::Pairing, t);
 
-        append_vouch(&db, &patron, &addr(&newcomer), t);
+        vouch(&db, &patron, &addr(&newcomer), t);
+        assert!(is_anchored(&db, &addr(&newcomer), t, &station.public_key()).unwrap());
         // Asked about a moment before the vouch existed.
         assert!(!is_anchored(&db, &addr(&newcomer), t - 1, &station.public_key()).unwrap());
     }

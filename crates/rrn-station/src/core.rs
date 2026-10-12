@@ -44,11 +44,11 @@ use rrn_governance::vote::{append_vote, Vote, VoteChoice};
 use rrn_identity::address::Address;
 use rrn_identity::recovery::flow::{reconstruct_wallet, RecoveryPackage};
 use rrn_identity::recovery::shamir::{RawShard, ShardIndex};
-use rrn_identity::vouch::{append_vouch, create_vouch, SignedVouch};
+use rrn_identity::vouch::{append_vouch, check_issued_at, create_vouch_at, SignedVouch};
 use rrn_identity::wallet::WalletContents;
 use rrn_ledger::contract::{ContractCharge, ContractRef};
 use rrn_ledger::dispute::{DisputeRecord, DisputeResponse, SignedDispute, SignedDisputeResponse};
-use rrn_ledger::engine::Engine;
+use rrn_ledger::engine::{Engine, CLOCK_SKEW_TOLERANCE_SECS};
 use rrn_ledger::enrollment::{
     append_enrollment, sign_enrollment, EnrollmentAction, EnrollmentBasis, ENROLLMENT_KIND,
 };
@@ -110,6 +110,13 @@ use crate::{history, rpc};
 /// Community identifier stamped on Phase 0 vouches (a placeholder until real
 /// community ids arrive in Phase 1).
 const VOUCH_COMMUNITY: &str = "rrn-phase0";
+
+/// The refusal both live vouch doors give a vouch whose `issued_at` is outside
+/// the clock-skew tolerance of the station clock (ADR-0038 §9).
+const VOUCH_ISSUED_AT_REFUSAL: &str =
+    "the vouch's issued_at must be within 5 minutes of the station clock";
+// The refusal text names the tolerance; keep the two in step.
+const _: () = assert!(CLOCK_SKEW_TOLERANCE_SECS == 5 * 60);
 
 /// How long a proposal stays valid before it auto-expires, in seconds.
 const PROPOSAL_TTL_SECS: i64 = 24 * 3600;
@@ -1729,15 +1736,24 @@ impl Core {
         let subject = parse_addr(&params.subject)?;
         let station = self.station_keypair();
 
-        let vouch = create_vouch(
+        // Stamped with the station's injected clock, so the instant it stamps is
+        // the instant the bound below checks (ADR-0038 §9).
+        let now = self.clock.now();
+        let vouch = create_vouch_at(
             &station,
             &subject,
             VOUCH_COMMUNITY,
             &params.statement,
             params.stake_centi,
+            now,
         );
+        check_issued_at(vouch.payload.issued_at, now, CLOCK_SKEW_TOLERANCE_SECS).map_err(|_| {
+            rpc::RpcError {
+                code: rpc::INVALID_PARAMS,
+                message: VOUCH_ISSUED_AT_REFUSAL.into(),
+            }
+        })?;
         let vouch_id = hex(&vouch.payload_hash().to_bytes());
-        let now = self.clock.now();
         let mut log = AppendLog::new(&self.db);
         append_vouch(&mut log, vouch, now).map_err(internal)?;
 
@@ -6028,8 +6044,13 @@ impl Core {
                 "vouch signature does not verify".into(),
             )
         })?;
-        let vouch_id = hex(&signed.payload_hash().to_bytes());
+        // A vouch is scored at its signed `issued_at`, so the door bounds it to
+        // the station clock, both ways (ADR-0038 §9). A phone whose clock is off
+        // by more than the tolerance cannot vouch until it is corrected.
         let now = self.clock.now();
+        check_issued_at(signed.payload.issued_at, now, CLOCK_SKEW_TOLERANCE_SECS)
+            .map_err(|_| (rpc::INVALID_PARAMS, VOUCH_ISSUED_AT_REFUSAL.into()))?;
+        let vouch_id = hex(&signed.payload_hash().to_bytes());
         let mut log = AppendLog::new(&self.db);
         append_vouch(&mut log, signed, now).map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({ "vouch_id": vouch_id }))
@@ -7246,6 +7267,8 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         // the member their signature is broken). No dedicated slug; the catch-all
         // carries it.
         LE::SenderMismatch | LE::ConfirmerMismatch => RefusalReason::Rejected,
+        // A payment to oneself (ADR-0038 §7) — final, but no dedicated slug.
+        LE::SelfPayment => RefusalReason::Rejected,
         LE::DuplicateProposal => RefusalReason::Duplicate,
         LE::BadNonce { .. } => RefusalReason::NonceGap,
         LE::Expired => RefusalReason::Expired,
@@ -9120,6 +9143,165 @@ mod tests {
         SignedConfirmation::sign(c, receiver)
     }
 
+    // --- standing accrual (ADR-0038 Part B) --------------------------
+
+    fn kaddr(kp: &Keypair) -> Address {
+        Address::from_public_key(kp.public_key())
+    }
+
+    #[test]
+    fn a_self_payment_over_dtn_is_rejected() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        enroll(&core, &alice);
+        let p = member_proposal(&alice, &alice, 100, 0, 900, 900 + 1_000_000);
+        let receipt = submit_bundle(&mut core, &[outbox_entry(&alice, 0, zero(), &p, 900)], 1000);
+        assert_eq!(
+            receipt.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::Rejected
+            }
+        );
+        assert!(tx_state(&core, &p.payload.id).is_none());
+    }
+
+    /// The October 2026 audit's manufactured-standing reproduction, with every
+    /// key enrolled — the strongest case. Self-sends are refused at the door; the same
+    /// records forced onto the log past every door and settled earn nothing; and
+    /// one member's vouches for three keys leave grace in force.
+    #[test]
+    fn manufactured_standing_does_not_end_grace() {
+        let mut core = test_core();
+        let station_pk = core.station_pubkey();
+        let m = Keypair::generate();
+        let sybils: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        let everyone: Vec<&Keypair> = std::iter::once(&m).chain(sybils.iter()).collect();
+        for k in &everyone {
+            enroll(&core, k);
+        }
+
+        // Each identity pays itself 0.01 ten times and confirms, all in a bundle.
+        let mut records = Vec::new();
+        for k in &everyone {
+            let mut entries = Vec::new();
+            let mut prev = zero();
+            for nonce in 0..10u64 {
+                let p = member_proposal(k, k, 1, nonce, 900, 900 + 1_000_000);
+                let pe = outbox_entry(k, 2 * nonce, prev, &p, 900);
+                prev = pe.payload.entry_hash();
+                let c = member_confirmation(k, &p, 950);
+                let ce = outbox_entry(k, 2 * nonce + 1, prev, &c, 950);
+                prev = ce.payload.entry_hash();
+                entries.push(pe);
+                entries.push(ce);
+                records.push((p, c));
+            }
+            let receipt = submit_bundle(&mut core, &entries, 1000);
+            for (i, outcome) in receipt.payload.outcomes.iter().enumerate() {
+                let reason = if i % 2 == 0 {
+                    RefusalReason::Rejected
+                } else {
+                    RefusalReason::NotProposed
+                };
+                assert_eq!(outcome.disposition, Disposition::Refused { reason });
+            }
+        }
+
+        // The same records, appended past every door, then settled.
+        {
+            let mut log = AppendLog::new(&core.db);
+            for (p, c) in &records {
+                log.append(p.clone(), 1000).unwrap();
+                log.append(c.clone(), 1000).unwrap();
+            }
+        }
+        core.clock.set(1_000 + 2 * 86_400);
+        assert_eq!(
+            core.do_sweep(),
+            records.len(),
+            "the forced self-sends settle"
+        );
+        let now = core.clock.now();
+        let ctx =
+            rrn_reputation::context::ScoringContext::unbounded(&core.db, &station_pk).unwrap();
+        for k in &everyone {
+            assert_eq!(ctx.score_raw(&kaddr(k), now).composite(), 0.0);
+        }
+
+        // M vouches for the three keys (each an eligible attestation for M, and
+        // nothing more: M is not anchored, so its vouches anchor no one).
+        for s in &sybils {
+            let v = create_vouch_at(&m, &kaddr(s), VOUCH_COMMUNITY, "ok", 0, now);
+            append_vouch(&mut AppendLog::new(&core.db), v, now).unwrap();
+        }
+        assert!(
+            rrn_reputation::staking::established_members(&core.db, now, &station_pk)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(rrn_reputation::staking::in_grace(&core.db, now, &station_pk).unwrap());
+    }
+
+    #[test]
+    fn a_vouch_with_a_stale_issued_at_is_refused() {
+        let mut core = test_core();
+        let now = core.clock.now();
+        let voucher = Keypair::generate();
+        let subject = kaddr(&Keypair::generate());
+        let submit = |core: &mut Core, issued_at: i64| {
+            let v = create_vouch_at(&voucher, &subject, VOUCH_COMMUNITY, "known", 0, issued_at);
+            let frame = rpc_envelope::frame_signed_record(
+                &to_canonical_bytes(v.payload.clone()),
+                &v.signer,
+                &v.signature,
+            );
+            let params = serde_json::json!({ "signed_vouch": hex(&frame) });
+            let env = RequestEnvelope {
+                method: "submit_vouch".into(),
+                params: params.to_string(),
+                signer: voucher.public_key(),
+                recipient: voucher.public_key(),
+                nonce: 1,
+                timestamp: now,
+            };
+            core.route_channel_method(&env)
+        };
+
+        // Channel: past or future beyond the tolerance is refused, and nothing
+        // is written; within it, admitted.
+        let tail = core.tail_seq();
+        for stale in [
+            now - CLOCK_SKEW_TOLERANCE_SECS - 1,
+            now + CLOCK_SKEW_TOLERANCE_SECS + 1,
+        ] {
+            let (code, message) = submit(&mut core, stale).unwrap_err();
+            assert_eq!(code, rpc::INVALID_PARAMS);
+            assert_eq!(message, VOUCH_ISSUED_AT_REFUSAL);
+        }
+        assert_eq!(core.tail_seq(), tail);
+        for fresh in [
+            now - CLOCK_SKEW_TOLERANCE_SECS,
+            now + CLOCK_SKEW_TOLERANCE_SECS,
+        ] {
+            assert!(submit(&mut core, fresh).is_ok());
+        }
+
+        // Operator: the vouch is stamped with the station's own clock (here far
+        // from the system clock), so it is within the bound and admitted.
+        call(
+            &mut core,
+            "vouch",
+            serde_json::json!({ "subject": subject.to_string(), "statement": "known", "stake_centi": 0 }),
+        );
+        let entry = AppendLog::new(&core.db).tail().unwrap().unwrap();
+        let vouch: SignedVouch = SignedPayload {
+            payload: rrn_crypto::serialize::from_canonical_bytes(&entry.payload.bytes).unwrap(),
+            signer: entry.payload.signer,
+            signature: entry.payload.signature,
+        };
+        assert_eq!(vouch.payload.issued_at, now);
+    }
+
     fn tx_state(core: &Core, id: &TransactionId) -> Option<TransactionState> {
         rrn_ledger::state::LedgerSnapshot::derive(&AppendLog::new(&core.db), &core.station_pubkey())
             .unwrap()
@@ -10510,7 +10692,7 @@ mod tests {
         let mut core = established_core(); // clock = TEN_MONTHS
         let now = core.clock.now();
         // End bootstrap grace: three established members exist.
-        gov_established_members(&core.db, 3, now, &core.station_keypair());
+        rrn_reputation::testutil::establish_members(&core.db, &core.station_keypair(), 3, now);
 
         let sender = Keypair::generate();
         let alice = Keypair::generate(); // fresh — below the Member band; the confirmer
@@ -12439,101 +12621,6 @@ mod tests {
         Address::from_public_key(kp.public_key())
     }
 
-    /// Appends a full proposal → confirmation → settlement chain, mirroring the
-    /// reputation crate's own fixture, so the parties earn trade standing.
-    fn gov_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        settler: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            gaddr(sender),
-            gaddr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(rrn_crypto::signed::SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        log.append(
-            rrn_crypto::signed::SignedPayload::sign(
-                TransactionConfirmation {
-                    proposal_id: pid,
-                    confirmer: gaddr(receiver),
-                    confirmed_at: at,
-                },
-                receiver,
-            ),
-            0,
-        )
-        .unwrap();
-        log.append(
-            rrn_crypto::signed::SignedPayload::sign(
-                rrn_ledger::settlement::SettlementRecord {
-                    proposal_id: pid,
-                    sender: gaddr(sender),
-                    receiver: gaddr(receiver),
-                    amount_centi: 300,
-                    settled_at: at,
-                },
-                settler,
-            ),
-            0,
-        )
-        .unwrap();
-    }
-
-    /// Appends a vouch, mirroring the reputation crate's fixture (raw
-    /// [`Attestation`] with a zero stake) so the issuer earns attestation standing.
-    fn gov_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        use rrn_identity::attestation::Attestation;
-        use rrn_identity::vouch::{VouchBody, VouchKind};
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        AppendLog::new(db).append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    /// Builds `n` established members anchored in a ring — the electorate the
-    /// governance guards require.
-    fn gov_established_members(
-        db: &Database,
-        n: usize,
-        at: i64,
-        station: &Keypair,
-    ) -> Vec<Keypair> {
-        // Settlements must be signed by the community station the Core derives
-        // reputation under, or the signer pin skips them and no one establishes.
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            for nonce in 0..10 {
-                gov_settled(db, m, &Keypair::generate(), station, nonce, at);
-            }
-            for _ in 0..10 {
-                gov_vouch(db, m, &gaddr(&Keypair::generate()), at);
-            }
-        }
-        for i in 0..n {
-            gov_vouch(db, &members[(i + 1) % n], &gaddr(&members[i]), at);
-        }
-        members
-    }
-
     /// A core whose clock sits at a realistic time, so seeded reputation scores as
     /// it would in production.
     fn established_core() -> Core {
@@ -12707,7 +12794,12 @@ mod tests {
     #[test]
     fn governance_channel_lifecycle_publishes_and_counts_votes() {
         let mut core = established_core();
-        let members = gov_established_members(&core.db, 4, TEN_MONTHS, &core.station_keypair());
+        let members = rrn_reputation::testutil::establish_members(
+            &core.db,
+            &core.station_keypair(),
+            4,
+            TEN_MONTHS,
+        );
 
         // The station publishes the genesis charter (sole founder).
         call(

@@ -160,18 +160,45 @@ pub fn vouchers_of_until(
     Ok(vouchers)
 }
 
+/// The distinct members `voucher` has vouched for, among vouches admitted at log
+/// sequence `until_seq` or earlier — its vouchees as of an admission position,
+/// prefix-bounded exactly as [`vouchers_of_until`]. Every vouch counts, eligible
+/// for standing or not (ADR-0038 §11): a party's vouchees are recused from its
+/// jury alongside its vouchers, so a party cannot seat identities it vouched in.
+pub fn vouchees_of_until(
+    db: &Database,
+    voucher: &Address,
+    until_seq: u64,
+) -> Result<HashSet<Address>> {
+    let log = AppendLog::new(db);
+    let mut vouchees = HashSet::new();
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        if entry.seq > until_seq {
+            break;
+        }
+        if Address::from_public_key(entry.payload.signer) != *voucher {
+            continue;
+        }
+        if let Ok(vouch) = from_canonical_bytes::<Vouch>(&entry.payload.bytes) {
+            vouchees.insert(vouch.subject);
+        }
+    }
+    Ok(vouchees)
+}
+
 /// The eligible jury pool for a dispute, each candidate paired with the
 /// raw-standing weight the draw uses, as of `at_time` (the dispute's open time) and
 /// the log prefix `[1, max_seq]` (the dispute's admission position — pass
 /// [`DisputedInfo::opened_seq`]).
 ///
-/// Eligibility is the governance electorate — established members (effective
-/// composite ≥ the Member band), plus the genesis `founders` while the community
-/// is in bootstrap grace (ADR-0015) — **minus both parties** (recusal) and
-/// **minus each party's direct vouchers**. Per ADR-0014 §5 the voucher-recusal
-/// relaxes before the panel goes unseated: if the strict pool cannot fill a
-/// panel, the voucher exclusion is dropped (the two parties are still never
-/// eligible). The returned pool may still be smaller than the panel — the caller
+/// Eligibility is the governance electorate — established members (ADR-0038
+/// §12), plus the genesis `founders` while the community is in bootstrap grace
+/// (ADR-0015) — **minus both parties** (recusal) and **minus each party's direct
+/// vouchers and vouchees** (ADR-0014 §2, ADR-0038 §11). Per ADR-0014 §5 the
+/// voucher/vouchee recusal relaxes, as one tier, before the panel goes unseated:
+/// if the strict pool cannot fill a panel, that exclusion is dropped (the two
+/// parties are still never eligible). The returned pool may still be smaller than the panel — the caller
 /// treats an unseatable jury as a dispute that will lapse.
 ///
 /// The electorate, the weights, **and** the recusal (voucher) graph are all bounded
@@ -191,15 +218,19 @@ pub fn eligible_pool(
     params: &DisputeParams,
     station: &PublicKey,
 ) -> Result<Vec<(Address, u64)>> {
-    // The two parties are never eligible (hard recusal); their vouchers are
-    // recused too but relax first if that is the only way to seat a panel. The
-    // voucher graph is read as of the same admission prefix as the electorate, so a
-    // vouch admitted after the dispute opened neither recuses nor seats anyone.
+    // The two parties are never eligible (hard recusal); their vouchers and
+    // vouchees are recused too but relax first if that is the only way to seat a
+    // panel. The vouch graph is read as of the same admission prefix as the
+    // electorate, so a vouch admitted after the dispute opened neither recuses
+    // nor seats anyone.
     let parties: HashSet<Address> = [info.sender, info.receiver].into_iter().collect();
-    let mut vouchers = vouchers_of_until(db, &info.sender, max_seq)?;
-    vouchers.extend(vouchers_of_until(db, &info.receiver, max_seq)?);
+    let mut soft = HashSet::new();
+    for party in &parties {
+        soft.extend(vouchers_of_until(db, party, max_seq)?);
+        soft.extend(vouchees_of_until(db, party, max_seq)?);
+    }
     eligible_pool_excluding(
-        db, founders, at_time, max_seq, params, &parties, &vouchers, station,
+        db, founders, at_time, max_seq, params, &parties, &soft, station,
     )
 }
 
@@ -209,9 +240,10 @@ pub fn eligible_pool(
 /// set* varies.
 ///
 /// `hard_excluded` are never eligible (the parties, or an equivocation's subject
-/// and injured payees). `soft_excluded` (each party's vouchers) are recused from
-/// the strict pool but dropped if the strict pool cannot fill a panel — the
-/// ADR-0014 §5 relaxation — so a small community can still seat jurors; the hard
+/// and injured payees). `soft_excluded` (each party's vouchers and vouchees) are
+/// recused from the strict pool but dropped if the strict pool cannot fill a
+/// panel — the ADR-0014 §5 relaxation — so a small community can still seat
+/// jurors; the hard
 /// set is never relaxed. Weights are raw standing as of `at_time`, floored at 1 so
 /// a zero-standing founder seated during grace stays selectable. The returned pool
 /// may still be smaller than the panel; the caller treats an unseatable jury as a
@@ -316,4 +348,95 @@ fn draw_u64(seed: &[u8; 32], round: u64) -> u64 {
     buf[32..].copy_from_slice(&round.to_le_bytes());
     let digest = Hash::of(&buf).to_bytes();
     u64::from_le_bytes(digest[..8].try_into().expect("32-byte digest has 8 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rrn_crypto::keypair::Keypair;
+    use rrn_ledger::enrollment::EnrollmentBasis;
+    use rrn_reputation::testutil::{enroll, establish_members, vouch, WEEK};
+    use rrn_storage::migrations;
+
+    fn fresh_db() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        migrations::run(&db).unwrap();
+        db
+    }
+
+    fn addr(kp: &Keypair) -> Address {
+        Address::from_public_key(kp.public_key())
+    }
+
+    /// The pool for a dispute between `sender` and an enrolled outsider, opened
+    /// at the log tail as of `at`.
+    fn pool_for(db: &Database, station: &Keypair, sender: &Keypair, at: i64) -> HashSet<Address> {
+        let outsider = Keypair::generate();
+        enroll(db, station, &addr(&outsider), EnrollmentBasis::Pairing, at);
+        let info = DisputedInfo {
+            sender: addr(sender),
+            receiver: addr(&outsider),
+            opened_at: at,
+            opened_seq: AppendLog::new(db).tail().unwrap().unwrap().seq,
+        };
+        eligible_pool(
+            db,
+            &[],
+            &info,
+            at,
+            info.opened_seq,
+            &DisputeParams::default(),
+            &station.public_key(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect()
+    }
+
+    #[test]
+    fn a_partys_vouchees_are_recused_softly() {
+        let t = 20 * WEEK;
+        let station = Keypair::generate();
+
+        // Six established members; the party (m0) vouched for m1 and m2. The
+        // strict pool (m3, m4, m5) seats a panel, so the vouchees are excluded.
+        let db = fresh_db();
+        let m = establish_members(&db, &station, 6, t);
+        vouch(&db, &m[0], &addr(&m[1]), t);
+        vouch(&db, &m[0], &addr(&m[2]), t);
+        let pool = pool_for(&db, &station, &m[0], t);
+        assert_eq!(pool, HashSet::from([addr(&m[3]), addr(&m[4]), addr(&m[5])]));
+
+        // Five established: the strict pool (m3, m4) cannot seat three, so the
+        // soft tier relaxes and the vouchees are readmitted; the party never is.
+        let db = fresh_db();
+        let m = establish_members(&db, &station, 5, t);
+        vouch(&db, &m[0], &addr(&m[1]), t);
+        vouch(&db, &m[0], &addr(&m[2]), t);
+        let pool = pool_for(&db, &station, &m[0], t);
+        assert_eq!(
+            pool,
+            HashSet::from([addr(&m[1]), addr(&m[2]), addr(&m[3]), addr(&m[4])])
+        );
+    }
+
+    #[test]
+    fn vouchees_are_read_as_of_the_admission_prefix() {
+        let t = 20 * WEEK;
+        let station = Keypair::generate();
+        let db = fresh_db();
+        let m = establish_members(&db, &station, 2, t);
+        let subject = Keypair::generate();
+        vouch(&db, &m[0], &addr(&subject), t);
+        let bound = AppendLog::new(&db).tail().unwrap().unwrap().seq;
+        // A later vouch, and a vouch by someone else, do not count.
+        let later = Keypair::generate();
+        vouch(&db, &m[0], &addr(&later), t);
+        vouch(&db, &m[1], &addr(&m[0]), t);
+        assert_eq!(
+            vouchees_of_until(&db, &addr(&m[0]), bound).unwrap(),
+            HashSet::from([addr(&subject)])
+        );
+    }
 }

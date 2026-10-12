@@ -53,11 +53,11 @@ pub fn get_cached_profile(
 /// Recomputes `address`'s profile as of `now` and writes it to the cache,
 /// last-write-wins on `now`. Returns the freshly computed profile.
 ///
-/// The refresh is also where the velocity cap is measured, since it is the only
-/// place two consecutive profiles for an identity meet
-/// ([`crate::sybil::check_velocity`]). A violation is logged for operator review
-/// and nothing else: the snapshot is still written and the score still stands, by
-/// design — humans decide what an implausible gain means.
+/// The refresh is also where consecutive profiles are compared for gain
+/// ([`crate::sybil::check_velocity`]), since it is the only place two of them
+/// meet. The scorer itself caps credit (ADR-0038 §10), so this is an operator
+/// signal, not the defense: a violation is logged and nothing else — the
+/// snapshot is still written and the score still stands.
 pub fn refresh_snapshot(
     db: &Database,
     address: &Address,

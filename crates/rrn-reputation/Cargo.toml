@@ -24,6 +24,13 @@ dcbor = "0.25"
 thiserror = "1"
 tracing = "0.1"
 
+[features]
+# Exposes `testutil` (the shared ADR-0038 standing helpers) to the test builds of
+# downstream crates. Never enabled by a non-dev dependency.
+test-util = []
+
 [dev-dependencies]
-# Drives the scoring-context equivalence property test (old scorer as oracle).
+# Property tests of the scoring rules (velocity cap, eligibility).
 proptest = "1"
+# The integration tests use the shared standing helpers (`testutil`).
+rrn-reputation = { path = ".", version = "0.1", features = ["test-util"] }

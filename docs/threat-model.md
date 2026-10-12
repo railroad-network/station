@@ -546,8 +546,8 @@ authenticity of vouches (a forged vouch is a fake social relationship).
 - *Residual risk:* authenticity is not authority. A *validly signed* vouch from a
   real-but-malicious identity, or a Sybil cluster of mutually-vouching keys, is
   cryptographically sound; defending against that is `rrn-reputation`'s
-  velocity cap and anchoring (Phase 1) and graph analysis (Phase 3), not a
-  signature problem.
+  enrollment-gated, rate-capped accrual and chain-of-trust anchoring (ADR-0038)
+  and graph analysis (Phase 3), not a signature problem.
 
 #### Tampering — altered wallet, altered address, altered vouch
 
@@ -1082,6 +1082,10 @@ could mint credit by generating throwaway keys, each taken to the floor
   confirming a payment request within it; raise and answer disputes on its own
   transactions; return a certificate, and request one only against positive
   settled headroom. It cannot go below zero or land a binding.
+- *Self-payments:* a proposal whose sender is its receiver is refused at the
+  engine front door (`Error::SelfPayment`, receipt slug `rejected`, ADR-0038
+  §7), on every door. One already on a log settles as before, with zero net
+  effect, and earns no standing for anyone.
 - *Residual:* the operator is the enrollment authority and can enroll one person
   twice — two keys double that person's walk-away exposure; the only control is
   social (every enrollment is on the log, listed by `station enroll --list`).
@@ -2176,9 +2180,11 @@ credit and never delivers.
 - *Threat:* colluding identities run wash sales against each other's listings to
   manufacture positive transaction history and inflate standing.
 - *Mitigation (shipped):* this threat is owned by `rrn-reputation` and its
-  Phase 1 answer is in place — velocity limiting caps any dimension at 0.5 per
-  week, and identity anchoring holds every dimension at 1.0 until an established
-  member vouches, so a ring of self-dealing accounts scores slowly and visibly.
+  answer is in place (ADR-0038) — only events between enrolled identities earn
+  standing, the scorer credits at most one event per dimension per trailing
+  week, and identity anchoring holds every dimension at 1.0 until a chain of
+  vouches from a founder reaches the identity, so a ring of self-dealing
+  accounts needs an in-person enrollment per account and scores slowly.
   See [Sybil clusters and manufactured
   standing](#sybil-clusters-and-manufactured-standing), which also records
   what those measures do *not* stop.
@@ -2352,13 +2358,14 @@ inherited standing.
 
 - *Threat:* colluding identities issue each other positive attestations to
   inflate scores.
-- *Partial mitigation (shipped):* the velocity cap below bounds the
-  *rate* of inflation, and all inputs decay (`rrn-reputation::decay`), so farmed
-  standing has to be continuously re-farmed.
+- *Partial mitigation (shipped):* the velocity cap below credits at most one
+  attestation per trailing week, only vouches and settled confirmations between
+  enrolled identities count (ADR-0038 §8, §10), and all inputs decay
+  (`rrn-reputation::decay`), so farmed standing has to be continuously re-farmed.
 - *Residual risk:* **this is the largest known Phase 1 gap.** With no fraud-finding
   mechanism, every attestation counts as accurate, so attestation accuracy rewards
-  *volume*, not correctness — writing vouches is itself the way to raise the
-  dimension (ADR-0009, Consequences). Weighting attestations by the attester's own
+  sustained activity, not correctness — writing one vouch a week is itself a way
+  to raise the dimension (ADR-0009, Consequences). Weighting attestations by the attester's own
   standing and discounting reciprocal or clustered ones needs the graph analysis
   deferred to Phase 3; retroactively marking an attestation wrong needs fraud
   findings (a later phase). Sophisticated collusion inside a real vouch cluster remains
@@ -2381,46 +2388,60 @@ inherited standing.
 
 - *Threat:* an attacker stands up many identities and transacts or vouches among
   them to manufacture standing cheaply — the cluster scoring itself into
-  legitimacy without any real member's involvement.
-- *Mitigation (shipped):* **velocity limiting.** No dimension may gain
-  more than 0.5 per week (`rrn-reputation::sybil::check_velocity`, run on every
-  snapshot refresh). Because a dimension maxes at 5.0 and each event is worth 0.5,
-  a fake identity needs ten weeks of sustained fabricated activity to reach the
-  ceiling — the defense is *time*, which is the one input an attacker cannot
-  manufacture in parallel. Violations are logged for operator review and never
-  auto-punish: an automatic penalty would be a griefing vector, since anyone who
-  can drive transactions at a member could push them over the cap.
-- *Mitigation (shipped):* **identity anchoring.** Every dimension of an
-  identity is held at 1.0 until a member holding at least a Member-band composite
-  (2.0) vouches for it — applied inside `ReputationScorer::score_at`, so
-  snapshots, exports and remote re-verification all see the same capped profile.
-  The evidence keeps accruing underneath the cap, so an anchoring vouch reveals
-  the standing already earned rather than starting it. A vouch for oneself is
-  ignored. ADR-0009's original 3.0 threshold was unreachable in Phase 1 and was
-  amended to the band floor; the reasoning is recorded in the ADR.
-- *Residual risk:* **anchoring stops a lone fake identity, not a patient pair.** A
-  prospective voucher is judged on their *uncapped* composite — necessarily so,
-  or no member could ever be the first anchor and mutual vouchers would be
-  undecidable — and an uncapped composite is computed from evidence, which
-  colluding identities can manufacture. Two fakes transacting with each other are
-  indistinguishable from two real members trading, so roughly ten weeks of
-  patience buys a full trade-reliability score and, with it, the standing to
-  anchor each other and any number of further identities. Velocity flagging plus
-  human review is what stands against that; detecting the pattern structurally is
-  the Phase 3 graph analysis, and a chain-of-trust walk from a genesis identity
-  (recorded in ADR-0009 as the rejected-for-now alternative) is the variant that
-  would close it. The velocity check is itself a known undercount: it compares
-  consecutive snapshots rather than a true trailing-7-day window (the cache
-  retains only the latest snapshot), so a member who stays just under the floor
-  across many sub-weekly refreshes is not flagged. That gap closes as the refresh
-  interval approaches weekly.
+  legitimacy without any real member's involvement. The October 2026 audit
+  reproduced it (RRN-A-017): self-payments from never-enrolled keys made three
+  throwaway keys the community's only established members inside one settlement
+  window, ending bootstrap grace.
+- *Mitigation (shipped):* **eligibility (ADR-0038 §7–§9).** A positive event
+  counts only when every party it names was enrolled before the entry that
+  admitted it — both parties of a trade before its confirmation, voucher and
+  subject before the vouch — so a key nobody enrolled in person earns nothing and
+  lends nothing. A self-payment is refused at the door and earns nothing if
+  already on a log. A confirmation is credited only once its transaction settles.
+  Events are timed by the station-signed `settled_at` and by a vouch's
+  `issued_at`, which both live vouch doors bound to within the clock-skew
+  tolerance of the station clock; no event time is a party's unbounded claim.
+- *Mitigation (shipped):* **the velocity cap.** The scorer credits at most one
+  event per dimension per trailing week (ADR-0038), so standing takes at least
+  eight credited events a week apart — 49 days — of activity with enrolled
+  counterparties; nothing is penalized automatically. An uncredited event still
+  counts as activity for decay. `rrn-reputation::sybil::check_velocity` remains an
+  operator log line between consecutive snapshots, no longer the defense.
+- *Mitigation (shipped):* **identity anchoring is a chain of trust from the
+  founders (ADR-0038 §11).** Every dimension of an identity is held at 1.0 until
+  it is anchored, applied inside `ReputationScorer::score_at` so snapshots,
+  exports and remote re-verification all see the same capped profile. The roots
+  are the identities enrolled with basis `founder`, which only the root founder
+  charter grants. A vouch forms an anchoring edge only if, over the log before
+  it, the voucher was itself anchored and held a raw composite of at least 2.0;
+  the edge is judged once and never re-judged, so decay never unanchors anyone,
+  and a revocation of either party voids it for good, cascading to everyone
+  anchored only through it. The station identity is never anchored or
+  established. A colluding pair of enrolled members no longer anchors itself.
+- *Mitigation (shipped):* **vouchee recusal (ADR-0038 §11, ADR-0014 §2).** A
+  dispute's jury recuses the parties' vouchees as well as their vouchers, in the
+  same soft tier, so a party cannot seat identities it vouched in.
+- *Residual risk:* **a founder is a root of trust.** Whoever the root founder
+  charter names anchors others once they have standing. The operator cannot
+  mint a root — no console form grants basis `founder` — but the operator is the
+  enrollment authority, and a revoked founder stops being a root for good.
+- *Residual risk:* **a corrupt established member can still anchor others** —
+  each anchor still needs its own in-person enrollment and 49 days of capped,
+  enrolled activity before it is established. Graph analysis remains the
+  federation-scale answer.
+- *Residual risk:* **grace lasts at least 49 days**, and a community whose
+  founders never reach raw 2.0 and vouch, or whose only founder is the station,
+  never leaves it; the founders govern meanwhile (ADR-0038 §12, disclosed in the
+  ADR-0015 banner).
 - *Residual risk (disclosure):* proving an anchor to a remote station means
-  shipping the anchoring voucher's own evidence inside the subject's export
-  (`rrn-reputation::portability`), since the verifier must recompute the voucher's
-  composite rather than trust the exporter's word for it. Only the first
-  qualifying voucher's entries travel, which is the least disclosure that
-  verifies, but it does expose one member's trade history inside another member's
-  bundle. A succinct proof of the voucher's standing is the Phase 3 improvement.
+  shipping the anchor chain's evidence inside the subject's export
+  (`rrn-reputation::portability`): the entries of every voucher on the chain to a
+  root, the chain that anchored each voucher when its edge formed, and the
+  enrollment records of everyone those entries name, since the verifier must form
+  each edge itself. That exposes several members' trade histories inside another
+  member's bundle. A succinct proof of a voucher's standing is the later
+  improvement. An exported history does not carry equivocation records, so a
+  verifier can read a convicted equivocator higher than the exporter does.
 
 #### Reading a score over the mobile channel
 
@@ -2500,12 +2521,12 @@ channel.
   is the established-member count at that same position, not the raw identity
   count, so unanchored Sybils inflate neither numerator nor denominator.
 - *Residual risk:* **governance is exactly as Sybil-resistant as
-  `rrn-reputation`, no more.** Establishing an identity means clearing the
-  anchoring cap, and that section's central residual risk — a patient collusion
-  *pair* can manufacture established standing in roughly ten weeks and then anchor
-  any number of further identities — carries straight through to votes: each such
-  identity is one established member and gets one vote. Governance adds no
-  independent defence against it.
+  `rrn-reputation`, no more.** Establishing an identity means enrollment, anchoring
+  and 49 days of capped activity (ADR-0038), and that section's central residual
+  risk — a corrupt anchored member can anchor enrolled identities, each of which
+  is established after its own in-person enrollment and 49 days of activity —
+  carries straight through to votes: each such identity is one established member
+  and gets one vote. Governance adds no independent defence against it.
 - *Residual risk (bootstrap electorate):* ADR-0012 accepts that a community with
   only one or two established members has a one- or two-person electorate, in
   which a lone member trivially meets quorum and approval and can pass statutes
@@ -4053,6 +4074,17 @@ label for a person; the correctness of the community a vouch is stamped into.
   authorship, not trustworthiness — a real-but-malicious member (or a Sybil cluster
   of mutually-vouching keys) issues cryptographically-sound vouches; content trust
   is `rrn-reputation`'s job, see [No Sybil resistance](#known-limitations).
+- **Back-dating a vouch (time spoofing).** *Threat:* a member signs a vouch with
+  an `issued_at` far in the past or future, to spread farmed attestation credit
+  across fictitious weeks or to judge an anchoring edge at a chosen instant.
+  *Mitigation (shipped):* both live vouch doors — channel `submit_vouch` and
+  operator `vouch` — refuse a vouch whose `issued_at` is more than the clock-skew
+  tolerance (5 minutes) from the station clock, either way (ADR-0038 §9); the
+  operator door stamps the station's injected clock itself. Vouches are not
+  DTN-routable, so the two-sided bound costs offline members nothing.
+  *Residual risk:* a phone whose clock is off by more than the tolerance cannot
+  vouch until it is corrected; a later ADR that routes vouches over DTN must
+  revisit the bound.
 - **Vouching for the wrong subject (handoff substitution).** *Threat:* an attacker
   interposes on the in-person handoff — a swapped QR, a look-alike address — so the
   member unknowingly stakes their word on the attacker's key. *Mitigation (shipped):*
@@ -4411,12 +4443,12 @@ entry citing its ADR or the section that owns it.
 ### Identity, reputation, and governance (standing)
 
 - **Partial Sybil resistance.** Vouch *authenticity* is enforced
-  cryptographically; vouch *trust* is not. The 0.5/week velocity cap and
-  identity anchoring stop a lone fake identity, but a *pair* of colluding
-  identities can trade with each other to raise the uncapped composites that
-  qualify them to anchor each other (see [Sybil clusters and manufactured
-  standing](#sybil-clusters-and-manufactured-standing)). Statistical graph
-  analysis is Phase 3.
+  cryptographically; vouch *trust* is not. Enrollment-gated eligibility, the
+  one-event-per-week credit cap and chain-of-trust anchoring (ADR-0038) stop
+  unenrolled keys and self-anchoring pairs, but a corrupt anchored member can
+  still anchor enrolled identities, each at a capped rate (see [Sybil clusters and
+  manufactured standing](#sybil-clusters-and-manufactured-standing)). Statistical
+  graph analysis is Phase 3.
 - **Governance has no spam bound, no ballot secrecy, and a capturable bootstrap
   electorate.** Nothing rate-limits proposals from a standing member; the
   cosign threshold is a fixed constant (clamped *down* during grace); ballots

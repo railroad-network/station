@@ -396,15 +396,21 @@ disputes have nothing to stand on. Found the community as soon as the
 founders' phones are paired.
 
 **Why founders matter beyond ceremony:** membership standing is earned
-through vouches and trade, which takes time. To avoid a dead zone where
-nobody can vote or sit on a dispute jury, the network runs a **bootstrap
-grace** (ADR‑0015): while the community has fewer than three established
-members, the electorate is the founders plus whoever is established. Your
-founders *are* the functioning government of the early community — the app
-shows a banner while this grace is active. Choose founders accordingly:
-three to five trusted people is a good shape for a ~20-person pilot.
+through trade and vouches with other enrolled members, at most one credited
+event per week in each kind, so nobody is established in under 49 days
+(ADR‑0038). Standing also needs a chain of vouches back to a founder: the
+founders the Charter names are the community's **roots of trust**, and each
+must first earn standing like everyone else before their vouch can anchor
+anyone. To avoid a dead zone where nobody can vote or sit on a dispute jury,
+the network runs a **bootstrap grace** (ADR‑0015): while the community has
+fewer than three established members, the electorate is the founders plus
+whoever is established. Your founders *are* the functioning government of the
+early community — for at least those first 49 days — and the app shows a
+banner while this grace is active. Choose founders accordingly: three to five
+trusted people, each with their own phone or wallet, is a good shape for a
+~20-person pilot.
 
-### Option A — solo bootstrap (station is the only founder)
+### Option A — solo bootstrap (station is the only founder; trials only)
 
 One command, no ceremony:
 
@@ -418,8 +424,12 @@ rrn governance charter-init \
 ```
 
 Quick, but it makes the station wallet — i.e. you, the steward — the sole
-founder, and therefore the whole grace-period electorate. Fine for a
-technical trial; not a great founding story for a real community.
+founder, and therefore the whole grace-period electorate. **A solo-bootstrap
+community never leaves grace** (ADR‑0038 §12): the station's own identity is
+never a root of trust, never anchored and never established, so with no other
+founder nobody can ever be anchored, and you remain the only voter and the
+only juror indefinitely. Use it for a technical trial only, never for a real
+community — use Option B.
 
 ### Option B — the founding ceremony (recommended)
 
@@ -441,7 +451,9 @@ rrn governance charter-begin \
 
 (Founder addresses: each member can read theirs off their app; paired phones
 also show up in `station list-mobiles`. Including the station's own address
-makes it co-sign immediately — leave it out for an all-phones founding.)
+makes it co-sign immediately — leave it out for an all-phones founding. The
+station keeps its grace seat if you include it, but it is never a root of
+trust, so it does not count toward the people who can anchor new members.)
 
 Each phone-holding founder then opens the app: **Community → Governance**
 shows a *"Sign the founding charter"* nudge. They review the Charter — it

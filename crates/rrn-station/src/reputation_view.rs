@@ -29,13 +29,14 @@ use serde::Serialize;
 
 use rrn_crypto::keypair::PublicKey;
 use rrn_identity::address::Address;
+use rrn_reputation::context::ScoringContext;
 use rrn_reputation::model::{
     max_composite_now, ReputationBand, ReputationProfile, DIMENSION_MAX, DORMANT_DIMENSIONS,
     WEIGHT_ATTESTATION_ACCURACY, WEIGHT_COMMUNITY_CONTRIBUTION, WEIGHT_DOMAIN_COMPETENCE,
     WEIGHT_GOVERNANCE_PARTICIPATION, WEIGHT_TRADE_RELIABILITY,
 };
 use rrn_reputation::snapshot::{get_cached_profile, refresh_snapshot};
-use rrn_reputation::sybil::{anchoring_voucher, ANCHOR_DIMENSION_CAP};
+use rrn_reputation::sybil::ANCHOR_DIMENSION_CAP;
 use rrn_storage::db::Database;
 
 /// How stale the member's *own* profile may be before a read recomputes it.
@@ -88,10 +89,12 @@ pub struct ReputationView {
     /// The highest composite reachable today ([`max_composite_now`]). Strictly
     /// below `scale_max` while any dimension is dormant.
     pub max_composite_now: f32,
-    /// Whether an identity-anchoring vouch has lifted the newcomer cap.
+    /// Whether the member is anchored — a founder root, or reached from one by
+    /// a chain of vouches (ADR-0038 §11) — which lifts the newcomer cap.
     pub anchored: bool,
-    /// The address of the vouch that anchored this member, when anchored. The
-    /// member can then recognise *who* vouched for them.
+    /// The address of the vouch that anchored this member on its chain, when
+    /// anchored by a vouch. The member can then recognise *who* vouched for
+    /// them. `None` for a founder root, which is anchored with no voucher.
     pub anchoring_voucher_address: Option<String>,
     /// While unanchored, every dimension is held to this ceiling
     /// ([`ANCHOR_DIMENSION_CAP`]) however much history the member has — the
@@ -130,7 +133,7 @@ pub struct BandView {
 /// The anchoring lookup is *not* cached — the snapshot stores the profile, not
 /// the reason behind it, and a capped profile is indistinguishable from a
 /// genuinely low-scoring one by its numbers alone. It costs one
-/// [`anchoring_voucher`] pass, which is why this is the own-profile path only.
+/// [`ScoringContext`] pass, which is why this is the own-profile path only.
 pub fn member_reputation(
     db: &Database,
     member: &Address,
@@ -138,8 +141,12 @@ pub fn member_reputation(
     station: &PublicKey,
 ) -> rrn_reputation::Result<ReputationView> {
     let profile = cached_or_fresh(db, member, now, OWN_PROFILE_MAX_AGE_SECS, station)?;
-    let voucher = anchoring_voucher(db, member, now, station)?;
-    Ok(view_of(&profile, voucher))
+    // A founder root is anchored with no anchoring voucher (ADR-0038 §11), so
+    // "anchored" is asked directly rather than read off the voucher.
+    let ctx = ScoringContext::unbounded(db, station)?;
+    let anchored = ctx.is_anchored(member, now);
+    let voucher = ctx.anchoring_voucher(member, now);
+    Ok(view_of(&profile, anchored, voucher))
 }
 
 /// The band for any address, cache-first (see [`BAND_MAX_AGE_SECS`]).
@@ -181,7 +188,11 @@ fn cached_or_fresh(
 }
 
 /// Flattens a profile (plus the anchoring answer) into the wire view.
-fn view_of(profile: &ReputationProfile, anchoring_voucher: Option<Address>) -> ReputationView {
+fn view_of(
+    profile: &ReputationProfile,
+    anchored: bool,
+    anchoring_voucher: Option<Address>,
+) -> ReputationView {
     let domain_scalar = mean_or_zero(profile.domain_competence.values().copied());
     ReputationView {
         address: profile.address.to_string(),
@@ -220,7 +231,7 @@ fn view_of(profile: &ReputationProfile, anchoring_voucher: Option<Address>) -> R
             .collect(),
         scale_max: DIMENSION_MAX,
         max_composite_now: max_composite_now(),
-        anchored: anchoring_voucher.is_some(),
+        anchored,
         anchoring_voucher_address: anchoring_voucher.map(|a| a.to_string()),
         anchor_dimension_cap: ANCHOR_DIMENSION_CAP,
         computed_at: profile.last_updated,
@@ -280,12 +291,11 @@ mod tests {
 
     use super::*;
     use rrn_crypto::keypair::Keypair;
-    use rrn_crypto::signed::SignedPayload;
-    use rrn_identity::vouch::{append_vouch, create_vouch};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_ledger::enrollment::EnrollmentBasis;
     use rrn_reputation::model::{BAND_MEMBER_MIN, BAND_TRUSTED_MIN};
-    use rrn_storage::log::AppendLog;
+    use rrn_reputation::testutil::{
+        earn_standing, enroll, establish_members, settle_trade, vouch, WEEK,
+    };
     use rrn_storage::migrations;
 
     fn fresh_db() -> Database {
@@ -309,58 +319,13 @@ mod tests {
             .as_secs() as i64
     }
 
-    /// Appends a full proposal → confirmation → settlement chain, settling at
-    /// `at`. Mirrors the scoring crate's own test fixture.
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        let confirmation = TransactionConfirmation {
-            proposal_id: pid,
-            confirmer: addr(receiver),
-            confirmed_at: at,
-        };
-        log.append(SignedPayload::sign(confirmation, receiver), 0)
-            .unwrap();
-        let settlement = SettlementRecord {
-            proposal_id: pid,
-            sender: addr(sender),
-            receiver: addr(receiver),
-            amount_centi: 300,
-            settled_at: at,
-        };
-        log.append(SignedPayload::sign(settlement, station), 0)
-            .unwrap();
-    }
-
-    /// Builds an identity that clears the anchoring bar on its raw score: as the
-    /// *receiver* of ten settled trades it maxes trade reliability (10 trades)
-    /// and attestation accuracy (ten confirmations it signed), for a raw
-    /// composite of 2.75 — above `BAND_MEMBER_MIN`. Returns its keypair.
+    /// An enrolled identity with raw standing over the anchoring bar (2.75), and
+    /// nobody's vouch: ten weekly trades in from an enrolled partner, ending a
+    /// week before `at` (ADR-0038). Returns its keypair.
     fn member_who_can_anchor(db: &Database, station: &Keypair, at: i64) -> Keypair {
-        let anchor = Keypair::generate();
-        for nonce in 0..10 {
-            let counterparty = Keypair::generate();
-            append_settled(db, &counterparty, &anchor, station, nonce, at);
-        }
-        anchor
+        let member = Keypair::generate();
+        earn_standing(db, station, &member, &Keypair::generate(), at);
+        member
     }
 
     fn dimension<'a>(view: &'a ReputationView, name: &str) -> &'a DimensionRow {
@@ -450,24 +415,22 @@ mod tests {
         let db = fresh_db();
         let station = Keypair::generate();
         let now = wall_now();
-        let anchor = member_who_can_anchor(&db, &station, now);
-        let newcomer = Keypair::generate();
+        // An established founder — a root with standing — anchors by vouching.
+        let anchor = establish_members(&db, &station, 2, now).remove(0);
+        let (newcomer, counterparty) = (Keypair::generate(), Keypair::generate());
+        enroll(&db, &station, &addr(&newcomer), EnrollmentBasis::Pairing, 0);
+        enroll(
+            &db,
+            &station,
+            &addr(&counterparty),
+            EnrollmentBasis::Pairing,
+            0,
+        );
         // One settled trade, so there is something for the lifted cap to reveal.
-        append_settled(&db, &newcomer, &Keypair::generate(), &station, 0, now);
+        settle_trade(&db, &station, &newcomer, &counterparty, 0, now - WEEK);
+        vouch(&db, &anchor, &addr(&newcomer), now);
 
-        let signed = create_vouch(&anchor, &addr(&newcomer), "demo", "I know them", 0);
-        append_vouch(&mut AppendLog::new(&db), signed, 0).unwrap();
-
-        // `create_vouch` stamps `issued_at` from the live clock, and
-        // `anchoring_voucher` ignores a vouch issued after the time being scored
-        // — so the read must be taken *after* the vouch exists, not at the `now`
-        // captured before thirty log appends' worth of work. Reusing that `now`
-        // passed whenever the test outran the second boundary and failed when it
-        // did not, which is the sort of flake that only shows up on a loaded CI
-        // runner.
-        let read_at = wall_now();
-        let view =
-            member_reputation(&db, &addr(&newcomer), read_at, &station.public_key()).unwrap();
+        let view = member_reputation(&db, &addr(&newcomer), now, &station.public_key()).unwrap();
 
         assert!(view.anchored);
         assert_eq!(
@@ -479,6 +442,19 @@ mod tests {
         // only above 1.0 — so assert the anchoring itself rather than a number
         // the cap never bound.
         assert!(dimension(&view, "trade_reliability").value > 0.0);
+    }
+
+    #[test]
+    fn a_founder_root_reads_anchored_with_no_voucher() {
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let now = wall_now();
+        let founder = establish_members(&db, &station, 2, now).remove(0);
+
+        let view = member_reputation(&db, &addr(&founder), now, &station.public_key()).unwrap();
+        assert!(view.anchored, "a founder root is anchored by definition");
+        assert_eq!(view.anchoring_voucher_address, None);
+        assert!(dimension(&view, "trade_reliability").value > ANCHOR_DIMENSION_CAP);
     }
 
     #[test]

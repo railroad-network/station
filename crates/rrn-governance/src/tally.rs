@@ -338,10 +338,7 @@ mod tests {
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::signed::SignedPayload;
     use rrn_identity::address::Address;
-    use rrn_identity::attestation::Attestation;
-    use rrn_identity::vouch::{VouchBody, VouchKind};
-    use rrn_ledger::settlement::SettlementRecord;
-    use rrn_ledger::transaction::{TransactionConfirmation, TransactionProposal};
+    use rrn_reputation::testutil::{establish_members, establish_newcomer};
     use rrn_storage::log::AppendLog;
     use rrn_storage::migrations;
 
@@ -356,95 +353,6 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         migrations::run(&db).unwrap();
         db
-    }
-
-    // --- Reputation seeding (mirrors rrn-reputation's own test helpers) -------
-
-    fn append_settled(
-        db: &Database,
-        sender: &Keypair,
-        receiver: &Keypair,
-        station: &Keypair,
-        nonce: u64,
-        at: i64,
-    ) {
-        let mut log = AppendLog::new(db);
-        let proposal = TransactionProposal::new(
-            addr(sender),
-            addr(receiver),
-            300,
-            None,
-            nonce,
-            1,
-            i64::MAX / 2,
-        );
-        let pid = proposal.id;
-        log.append(SignedPayload::sign(proposal, sender), 0)
-            .unwrap();
-        log.append(
-            SignedPayload::sign(
-                TransactionConfirmation {
-                    proposal_id: pid,
-                    confirmer: addr(receiver),
-                    confirmed_at: at,
-                },
-                receiver,
-            ),
-            0,
-        )
-        .unwrap();
-        log.append(
-            SignedPayload::sign(
-                SettlementRecord {
-                    proposal_id: pid,
-                    sender: addr(sender),
-                    receiver: addr(receiver),
-                    amount_centi: 300,
-                    settled_at: at,
-                },
-                station,
-            ),
-            0,
-        )
-        .unwrap();
-    }
-
-    fn append_vouch(db: &Database, voucher: &Keypair, subject: &Address, at: i64) {
-        let mut log = AppendLog::new(db);
-        let vouch = Attestation {
-            kind: VouchKind,
-            body: VouchBody {
-                community: "commons".into(),
-                statement: "trustworthy".into(),
-                reputation_stake_centi: 0,
-            },
-            subject: *subject,
-            issued_at: at,
-            expires_at: None,
-        };
-        log.append(vouch.sign(voucher), 0).unwrap();
-    }
-
-    fn earn_raw_standing(db: &Database, who: &Keypair, station: &Keypair, at: i64) {
-        for nonce in 0..10 {
-            append_settled(db, who, station, &test_station(), nonce, at);
-        }
-        for _ in 0..10 {
-            append_vouch(db, who, &addr(&Keypair::generate()), at);
-        }
-    }
-
-    /// Builds `n` established members anchored in a ring, so exactly `n` count
-    /// toward the electorate.
-    fn established_members(db: &Database, station: &Keypair, n: usize, at: i64) -> Vec<Keypair> {
-        let members: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();
-        for m in &members {
-            earn_raw_standing(db, m, station, at);
-        }
-        for i in 0..n {
-            append_vouch(db, &members[(i + 1) % n], &addr(&members[i]), at);
-        }
-        members
     }
 
     fn test_charter_body() -> Charter {
@@ -572,12 +480,8 @@ mod tests {
     /// A published statute with `member_count` established members (member `[0]`
     /// authored it, `[1..=3]` co-signed it) and a real Charter on the log.
     /// Returns `(members, proposal)`.
-    fn published_statute(
-        db: &Database,
-        station: &Keypair,
-        member_count: usize,
-    ) -> (Vec<Keypair>, Proposal) {
-        let members = established_members(db, station, member_count, NOW);
+    fn published_statute(db: &Database, member_count: usize) -> (Vec<Keypair>, Proposal) {
+        let members = establish_members(db, &test_station(), member_count, NOW);
         publish_charter(db, &members);
         let author = members[0].clone();
         let mut log = AppendLog::new(db);
@@ -600,9 +504,8 @@ mod tests {
     #[test]
     fn known_votes_produce_a_known_tally() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Ten established members; author + 3 co-signers, then a spread of ballots.
-        let (members, proposal) = published_statute(&db, &station, 10);
+        let (members, proposal) = published_statute(&db, 10);
         let mut log = AppendLog::new(&db);
 
         // 5 yes, 2 no, 1 abstain — 8 of 10 participate.
@@ -640,11 +543,10 @@ mod tests {
         // position pin, `grace_electorate(db, founders, voting_ends_at)` read the
         // electorate by wall-clock time and would silently grow a concluded quorum.
         let db = fresh_db();
-        let station = Keypair::generate();
         // Four established members (past bootstrap grace); the minimum a published
         // statute needs (author + three co-signers). Kept small: the reputation
         // anchoring check is costly, so a bigger electorate only slows the test.
-        let (members, proposal) = published_statute(&db, &station, 4);
+        let (members, proposal) = published_statute(&db, 4);
 
         let close = proposal.voting_ends_at;
         let before = tally(&db, &proposal.proposal_id, close + 1)
@@ -652,12 +554,11 @@ mod tests {
             .eligible_voters;
         assert_eq!(before, 4);
 
-        // After the proposal opened, seed an 11th established member — real raw
-        // standing plus an anchoring vouch — all admitted now, timestamped at the
-        // open instant (a time-pin at the open would have counted them).
+        // After the proposal opened, seed a fifth established member — real
+        // standing plus an anchoring vouch — all admitted now, timestamped at or
+        // before the open instant (a time-pin at the open would have counted them).
         let newcomer = Keypair::generate();
-        earn_raw_standing(&db, &newcomer, &station, NOW);
-        append_vouch(&db, &members[0], &addr(&newcomer), NOW);
+        establish_newcomer(&db, &test_station(), &newcomer, &members[0], NOW);
 
         // Time-based, the community now has a fifth established member...
         assert_eq!(
@@ -683,9 +584,8 @@ mod tests {
     #[test]
     fn quorum_shortfall_fails_even_with_unanimous_yes() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Ten members but only two vote — 20% turnout, under the 30% quorum.
-        let (members, proposal) = published_statute(&db, &station, 10);
+        let (members, proposal) = published_statute(&db, 10);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -713,9 +613,8 @@ mod tests {
     #[test]
     fn approval_shortfall_fails_even_with_quorum() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Four members, all vote: 1 yes, 3 no. Full turnout, approval 25% < 50%.
-        let (members, proposal) = published_statute(&db, &station, 4);
+        let (members, proposal) = published_statute(&db, 4);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -738,10 +637,9 @@ mod tests {
     #[test]
     fn abstentions_count_toward_quorum_but_not_approval() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Four members: 2 yes, 0 no, 2 abstain. Approval 2/2 = 100%; abstain lifts
         // turnout to 100% but is excluded from the yes/no ratio.
-        let (members, proposal) = published_statute(&db, &station, 4);
+        let (members, proposal) = published_statute(&db, 4);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -783,8 +681,7 @@ mod tests {
     #[test]
     fn a_vote_of_only_abstentions_approves_nothing() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 4);
+        let (members, proposal) = published_statute(&db, 4);
         let mut log = AppendLog::new(&db);
 
         for m in &members[0..4] {
@@ -808,8 +705,7 @@ mod tests {
     #[test]
     fn outcome_is_none_while_voting_is_open_but_counts_are_live() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 4);
+        let (members, proposal) = published_statute(&db, 4);
         let mut log = AppendLog::new(&db);
 
         append_vote(
@@ -829,8 +725,7 @@ mod tests {
     #[test]
     fn outcome_is_stable_after_the_close_even_as_the_community_grows() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db, &station, 4);
+        let (members, proposal) = published_statute(&db, 4);
         let mut log = AppendLog::new(&db);
 
         for m in &members[0..3] {
@@ -846,7 +741,7 @@ mod tests {
         // quorum: eligibility is pinned at voting_ends_at, so the count stays 4
         // rather than growing to 8.
         let later = proposal.voting_ends_at + MONTH;
-        established_members(&db, &station, 4, later);
+        establish_members(&db, &test_station(), 4, later);
 
         let after = tally(&db, &proposal.proposal_id, later + 1).unwrap();
         assert_eq!(after.eligible_voters, before.eligible_voters);
@@ -865,8 +760,7 @@ mod tests {
         // of one chain disagreed on the result. This is the regression that a
         // one-replica test cannot see.
         let db1 = fresh_db();
-        let station = Keypair::generate();
-        let (members, proposal) = published_statute(&db1, &station, 4);
+        let (members, proposal) = published_statute(&db1, 4);
         let mut log1 = AppendLog::new(&db1);
         for m in &members[0..3] {
             append_vote(
@@ -926,8 +820,7 @@ mod tests {
     #[test]
     fn a_charter_amendment_answers_to_the_higher_amendment_bars() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         publish_charter(&db, &members);
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
@@ -1147,8 +1040,7 @@ mod tests {
     #[test]
     fn tallying_an_unknown_proposal_is_an_error() {
         let db = fresh_db();
-        let station = Keypair::generate();
-        let members = established_members(&db, &station, 2, NOW);
+        let members = establish_members(&db, &test_station(), 2, NOW);
         publish_charter(&db, &members);
         let phantom = statute(&members[0], NOW);
 
@@ -1159,9 +1051,8 @@ mod tests {
     #[test]
     fn tallying_without_a_published_charter_is_an_error() {
         let db = fresh_db();
-        let station = Keypair::generate();
         // Members and a proposal, but no Charter on the log.
-        let members = established_members(&db, &station, 4, NOW);
+        let members = establish_members(&db, &test_station(), 4, NOW);
         let author = members[0].clone();
         let mut log = AppendLog::new(&db);
         let proposal = statute(&author, NOW);
