@@ -312,3 +312,12 @@ follows it, and any divergence is a bug in the code, not a local policy choice.
 - [ADR-0008](0008-mobile-station-transport.md) — the log entries scored here arrive as signed, sealed envelopes.
 - `docs/threat-model.md`, "Vouching surface" — vouches are a reputation input; the attestation-accuracy farming surface named above extends it.
 - The reputation task spec implements this ADR.
+
+## Amended by ADR-0038 (Accepted, 2026-10-10)
+
+[ADR-0038](0038-enrollment-and-standing-accrual.md) changes three rules. The
+velocity flag becomes a credit cap: at most 0.5 per dimension per trailing seven
+days (§10). Raw-composite anchoring judged at the scoring instant becomes a
+chain of trust from the `founder`-basis roots, with each edge judged once at the
+vouch's admission (§11). Only events between enrolled parties count, self-sends
+never count, and confirmations count at the station-signed `settled_at` (§7–§9).
