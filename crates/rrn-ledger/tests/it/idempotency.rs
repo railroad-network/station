@@ -44,7 +44,7 @@ fn run_once() -> (i64, i64, u64) {
     let mut engine = Engine::new(&db, station.clone());
     enroll(&db, &station, &alice);
     let mut settler = Settler::new(&db, station.clone(), SettlementConfig::uniform(WINDOW));
-    let balances = BalanceView::new(&db);
+    let balances = BalanceView::new(&db, station.public_key());
 
     // --- propose ---
     let proposal = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 0, 1_000_000);

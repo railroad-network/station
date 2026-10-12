@@ -69,6 +69,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "wallet_meta",
         sql: include_str!("../migrations/0009_wallet_meta.sql"),
     },
+    Migration {
+        version: 10,
+        name: "retire_ledger_balances",
+        sql: include_str!("../migrations/0010_retire_ledger_balances.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.

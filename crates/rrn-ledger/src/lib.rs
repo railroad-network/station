@@ -12,7 +12,7 @@
 //!   transitions are legal. State is *derived from the log*, never the reverse.
 //! - [`settlement`] — the [`settlement::Settler`], which sweeps confirmed
 //!   transactions whose settlement window has elapsed and moves the Commons,
-//!   plus [`settlement::BalanceView`] for reading materialized balances.
+//!   plus [`settlement::BalanceView`] for reading log-derived balances.
 //! - [`engine`] — the [`engine::Engine`] front door: submit a proposal, submit a
 //!   confirmation, cancel, or query state, with nonce + timestamp replay
 //!   protection.
@@ -40,9 +40,9 @@
 //! Every lifecycle transition appends a signed entry to
 //! [`rrn_storage::log`]'s append-only, hash-chained log. The current
 //! [`state::TransactionState`] of any transaction is *derived* by replaying
-//! those entries (see [`state::LedgerSnapshot`]); the materialized `balances`
-//! table (a PN-Counter per identity) is likewise derivable from the settlement
-//! entries. If derived state and the log ever disagree, the log wins.
+//! those entries (see [`state::LedgerSnapshot`]), and so is every balance —
+//! folded from the station-signed settlement and contract-charge records, never
+//! stored ([`state::LedgerSnapshot::balance_of`], ADR-0018).
 //!
 //! # Who signs a settlement
 //!
@@ -53,8 +53,7 @@
 //! This is why [`engine::Engine`] and [`settlement::Settler`] are constructed
 //! with a station [`rrn_crypto::keypair::Keypair`], which the task spec's
 //! sketches omitted (they predate the realization that the log only accepts
-//! *signed* entries). The station key also identifies this replica for the
-//! per-replica PN-Counter. See ADR-0005.
+//! *signed* entries). See ADR-0005.
 //!
 //! # Time is injected
 //!

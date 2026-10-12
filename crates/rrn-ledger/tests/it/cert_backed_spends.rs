@@ -185,9 +185,9 @@ fn a_cert_backed_spend_admits_with_no_floor_headroom_remaining() {
     engine
         .submit_confirmation(confirm(&bob, spend_id, now), now)
         .unwrap();
-    let mut settler = Settler::new(&db, station, SettlementConfig::uniform(10));
+    let mut settler = Settler::new(&db, station.clone(), SettlementConfig::uniform(10));
     settler.settle(&spend_id, now + 100).unwrap();
-    let balances = BalanceView::new(&db);
+    let balances = BalanceView::new(&db, station.public_key());
     assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
     assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
 }
@@ -555,7 +555,7 @@ proptest! {
         // So each op costs the engine's own internal derive plus this one, not a
         // fresh derive inside every helper.
         let assert_floor = |snap: &LedgerSnapshot, db: &Database, now: i64| {
-            let balances = BalanceView::new(db);
+            let balances = BalanceView::new(db, station.public_key());
             for m in &members {
                 let settled = balances.balance_of(m).unwrap();
                 let committed = committed_debits_centi(snap, m, now, &cfg);

@@ -7,33 +7,39 @@
 //! transfer clears sooner than the deliberate Tier-2 purchase it stakes
 //! reputation on. While it waits, *no balances change* — that delay is the whole
 //! point: it is also the dispute window for the Phase 1 oracle. When the window
-//! elapses the [`Settler`] moves the transaction to
-//! [`Settled`](crate::state::TransactionState::Settled) and applies the balance
-//! change, exactly once.
+//! elapses the [`Settler`] appends the station-signed record that moves the
+//! transaction to [`Settled`](crate::state::TransactionState::Settled) — and the
+//! balance with it, exactly once.
 //!
 //! # Settlement appends a station-signed record
 //!
 //! Settlement is automatic, so neither the sender nor the receiver is present to
 //! sign it. The local station signs a [`SettlementRecord`] with its own key and
 //! appends it to the log; that record is the source of truth, and replaying it
-//! is what turns the transaction's derived state to `Settled`. The same station
-//! key identifies this replica for the per-replica PN-Counter. See ADR-0005 and
-//! the crate-level docs.
+//! is what turns the transaction's derived state to `Settled` and moves the
+//! balance. See ADR-0005 and the crate-level docs.
+//!
+//! # Balances are derived, never stored
+//!
+//! No balance is written anywhere: [`LedgerSnapshot::balance_of`] folds every
+//! station-signed settlement record (once per transaction) and contract charge
+//! (once per period) on replay, and [`BalanceView`] and the debt floor read
+//! that fold (ADR-0018). So there is no window in which a settlement is on the
+//! log but missing from a balance.
 //!
 //! # Idempotence
 //!
 //! [`Settler::settle`] derives the transaction's current state from the log
 //! first. An already-`Settled` transaction is a no-op (returns `Ok` without
-//! touching balances); a non-existent one is an error. Because the
-//! already-settled check happens *before* any balance write, settling twice can
-//! never double-apply a balance change.
+//! appending); a non-existent one is an error. Even a redundant settlement
+//! record for the same transaction moves no balance: the fold applies the first
+//! one per `proposal_id`.
 
 use dcbor::prelude::*;
 use rrn_crypto::keypair::Keypair;
+use rrn_crypto::keypair::PublicKey;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
-use rrn_storage::crdt::pn_counter::PnCounter;
-use rrn_storage::crdt::ReplicaId;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -98,7 +104,7 @@ impl SettlementConfig {
 /// The log record that marks a transaction settled. Signed by the station.
 ///
 /// It restates the parties and amount so that balances are fully re-derivable
-/// from the log alone (the materialized `balances` table is just a cache).
+/// from the log alone ([`LedgerSnapshot::balance_of`] folds it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettlementRecord {
     /// The transaction being settled.
@@ -155,22 +161,15 @@ impl TryFrom<CBOR> for SettlementRecord {
 pub struct Settler<'db> {
     config: SettlementConfig,
     station: Keypair,
-    replica: ReplicaId,
     db: &'db Database,
 }
 
 impl<'db> Settler<'db> {
     /// Creates a settler over `db`, signing settlement records with `station`.
-    ///
-    /// The station's public key also identifies this replica in the per-replica
-    /// PN-Counter. (The task spec's `new(db, config)` predated the requirement
-    /// that settlement append a *signed* log entry — see the module docs.)
     pub fn new(db: &'db Database, station: Keypair, config: SettlementConfig) -> Self {
-        let replica = ReplicaId(station.public_key());
         Self {
             config,
             station,
-            replica,
             db,
         }
     }
@@ -239,11 +238,9 @@ impl<'db> Settler<'db> {
         };
 
         let p = &proposal.payload;
-        // 1. Append the settlement record (the source of truth) signed by the
-        //    station. 2. Update the materialized balances. The two are not in a
-        //    single SQL transaction (the log's append commits its own), but the
-        //    log entry is authoritative and balances are re-derivable from it,
-        //    so a crash between the two is recoverable by replay.
+        // Append the station-signed settlement record — the source of truth.
+        // The balance move is the fold of this record on replay; nothing else
+        // is written.
         let record = SettlementRecord {
             proposal_id: *tx_id,
             sender: p.sender,
@@ -252,8 +249,6 @@ impl<'db> Settler<'db> {
             settled_at: now,
         };
         AppendLog::new(self.db).append(SignedPayload::sign(record, &self.station), now)?;
-
-        self.apply_balance(&p.sender, &p.receiver, p.amount_centi)?;
         tracing::info!(tx = ?tx_id, amount_centi = p.amount_centi, "settled");
         Ok(())
     }
@@ -267,55 +262,26 @@ impl<'db> Settler<'db> {
         }
         Ok(count)
     }
-
-    /// Moves `amount_centi` from sender to receiver in the PN-Counter, applying
-    /// the sign convention (positive = sender → receiver).
-    fn apply_balance(&self, sender: &Address, receiver: &Address, amount_centi: i64) -> Result<()> {
-        let sender_pk = *sender.public_key();
-        let receiver_pk = *receiver.public_key();
-
-        // A self-payment nets to zero; applying it via two separate load/save
-        // cycles on the same row would lose one side, so short-circuit.
-        if sender_pk == receiver_pk {
-            return Ok(());
-        }
-
-        let mut sender_balance = PnCounter::load(self.db, &sender_pk)?;
-        let mut receiver_balance = PnCounter::load(self.db, &receiver_pk)?;
-
-        // The PN-Counter API takes `u64`; split the i64 amount into a magnitude
-        // applied to the correct side per the sign convention.
-        if amount_centi >= 0 {
-            let mag = amount_centi as u64;
-            sender_balance.decrement(&self.replica, mag);
-            receiver_balance.increment(&self.replica, mag);
-        } else {
-            let mag = amount_centi.unsigned_abs();
-            sender_balance.increment(&self.replica, mag);
-            receiver_balance.decrement(&self.replica, mag);
-        }
-
-        sender_balance.save(self.db, &sender_pk)?;
-        receiver_balance.save(self.db, &receiver_pk)?;
-        Ok(())
-    }
 }
 
-/// Reads materialized balances. The balance of an identity is the value of its
-/// PN-Counter, in centicommons (may be negative — members can hold debt).
+/// Reads settled balances, derived from the log (ADR-0018). The balance of an
+/// identity is [`LedgerSnapshot::balance_of`] over a fresh replay, in
+/// centicommons (may be negative — members can hold debt).
 pub struct BalanceView<'db> {
     db: &'db Database,
+    station: PublicKey,
 }
 
 impl<'db> BalanceView<'db> {
-    /// Wraps a database handle for balance queries.
-    pub fn new(db: &'db Database) -> Self {
-        Self { db }
+    /// Wraps a database handle for balance queries. `station` is the community
+    /// station key the balance records are pinned to (ADR-0005).
+    pub fn new(db: &'db Database, station: PublicKey) -> Self {
+        Self { db, station }
     }
 
     /// The current balance of `identity`, in centicommons.
     pub fn balance_of(&self, identity: &Address) -> Result<i64> {
-        Ok(PnCounter::load(self.db, identity.public_key())?.value())
+        Ok(LedgerSnapshot::derive(&AppendLog::new(self.db), &self.station)?.balance_of(identity))
     }
 }
 
@@ -492,7 +458,7 @@ mod tests {
         let id = confirmed_tx(&db, &alice, &bob, 300, 1_000);
         let mut s = settler(&db, &station, 100);
 
-        let balances = BalanceView::new(&db);
+        let balances = BalanceView::new(&db, station.public_key());
         // Before settlement, both balances are zero.
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 0);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 0);
@@ -517,7 +483,7 @@ mod tests {
         // Settling again must not error and must not double-apply.
         s.settle(&id, 1_200).unwrap();
 
-        let balances = BalanceView::new(&db);
+        let balances = BalanceView::new(&db, station.public_key());
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
     }
@@ -533,7 +499,7 @@ mod tests {
         confirmed_tx(&db, &alice, &bob, 300, 1_000);
         // No settle call.
         let _ = settler(&db, &station, 100);
-        let balances = BalanceView::new(&db);
+        let balances = BalanceView::new(&db, station.public_key());
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 0);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 0);
     }
@@ -590,7 +556,7 @@ mod tests {
         assert!(s.find_eligible(10_000).unwrap().is_empty());
         assert_eq!(s.sweep(10_000).unwrap(), 0);
 
-        let balances = BalanceView::new(&db);
+        let balances = BalanceView::new(&db, station.public_key());
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 0);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 0);
         let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
@@ -614,7 +580,7 @@ mod tests {
         let mut s = settler(&db, &station, 100);
 
         s.settle(&id, 20_000).unwrap();
-        let balances = BalanceView::new(&db);
+        let balances = BalanceView::new(&db, station.public_key());
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
         let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
@@ -637,7 +603,7 @@ mod tests {
         let mut s = settler(&db, &station, 100);
         s.settle(&id, 1_100).unwrap();
 
-        let balances = BalanceView::new(&db);
+        let balances = BalanceView::new(&db, station.public_key());
         assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), 300);
         assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), -300);
     }
@@ -751,5 +717,57 @@ mod tests {
             ));
             prop_assert!(engine.raise_dispute(dispute(deadline), &cfg, deadline).is_ok());
         }
+    }
+
+    #[test]
+    fn a_settlement_record_without_a_cache_write_counts() {
+        // The window a cached balance used to open: a station-signed settlement
+        // record is on the log, but nothing else was written after it (a crash
+        // between the append and a cache write). The debt floor reads the
+        // log-derived balance, so the receiver's +300 counts: a 2200 spend
+        // projects to -1900, inside the -2000 floor.
+        use crate::engine::Engine;
+        use crate::enrollment::{append_enrollment, EnrollmentAction, EnrollmentBasis};
+
+        let db = fresh_db();
+        let (alice, bob, carol, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let id = confirmed_tx(&db, &alice, &bob, 300, 1_000);
+        let record = SettlementRecord {
+            proposal_id: id,
+            sender: addr(&alice),
+            receiver: addr(&bob),
+            amount_centi: 300,
+            settled_at: 1_100,
+        };
+        AppendLog::new(&db)
+            .append(SignedPayload::sign(record, &station), 1_100)
+            .unwrap();
+        append_enrollment(
+            &mut AppendLog::new(&db),
+            &station,
+            addr(&bob),
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Pairing,
+            1_100,
+        )
+        .unwrap();
+
+        let mut engine = Engine::new(&db, station.clone());
+        let spend =
+            TransactionProposal::new(addr(&bob), addr(&carol), 2_200, None, 0, 1_200, 9_999);
+        engine
+            .submit_proposal(SignedProposal::sign(spend, &bob), 1_200)
+            .unwrap();
+        assert_eq!(
+            BalanceView::new(&db, station.public_key())
+                .balance_of(&addr(&bob))
+                .unwrap(),
+            300
+        );
     }
 }

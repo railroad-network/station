@@ -11616,6 +11616,78 @@ mod tests {
         assert!(err.message.contains("buyer"), "{}", err.message);
     }
 
+    /// A spend of `amount` from `kp` at `nonce`, through the engine directly at
+    /// the core's clock — the debt-floor door every carrier reaches.
+    fn floor_checked_spend(
+        core: &Core,
+        kp: &Keypair,
+        amount: i64,
+        nonce: u64,
+    ) -> rrn_ledger::Result<()> {
+        let now = core.clock.now();
+        let proposal = TransactionProposal::new(
+            Address::from_public_key(kp.public_key()),
+            Address::from_public_key(Keypair::generate().public_key()),
+            amount,
+            None,
+            nonce,
+            now,
+            now + 3_600,
+        );
+        Engine::new(&core.db, core.station_keypair())
+            .with_credit_config(core.credit)
+            .submit_proposal(SignedProposal::sign(proposal, kp), now)
+    }
+
+    #[test]
+    fn the_floor_counts_contract_charges_against_the_buyer() {
+        // Three weekly charges (periods 0, 1, 2) put the buyer at -1500. The
+        // debt floor reads the same log-derived balance the member sees, so
+        // only 500 of headroom remains: a 400 spend admits (-1900) and a second
+        // one is refused at -2300.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        seed_contract(&core, &provider, &buyer);
+        enroll(&core, &buyer);
+        core.clock.set(NOW + 2 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 3);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -1_500
+        );
+
+        floor_checked_spend(&core, &buyer, 400, 0).unwrap();
+        let err = floor_checked_spend(&core, &buyer, 400, 1).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rrn_ledger::Error::DebtFloorExceeded {
+                    projected_centi: -2_300,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_floor_credits_contract_income_to_the_provider() {
+        // The provider's +1500 of subscription income is headroom like any
+        // settled credit: five pending 450 spends project to -750, inside the
+        // -2000 floor.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        seed_contract(&core, &provider, &buyer);
+        enroll(&core, &provider);
+        core.clock.set(NOW + 2 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 3);
+
+        for nonce in 0..5 {
+            floor_checked_spend(&core, &provider, 450, nonce).unwrap();
+        }
+    }
+
     #[test]
     fn the_charge_sweep_bills_due_periods_once_and_catches_up() {
         let mut core = test_core();

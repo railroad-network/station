@@ -1,0 +1,13 @@
+-- Retire the ledger's materialized balances (ADR-0018 Clarification, 2026-10-12).
+--
+-- The ledger no longer writes or reads the `balances` table. Every balance —
+-- including the one the debt floor reads — is derived from the log on each
+-- operation: station-signed settlement records once per transaction plus
+-- station-signed contract charges once per period. The rows a settling station
+-- wrote before this change are stale (they never counted contract charges, and
+-- a crash between a settlement append and its row write left them short), so
+-- they are deleted rather than left to look authoritative.
+--
+-- The table itself survives only as the generic PN-Counter store
+-- (`rrn_storage::crdt::pn_counter`); no ledger code reads it.
+DELETE FROM balances;

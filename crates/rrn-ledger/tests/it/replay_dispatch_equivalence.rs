@@ -12,13 +12,15 @@
 //! logs that mix every ledger kind — proposals, confirmations, settlements,
 //! cancellations, disputes, certificate requests/certificates/returns,
 //! cert-backed spends, equivocations and their verdicts, enrollments and
-//! revocations (including member-signed and station-naming ones) — with vouches and
+//! revocations (including member-signed and station-naming ones), contract
+//! charges (duplicate periods, the penalty index, negative amounts, forged
+//! signers) — with vouches and
 //! synthetic marketplace/governance records (wrong-kind for the ledger),
 //! forged-signer station records, malformed bytes, and maps carrying a known
 //! `kind` over the wrong shape. Equality is asserted at the whole log and at a
 //! random prefix bound. A `LedgerSnapshot` is compared with its derived
-//! `PartialEq`, so states, nonces, admissions, certificates, equivocations and
-//! verdicts must all match.
+//! `PartialEq`, so states, nonces, admissions, certificates, equivocations,
+//! verdicts and balances must all match.
 //!
 //! Run the deep lane before opening a PR: `PROPTEST_CASES=512 cargo nextest run
 //! -p rrn-ledger --test it replay_dispatch_equivalence` (proptest honors the env
@@ -32,6 +34,7 @@ use rrn_crypto::keypair::Keypair;
 use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
+use rrn_ledger::contract::{ContractCharge, ContractRef};
 use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
 use rrn_ledger::enrollment::{EnrollmentAction, EnrollmentBasis, EnrollmentRecord};
 use rrn_ledger::escrow::{
@@ -224,6 +227,32 @@ fn append_equivocation(
     }
 }
 
+/// A contract charge for `(contract, period)` debiting `buyer`, signed by
+/// `signer` (the station, or a forger the signer pin must skip).
+#[allow(clippy::too_many_arguments)]
+fn append_charge(
+    db: &Database,
+    buyer: &Keypair,
+    provider: &Keypair,
+    signer: &Keypair,
+    contract: u8,
+    period_index: u32,
+    amount_centi: i64,
+    charged_at: i64,
+) {
+    let charge = ContractCharge {
+        contract_ref: ContractRef([contract; 32]),
+        buyer: addr(buyer),
+        provider: addr(provider),
+        amount_centi,
+        period_index,
+        charged_at,
+    };
+    AppendLog::new(db)
+        .append(SignedPayload::sign(charge, signer), 0)
+        .unwrap();
+}
+
 /// Appends raw bytes with a genuine signature over them (any signer).
 fn append_raw_signed(db: &Database, signer: &Keypair, bytes: Vec<u8>) {
     let signature = signer.sign(&bytes);
@@ -289,6 +318,18 @@ enum Action {
         s: usize,
         r: usize,
     },
+    /// A contract charge: a small contract-id space and period set so duplicate
+    /// `(contract, period)` keys recur; `period` 3 stands for the
+    /// early-termination penalty index; `forged` signs it with the buyer.
+    Charge {
+        b: usize,
+        p: usize,
+        contract: u8,
+        period: u32,
+        amount: i64,
+        forged: bool,
+        at: i64,
+    },
     /// Wrong-kind, wrong-shape or unknown map — a known-kind index picks which.
     Garbage {
         which: usize,
@@ -329,7 +370,27 @@ fn action_strategy(n: usize) -> impl Strategy<Value = Action> {
         )
             .prop_map(|(m, cap, verdict)| Action::Equivocate { m, cap, verdict }),
         (idx.clone(), 0..n).prop_map(|(voucher, subject)| Action::Vouch { voucher, subject }),
-        (idx, 0..n).prop_map(|(s, r)| Action::ForgedSettlement { s, r }),
+        (idx.clone(), 0..n).prop_map(|(s, r)| Action::ForgedSettlement { s, r }),
+        (
+            idx,
+            0..n,
+            0u8..3,
+            0u32..4,
+            prop::sample::select(vec![200i64, 500, -300]),
+            prop::bool::weighted(0.2),
+            0i64..=10_000,
+        )
+            .prop_map(|(b, p, contract, period, amount, forged, at)| {
+                Action::Charge {
+                    b,
+                    p,
+                    contract,
+                    period,
+                    amount,
+                    forged,
+                    at,
+                }
+            }),
         (0usize..GARBAGE_KINDS.len()).prop_map(|which| Action::Garbage { which }),
         (0usize..4).prop_map(|which| Action::Malformed { which }),
         (
@@ -463,6 +524,28 @@ fn build_log(db: &Database, members: &[Keypair], station: &Keypair, plan: &[Acti
                 AppendLog::new(db)
                     .append(SignedPayload::sign(settlement, &members[*s]), 0)
                     .unwrap();
+            }
+            Action::Charge {
+                b,
+                p,
+                contract,
+                period,
+                amount,
+                forged,
+                at,
+            } => {
+                let signer = if *forged { &members[*b] } else { station };
+                let period = if *period == 3 { u32::MAX } else { *period };
+                append_charge(
+                    db,
+                    &members[*b],
+                    &members[*p],
+                    signer,
+                    *contract,
+                    period,
+                    *amount,
+                    *at,
+                );
             }
             Action::Garbage { which } => {
                 append_raw_signed(db, station, kinded_garbage(GARBAGE_KINDS[*which]));
@@ -633,6 +716,14 @@ fn a_deterministic_rich_log_matches_and_is_non_empty() {
         };
         append_raw_signed(&db, signer, to_canonical_bytes(record));
     }
+
+    // Contract charges: two periods, a duplicate period, a forged one, and a
+    // provider-terminated penalty (negative amount on the penalty index).
+    append_charge(&db, &alice, &bob, &station, 1, 0, 500, 1_000);
+    append_charge(&db, &alice, &bob, &station, 1, 1, 500, 2_000);
+    append_charge(&db, &alice, &bob, &station, 1, 1, 500, 2_001);
+    append_charge(&db, &alice, &bob, &alice, 1, 2, 500, 3_000);
+    append_charge(&db, &alice, &bob, &station, 1, u32::MAX, -300, 3_500);
 
     // Garbage of every flavour.
     for k in GARBAGE_KINDS {

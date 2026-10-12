@@ -17,7 +17,7 @@
 //! transaction is not stored as a mutable row — it is *derived* by replaying the
 //! log entries for that transaction ([`LedgerSnapshot::derive`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dcbor::prelude::*;
 use rrn_crypto::keypair::PublicKey;
@@ -26,6 +26,7 @@ use rrn_identity::address::Address;
 use rrn_storage::log::{AppendLog, LogEntry};
 use serde::{Deserialize, Serialize};
 
+use crate::contract::{ContractCharge, ContractRef, CONTRACT_CHARGE_KIND};
 use crate::credit::CreditConfig;
 use crate::dispute::{DisputeRecord, SignedDispute, DISPUTE_KIND};
 use crate::enrollment::{EnrollmentAction, EnrollmentBasis, EnrollmentRecord, ENROLLMENT_KIND};
@@ -427,6 +428,21 @@ pub struct LedgerSnapshot {
     /// 32-byte public key (ADR-0038 §1). Only station-signed, well-formed
     /// enrollment records that changed something land here.
     enrollments: BTreeMap<[u8; 32], (Address, Vec<EnrollmentEvent>)>,
+    /// Settled balance per member, in centicommons, keyed by the raw 32-byte
+    /// public key — the balance members see and the debt floor reads (ADR-0018).
+    /// Folded from the two station-signed balance records: a
+    /// [`SettlementRecord`] moves `sender −amount / receiver +amount` once per
+    /// `proposal_id`, and a [`ContractCharge`] moves `buyer −amount / provider
+    /// +amount` once per `(contract_ref, period_index)`. A record signed by any
+    /// other key moves nothing and occupies no dedup slot. All arithmetic
+    /// saturates; a member absent here is at zero.
+    balances: BTreeMap<[u8; 32], i64>,
+    /// The transactions whose settlement has moved a balance — first
+    /// station-signed settlement record per `proposal_id` wins.
+    settled_ids: BTreeSet<TransactionId>,
+    /// The contract periods whose charge has moved a balance — first
+    /// station-signed charge per `(contract_ref, period_index)` wins.
+    charged: BTreeSet<(ContractRef, u32)>,
 }
 
 impl LedgerSnapshot {
@@ -600,6 +616,12 @@ impl LedgerSnapshot {
                 };
                 self.apply_enrollment(record, entry, station)
             }
+            CONTRACT_CHARGE_KIND => {
+                let Ok(charge) = ContractCharge::try_from(cbor) else {
+                    return Ok(());
+                };
+                self.apply_contract_charge(charge, entry, station)
+            }
             _ => Ok(()),
         }
     }
@@ -649,6 +671,9 @@ impl LedgerSnapshot {
         }
         if let Ok(record) = from_canonical_bytes::<EnrollmentRecord>(bytes) {
             return self.apply_enrollment(record, entry, station);
+        }
+        if let Ok(charge) = from_canonical_bytes::<ContractCharge>(bytes) {
+            return self.apply_contract_charge(charge, entry, station);
         }
         Ok(())
     }
@@ -811,6 +836,16 @@ impl LedgerSnapshot {
         if stored.signer != *station {
             return Ok(());
         }
+        // The balance moves once per transaction, on its first station-signed
+        // settlement record, whatever the transaction's derived state — a
+        // redundant record for an already-settled id moves nothing.
+        if self.settled_ids.insert(settlement.proposal_id) {
+            self.move_balance(
+                &settlement.sender,
+                &settlement.receiver,
+                settlement.amount_centi,
+            );
+        }
         // A settlement closes either a `Confirmed` transaction (the normal
         // path) or a `Disputed` one whose dispute was rejected or lapsed
         // (ADR-0014 §6) — both carry the proposal and confirmation it needs.
@@ -840,6 +875,44 @@ impl LedgerSnapshot {
             }
         }
         Ok(())
+    }
+
+    /// Folds a decoded contract charge (`CONTRACT_CHARGE_KIND`): a station-signed
+    /// direct debit that moves `buyer −amount / provider +amount` once per
+    /// `(contract_ref, period_index)`. The signer pin is checked before the
+    /// once-only dedup, so a forged charge cannot burn a period's slot and
+    /// suppress the genuine charge the station later signs for it.
+    fn apply_contract_charge(
+        &mut self,
+        charge: ContractCharge,
+        entry: &LogEntry,
+        station: &PublicKey,
+    ) -> Result<()> {
+        if entry.payload.signer != *station {
+            return Ok(());
+        }
+        if self
+            .charged
+            .insert((charge.contract_ref, charge.period_index))
+        {
+            self.move_balance(&charge.buyer, &charge.provider, charge.amount_centi);
+        }
+        Ok(())
+    }
+
+    /// Moves `amount_centi` from `debtor` to `creditor` (saturating). A
+    /// self-move nets to zero.
+    fn move_balance(&mut self, debtor: &Address, creditor: &Address, amount_centi: i64) {
+        let d = self
+            .balances
+            .entry(debtor.public_key().to_bytes())
+            .or_insert(0);
+        *d = d.saturating_sub(amount_centi);
+        let c = self
+            .balances
+            .entry(creditor.public_key().to_bytes())
+            .or_insert(0);
+        *c = c.saturating_add(amount_centi);
     }
 
     /// Folds a decoded cancellation (`CANCELLATION_KIND`): retires a `Proposed`
@@ -1211,6 +1284,16 @@ impl LedgerSnapshot {
         self.max_nonce
             .get(sender_pubkey)
             .map(|n| n.saturating_add(1))
+            .unwrap_or(0)
+    }
+
+    /// The settled balance of `who`, in centicommons, derived from the log's
+    /// station-signed settlement records and contract charges (0 if none). This
+    /// is the balance members see and the one the debt floor reads (ADR-0018).
+    pub fn balance_of(&self, who: &Address) -> i64 {
+        self.balances
+            .get(&who.public_key().to_bytes())
+            .copied()
             .unwrap_or(0)
     }
 
@@ -2185,5 +2268,105 @@ mod tests {
         .unwrap();
         let snap2 = LedgerSnapshot::derive(&log2, &station.public_key()).unwrap();
         assert!(snap2.enrollment_events(&stranger).is_empty());
+    }
+
+    #[test]
+    fn snapshot_balance_matches_the_log_fold() {
+        // The balance fold's edges: each transaction settles once (first
+        // station-signed record wins), each contract period charges once, a
+        // forged record of either kind moves nothing and burns no dedup slot, a
+        // self-settlement nets to zero, and the penalty index (including a
+        // provider-terminated, negative penalty) folds like any period.
+        use crate::contract::{ContractCharge, ContractRef};
+        use rrn_crypto::signed::SignedPayload;
+
+        let db = rrn_storage::db::Database::open_in_memory().unwrap();
+        rrn_storage::migrations::run(&db).unwrap();
+        let mut log = AppendLog::new(&db);
+        let (alice, bob, carol, station, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let addr = |kp: &Keypair| Address::from_public_key(kp.public_key());
+        let (a, b, c) = (addr(&alice), addr(&bob), addr(&carol));
+        let settlement = |sender: Address, receiver: Address, amount: i64, nonce: u64, at: i64| {
+            SettlementRecord {
+                proposal_id: TransactionProposal::new(sender, receiver, amount, None, nonce, 0, 1)
+                    .id,
+                sender,
+                receiver,
+                amount_centi: amount,
+                settled_at: at,
+            }
+        };
+        let charge = |contract: u8, period_index: u32, amount: i64, at: i64| ContractCharge {
+            contract_ref: ContractRef([contract; 32]),
+            buyer: a,
+            provider: b,
+            amount_centi: amount,
+            period_index,
+            charged_at: at,
+        };
+
+        // Settlements: a -> b 300, settled twice (the second is redundant).
+        let ab = settlement(a, b, 300, 0, 100);
+        log.append(SignedPayload::sign(ab.clone(), &station), 0)
+            .unwrap();
+        let ab_again = SettlementRecord {
+            settled_at: 101,
+            ..ab
+        };
+        log.append(SignedPayload::sign(ab_again, &station), 0)
+            .unwrap();
+        // A forged settlement for a fresh id lands first, then the genuine one.
+        let bc = settlement(b, c, 100, 1, 200);
+        log.append(SignedPayload::sign(bc.clone(), &mallory), 0)
+            .unwrap();
+        log.append(SignedPayload::sign(bc, &station), 0).unwrap();
+        // A self-settlement moves nothing.
+        log.append(
+            SignedPayload::sign(settlement(c, c, 50, 2, 300), &station),
+            0,
+        )
+        .unwrap();
+
+        // Charges: periods 0 and 1 of contract 1 at 500, period 1 charged twice,
+        // a forged period 2, a buyer-terminated penalty of 200 on contract 1 and a
+        // provider-terminated penalty of 300 (negative) on contract 2.
+        log.append(SignedPayload::sign(charge(1, 0, 500, 1_000), &station), 0)
+            .unwrap();
+        log.append(SignedPayload::sign(charge(1, 1, 500, 2_000), &station), 0)
+            .unwrap();
+        log.append(SignedPayload::sign(charge(1, 1, 500, 2_005), &station), 0)
+            .unwrap();
+        log.append(SignedPayload::sign(charge(1, 2, 500, 3_000), &mallory), 0)
+            .unwrap();
+        log.append(
+            SignedPayload::sign(charge(1, u32::MAX, 200, 3_500), &station),
+            0,
+        )
+        .unwrap();
+        log.append(
+            SignedPayload::sign(charge(2, u32::MAX, -300, 3_600), &station),
+            0,
+        )
+        .unwrap();
+
+        let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
+        // alice: -300 (settled) - 500 - 500 (periods) - 200 (penalty) + 300.
+        assert_eq!(snap.balance_of(&a), -300 - 1_000 - 200 + 300);
+        // bob: +300 - 100 + 1000 + 200 - 300.
+        assert_eq!(snap.balance_of(&b), 300 - 100 + 1_000 + 200 - 300);
+        assert_eq!(snap.balance_of(&c), 100);
+        assert_eq!(snap.balance_of(&addr(&mallory)), 0);
+        assert_eq!(snap.balance_of(&addr(&station)), 0);
+        // Conservation: every move has two equal and opposite legs.
+        assert_eq!(
+            snap.balance_of(&a) + snap.balance_of(&b) + snap.balance_of(&c),
+            0
+        );
     }
 }

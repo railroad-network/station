@@ -218,13 +218,19 @@ fn signed_ballot(
     )
 }
 
+/// The disputed amount in [`cannot_seat_setup`]. Not the ring's 300: the
+/// parties' first ring trade is `alice → bob` for 300 at nonce 0, the exact
+/// proposal [`append_disputed`] would sign, so the dispute would share its
+/// transaction id with a trade that has already settled.
+const CANNOT_SEAT_TX_CENTI: i64 = 350;
+
 /// A dispute whose jury pool is too small to seat a panel: three established
 /// members, two of whom are the parties, leaving a single eligible member. Returns
 /// the parties, the lone eligible member, and the disputed transaction id.
 fn cannot_seat_setup(db: &Database) -> (Keypair, Keypair, Keypair, TransactionId) {
     let members = establish_members(db, &test_station(), 3, T);
     let [alice, bob, lone] = <[Keypair; 3]>::try_from(members).ok().unwrap();
-    let tx = append_disputed(db, &alice, &bob, 300, T);
+    let tx = append_disputed(db, &alice, &bob, CANNOT_SEAT_TX_CENTI, T);
     (alice, bob, lone, tx)
 }
 
@@ -435,7 +441,7 @@ fn two_reject_verdicts_settle_the_transaction() {
         Some(TransactionState::Settled { .. })
     ));
     // The confirmed transfer moved: alice -300, bob +300.
-    let balances = BalanceView::new(&db);
+    let balances = BalanceView::new(&db, test_station().public_key());
     assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
     assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
 }
@@ -730,9 +736,17 @@ fn cannot_seat_escalation_rejected_by_the_electorate_settles() {
         snapshot.get(&tx),
         Some(TransactionState::Settled { .. })
     ));
-    let balances = BalanceView::new(&db);
-    assert_eq!(balances.balance_of(&addr(&alice)).unwrap(), -300);
-    assert_eq!(balances.balance_of(&addr(&bob)).unwrap(), 300);
+    // The ring trades that established the parties net to zero, so the
+    // balances are the disputed transfer alone.
+    let balances = BalanceView::new(&db, test_station().public_key());
+    assert_eq!(
+        balances.balance_of(&addr(&alice)).unwrap(),
+        -CANNOT_SEAT_TX_CENTI
+    );
+    assert_eq!(
+        balances.balance_of(&addr(&bob)).unwrap(),
+        CANNOT_SEAT_TX_CENTI
+    );
 }
 
 #[test]
