@@ -43,7 +43,7 @@ use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::{MultiSignedPayload, MultiVerifyError, SignedPayload};
 use rrn_identity::address::Address;
 use rrn_storage::db::Database;
-use rrn_storage::log::{AppendLog, LogEntry};
+use rrn_storage::log::{AppendLog, LogBatch, LogEntry};
 
 /// Discriminant carried in the `kind` field of a [`SignedCharter`]'s canonical
 /// CBOR, so log replay can tell it apart from other records.
@@ -515,6 +515,22 @@ pub fn store_charter(
     Ok(log.append(SignedPayload::sign(charter, publisher), now)?)
 }
 
+/// [`store_charter`] into an open [`LogBatch`], so the writer can land records
+/// that must accompany a published charter — the founders' enrollments (ADR-0038
+/// §1) — in the same atomic append. Same checks, same refusals; nothing is
+/// durable until the caller commits the batch.
+pub fn store_charter_in(
+    batch: &mut LogBatch<'_>,
+    db: &Database,
+    publisher: &Keypair,
+    charter: SignedCharter,
+    now: i64,
+) -> Result<LogEntry, CharterError> {
+    charter.verify_founders()?;
+    check_charter_freeze(&AppendLog::new(db), db, &publisher.public_key(), now)?;
+    Ok(batch.append(SignedPayload::sign(charter, publisher), now)?)
+}
+
 /// The community's root founder Charter: the highest-`version`, founder-authorized
 /// Charter on the log, or `None` if none has been published yet. Ties on version
 /// break toward the later log entry — so an equal-version charter admitted later
@@ -586,6 +602,43 @@ pub fn store_pending_charter(
 ) -> Result<LogEntry, CharterError> {
     check_charter_freeze(log, db, &publisher.public_key(), now)?;
     Ok(log.append(SignedPayload::sign(charter, publisher), now)?)
+}
+
+/// [`store_pending_charter`] into an open [`LogBatch`] — the ceremony's
+/// counterpart of [`store_charter_in`], for the threshold-clearing append that
+/// publishes the charter alongside its founders' enrollments (ADR-0038 §1).
+pub fn store_pending_charter_in(
+    batch: &mut LogBatch<'_>,
+    db: &Database,
+    publisher: &Keypair,
+    charter: SignedCharter,
+    now: i64,
+) -> Result<LogEntry, CharterError> {
+    check_charter_freeze(&AppendLog::new(db), db, &publisher.public_key(), now)?;
+    Ok(batch.append(SignedPayload::sign(charter, publisher), now)?)
+}
+
+/// The community's **genesis** founder charter: the first founder-signed charter
+/// on the log to clear its founder threshold (ADR-0038 §1), or `None` before one
+/// has. Its `founders` are the community's roots of trust — the only identities
+/// the writer enrolls with the `founder` basis.
+///
+/// Distinct from [`founder_charter`], which selects the *highest-version*
+/// founder charter. The console doors refuse to re-root a community, so on a
+/// writer's own log the two agree; reading the first one keeps a later founder
+/// charter — however it reached the log — from minting new roots.
+pub fn root_founder_charter(db: &Database) -> Result<Option<SignedCharter>, CharterError> {
+    let log = AppendLog::new(db);
+    for entry in log.iter_from(1) {
+        let entry = entry?;
+        let Ok(signed) = from_canonical_bytes::<SignedCharter>(&entry.payload.bytes) else {
+            continue;
+        };
+        if signed.verify_founders().is_ok() {
+            return Ok(Some(signed));
+        }
+    }
+    Ok(None)
 }
 
 /// The most recently appended Charter, **regardless of whether it clears the
@@ -948,6 +1001,39 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         rrn_storage::migrations::run(&db).unwrap();
         db
+    }
+
+    /// The genesis root is the *first* threshold-clearing founder charter: a later
+    /// founder charter, however it reached the log, re-roots `founder_charter`
+    /// but never `root_founder_charter` — so it cannot mint new roots of trust
+    /// (ADR-0038 §1). The batch door lands the same append as the plain one.
+    #[test]
+    fn the_root_founder_charter_is_the_first_to_clear_its_threshold() {
+        let db = fresh_db();
+        let station = Keypair::generate();
+        assert!(root_founder_charter(&db).unwrap().is_none());
+
+        let first = founder_keys(2);
+        let v1 = create_charter(params_for(&first), &first).unwrap();
+        let log = AppendLog::new(&db);
+        let mut batch = log.begin_batch().unwrap();
+        store_charter_in(&mut batch, &db, &station, v1.clone(), 100).unwrap();
+        batch.commit().unwrap();
+
+        let second = founder_keys(2);
+        let mut params = params_for(&second);
+        params.version = 2;
+        let v2 = create_charter(params, &second).unwrap();
+        store_charter(&mut AppendLog::new(&db), &db, &station, v2.clone(), 200).unwrap();
+
+        assert_eq!(
+            root_founder_charter(&db).unwrap().unwrap().charter_hash(),
+            v1.charter_hash()
+        );
+        assert_eq!(
+            founder_charter(&db).unwrap().unwrap().charter_hash(),
+            v2.charter_hash()
+        );
     }
 
     #[test]

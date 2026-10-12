@@ -25,6 +25,8 @@ use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
 
+use crate::support::enroll;
+
 fn fresh_db() -> Database {
     let db = Database::open_in_memory().unwrap();
     migrations::run(&db).unwrap();
@@ -146,6 +148,8 @@ fn a_cert_backed_spend_admits_with_no_floor_headroom_remaining() {
     );
     let cfg = CreditConfig::default(); // floor -2000
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(cfg);
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let now = 1_000;
 
     // Reserve a 500 certificate (committed rises to 500; headroom left 1500).
@@ -197,6 +201,8 @@ fn overspend_is_refused_with_the_three_amounts() {
         Keypair::generate(),
     );
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let now = 1_000;
     let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
@@ -227,6 +233,8 @@ fn spending_to_exactly_the_cap_admits() {
         Keypair::generate(),
     );
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let now = 1_000;
     let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
@@ -273,6 +281,8 @@ fn expiry_boundary_is_the_shared_escrow_instant() {
     );
     let cfg = CreditConfig::default();
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(cfg);
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let issued_at = 1_000;
     let cert = issue(&mut engine, &db, &station, &alice, 500, issued_at);
 
@@ -314,6 +324,8 @@ fn wrong_member_returned_negative_and_unknown_are_each_refused() {
         Keypair::generate(),
     );
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let now = 1_000;
     let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
@@ -372,6 +384,8 @@ fn consumption_is_monotone_across_cancellation() {
     );
     let cfg = CreditConfig::default();
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(cfg);
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let now = 1_000;
     let cert = issue(&mut engine, &db, &station, &alice, 500, now);
 
@@ -432,6 +446,8 @@ fn nonces_interleave_across_request_cert_backed_and_plain() {
         Keypair::generate(),
     );
     let mut engine = Engine::new(&db, station.clone()).with_credit_config(CreditConfig::default());
+    enroll(&db, &station, &alice);
+    enroll(&db, &station, &bob);
     let now = 1_000;
 
     let req = CertificateRequest::new(addr(&alice), 500, 0, now);
@@ -526,6 +542,8 @@ proptest! {
         let cfg = CreditConfig::default();
         let settle_cfg = SettlementConfig::uniform(100);
         let mut engine = Engine::new(&db, station.clone()).with_credit_config(cfg);
+        enroll(&db, &station, &alice);
+        enroll(&db, &station, &bob);
 
         let mut now: i64 = 1_000;
         let mut certs: Vec<CertId> = Vec::new();

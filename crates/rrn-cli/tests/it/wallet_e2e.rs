@@ -578,7 +578,15 @@ async fn bundle_export_matches_ingest() {
     // same admitted receipt shape an online submit would.
     let h = Harness::start(false).await;
     let dir = tempfile::tempdir().unwrap();
-    let (home, _member) = init_wallet(dir.path(), "w", &h.station_addr).await;
+    let (home, member) = init_wallet(dir.path(), "w", &h.station_addr).await;
+    // This wallet never pairs, so the operator enrolls it (ADR-0038) before it
+    // may spend from zero.
+    socket_call(
+        &h.client(),
+        "enroll",
+        serde_json::json!({ "address": member }),
+    )
+    .await;
     wjson(&home, &["pay", &h.station_addr, "1.50"]).await;
     let out = home.join("out");
     wjson(&home, &["export", "bundle", "--out", out.to_str().unwrap()]).await;

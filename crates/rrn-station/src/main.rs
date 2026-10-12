@@ -55,10 +55,27 @@ enum Command {
     },
     /// List the mobiles currently paired with this station.
     ListMobiles,
-    /// Revoke a mobile's pairing by its bech32 address.
+    /// Revoke a mobile's pairing by its bech32 address. The member stays
+    /// enrolled; use `station enroll --revoke` to end its credit.
     Unpair {
         /// The mobile's bech32 address.
         address: String,
+    },
+    /// Enroll a member who never pairs — paper-first or radio-only — after the
+    /// same in-person check as pairing (ADR-0038). Only an enrolled member may
+    /// go into debt; any other key can spend only what it holds. Pairing a
+    /// phone enrolls it automatically.
+    #[command(group(clap::ArgGroup::new("enroll_mode").args(["address", "list"]).required(true)))]
+    Enroll {
+        /// The member's bech32 address.
+        address: Option<String>,
+        /// Revoke the member's enrollment instead: from now on it can spend only
+        /// what it holds. Its outstanding certificates are still honored.
+        #[arg(long, requires = "address")]
+        revoke: bool,
+        /// List the enrolled members, with the basis and log position of each.
+        #[arg(long, conflicts_with_all = ["address", "revoke"])]
+        list: bool,
     },
     /// Write an encrypted backup of this station (wallet + ledger + config).
     ///
@@ -191,6 +208,11 @@ fn main() -> Result<()> {
         Command::PairMobile { address } => cmd_pair_mobile(&data_dir, address),
         Command::ListMobiles => cmd_list_mobiles(&data_dir),
         Command::Unpair { address } => cmd_unpair(&data_dir, address),
+        Command::Enroll {
+            address,
+            revoke,
+            list,
+        } => cmd_enroll(&data_dir, address, revoke, list),
         Command::Backup { out } => cmd_backup(&data_dir, out),
         Command::Restore { archive, force } => cmd_restore(&data_dir, &archive, force),
         Command::Recovery { cmd } => match cmd {
@@ -557,6 +579,45 @@ fn cmd_unpair(data_dir: &std::path::Path, address: String) -> Result<()> {
         eprintln!("Unpaired {address}.");
     } else {
         eprintln!("{address} was not paired.");
+    }
+    Ok(())
+}
+
+/// `station enroll <address>`, `station enroll --revoke <address>`, and
+/// `station enroll --list` — the operator's enrollment surface (ADR-0038).
+fn cmd_enroll(
+    data_dir: &std::path::Path,
+    address: Option<String>,
+    revoke: bool,
+    list: bool,
+) -> Result<()> {
+    if list {
+        let result = socket_call(data_dir, "list_enrolled", json!({}))?;
+        let members = result["members"].as_array().cloned().unwrap_or_default();
+        if members.is_empty() {
+            eprintln!("(no enrolled members)");
+            return Ok(());
+        }
+        for entry in &members {
+            let addr = entry["address"].as_str().unwrap_or("?");
+            let basis = entry["basis"].as_str().unwrap_or("?");
+            let seq = entry["seq"].as_u64().unwrap_or(0);
+            println!("{addr}   {basis}   (enrolled at log position {seq})");
+        }
+        return Ok(());
+    }
+    let address = address.context("an address is required")?;
+    if revoke {
+        socket_call(data_dir, "enroll_revoke", json!({ "address": address }))?;
+        eprintln!("Revoked {address}: it can now spend only what it holds.");
+    } else {
+        let result = socket_call(data_dir, "enroll", json!({ "address": address }))?;
+        let basis = result["basis"].as_str().unwrap_or("?");
+        if result["appended"].as_bool().unwrap_or(false) {
+            eprintln!("Enrolled {address}.");
+        } else {
+            eprintln!("{address} was already enrolled ({basis}).");
+        }
     }
     Ok(())
 }

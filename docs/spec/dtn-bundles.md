@@ -174,8 +174,9 @@ outside this table, so the set is also the length bound:
 | `bad-signature` | a record or outbox-entry signature did not verify |
 | `nonce-gap` | the sender's per-sender nonce was a gap or duplicate |
 | `debt-floor` | admitting the record would commit its signer below the debt floor (ADR-0018) |
+| `not-enrolled` | the signer is not enrolled in this community, so it may spend only what it holds and this record would take it below zero; or an unenrolled key presented an `rrn.net.binding` / `rrn.net.sms_binding` (ADR-0038 §3–§4). State-dependent: the record can be admitted after an inflow or after enrollment when presented again — though a byte-identical presentation is answered from the stored receipt (§3 idempotency), so it must travel in a new presentation |
 | `expired` | the proposal had expired by the admission clock (ADR-0022 §4) |
-| `unroutable-kind` | the record's `kind` is not one the station admits over DTN (e.g. a certificate *request*, which needs a live signed reply — ADR-0021 §1) |
+| `unroutable-kind` | the record's `kind` is not one the station admits over DTN (e.g. a certificate *request*, which needs a live signed reply — ADR-0021 §1; or an `rrn.member.enrollment`, which is station-only — ADR-0038 §1) |
 | `outbox-fork` | the entry is one side of an outbox fork (ADR-0020 §2 / ADR-0021) |
 | `duplicate` | a record content-identical to one already on the log was re-presented as a *new* admission (distinct from the benign `known` outcome) |
 | `tier-unsupported` | the record's oracle tier is above what this phase admits — blocked, never clamped (ADR-0011) |
@@ -191,6 +192,12 @@ outside this table, so the set is also the length bound:
 
 A reader that does not recognise a slug treats the outcome as an unknown refusal
 (the decoder rejects an unknown slug rather than guessing).
+
+`rrn.member.enrollment` (ADR-0038 §1) is a station-only record: the writer appends
+it at an in-person ceremony, so a carried one is refused `unroutable-kind`, and a
+member-signed one that reaches a log by any other path is inert under the
+station-signer pin. `not-enrolled` was added with ADR-0038; a receipt decoder
+built before it rejects a receipt carrying the slug.
 
 ---
 

@@ -6,10 +6,12 @@
 //! `cargo test -p rrn-ledger --test it <name>`.
 mod cert_backed_spends;
 mod cross_platform_certificates;
+mod cross_platform_enrollment;
 mod cross_platform_equivocation;
 mod cross_platform_signed_payload;
 mod idempotency;
 mod ledger_signer_pinning;
 mod lifecycle;
 mod replay_dispatch_equivalence;
+mod support;
 mod tier_lifecycle;

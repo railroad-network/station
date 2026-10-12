@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::credit::CreditConfig;
 use crate::dispute::{DisputeRecord, SignedDispute, DISPUTE_KIND};
+use crate::enrollment::{EnrollmentAction, EnrollmentBasis, EnrollmentRecord, ENROLLMENT_KIND};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateRequest, CertificateReturn, CertificateState,
     CertificateStatus, EquivocationBasis, EquivocationId, EquivocationRecord,
@@ -345,6 +346,21 @@ pub struct AdmissionTimes {
     pub dispute_admitted_at: Option<i64>,
 }
 
+/// One *effective* enrollment event for a member (ADR-0038 §1): an enrollment
+/// that took effect, a `founder` upgrade of an existing enrollment, or a
+/// revocation of an enrolled member. Records that the fold treats as no-ops
+/// (re-enrolling an enrolled member, revoking one who is not enrolled) leave no
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnrollmentEvent {
+    /// Log seq of the enrollment record's entry.
+    pub seq: u64,
+    /// Enroll (including a founder upgrade) or revoke.
+    pub action: EnrollmentAction,
+    /// The record's basis.
+    pub basis: EnrollmentBasis,
+}
+
 /// A point-in-time view of every transaction, derived by replaying the log.
 ///
 /// Replay is the only way to learn a transaction's state: the log is the source
@@ -396,6 +412,14 @@ pub struct LedgerSnapshot {
     /// [`Confirm`](crate::escrow::VerdictDecision::Confirm) records finality but
     /// leaves both standing. The first station-signed ruling per id wins.
     equivocation_verdict: BTreeMap<EquivocationId, VerdictDecision>,
+    /// The community station's own address, set by [`derive_to`](Self::derive_to)
+    /// from the pinned station key. The station identity is enrolled at every
+    /// position by derivation, with no record (ADR-0038 §1).
+    station_address: Option<Address>,
+    /// Effective enrollment events per member, in log order, keyed by the raw
+    /// 32-byte public key (ADR-0038 §1). Only station-signed, well-formed
+    /// enrollment records that changed something land here.
+    enrollments: BTreeMap<[u8; 32], (Address, Vec<EnrollmentEvent>)>,
 }
 
 impl LedgerSnapshot {
@@ -428,7 +452,10 @@ impl LedgerSnapshot {
     /// `station` pins station-signed records to the community key; see
     /// [`derive`](Self::derive).
     pub fn derive_to(log: &AppendLog, max_seq: u64, station: &PublicKey) -> Result<Self> {
-        let mut snapshot = LedgerSnapshot::default();
+        let mut snapshot = LedgerSnapshot {
+            station_address: Some(Address::from_public_key(*station)),
+            ..LedgerSnapshot::default()
+        };
         for entry in log.iter_from(1) {
             let entry = entry?;
             if entry.seq > max_seq {
@@ -448,7 +475,10 @@ impl LedgerSnapshot {
     /// record (or the same skip) as trial decoding. Not used in production.
     #[doc(hidden)]
     pub fn derive_to_reference(log: &AppendLog, max_seq: u64, station: &PublicKey) -> Result<Self> {
-        let mut snapshot = LedgerSnapshot::default();
+        let mut snapshot = LedgerSnapshot {
+            station_address: Some(Address::from_public_key(*station)),
+            ..LedgerSnapshot::default()
+        };
         for entry in log.iter_from(1) {
             let entry = entry?;
             if entry.seq > max_seq {
@@ -557,6 +587,12 @@ impl LedgerSnapshot {
                 };
                 self.apply_equivocation_verdict(verdict, entry, station)
             }
+            ENROLLMENT_KIND => {
+                let Ok(record) = EnrollmentRecord::try_from(cbor) else {
+                    return Ok(());
+                };
+                self.apply_enrollment(record, entry, station)
+            }
             _ => Ok(()),
         }
     }
@@ -603,6 +639,9 @@ impl LedgerSnapshot {
         }
         if let Ok(verdict) = from_canonical_bytes::<EquivocationVerdictRecord>(bytes) {
             return self.apply_equivocation_verdict(verdict, entry, station);
+        }
+        if let Ok(record) = from_canonical_bytes::<EnrollmentRecord>(bytes) {
+            return self.apply_enrollment(record, entry, station);
         }
         Ok(())
     }
@@ -1016,6 +1055,131 @@ impl LedgerSnapshot {
         Ok(())
     }
 
+    /// Folds a decoded enrollment record (`ENROLLMENT_KIND`, ADR-0038 §1), in
+    /// log order:
+    ///
+    /// - only a record signed by the community station key counts, and only a
+    ///   well-formed one ([`EnrollmentRecord::validate`]); anything else is
+    ///   skipped, never a halt;
+    /// - a record naming the station's own address is a no-op — the station is
+    ///   enrolled by derivation;
+    /// - an `enroll` of a member not currently enrolled takes effect, including
+    ///   one revoked earlier;
+    /// - a `founder` enroll of an enrolled member whose current basis is not
+    ///   `founder` upgrades the basis; its enrollment position stands;
+    /// - any other `enroll` of an enrolled member is a no-op;
+    /// - a `revoke` of an enrolled member takes effect; of anyone else, a no-op.
+    fn apply_enrollment(
+        &mut self,
+        record: EnrollmentRecord,
+        entry: &LogEntry,
+        station: &PublicKey,
+    ) -> Result<()> {
+        if entry.payload.signer != *station || record.validate().is_err() {
+            return Ok(());
+        }
+        if record.member == Address::from_public_key(*station) {
+            return Ok(());
+        }
+        let key = record.member.public_key().to_bytes();
+        let (_, events) = self
+            .enrollments
+            .entry(key)
+            .or_insert_with(|| (record.member, Vec::new()));
+        let current = events
+            .last()
+            .filter(|e| e.action == EnrollmentAction::Enroll)
+            .map(|e| e.basis);
+        let effective = match (record.action, current) {
+            (EnrollmentAction::Enroll, None) => true,
+            (EnrollmentAction::Enroll, Some(basis)) => {
+                record.basis == EnrollmentBasis::Founder && basis != EnrollmentBasis::Founder
+            }
+            (EnrollmentAction::Revoke, current) => current.is_some(),
+        };
+        if effective {
+            events.push(EnrollmentEvent {
+                seq: entry.seq,
+                action: record.action,
+                basis: record.basis,
+            });
+        } else if events.is_empty() {
+            // Never leave an empty entry behind: "has any enrollment event" is
+            // how the startup backfill tells a never-enrolled address apart.
+            self.enrollments.remove(&key);
+        }
+        Ok(())
+    }
+
+    /// Whether `member` is enrolled at the end of the derived prefix (ADR-0038
+    /// §1) — i.e. at the position the next admitted entry will take. The
+    /// station's own identity is always enrolled.
+    pub fn is_enrolled(&self, member: &Address) -> bool {
+        self.is_enrolled_at(member, u64::MAX)
+    }
+
+    /// Whether `member` is *enrolled at position `p`*: its most recent effective
+    /// enrollment event with `seq < p` is an enroll (ADR-0038 §1). The station's
+    /// own identity is enrolled at every position.
+    pub fn is_enrolled_at(&self, member: &Address, p: u64) -> bool {
+        if self.station_address.as_ref() == Some(member) {
+            return true;
+        }
+        self.last_event_before(member, p)
+            .is_some_and(|e| e.action == EnrollmentAction::Enroll)
+    }
+
+    /// The current basis of `member`'s enrollment, or `None` if it is not
+    /// enrolled. The station identity is enrolled with no record, so it has no
+    /// basis.
+    pub fn enrollment_basis(&self, member: &Address) -> Option<EnrollmentBasis> {
+        self.enrollment_basis_at(member, u64::MAX)
+    }
+
+    /// The current basis of `member`'s enrollment at position `p` — the basis of
+    /// its most recent effective event before `p`, a founder upgrade included —
+    /// or `None` if it is not enrolled there (ADR-0038 §1).
+    pub fn enrollment_basis_at(&self, member: &Address, p: u64) -> Option<EnrollmentBasis> {
+        self.last_event_before(member, p)
+            .filter(|e| e.action == EnrollmentAction::Enroll)
+            .map(|e| e.basis)
+    }
+
+    /// Every currently enrolled member (the station identity excluded), with its
+    /// current basis and its enrollment position — the seq of the record that
+    /// enrolled it, which a later founder upgrade does not move.
+    pub fn enrolled(&self) -> impl Iterator<Item = (&Address, EnrollmentBasis, u64)> {
+        self.enrollments.values().filter_map(|(address, events)| {
+            let last = events.last()?;
+            if last.action != EnrollmentAction::Enroll {
+                return None;
+            }
+            let since = events
+                .iter()
+                .rev()
+                .take_while(|e| e.action == EnrollmentAction::Enroll)
+                .last()
+                .map_or(last.seq, |e| e.seq);
+            Some((address, last.basis, since))
+        })
+    }
+
+    /// `member`'s effective enrollment events in log order — empty for an
+    /// address that was never enrolled. The writer's startup backfill reads this
+    /// to skip anyone already enrolled, revoked, or upgraded (ADR-0038 §6).
+    pub fn enrollment_events(&self, member: &Address) -> &[EnrollmentEvent] {
+        self.enrollments
+            .get(&member.public_key().to_bytes())
+            .map_or(&[], |(_, events)| events.as_slice())
+    }
+
+    fn last_event_before(&self, member: &Address, p: u64) -> Option<&EnrollmentEvent> {
+        self.enrollment_events(member)
+            .iter()
+            .rev()
+            .find(|e| e.seq < p)
+    }
+
     /// The state of one transaction, if it appears in the log.
     pub fn get(&self, id: &TransactionId) -> Option<&TransactionState> {
         self.states.get(id)
@@ -1329,6 +1493,7 @@ mod tests {
             CERT_RETURN_KIND,
             EQUIVOCATION_KIND,
             EQUIVOCATION_VERDICT_KIND,
+            ENROLLMENT_KIND,
         ] {
             let db = fresh_db();
             // A map with the kind but none of the fields the type needs — signed
@@ -1347,9 +1512,13 @@ mod tests {
 
             let snapshot = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key())
                 .unwrap_or_else(|e| panic!("kind {kind} must be skipped, not a hard error: {e}"));
+            // Empty but for the pinned station identity every derivation records.
+            let empty = LedgerSnapshot {
+                station_address: Some(Address::from_public_key(station.public_key())),
+                ..LedgerSnapshot::default()
+            };
             assert_eq!(
-                snapshot,
-                LedgerSnapshot::default(),
+                snapshot, empty,
                 "a wrong-shape {kind} record must leave the snapshot empty"
             );
         }
@@ -1456,6 +1625,15 @@ mod tests {
                     equivocation_id: equiv.equivocation_id,
                     decision: VerdictDecision::Confirm,
                     decided_at: 1,
+                }),
+            ),
+            (
+                ENROLLMENT_KIND,
+                to_canonical_bytes(EnrollmentRecord {
+                    member: Address::from_public_key(a.public_key()),
+                    action: EnrollmentAction::Enroll,
+                    basis: EnrollmentBasis::Pairing,
+                    recorded_at: 1,
                 }),
             ),
         ];
@@ -1828,5 +2006,169 @@ mod tests {
         let snap = LedgerSnapshot::derive(&AppendLog::new(&db), &station.public_key()).unwrap();
         assert!(snap.has_cert_equivocation(&cert_id));
         assert_eq!(snap.equivocations().count(), 1);
+    }
+    #[test]
+    fn enrollment_is_pinned_to_the_station_key() {
+        use crate::enrollment::{append_enrollment, sign_enrollment};
+
+        let db = fresh_db();
+        let station = Keypair::generate();
+        let (alice, mallory) = (Keypair::generate(), Keypair::generate());
+        let a = Address::from_public_key(alice.public_key());
+        let station_addr = Address::from_public_key(station.public_key());
+        let mut log = AppendLog::new(&db);
+        let append = |log: &mut AppendLog, signer: &Keypair, action, basis| {
+            log.append(sign_enrollment(signer, a, action, basis, 0).unwrap(), 0)
+                .unwrap()
+                .seq
+        };
+
+        // Signed by the member itself, and by an unrelated key: both skipped.
+        append(
+            &mut log,
+            &alice,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Founder,
+        );
+        append(
+            &mut log,
+            &mallory,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Pairing,
+        );
+        let snap = LedgerSnapshot::derive(&log, &station.public_key()).unwrap();
+        assert!(!snap.is_enrolled(&a));
+        assert!(snap.enrollment_events(&a).is_empty());
+
+        // A malformed (pairing-basis) revoke, raw so it reaches the log: skipped.
+        let malformed = EnrollmentRecord {
+            member: a,
+            action: EnrollmentAction::Revoke,
+            basis: EnrollmentBasis::Pairing,
+            recorded_at: 0,
+        };
+        let bytes = to_canonical_bytes(malformed);
+        log.append_raw(
+            rrn_storage::log::StoredPayload {
+                signature: station.sign(&bytes),
+                bytes,
+                signer: station.public_key(),
+            },
+            0,
+        )
+        .unwrap();
+
+        // enroll → re-enroll (no-op) → founder upgrade → revoke → re-enroll.
+        let enrolled = append(
+            &mut log,
+            &station,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Pairing,
+        );
+        append(
+            &mut log,
+            &station,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Operator,
+        );
+        let upgraded = append(
+            &mut log,
+            &station,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Founder,
+        );
+        let revoked = append(
+            &mut log,
+            &station,
+            EnrollmentAction::Revoke,
+            EnrollmentBasis::Operator,
+        );
+        let again = append(
+            &mut log,
+            &station,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Operator,
+        );
+        let snap = LedgerSnapshot::derive(&log, &station.public_key()).unwrap();
+
+        // Enrolled at p means an enroll strictly before p.
+        assert!(!snap.is_enrolled_at(&a, enrolled));
+        assert!(snap.is_enrolled_at(&a, enrolled + 1));
+        assert_eq!(
+            snap.enrollment_basis_at(&a, upgraded),
+            Some(EnrollmentBasis::Pairing)
+        );
+        assert_eq!(
+            snap.enrollment_basis_at(&a, upgraded + 1),
+            Some(EnrollmentBasis::Founder)
+        );
+        assert!(snap.is_enrolled_at(&a, revoked));
+        assert!(!snap.is_enrolled_at(&a, revoked + 1));
+        assert!(!snap.is_enrolled_at(&a, again));
+        assert!(snap.is_enrolled(&a));
+        assert_eq!(snap.enrollment_basis(&a), Some(EnrollmentBasis::Operator));
+        // Only effective events are kept: the no-op re-enroll left none.
+        let seqs: Vec<u64> = snap.enrollment_events(&a).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![enrolled, upgraded, revoked, again]);
+        // The listing reports the current run's position, not the first ever.
+        let listed: Vec<_> = snap.enrolled().map(|(m, b, seq)| (*m, b, seq)).collect();
+        assert_eq!(listed, vec![(a, EnrollmentBasis::Operator, again)]);
+
+        // A founder upgrade keeps the enrollment position.
+        let db2 = fresh_db();
+        let mut log2 = AppendLog::new(&db2);
+        let first = append_enrollment(
+            &mut log2,
+            &station,
+            a,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Pairing,
+            0,
+        )
+        .unwrap()
+        .seq;
+        append_enrollment(
+            &mut log2,
+            &station,
+            a,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Founder,
+            0,
+        )
+        .unwrap();
+        let snap2 = LedgerSnapshot::derive(&log2, &station.public_key()).unwrap();
+        let listed: Vec<_> = snap2.enrolled().map(|(m, b, seq)| (*m, b, seq)).collect();
+        assert_eq!(listed, vec![(a, EnrollmentBasis::Founder, first)]);
+
+        // The station is enrolled at every position, with no record and no
+        // basis; a record naming it is a no-op.
+        append_enrollment(
+            &mut log2,
+            &station,
+            station_addr,
+            EnrollmentAction::Revoke,
+            EnrollmentBasis::Operator,
+            0,
+        )
+        .unwrap();
+        let snap2 = LedgerSnapshot::derive(&log2, &station.public_key()).unwrap();
+        assert!(snap2.is_enrolled_at(&station_addr, 0));
+        assert!(snap2.is_enrolled(&station_addr));
+        assert_eq!(snap2.enrollment_basis(&station_addr), None);
+        assert!(snap2.enrollment_events(&station_addr).is_empty());
+
+        // Revoking someone never enrolled is a no-op.
+        let stranger = Address::from_public_key(mallory.public_key());
+        append_enrollment(
+            &mut log2,
+            &station,
+            stranger,
+            EnrollmentAction::Revoke,
+            EnrollmentBasis::Operator,
+            0,
+        )
+        .unwrap();
+        let snap2 = LedgerSnapshot::derive(&log2, &station.public_key()).unwrap();
+        assert!(snap2.enrollment_events(&stranger).is_empty());
     }
 }

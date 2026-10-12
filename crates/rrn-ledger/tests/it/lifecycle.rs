@@ -21,6 +21,8 @@ use rrn_ledger::transaction::{
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
+
+use crate::support::enroll;
 use tracing::info;
 
 /// Captures `info!` output under `--nocapture`. Idempotent across tests.
@@ -78,6 +80,7 @@ fn full_transaction_lifecycle() {
     migrations::run(&db).unwrap();
 
     let mut engine = Engine::new(&db, station.clone());
+    enroll(&db, &station, &alice_kp);
     let mut settler = Settler::new(&db, station.clone(), SettlementConfig::uniform(WINDOW));
     let balances = BalanceView::new(&db);
 
@@ -143,7 +146,7 @@ fn full_transaction_lifecycle() {
     let (proposals, confirmations, settlements) = log_entry_counts(&db);
     assert_eq!((proposals, confirmations, settlements), (1, 1, 1));
 
-    // 9. The hash chain is intact.
-    assert_eq!(AppendLog::new(&db).verify_chain().unwrap(), 3);
-    info!("append-only log verified: 1 proposal, 1 confirmation, 1 settlement");
+    // 9. The hash chain is intact: Alice's enrollment plus those three.
+    assert_eq!(AppendLog::new(&db).verify_chain().unwrap(), 4);
+    info!("append-only log verified: 1 enrollment, 1 proposal, 1 confirmation, 1 settlement");
 }

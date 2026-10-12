@@ -24,7 +24,7 @@ use rrn_storage::log::AppendLog;
 
 use rrn_identity::address::Address;
 
-use crate::credit::{committed_debits_centi, CreditConfig};
+use crate::credit::{committed_debits_centi, CreditConfig, UNENROLLED_FLOOR_CENTI};
 use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateStatus, HeadroomCertificate,
@@ -71,6 +71,13 @@ impl<'db> Engine<'db> {
     /// Rejects a new `debit_centi` (> 0) against `debtor` that would commit
     /// them below the debt floor: settled balance, minus the pending debits
     /// they have already signed, minus this one (ADR-0018; see [`crate::credit`]).
+    ///
+    /// The configured floor applies only to an identity enrolled at the
+    /// admission position — the end of `snapshot`'s prefix, where this record
+    /// would land. Any other key's floor is [`UNENROLLED_FLOOR_CENTI`], and its
+    /// breach is [`Error::NotEnrolled`] (ADR-0038 §4). Every debit door —
+    /// proposal, payment-request confirmation, certificate issuance — reaches
+    /// this one check, so every carrier gets the rule by construction.
     fn check_debt_floor(
         &self,
         snapshot: &LedgerSnapshot,
@@ -82,9 +89,15 @@ impl<'db> Engine<'db> {
         let projected = settled
             .saturating_sub(committed_debits_centi(snapshot, debtor, now, &self.credit))
             .saturating_sub(debit_centi);
-        if projected < self.credit.debt_floor_centi {
-            return Err(Error::DebtFloorExceeded {
-                floor_centi: self.credit.debt_floor_centi,
+        if snapshot.is_enrolled(debtor) {
+            if projected < self.credit.debt_floor_centi {
+                return Err(Error::DebtFloorExceeded {
+                    floor_centi: self.credit.debt_floor_centi,
+                    projected_centi: projected,
+                });
+            }
+        } else if projected < UNENROLLED_FLOOR_CENTI.max(self.credit.debt_floor_centi) {
+            return Err(Error::NotEnrolled {
                 projected_centi: projected,
             });
         }
@@ -693,6 +706,39 @@ mod tests {
         Address::from_public_key(kp.public_key())
     }
 
+    impl Engine<'_> {
+        /// Test setup: enrolls `kp` under this engine's station key (ADR-0038),
+        /// so a member who spends from zero runs the configured floor.
+        fn enroll(&self, kp: &Keypair) {
+            self.enrollment(kp, crate::enrollment::EnrollmentAction::Enroll);
+        }
+
+        /// The operator's revocation of `kp` (ADR-0038 §5).
+        fn revoke(&self, kp: &Keypair) {
+            self.enrollment(kp, crate::enrollment::EnrollmentAction::Revoke);
+        }
+
+        fn enrollment(&self, kp: &Keypair, action: crate::enrollment::EnrollmentAction) {
+            let basis = match action {
+                crate::enrollment::EnrollmentAction::Enroll => {
+                    crate::enrollment::EnrollmentBasis::Pairing
+                }
+                crate::enrollment::EnrollmentAction::Revoke => {
+                    crate::enrollment::EnrollmentBasis::Operator
+                }
+            };
+            crate::enrollment::append_enrollment(
+                &mut AppendLog::new(self.db),
+                &self.station,
+                addr(kp),
+                action,
+                basis,
+                0,
+            )
+            .unwrap();
+        }
+    }
+
     fn signed_proposal(
         sender: &Keypair,
         receiver: &Keypair,
@@ -721,6 +767,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p0 = signed_proposal(&alice, &bob, 0, 100, 100_000);
         engine.submit_proposal(p0, 100).unwrap();
@@ -742,6 +790,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // 50 Commons (5_000 centi) is Tier 3, which Phase 1 cannot service.
         let p = TransactionProposal::new(addr(&alice), addr(&bob), 5_000, None, 0, 100, 100_000);
@@ -844,6 +894,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         for nonce in 0..3 {
             let p = signed_proposal(&alice, &bob, nonce, 100, 100_000);
@@ -860,6 +912,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 100_000);
         let id = p.payload.id;
@@ -893,6 +947,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 100_000);
         let id = p.payload.id;
@@ -919,6 +975,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 100_000);
         let id = p.payload.id;
@@ -959,6 +1017,8 @@ mod tests {
                 debt_floor_centi: -500,
                 ..crate::credit::CreditConfig::default()
             });
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // 5 Commons (500 centi) down to exactly the floor: allowed.
         let at_floor =
@@ -999,6 +1059,8 @@ mod tests {
                 debt_floor_centi: -500,
                 ..crate::credit::CreditConfig::default()
             });
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Alice requests 501 from Bob (negative amount = receiver pays). The
         // proposal itself is fine — Bob has signed nothing yet.
@@ -1038,6 +1100,8 @@ mod tests {
                 debt_floor_centi: -500,
                 ..crate::credit::CreditConfig::default()
             });
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Alice pays Bob 300 and it settles: her settled balance is -300.
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1075,6 +1139,8 @@ mod tests {
                 debt_floor_centi: -500,
                 ..crate::credit::CreditConfig::default()
             });
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 100_000); // 300 centi
         let id = p.payload.id;
@@ -1110,6 +1176,8 @@ mod tests {
                 debt_floor_centi: -500,
                 ..crate::credit::CreditConfig::default()
             });
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Alice signs 500 down to exactly the floor; Bob never confirms.
         let stale = TransactionProposal::new(addr(&alice), addr(&bob), 500, None, 0, 100, 1_000);
@@ -1142,6 +1210,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 1_000);
         let id = p.payload.id;
@@ -1171,6 +1241,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Propose at t=100 with a long validity window.
         let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
@@ -1204,6 +1276,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Proposed at t=10_000; a confirmation cannot claim to have happened
         // before that (beyond skew) — that is not "carried", it is inconsistent
@@ -1236,6 +1310,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Offer stands only until t=1_000. A confirmation admitted past that
         // boundary (plus skew) is `Expired` regardless of a small, in-window
@@ -1265,6 +1341,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
         let id = p.payload.id;
@@ -1293,6 +1371,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let p = signed_proposal(&alice, &bob, 0, 100, 1_000_000);
         let id = p.payload.id;
@@ -1387,6 +1467,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1409,6 +1491,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let w = 5_000i64;
         let cfg = SettlementConfig::uniform(w as u64);
 
@@ -1436,6 +1520,7 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine2 = Engine::new(&db2, s2);
+        engine2.enroll(&a2);
         let id2 = confirmed_with_admission(&mut engine2, &a2, &b2, 100, 10_000);
         let too_late = 10_000 + w + CLOCK_SKEW_TOLERANCE_SECS + 1;
         assert!(matches!(
@@ -1454,6 +1539,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1477,6 +1564,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1496,6 +1585,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         // Proposed but not confirmed.
@@ -1517,6 +1608,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1542,6 +1635,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Confirmed but never disputed.
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1590,6 +1685,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = disputed(&mut engine, &alice, &bob, &cfg);
@@ -1617,6 +1714,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = disputed(&mut engine, &alice, &bob, &cfg);
@@ -1638,6 +1737,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = SettlementConfig::uniform(10_000);
 
         let id = disputed(&mut engine, &alice, &bob, &cfg);
@@ -1667,6 +1768,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // Confirmed but never disputed.
         let id = confirmed(&mut engine, &alice, &bob, 200);
@@ -1713,6 +1816,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // A 1000-cap request at now=1000 → certificate with the default 7-day
         // validity, Outstanding.
@@ -1749,6 +1854,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
 
         // Above the default max cap (1000).
         assert!(matches!(
@@ -1801,6 +1907,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // A bad nonce (skipping 0) is refused.
         assert!(matches!(
@@ -1828,6 +1936,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
 
         // Four small certificates fit (4 × 100 = 400 ≤ 2000 headroom); the fifth
         // hits the default cap of 4 outstanding.
@@ -1855,6 +1964,7 @@ mod tests {
             cert_max_cap_centi: 2_000,
             ..CreditConfig::default()
         });
+        engine.enroll(&alice);
 
         // First a 1000-cap certificate (projected −1000, fits).
         engine
@@ -1880,6 +1990,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         let cert = engine
             .submit_certificate_request(signed_cert_request(&alice, 1_000, 0, 100), 100)
@@ -1913,6 +2025,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
         let cfg = CreditConfig::default();
 
         let cert = engine
@@ -1956,6 +2070,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
 
         let cert = engine
             .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
@@ -1975,6 +2090,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
         let cfg = CreditConfig::default();
 
         // Fill the four-certificate limit (4 × 100 ≤ 2000, so the count binds, not
@@ -2014,6 +2130,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
 
         let cert = engine
             .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
@@ -2050,6 +2167,7 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
 
         let cert = engine
             .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
@@ -2141,6 +2259,8 @@ mod tests {
             Keypair::generate(),
         );
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+        engine.enroll(&bob);
 
         // The bound sits far below the evidence-item ceiling (checked at compile
         // time), so an admitted spend is always embeddable as equivocation evidence.
@@ -2165,6 +2285,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
 
         // A generous cap so every spend is within it; the *count* limit, not the
         // cap, is what bites.
@@ -2211,6 +2332,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station.clone());
+        engine.enroll(&alice);
 
         // Alice holds a 500-cap cert (nonce 0), then equivocates against it.
         let cert = engine
@@ -2243,6 +2365,7 @@ mod tests {
         let db = fresh_db();
         let (alice, station) = (Keypair::generate(), Keypair::generate());
         let mut engine = Engine::new(&db, station.clone());
+        engine.enroll(&alice);
         let cert = engine
             .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
             .unwrap();
@@ -2262,5 +2385,196 @@ mod tests {
             engine.submit_certificate_request(signed_cert_request(&alice, 100, 1, 300), 300),
             Err(Error::EquivocationBlocked)
         ));
+    }
+    // --- Enrollment and the floor (ADR-0038 §3–§5) ---------------------------
+
+    /// Settles a `amount`-centi payment from enrolled `payer` to `payee`, so
+    /// `payee` holds a settled inflow.
+    fn settled_inflow(
+        engine: &mut Engine,
+        db: &Database,
+        station: &Keypair,
+        payer: &Keypair,
+        payee: &Keypair,
+        amount: i64,
+        nonce: u64,
+    ) {
+        let p =
+            TransactionProposal::new(addr(payer), addr(payee), amount, None, nonce, 100, 100_000);
+        let id = p.id;
+        engine
+            .submit_proposal(SignedProposal::sign(p, payer), 100)
+            .unwrap();
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(payee),
+            confirmed_at: 200,
+        };
+        engine
+            .submit_confirmation(SignedConfirmation::sign(c, payee), 200)
+            .unwrap();
+        crate::settlement::Settler::new(db, station.clone(), SettlementConfig::uniform(10))
+            .settle(&id, 1_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_unenrolled_sender_spends_only_what_it_holds() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station.clone());
+        engine.enroll(&bob);
+
+        // From zero, one centicommon is refused: an unenrolled key's floor is 0.
+        let one = TransactionProposal::new(addr(&alice), addr(&bob), 1, None, 0, 100, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(one, &alice), 100),
+            Err(Error::NotEnrolled {
+                projected_centi: -1
+            })
+        ));
+
+        // After a settled +300 inflow, exactly 300 admits and one more refuses.
+        settled_inflow(&mut engine, &db, &station, &bob, &alice, 300, 0);
+        let all = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 2_000, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(all, &alice), 2_000)
+            .unwrap();
+        let more = TransactionProposal::new(addr(&alice), addr(&bob), 1, None, 1, 2_000, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(more, &alice), 2_000),
+            Err(Error::NotEnrolled {
+                projected_centi: -1
+            })
+        ));
+    }
+
+    #[test]
+    fn an_unenrolled_payment_request_confirmer_is_held_at_zero() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+
+        // Enrolled Alice requests 1 from unenrolled Bob; Bob's confirmation is his
+        // signature on the debit, and his floor is zero.
+        let request = TransactionProposal::new(addr(&alice), addr(&bob), -1, None, 0, 100, 100_000);
+        let id = request.id;
+        engine
+            .submit_proposal(SignedProposal::sign(request, &alice), 100)
+            .unwrap();
+        let c = TransactionConfirmation {
+            proposal_id: id,
+            confirmer: addr(&bob),
+            confirmed_at: 200,
+        };
+        assert!(matches!(
+            engine.submit_confirmation(SignedConfirmation::sign(c, &bob), 200),
+            Err(Error::NotEnrolled {
+                projected_centi: -1
+            })
+        ));
+    }
+
+    #[test]
+    fn an_enrolled_sender_keeps_the_configured_floor() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+
+        // Down to exactly the default −2000 floor: admitted.
+        let to_floor =
+            TransactionProposal::new(addr(&alice), addr(&bob), 2_000, None, 0, 100, 100_000);
+        engine
+            .submit_proposal(SignedProposal::sign(to_floor, &alice), 100)
+            .unwrap();
+        // One more is the enrolled breach, not the unenrolled one.
+        let over = TransactionProposal::new(addr(&alice), addr(&bob), 1, None, 1, 100, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(over, &alice), 100),
+            Err(Error::DebtFloorExceeded {
+                floor_centi: -2_000,
+                projected_centi: -2_001,
+            })
+        ));
+    }
+
+    #[test]
+    fn certificate_headroom_of_an_unenrolled_key_is_its_balance() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station.clone());
+        engine.enroll(&bob);
+
+        // No positive headroom, no certificate.
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 1, 0, 100), 100),
+            Err(Error::NotEnrolled {
+                projected_centi: -1
+            })
+        ));
+
+        // With 300 settled, a 300-cap certificate is issued and nothing more.
+        settled_inflow(&mut engine, &db, &station, &bob, &alice, 300, 0);
+        engine
+            .submit_certificate_request(signed_cert_request(&alice, 300, 0, 2_000), 2_000)
+            .unwrap();
+        assert!(matches!(
+            engine.submit_certificate_request(signed_cert_request(&alice, 1, 1, 2_000), 2_000),
+            Err(Error::NotEnrolled {
+                projected_centi: -1
+            })
+        ));
+    }
+
+    #[test]
+    fn a_revoked_members_cert_backed_spend_is_still_admitted() {
+        let db = fresh_db();
+        let (alice, bob, station) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        let mut engine = Engine::new(&db, station);
+        engine.enroll(&alice);
+
+        // Enrolled, Alice reserves a 500-cap certificate from zero.
+        let cert = engine
+            .submit_certificate_request(signed_cert_request(&alice, 500, 0, 100), 100)
+            .unwrap();
+        let cert_id = cert.payload.cert_id;
+
+        // The operator revokes her: a plain debit is now held at zero …
+        engine.revoke(&alice);
+        let plain = TransactionProposal::new(addr(&alice), addr(&bob), 1, None, 1, 100, 100_000);
+        assert!(matches!(
+            engine.submit_proposal(SignedProposal::sign(plain, &alice), 100),
+            Err(Error::NotEnrolled { .. })
+        ));
+
+        // … but the headroom reserved at issuance is honored (ADR-0021 §4).
+        let spend =
+            TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 1, 100, i64::MAX / 2)
+                .with_certificate(cert_id);
+        engine
+            .submit_proposal(SignedProposal::sign(spend, &alice), 100)
+            .unwrap();
     }
 }

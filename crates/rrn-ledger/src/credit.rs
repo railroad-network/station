@@ -20,6 +20,10 @@
 //! within the floor, that jointly blow through it. Pending *credits* (money
 //! owed to the member) do not count: they can still cancel or be disputed, and
 //! headroom must never be borrowed against an unsettled inflow.
+//!
+//! The floor binds a *person*, not a key (ADR-0038 §4): the configured floor
+//! applies only to an enrolled identity, and any other key's floor is
+//! [`UNENROLLED_FLOOR_CENTI`] (zero).
 
 use rrn_identity::address::Address;
 
@@ -37,6 +41,16 @@ use crate::state::{LedgerSnapshot, TransactionState};
 /// overridable per station via `[credit] debt_floor_centi`, earmarked for
 /// governance tuning later.
 pub const DEFAULT_DEBT_FLOOR_CENTI: i64 = -2_000;
+
+/// The floor of a key the community has not enrolled: zero (ADR-0038 §4).
+///
+/// The configured floor is credit, and credit needs to know whom it was
+/// extended to — so it applies only to an enrolled identity
+/// ([`crate::enrollment`]). Any other key may spend only what it holds; its
+/// floor is `max(UNENROLLED_FLOOR_CENTI, debt_floor_centi)`, never looser than
+/// an enrolled member's. A protocol constant, not a configuration value, so no
+/// operator tuning the member floor can re-open credit for strangers' keys.
+pub const UNENROLLED_FLOOR_CENTI: i64 = 0;
 
 /// The default validity of a headroom certificate: 7 days (ADR-0021 §1).
 ///

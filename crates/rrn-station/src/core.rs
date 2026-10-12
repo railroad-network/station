@@ -32,8 +32,8 @@ use rrn_dispute::resolution::{
 use rrn_dispute::verdict::{JurorVerdict, SignedVerdict};
 use rrn_dispute::DisputeParams;
 use rrn_governance::charter::{
-    create_charter, founder_charter, latest_charter, store_charter, store_pending_charter,
-    CharterParams, SignedCharter,
+    create_charter, founder_charter, latest_charter, root_founder_charter, store_charter_in,
+    store_pending_charter_in, CharterParams, SignedCharter,
 };
 use rrn_governance::emergency::{self, EmergencyCosign, EmergencyDeclaration, EmergencyLapse};
 use rrn_governance::proposal::{
@@ -49,6 +49,9 @@ use rrn_identity::wallet::WalletContents;
 use rrn_ledger::contract::{ContractCharge, ContractRef};
 use rrn_ledger::dispute::{DisputeRecord, DisputeResponse, SignedDispute, SignedDisputeResponse};
 use rrn_ledger::engine::Engine;
+use rrn_ledger::enrollment::{
+    append_enrollment, sign_enrollment, EnrollmentAction, EnrollmentBasis, ENROLLMENT_KIND,
+};
 use rrn_ledger::escrow::{CertificateReturn, EquivocationBasis, EquivocationRecord, EvidenceItem};
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
@@ -814,6 +817,14 @@ impl Core {
     /// caught, the caller answered, and the loop stops — see [`Core::spawn`]).
     fn run(mut self, rx: mpsc::Receiver<Command>) -> CoreExit {
         self.rebuild_listing_index();
+        // Existing logs (ADR-0038 §6): enroll the founders and paired members a
+        // log written before enrollment never recorded. Writer only; a failure
+        // is logged, not fatal — the next start retries.
+        match self.backfill_enrollments(self.clock.now()) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(appended = n, "backfilled member enrollments"),
+            Err(e) => tracing::error!(error = %e, "enrollment backfill failed"),
+        }
         while let Ok(cmd) = rx.recv() {
             match std::panic::catch_unwind(AssertUnwindSafe(|| self.dispatch(cmd))) {
                 Ok(ControlFlow::Continue(())) => {}
@@ -1126,6 +1137,10 @@ impl Core {
             "pair_confirm" => self.m_pair_confirm(req),
             "list_mobiles" => self.m_list_mobiles(),
             "unpair" => self.m_unpair(req),
+            // Enrollment (ADR-0038): who may go into debt.
+            "enroll" => self.m_enroll(req),
+            "enroll_revoke" => self.m_enroll_revoke(req),
+            "list_enrolled" => self.m_list_enrolled(),
             // DTN bundle ingest (ADR-0020): the operator/courier hands the
             // station a bundle over the Unix socket; the station admits each
             // carried record through the same engine front doors the live path
@@ -3097,9 +3112,11 @@ impl Core {
         let charter_hash = signed.charter_hash().to_string();
         let version = signed.charter().version;
 
-        let mut log = AppendLog::new(&self.db);
-        store_charter(&mut log, &self.db, &station, signed, now)
-            .map_err(|e| invalid_params(e.to_string()))?;
+        self.append_charter_enrolling_founders(&signed, true, now)
+            .map_err(|e| match e {
+                CharterAppendError::Refused(e) => invalid_params(e.to_string()),
+                CharterAppendError::Internal(e) => internal(e),
+            })?;
         ok(&rpc::GovCharterResult {
             charter_hash,
             version,
@@ -3154,9 +3171,11 @@ impl Core {
         let signed = create_charter(charter_params, &self_signer)
             .map_err(|e| invalid_params(e.to_string()))?;
 
-        let mut log = AppendLog::new(&self.db);
-        store_pending_charter(&mut log, &self.db, &station, signed.clone(), now)
-            .map_err(|e| invalid_params(e.to_string()))?;
+        self.append_charter_enrolling_founders(&signed, false, now)
+            .map_err(|e| match e {
+                CharterAppendError::Refused(e) => invalid_params(e.to_string()),
+                CharterAppendError::Internal(e) => internal(e),
+            })?;
         ok(&self.pending_charter_view(&signed))
     }
 
@@ -3248,11 +3267,14 @@ impl Core {
                 "the charter is frozen while an emergency is active (ADR-0023 §3b)".to_string(),
             ));
         }
-        let mut log = AppendLog::new(&self.db);
-        // Threshold-clearing appends publish (verify_founders holds); short of it,
-        // the Charter stays pending — both are the same append, gated on reads.
-        store_pending_charter(&mut log, &self.db, &station, signed.clone(), now)
-            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
+        // Threshold-clearing appends publish (verify_founders holds) and enroll
+        // the founders in the same batch; short of it, the Charter stays pending
+        // — both are the same append, gated on reads.
+        self.append_charter_enrolling_founders(&signed, false, now)
+            .map_err(|e| match e {
+                CharterAppendError::Refused(e) => (rpc::INTERNAL_ERROR, e.to_string()),
+                CharterAppendError::Internal(e) => (rpc::INTERNAL_ERROR, e),
+            })?;
         Ok(signed)
     }
 
@@ -4776,15 +4798,31 @@ impl Core {
             // self-signed statement appended verbatim so the station can derive its
             // inbound SMS sender registry from the log. Handled off to the
             // side and returned early; it never touches the ledger engine below.
-            Some(KIND_SMS_BINDING) => return self.admit_sms_binding(bytes, signer, signature, now),
+            //
+            // A binding from a key the community never enrolled is refused: a
+            // stranger's reachability claim carries no credit and would only
+            // pollute the routing directory (ADR-0038 §3).
+            Some(KIND_SMS_BINDING) => {
+                if !self.is_enrolled_signer(&signer)? {
+                    return Ok(refused_disposition(RefusalReason::NotEnrolled));
+                }
+                return self.admit_sms_binding(bytes, signer, signature, now);
+            }
             // A Reticulum transport binding carries no engine semantics — a
             // self-signed "you can reach me at this destination" appended verbatim
             // so the station can derive its routing directory from the log.
             // Handled off to the side and returned early, exactly like
-            // the SMS binding; it never touches the ledger engine below.
+            // the SMS binding — including its enrollment gate (ADR-0038 §3); it
+            // never touches the ledger engine below.
             Some(KIND_TRANSPORT_BINDING) => {
-                return self.admit_transport_binding(bytes, signer, signature, now)
+                if !self.is_enrolled_signer(&signer)? {
+                    return Ok(refused_disposition(RefusalReason::NotEnrolled));
+                }
+                return self.admit_transport_binding(bytes, signer, signature, now);
             }
+            // Enrollment is a station-only record the writer appends at an
+            // in-person ceremony (ADR-0038 §1); a carried one is never admitted.
+            Some(ENROLLMENT_KIND) => return Ok(refused_disposition(RefusalReason::UnroutableKind)),
             // Governance records ride DTN like any member record (ADR-0020): a
             // proposal, co-signature, or ballot authored offline is admitted on
             // arrival through the same append guards the live RPC uses, so windows
@@ -4860,6 +4898,17 @@ impl Core {
             Err(rrn_ledger::Error::Storage(e)) => Err(BundleIngestError::Internal(e.to_string())),
             Err(e) => Ok(refused_disposition(map_refusal(&e))),
         }
+    }
+
+    /// Whether the key `signer` is enrolled in this community at the next log
+    /// position (ADR-0038 §1), derived from the log under the station-key pin.
+    fn is_enrolled_signer(&self, signer: &PublicKey) -> Result<bool, BundleIngestError> {
+        let snapshot = LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_keypair().public_key(),
+        )
+        .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
+        Ok(snapshot.is_enrolled(&Address::from_public_key(*signer)))
     }
 
     /// Admits a self-signed `rrn.net.sms_binding` record: validate it is a
@@ -6768,13 +6817,25 @@ impl Core {
 
         let now = self.clock.now();
         self.prune_pending(now);
-        let pending = self.pending.remove(&params.address).ok_or_else(|| {
+        let pending = self.pending.get(&params.address).cloned().ok_or_else(|| {
             invalid_params(format!(
                 "no pending pairing request from {} (it may have expired)",
                 params.address
             ))
         })?;
 
+        // Pairing is the enrollment ceremony (ADR-0038 §1): the operator has
+        // compared the code in person. The writer enrolls the member *before*
+        // the paired list is written — an append failure fails the pairing, and
+        // a crash between the two leaves a member enrolled but not paired, which
+        // re-pairing repairs. A replica pairs a phone only to browse, and
+        // appends nothing.
+        if self.role.admits() {
+            let member = parse_addr(&pending.mobile_address)?;
+            self.ensure_enrolled(member, EnrollmentBasis::Pairing, now)
+                .map_err(internal)?;
+        }
+        self.pending.remove(&params.address);
         self.paired.add(pending.mobile_address.clone(), now);
         self.paired.save().map_err(internal)?;
         ok(&serde_json::json!({
@@ -6814,6 +6875,273 @@ impl Core {
         }
         ok(&serde_json::json!({ "removed": removed }))
     }
+
+    // --- Enrollment (ADR-0038 Part A) ---------------------------------------
+
+    /// The ledger view the writer reads enrollment from: the whole log, under
+    /// the community station-key pin.
+    fn ledger_snapshot(&self) -> anyhow::Result<LedgerSnapshot> {
+        Ok(LedgerSnapshot::derive(
+            &AppendLog::new(&self.db),
+            &self.station_keypair().public_key(),
+        )?)
+    }
+
+    /// Appends an `Enroll` for `member` with `basis` iff the record would take
+    /// effect and the rules of ADR-0038 §1 call for it; returns whether it
+    /// appended. Writer only.
+    ///
+    /// - `pairing` / `operator`: iff `member` is not currently enrolled —
+    ///   including one revoked earlier (re-enrolling is a fresh in-person
+    ///   decision);
+    /// - `founder`: iff `member` has neither a `founder`-basis event nor any
+    ///   effective revocation — a revoked founder is never a root again (§5).
+    ///
+    /// The station's own identity is enrolled by derivation and never gets a
+    /// record.
+    fn ensure_enrolled(
+        &self,
+        member: Address,
+        basis: EnrollmentBasis,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let snapshot = self.ledger_snapshot()?;
+        if !self.enrollment_owed(&snapshot, &member, basis) {
+            return Ok(false);
+        }
+        append_enrollment(
+            &mut AppendLog::new(&self.db),
+            &self.station_keypair(),
+            member,
+            EnrollmentAction::Enroll,
+            basis,
+            now,
+        )?;
+        tracing::info!(%member, basis = basis.as_str(), "enrolled member");
+        Ok(true)
+    }
+
+    /// Whether the writer owes `member` an `Enroll` with `basis` over
+    /// `snapshot` (see [`ensure_enrolled`](Self::ensure_enrolled)).
+    fn enrollment_owed(
+        &self,
+        snapshot: &LedgerSnapshot,
+        member: &Address,
+        basis: EnrollmentBasis,
+    ) -> bool {
+        if *member == self.wallet.address {
+            return false;
+        }
+        match basis {
+            EnrollmentBasis::Founder => !snapshot.enrollment_events(member).iter().any(|e| {
+                e.action == EnrollmentAction::Revoke || e.basis == EnrollmentBasis::Founder
+            }),
+            EnrollmentBasis::Pairing | EnrollmentBasis::Operator => !snapshot.is_enrolled(member),
+        }
+    }
+
+    /// Appends a founder charter — through the console's threshold-checked door
+    /// (`checked`) or the ceremony's pending door — and, when this append is the
+    /// one at which the community's root founder charter first clears its
+    /// threshold, the `founder` enrollments it owes, in **one** [`LogBatch`]
+    /// (ADR-0038 §1). A crash can never leave a published charter whose founders
+    /// were not enrolled.
+    fn append_charter_enrolling_founders(
+        &self,
+        signed: &SignedCharter,
+        checked: bool,
+        now: i64,
+    ) -> Result<(), CharterAppendError> {
+        let internal = |e: &dyn std::fmt::Display| CharterAppendError::Internal(e.to_string());
+        let station = self.station_keypair();
+        let publishes = signed.verify_founders().is_ok()
+            && root_founder_charter(&self.db)
+                .map_err(|e| internal(&e))?
+                .is_none();
+        let snapshot = self.ledger_snapshot().map_err(|e| internal(&e))?;
+        let log = AppendLog::new(&self.db);
+        let mut batch = log.begin_batch().map_err(|e| internal(&e))?;
+        if checked {
+            store_charter_in(&mut batch, &self.db, &station, signed.clone(), now)
+        } else {
+            store_pending_charter_in(&mut batch, &self.db, &station, signed.clone(), now)
+        }
+        .map_err(CharterAppendError::Refused)?;
+        let mut enrolled = 0usize;
+        if publishes {
+            let mut seen = std::collections::HashSet::new();
+            for founder in &signed.charter().founders {
+                if !seen.insert(founder.public_key().to_bytes())
+                    || !self.enrollment_owed(&snapshot, founder, EnrollmentBasis::Founder)
+                {
+                    continue;
+                }
+                let record = sign_enrollment(
+                    &station,
+                    *founder,
+                    EnrollmentAction::Enroll,
+                    EnrollmentBasis::Founder,
+                    now,
+                )
+                .map_err(|e| internal(&e))?;
+                batch.append(record, now).map_err(|e| internal(&e))?;
+                enrolled += 1;
+            }
+        }
+        batch.commit().map_err(|e| internal(&e))?;
+        if publishes {
+            tracing::info!(founders = enrolled, "charter published; founders enrolled");
+        }
+        Ok(())
+    }
+
+    /// The writer's startup backfill (ADR-0038 §6) — run on every writer start,
+    /// idempotent, usually a no-op — in one
+    /// [`LogBatch`]: a `founder` enrollment for every founder of the root founder
+    /// charter that the founder rule covers, and a `pairing` enrollment for every
+    /// paired address with **no enrollment record at all** — so a revoked member
+    /// who is still paired is not re-enrolled on every restart. Idempotent. The
+    /// paired list and the charter are writer-side inputs, never inputs
+    /// to replay. A replica appends nothing. Returns how many records it appended.
+    fn backfill_enrollments(&self, now: i64) -> anyhow::Result<usize> {
+        if !self.role.admits() {
+            return Ok(0);
+        }
+        let snapshot = self.ledger_snapshot()?;
+        let mut owed: Vec<(Address, EnrollmentBasis)> = Vec::new();
+        let mut queued = std::collections::HashSet::new();
+        if let Some(root) = root_founder_charter(&self.db)? {
+            for founder in &root.charter().founders {
+                if self.enrollment_owed(&snapshot, founder, EnrollmentBasis::Founder)
+                    && queued.insert(founder.public_key().to_bytes())
+                {
+                    owed.push((*founder, EnrollmentBasis::Founder));
+                }
+            }
+        }
+        for mobile in self.paired.list() {
+            let Ok(member) = mobile.address.parse::<Address>() else {
+                tracing::warn!(address = %mobile.address, "paired entry is not an address; not enrolled");
+                continue;
+            };
+            if member != self.wallet.address
+                && snapshot.enrollment_events(&member).is_empty()
+                && queued.insert(member.public_key().to_bytes())
+            {
+                owed.push((member, EnrollmentBasis::Pairing));
+            }
+        }
+        if owed.is_empty() {
+            return Ok(0);
+        }
+        let station = self.station_keypair();
+        let log = AppendLog::new(&self.db);
+        let mut batch = log.begin_batch()?;
+        for (member, basis) in &owed {
+            let record = sign_enrollment(&station, *member, EnrollmentAction::Enroll, *basis, now)?;
+            batch.append(record, now)?;
+        }
+        batch.commit()?;
+        Ok(owed.len())
+    }
+
+    /// `enroll { address }` — the operator enrolls a member who never pairs
+    /// (paper-first, radio-only) after the same in-person check (ADR-0038 §1).
+    /// Idempotent: an already-enrolled address appends nothing.
+    fn m_enroll(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            address: String,
+        }
+        let params: Params = parse_params(req)?;
+        let member = parse_addr(&params.address)?;
+        if member == self.wallet.address {
+            return Err(invalid_params(
+                "the station's own identity is enrolled by derivation",
+            ));
+        }
+        let now = self.clock.now();
+        let appended = self
+            .ensure_enrolled(member, EnrollmentBasis::Operator, now)
+            .map_err(internal)?;
+        let basis = self
+            .ledger_snapshot()
+            .map_err(internal)?
+            .enrollment_basis(&member)
+            .map(EnrollmentBasis::as_str);
+        ok(&serde_json::json!({
+            "address": member.to_string(),
+            "appended": appended,
+            "basis": basis,
+        }))
+    }
+
+    /// `enroll_revoke { address }` — the operator revokes an enrolled member
+    /// (ADR-0038 §5): from here on its floor is zero. Refuses the station's own
+    /// identity and an address that is not enrolled. Unpairing is separate.
+    fn m_enroll_revoke(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            address: String,
+        }
+        let params: Params = parse_params(req)?;
+        let member = parse_addr(&params.address)?;
+        if member == self.wallet.address {
+            return Err(invalid_params(
+                "the station's own identity cannot be revoked",
+            ));
+        }
+        if !self
+            .ledger_snapshot()
+            .map_err(internal)?
+            .is_enrolled(&member)
+        {
+            return Err(invalid_params(format!("{member} is not enrolled")));
+        }
+        let now = self.clock.now();
+        let entry = append_enrollment(
+            &mut AppendLog::new(&self.db),
+            &self.station_keypair(),
+            member,
+            EnrollmentAction::Revoke,
+            EnrollmentBasis::Operator,
+            now,
+        )
+        .map_err(internal)?;
+        tracing::info!(%member, seq = entry.seq, "revoked member's enrollment");
+        ok(&serde_json::json!({
+            "address": member.to_string(),
+            "revoked": true,
+            "seq": entry.seq,
+        }))
+    }
+
+    /// `list_enrolled` — every currently enrolled member with its basis and
+    /// enrollment position, read from the log. The station's own identity is
+    /// enrolled by derivation and is not listed.
+    fn m_list_enrolled(&self) -> Result<serde_json::Value, rpc::RpcError> {
+        let snapshot = self.ledger_snapshot().map_err(internal)?;
+        let mut members: Vec<_> = snapshot
+            .enrolled()
+            .map(|(address, basis, seq)| {
+                serde_json::json!({
+                    "address": address.to_string(),
+                    "basis": basis.as_str(),
+                    "seq": seq,
+                })
+            })
+            .collect();
+        members.sort_by_key(|m| m["seq"].as_u64());
+        ok(&serde_json::json!({ "members": members }))
+    }
+}
+
+/// Why [`Core::append_charter_enrolling_founders`] did not append.
+enum CharterAppendError {
+    /// The charter door refused it (threshold, emergency freeze).
+    Refused(rrn_governance::charter::CharterError),
+    /// A storage fault.
+    Internal(String),
 }
 
 // --- DTN bundle ingest helpers -------------------------------------
@@ -6923,6 +7251,8 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         LE::Expired => RefusalReason::Expired,
         LE::TierNotSupported { .. } => RefusalReason::TierUnsupported,
         LE::DebtFloorExceeded { .. } => RefusalReason::DebtFloor,
+        // An unenrolled signer held at its zero floor (ADR-0038 §4).
+        LE::NotEnrolled { .. } => RefusalReason::NotEnrolled,
         // The referenced transaction is absent or not in the state the record
         // needs — most commonly a confirmation whose proposal has not yet been
         // admitted (couriers must keep outbox order, ADR-0020 §4).
@@ -7191,6 +7521,8 @@ fn operator_method_is_replica_safe(method: &str) -> bool {
             | "pair_confirm"
             | "list_mobiles"
             | "unpair"
+            // Enrollment read (the writes are refused here).
+            | "list_enrolled"
             // Certificate reads.
             | "cert_list"
             | "cert_export"
@@ -7762,6 +8094,21 @@ mod tests {
             PairedMobiles::default(),
             SearchIndex::in_memory(),
         )
+    }
+
+    /// Test setup: enrolls `kp` under the core's station key (ADR-0038), as
+    /// pairing or `station enroll` would, so a member who spends from zero runs
+    /// the configured debt floor.
+    fn enroll(core: &Core, kp: &Keypair) {
+        append_enrollment(
+            &mut AppendLog::new(&core.db),
+            &core.station_keypair(),
+            Address::from_public_key(kp.public_key()),
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Pairing,
+            core.clock.now(),
+        )
+        .unwrap();
     }
 
     /// Builds a wire entry from a freshly-signed vouch, optionally corrupting the
@@ -8344,6 +8691,8 @@ mod tests {
         let mut core = test_core();
         let sender = Keypair::generate();
         let receiver = Keypair::generate(); // the confirming mobile
+        enroll(&core, &sender);
+        enroll(&core, &receiver);
         let receiver_addr = Address::from_public_key(receiver.public_key());
 
         // A Tier-2 proposal — 15 Commons = 1500 centi, above the 5-Common Tier-2
@@ -8611,6 +8960,7 @@ mod tests {
     fn cert_request_over_channel_issues_a_station_signed_certificate() {
         let mut core = test_core();
         let member = Keypair::generate();
+        enroll(&core, &member);
         let now = core.clock.now();
 
         let frame = framed_cert_request(&member, 500, 0, now);
@@ -8787,6 +9137,8 @@ mod tests {
         let mut core = test_core(); // clock = 1000
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
 
         // Signed offline: proposed/confirmed well before ingest (testimony only).
         let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
@@ -9201,6 +9553,8 @@ mod tests {
         let mut core = test_core(); // clock 1000, floor -2000, cert cap max 1000
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
 
         // Alice reserves a 1000 certificate (nonce 0) while connected, then a
         // plain 1000 debit (nonce 1) takes her committed position to the -2000
@@ -9257,6 +9611,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
 
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
 
@@ -9342,6 +9698,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
 
         // 300 admits (consumes 300); 201 overspends (501 > cap 500) → refused.
@@ -9421,6 +9779,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
 
         // Three distinct records alice could place at outbox position 0.
         let p_a = member_proposal(&alice, &bob, 100, 0, 900, 900 + 1_000_000);
@@ -9487,6 +9847,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
 
         let spend0 = cert_backed_proposal(&alice, &bob, 100, cert, 1, 900, 901_000);
@@ -9515,6 +9877,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let cert = issue_cert_for(&core, &alice, 500, 1000);
 
         let spend = cert_backed_proposal(&alice, &bob, 600, cert, 1, 900, 901_000);
@@ -9548,6 +9912,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
 
         // MAX_EVIDENCE_ITEMS - 1 = 15 admitted 30-spends (450 ≤ cap 500).
@@ -9592,6 +9958,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
         let alice_addr = Address::from_public_key(alice.public_key());
         let bob_addr = Address::from_public_key(bob.public_key());
@@ -9637,6 +10005,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let cert = issue_cert_for(&core, &alice, 500, 1000); // alice nonce 0
 
         // A 300 spend admits on time.
@@ -9694,6 +10064,10 @@ mod tests {
         let bob = Keypair::generate();
         let charlie = Keypair::generate();
         let dave = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
+        enroll(&core, &charlie);
+        enroll(&core, &dave);
 
         // Pre-admit charlie's proposal so the mixed bundle can re-carry it as a
         // known duplicate.
@@ -9805,6 +10179,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         // Two DIFFERENT proposals equivocating at nonce 0 / outbox position 0.
         let a = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
         let b = member_proposal(&alice, &bob, 700, 0, 900, 900 + 1_000_000);
@@ -10090,6 +10466,8 @@ mod tests {
         let mut core = test_core();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
+        enroll(&core, &alice);
+        enroll(&core, &bob);
         let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
         let confirmation = member_confirmation(&bob, &proposal, 950);
         let p_entry = outbox_entry(&alice, 0, zero(), &proposal, 900);
@@ -10136,7 +10514,9 @@ mod tests {
 
         let sender = Keypair::generate();
         let alice = Keypair::generate(); // fresh — below the Member band; the confirmer
-                                         // A Tier-2 payment (10 Commons ≥ 5) to alice, signed offline.
+        enroll(&core, &sender);
+        enroll(&core, &alice);
+        // A Tier-2 payment (10 Commons ≥ 5) to alice, signed offline.
         let proposal = member_proposal(&sender, &alice, 1000, 0, now - 1000, now + 1_000_000);
         assert_eq!(proposal.payload.effective_tier(), 2, "a Tier-2 amount");
         let confirmation = member_confirmation(&alice, &proposal, now - 500);
@@ -12655,6 +13035,10 @@ mod tests {
         let alice = Keypair::generate();
         let alice_addr = Address::from_public_key(alice.public_key());
         let mallory = Keypair::generate();
+        enroll(&core, &alice);
+        // Mallory is an enrolled member too, so the forged binding below reaches
+        // the self-signed check (an unenrolled forger is refused earlier).
+        enroll(&core, &mallory);
 
         // alice's chain (same-author entries must be carried in position order):
         // pos0 = newer (issued 200, "newdest"), admitted first; pos1 = older
@@ -12858,5 +13242,469 @@ mod tests {
         let mut core = core;
         let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
         assert_eq!(status["pushes"][0]["state"], "abandoned");
+    }
+    // --- Enrollment (ADR-0038 Part A) ----------------------------------------
+
+    fn addr_of(kp: &Keypair) -> Address {
+        Address::from_public_key(kp.public_key())
+    }
+
+    /// How many enrollment records (effective or not) are on the log.
+    fn enrollment_records(core: &Core) -> usize {
+        AppendLog::new(&core.db)
+            .iter_from(1)
+            .filter(|e| {
+                dtn_record_kind(&e.as_ref().unwrap().payload.bytes).as_deref()
+                    == Some(ENROLLMENT_KIND)
+            })
+            .count()
+    }
+
+    fn snapshot_of(core: &Core) -> LedgerSnapshot {
+        LedgerSnapshot::derive(&AppendLog::new(&core.db), &core.station_pubkey()).unwrap()
+    }
+
+    /// A test core whose paired list persists to a scratch directory, so the
+    /// operator's `pair_confirm` can save it.
+    fn pairing_core(dir: &tempfile::TempDir) -> Core {
+        let mut core = test_core();
+        core.paired = PairedMobiles::load(dir.path()).unwrap();
+        core
+    }
+
+    /// Runs the pairing handshake for `member` and the operator's confirmation.
+    fn pair(core: &mut Core, member: &Keypair) {
+        let token = [7u8; 32];
+        let now = core.clock.now();
+        let msg = pairing::request_signed_bytes(&member.public_key(), &token, now);
+        core.do_pair_request(PairRequest {
+            mobile_address: addr_of(member).to_string(),
+            token: hex(&token),
+            requested_at: now,
+            signature: hex(&member.sign(&msg).to_bytes()),
+        })
+        .unwrap();
+        call(
+            core,
+            "pair_confirm",
+            serde_json::json!({ "address": addr_of(member).to_string() }),
+        );
+    }
+
+    /// The audited reproduction: three brand-new keys each pay 4.99 to one
+    /// receiver over the delay-tolerant door. Each throwaway proposal is refused
+    /// `not-enrolled`, so each confirmation has nothing to confirm, nothing
+    /// settles, and no credit is minted.
+    #[test]
+    fn dtn_door_refuses_debits_from_never_enrolled_keys() {
+        let mut core = test_core();
+        let station_pk = core.station_pubkey();
+        let receiver = Keypair::generate();
+        let recv_addr = Address::from_public_key(receiver.public_key());
+        let mut recv_prev = zero();
+        let mut throwaways = Vec::new();
+        for recv_pos in 0..3u64 {
+            // A brand-new key nobody paired, vouched for, or has ever seen.
+            let k = Keypair::generate();
+            let p = member_proposal(&k, &receiver, 499, 0, 900, 900 + 1_000_000);
+            let pe = outbox_entry(&k, 0, zero(), &p, 900);
+            let c = member_confirmation(&receiver, &p, 950);
+            let ce = outbox_entry(&receiver, recv_pos, recv_prev, &c, 950);
+            recv_prev = ce.payload.entry_hash();
+            let r = submit_bundle(&mut core, &[pe, ce], 1000);
+            assert!(matches!(
+                r.payload.outcomes[0].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::NotEnrolled
+                }
+            ));
+            assert!(matches!(
+                r.payload.outcomes[1].disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::NotProposed
+                }
+            ));
+            throwaways.push(Address::from_public_key(k.public_key()));
+        }
+        core.clock.set(1_000 + 3 * 86_400);
+        let settled = core.do_sweep();
+        assert_eq!(settled, 0);
+        let rb = ledger_view::balance_of(&core.db, &recv_addr, &station_pk).unwrap();
+        assert_eq!(rb, 0, "no credit minted for the receiver");
+        for a in &throwaways {
+            assert_eq!(
+                ledger_view::balance_of(&core.db, a, &station_pk).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn an_operator_enrolled_dtn_member_keeps_the_floor() {
+        let mut core = test_core();
+        let station_pk = core.station_pubkey();
+        let (sender, receiver) = (Keypair::generate(), Keypair::generate());
+        let enrolled = call(
+            &mut core,
+            "enroll",
+            serde_json::json!({ "address": addr_of(&sender).to_string() }),
+        );
+        assert_eq!(enrolled["appended"], true);
+        assert_eq!(enrolled["basis"], "operator");
+
+        let p = member_proposal(&sender, &receiver, 499, 0, 900, 900 + 1_000_000);
+        let c = member_confirmation(&receiver, &p, 950);
+        let entries = [
+            outbox_entry(&sender, 0, zero(), &p, 900),
+            outbox_entry(&receiver, 0, zero(), &c, 950),
+        ];
+        let r = submit_bundle(&mut core, &entries, 1000);
+        for o in &r.payload.outcomes {
+            assert!(matches!(o.disposition, Disposition::Admitted { .. }));
+        }
+        core.clock.set(1_000 + 3 * 86_400);
+        assert_eq!(core.do_sweep(), 1);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &addr_of(&sender), &station_pk).unwrap(),
+            -499
+        );
+    }
+
+    #[test]
+    fn an_unenrolled_key_cannot_land_a_binding() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        let a = addr_of(&member);
+        let transport = SignedPayload::sign(TransportBinding::new(a, "dest", 100), &member);
+        let sms = SignedPayload::sign(
+            rrn_protocol::binding::SmsBinding::new(a, "+15551234567", 100),
+            &member,
+        );
+        let e0 = outbox_entry(&member, 0, zero(), &transport, 100);
+        let e1 = outbox_entry(&member, 1, e0.payload.entry_hash(), &sms, 100);
+
+        let r = submit_bundle(&mut core, &[e0.clone(), e1.clone()], 1000);
+        for o in &r.payload.outcomes {
+            assert!(matches!(
+                o.disposition,
+                Disposition::Refused {
+                    reason: RefusalReason::NotEnrolled
+                }
+            ));
+        }
+
+        // Once enrolled, the same bindings land (each presented on its own, so
+        // the earlier receipt is not simply replayed).
+        enroll(&core, &member);
+        for e in [e0, e1] {
+            let r = submit_bundle(&mut core, &[e], 1000);
+            assert!(matches!(
+                r.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn an_enrollment_record_is_not_routable() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        // Even one correctly signed by the station key cannot be carried in.
+        let record = rrn_ledger::enrollment::sign_enrollment(
+            &core.station_keypair(),
+            addr_of(&member),
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Operator,
+            100,
+        )
+        .unwrap();
+        let entry = outbox_entry(&member, 0, zero(), &record, 100);
+        let r = submit_bundle(&mut core, &[entry], 1000);
+        assert!(matches!(
+            r.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::UnroutableKind
+            }
+        ));
+        assert_eq!(enrollment_records(&core), 0);
+        assert!(!snapshot_of(&core).is_enrolled(&addr_of(&member)));
+    }
+
+    #[test]
+    fn pair_confirm_enrolls_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = pairing_core(&dir);
+        let member = Keypair::generate();
+        pair(&mut core, &member);
+        assert_eq!(enrollment_records(&core), 1);
+        assert_eq!(
+            snapshot_of(&core).enrollment_basis(&addr_of(&member)),
+            Some(EnrollmentBasis::Pairing)
+        );
+        // Re-pairing (a new device handshake for the same identity) appends none.
+        call(
+            &mut core,
+            "unpair",
+            serde_json::json!({ "address": addr_of(&member).to_string() }),
+        );
+        pair(&mut core, &member);
+        assert_eq!(enrollment_records(&core), 1);
+        // Unpairing never revoked it.
+        assert!(snapshot_of(&core).is_enrolled(&addr_of(&member)));
+
+        // A replica pairs a phone to browse, and appends nothing.
+        let replica_dir = tempfile::tempdir().unwrap();
+        let mut replica = pairing_core(&replica_dir).with_role(crate::config::StationRole::Replica);
+        pair(&mut replica, &Keypair::generate());
+        assert_eq!(enrollment_records(&replica), 0);
+    }
+
+    #[test]
+    fn charter_publication_enrolls_founders() {
+        // Solo console path: two key-held founders, published in one append. Their
+        // `founder` enrollments land right behind the charter, in the same batch.
+        let mut core = test_core();
+        let (f1, f2) = (Keypair::generate(), Keypair::generate());
+        call(
+            &mut core,
+            "governance_init_charter",
+            serde_json::json!({
+                "community_id": "commons",
+                "founder_secrets_hex": [
+                    hex(&f1.secret_key().to_bytes()),
+                    hex(&f2.secret_key().to_bytes()),
+                ],
+            }),
+        );
+        let snap = snapshot_of(&core);
+        for f in [&f1, &f2] {
+            assert_eq!(
+                snap.enrollment_basis(&addr_of(f)),
+                Some(EnrollmentBasis::Founder)
+            );
+        }
+        assert_eq!(core.tail_seq(), 3, "the charter and two enrollments");
+
+        // Solo with the station as sole founder: the station is never a root, so
+        // nothing is appended beyond the charter.
+        let mut solo = test_core();
+        call(
+            &mut solo,
+            "governance_init_charter",
+            serde_json::json!({ "community_id": "solo" }),
+        );
+        assert_eq!(enrollment_records(&solo), 0);
+
+        // Ceremony path: one founder pairs first (enrolled `pairing`), then the
+        // ceremony publishes at the threshold-clearing co-signature. The
+        // pre-paired founder is upgraded, not re-enrolled; every external founder
+        // is a root; nothing is enrolled while the charter is still pending.
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = pairing_core(&dir);
+        let externals: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        pair(&mut core, &externals[0]);
+        let paired_seq = snapshot_of(&core).enrollment_events(&addr_of(&externals[0]))[0].seq;
+        let mut founders = vec![core.wallet.address.to_string()];
+        founders.extend(externals.iter().map(|k| addr_of(k).to_string()));
+        let begun = call(
+            &mut core,
+            "governance_charter_begin",
+            serde_json::json!({ "community_id": "pilot", "founders": founders }),
+        );
+        assert_eq!(begun["published"], false);
+        assert_eq!(enrollment_records(&core), 1);
+        let body = unhex(begun["body_hex"].as_str().unwrap()).unwrap();
+        for f in &externals[..2] {
+            call(
+                &mut core,
+                "governance_add_charter_signature",
+                serde_json::json!({
+                    "signer_pubkey_hex": hex(&f.public_key().to_bytes()),
+                    "signature_hex": hex(&f.sign(&body).to_bytes()),
+                }),
+            );
+        }
+        let snap = snapshot_of(&core);
+        for f in &externals {
+            assert_eq!(
+                snap.enrollment_basis(&addr_of(f)),
+                Some(EnrollmentBasis::Founder)
+            );
+        }
+        // The upgrade keeps the original enrollment position.
+        let pos: Vec<_> = snap
+            .enrolled()
+            .filter(|(a, _, _)| **a == addr_of(&externals[0]))
+            .map(|(_, _, seq)| seq)
+            .collect();
+        assert_eq!(pos, vec![paired_seq]);
+        assert!(snap.enrollment_basis(&core.wallet.address).is_none());
+        assert_eq!(enrollment_records(&core), 4, "one pairing + three founders");
+    }
+
+    #[test]
+    fn writer_startup_backfills_founders_and_paired() {
+        let mut core = test_core();
+        let (f1, f2) = (Keypair::generate(), Keypair::generate());
+        let (paired_only, revoked) = (Keypair::generate(), Keypair::generate());
+        // A log written before enrollment: a published charter (station + two
+        // founders), no enrollment records.
+        let charter = create_charter(
+            CharterParams {
+                version: 1,
+                community_id: "old".into(),
+                founding_principles: vec![],
+                rights_floor: vec![],
+                governance_structure: rrn_governance::charter::GovernanceStructure::default(),
+                amendment_rules: rrn_governance::charter::AmendmentRules::default(),
+                founders: vec![core.wallet.address, addr_of(&f1), addr_of(&f2)],
+                created_at: 900,
+                previous_hash: None,
+            },
+            &[core.station_keypair(), f1.clone(), f2.clone()],
+        )
+        .unwrap();
+        rrn_governance::charter::store_charter(
+            &mut AppendLog::new(&core.db),
+            &core.db,
+            &core.station_keypair(),
+            charter,
+            900,
+        )
+        .unwrap();
+        // f2 was revoked by the operator: never a root again. A second member was
+        // enrolled and revoked, and is still paired: not re-enrolled.
+        for (kp, action) in [
+            (&f2, EnrollmentAction::Enroll),
+            (&f2, EnrollmentAction::Revoke),
+            (&revoked, EnrollmentAction::Enroll),
+            (&revoked, EnrollmentAction::Revoke),
+        ] {
+            let basis = if action == EnrollmentAction::Revoke {
+                EnrollmentBasis::Operator
+            } else {
+                EnrollmentBasis::Pairing
+            };
+            append_enrollment(
+                &mut AppendLog::new(&core.db),
+                &core.station_keypair(),
+                addr_of(kp),
+                action,
+                basis,
+                950,
+            )
+            .unwrap();
+        }
+        for kp in [&paired_only, &revoked, &f1] {
+            core.paired.add(addr_of(kp).to_string(), 950);
+        }
+        let before = enrollment_records(&core);
+
+        assert_eq!(core.backfill_enrollments(1_000).unwrap(), 2);
+        let snap = snapshot_of(&core);
+        assert_eq!(
+            snap.enrollment_basis(&addr_of(&f1)),
+            Some(EnrollmentBasis::Founder)
+        );
+        assert_eq!(
+            snap.enrollment_basis(&addr_of(&paired_only)),
+            Some(EnrollmentBasis::Pairing)
+        );
+        assert!(!snap.is_enrolled(&addr_of(&f2)));
+        assert!(!snap.is_enrolled(&addr_of(&revoked)));
+        assert!(snap.enrollment_basis(&core.wallet.address).is_none());
+        assert_eq!(enrollment_records(&core), before + 2);
+        // Idempotent.
+        assert_eq!(core.backfill_enrollments(1_001).unwrap(), 0);
+
+        // A replica appends nothing, whatever it holds.
+        let mut replica = test_core().with_role(crate::config::StationRole::Replica);
+        replica.paired.add(addr_of(&paired_only).to_string(), 950);
+        assert_eq!(replica.backfill_enrollments(1_000).unwrap(), 0);
+        assert_eq!(enrollment_records(&replica), 0);
+    }
+
+    #[test]
+    fn enroll_and_revoke_rpcs() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        let receiver = Keypair::generate();
+        let station_addr = core.wallet.address.to_string();
+
+        // Revoking the station or a non-member is refused.
+        for address in [station_addr.clone(), addr_of(&member).to_string()] {
+            let e = call_err(
+                &mut core,
+                "enroll_revoke",
+                serde_json::json!({ "address": address }),
+            );
+            assert_eq!(e.code, rpc::INVALID_PARAMS);
+        }
+        let e = call_err(
+            &mut core,
+            "enroll",
+            serde_json::json!({ "address": station_addr }),
+        );
+        assert_eq!(e.code, rpc::INVALID_PARAMS);
+
+        // Enroll (idempotent), list, revoke.
+        let first = call(
+            &mut core,
+            "enroll",
+            serde_json::json!({ "address": addr_of(&member).to_string() }),
+        );
+        assert_eq!(first["appended"], true);
+        let again = call(
+            &mut core,
+            "enroll",
+            serde_json::json!({ "address": addr_of(&member).to_string() }),
+        );
+        assert_eq!(again["appended"], false);
+        assert_eq!(again["basis"], "operator");
+        let listed = call(&mut core, "list_enrolled", serde_json::json!({}));
+        let members = listed["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["address"], addr_of(&member).to_string());
+        assert_eq!(members[0]["basis"], "operator");
+        assert_eq!(members[0]["seq"], 1);
+
+        call(
+            &mut core,
+            "enroll_revoke",
+            serde_json::json!({ "address": addr_of(&member).to_string() }),
+        );
+        let listed = call(&mut core, "list_enrolled", serde_json::json!({}));
+        assert!(listed["members"].as_array().unwrap().is_empty());
+
+        // After the revocation the member is held at zero.
+        let p = member_proposal(&member, &receiver, 1, 0, 900, 900 + 1_000_000);
+        let r = submit_bundle(
+            &mut core,
+            &[outbox_entry(&member, 0, zero(), &p, 900)],
+            1000,
+        );
+        assert!(matches!(
+            r.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::NotEnrolled
+            }
+        ));
+
+        // A replica refuses the writes and serves the read.
+        let mut replica = test_core().with_role(crate::config::StationRole::Replica);
+        let e = call_err(
+            &mut replica,
+            "enroll",
+            serde_json::json!({ "address": addr_of(&member).to_string() }),
+        );
+        assert_eq!(e.code, rpc::READ_REPLICA);
+        let e = call_err(
+            &mut replica,
+            "enroll_revoke",
+            serde_json::json!({ "address": addr_of(&member).to_string() }),
+        );
+        assert_eq!(e.code, rpc::READ_REPLICA);
+        let listed = call(&mut replica, "list_enrolled", serde_json::json!({}));
+        assert!(listed["members"].as_array().unwrap().is_empty());
     }
 }

@@ -45,6 +45,13 @@ pub enum RefusalReason {
     /// Admitting the record would commit its signer below the debt floor
     /// (ADR-0018).
     DebtFloor,
+    /// The signer is not enrolled in this community, so it may spend only what
+    /// it holds, and this record would take it below zero (ADR-0038 §4); or an
+    /// unenrolled key presented a transport/SMS binding (ADR-0038 §3). Like
+    /// `debt-floor` it depends on state: the record can be admitted later, after
+    /// an inflow or after enrollment, in a new presentation (a byte-identical one
+    /// is answered from the stored receipt).
+    NotEnrolled,
     /// The proposal had expired by the admission clock (ADR-0022 §4).
     Expired,
     /// The record's `kind` is not one the station admits over DTN.
@@ -113,6 +120,7 @@ impl RefusalReason {
             RefusalReason::BadSignature => "bad-signature",
             RefusalReason::NonceGap => "nonce-gap",
             RefusalReason::DebtFloor => "debt-floor",
+            RefusalReason::NotEnrolled => "not-enrolled",
             RefusalReason::Expired => "expired",
             RefusalReason::UnroutableKind => "unroutable-kind",
             RefusalReason::OutboxFork => "outbox-fork",
@@ -141,6 +149,7 @@ impl RefusalReason {
             "bad-signature" => Some(RefusalReason::BadSignature),
             "nonce-gap" => Some(RefusalReason::NonceGap),
             "debt-floor" => Some(RefusalReason::DebtFloor),
+            "not-enrolled" => Some(RefusalReason::NotEnrolled),
             "expired" => Some(RefusalReason::Expired),
             "unroutable-kind" => Some(RefusalReason::UnroutableKind),
             "outbox-fork" => Some(RefusalReason::OutboxFork),
@@ -484,6 +493,7 @@ mod tests {
             RefusalReason::BadSignature,
             RefusalReason::NonceGap,
             RefusalReason::DebtFloor,
+            RefusalReason::NotEnrolled,
             RefusalReason::Expired,
             RefusalReason::UnroutableKind,
             RefusalReason::OutboxFork,
