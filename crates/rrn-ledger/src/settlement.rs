@@ -691,6 +691,16 @@ mod tests {
                 Keypair::generate(),
             );
             let mut engine = Engine::new(&db, station.clone());
+            // Alice spends from zero, so she must be enrolled (ADR-0038).
+            crate::enrollment::append_enrollment(
+                &mut AppendLog::new(&db),
+                &station,
+                addr(&alice),
+                crate::enrollment::EnrollmentAction::Enroll,
+                crate::enrollment::EnrollmentBasis::Pairing,
+                0,
+            )
+            .unwrap();
 
             // Propose at PROPOSED_AT; admit the confirmation at `confirm_admit`
             // while it claims the swept-over `confirmed_at`.

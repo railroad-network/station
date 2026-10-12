@@ -21,6 +21,8 @@ use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 use rrn_storage::migrations;
 
+use crate::support::enroll;
+
 const WINDOW: u64 = 100;
 
 fn addr(kp: &Keypair) -> Address {
@@ -40,6 +42,7 @@ fn run_once() -> (i64, i64, u64) {
     let station = Keypair::generate();
 
     let mut engine = Engine::new(&db, station.clone());
+    enroll(&db, &station, &alice);
     let mut settler = Settler::new(&db, station.clone(), SettlementConfig::uniform(WINDOW));
     let balances = BalanceView::new(&db);
 
@@ -87,10 +90,10 @@ fn run_once() -> (i64, i64, u64) {
     let bob_balance = balances.balance_of(&addr(&bob)).unwrap();
     assert_eq!((alice_balance, bob_balance), (-300, 300));
 
-    // The log holds proposal + confirmation + a single settlement (replayed
-    // operations that errored or no-op'd appended nothing).
+    // The log holds Alice's enrollment + proposal + confirmation + a single
+    // settlement (replayed operations that errored or no-op'd appended nothing).
     let log_len = AppendLog::new(&db).verify_chain().unwrap();
-    assert_eq!(log_len, 3, "no extra entries from replayed operations");
+    assert_eq!(log_len, 4, "no extra entries from replayed operations");
 
     (alice_balance, bob_balance, log_len)
 }
@@ -102,5 +105,5 @@ fn replayed_operations_do_not_change_final_state() {
     for _ in 0..9 {
         assert_eq!(run_once(), first);
     }
-    assert_eq!(first, (-300, 300, 3));
+    assert_eq!(first, (-300, 300, 4));
 }

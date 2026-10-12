@@ -24,6 +24,8 @@ use rrn_ledger::transaction::{
 };
 use rrn_storage::db::Database;
 use rrn_storage::migrations;
+
+use crate::support::enroll;
 use tracing::info;
 
 /// Captures `info!` output under `--nocapture`. Idempotent across tests.
@@ -133,6 +135,7 @@ fn tiers_settle_on_their_own_windows() {
             debt_floor_centi: -10_000,
             ..rrn_ledger::credit::CreditConfig::default()
         });
+    enroll(&db, &station, &alice_kp);
     // The real production defaults — 24h Tier 1, 48h Tier 2.
     let mut settler = Settler::new(&db, station.clone(), SettlementConfig::default());
 

@@ -259,9 +259,10 @@ mod tests {
         core.spawn()
     }
 
-    /// A real one-record proposal bundle (encoded bytes + its push id), which the
-    /// receiver admits so delivery reflects a genuine log append.
-    fn proposal_bundle() -> (Vec<u8>, [u8; 32]) {
+    /// A real one-record proposal bundle (encoded bytes + its push id + the
+    /// sender's address), which the receiver admits — once it has enrolled the
+    /// sender (ADR-0038) — so delivery reflects a genuine log append.
+    fn proposal_bundle() -> (Vec<u8>, [u8; 32], Address) {
         let alice = Keypair::generate();
         let bob = Keypair::generate();
         let alice_addr = Address::from_public_key(alice.public_key());
@@ -273,7 +274,7 @@ mod tests {
         let soe = SignedPayload::sign(entry, &alice);
         let push_id = Hash::of(&soe.payload.record_hash().to_bytes()).to_bytes();
         let bundle = Bundle::new(vec![EntryEnvelope::from_signed(&soe)], 1000);
-        (bundle.encode(), push_id)
+        (bundle.encode(), push_id, alice_addr)
     }
 
     fn mock_pair(now: i64, drop_prob: f64) -> (DtnLoop<Mock>, DtnLoop<Mock>, LoopbackNet) {
@@ -338,7 +339,16 @@ mod tests {
         let core_b = spawn_core(clock.clone(), None);
         let (mut a, mut b, _net) = mock_pair(1000, 0.10);
 
-        let (bundle, push_id) = proposal_bundle();
+        let (bundle, push_id, sender) = proposal_bundle();
+        // B's operator enrolled the sender, so B admits its debit.
+        core_b
+            .call(rpc::Request {
+                id: "0".into(),
+                method: "enroll".into(),
+                params: serde_json::json!({ "address": sender.to_string() }),
+            })
+            .await
+            .unwrap();
 
         // A originates the push through the RPC front door (row inserted + signal).
         let queued = core_a
@@ -409,7 +419,7 @@ mod tests {
         let (_tx_b, mut rx_b) = mpsc::channel(16);
         let core_a = spawn_core(clock.clone(), Some(tx_a));
         let core_b = spawn_core(clock.clone(), None);
-        let (bundle, push_id) = proposal_bundle();
+        let (bundle, push_id, _) = proposal_bundle();
 
         core_a
             .call(rpc::Request {
@@ -500,7 +510,7 @@ mod tests {
         let clock = Clock::manual(1000);
         let (tx_a, mut rx_a) = mpsc::channel(16);
         let core_a = spawn_core(clock.clone(), Some(tx_a));
-        let (bundle, push_id) = proposal_bundle();
+        let (bundle, push_id, _) = proposal_bundle();
         core_a
             .call(rpc::Request {
                 id: "1".into(),

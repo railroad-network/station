@@ -30,6 +30,10 @@
 //!   outstanding certificate's remaining cap counts against its member's
 //!   committed position exactly like a pending debit, so a cert-backed spend can
 //!   later be admitted under partition without a fresh floor check.
+//! - [`enrollment`] — who may go into debt (ADR-0038): the station-signed
+//!   enrollment record the writer appends at an in-person ceremony. Only an
+//!   enrolled identity runs the configured debt floor; any other key is held at
+//!   zero, so it can spend only what it holds.
 //!
 //! # The log is the source of truth
 //!
@@ -65,6 +69,7 @@ pub mod contract;
 pub mod credit;
 pub mod dispute;
 pub mod engine;
+pub mod enrollment;
 pub mod escrow;
 pub mod settlement;
 pub mod state;
@@ -155,6 +160,20 @@ pub enum Error {
         /// The configured floor, in centicommons (≤ 0).
         floor_centi: i64,
         /// The balance the member would be committed to if this debit were
+        /// accepted, in centicommons.
+        projected_centi: i64,
+    },
+    /// The debtor is not enrolled in this community (ADR-0038 §4), so its floor
+    /// is zero: it may spend only what it holds, and this debit would take its
+    /// projected balance below that. Like [`Error::DebtFloorExceeded`] it
+    /// depends on state — the same record can be admitted after an inflow or
+    /// after enrollment.
+    #[error(
+        "not enrolled in this community: you can spend only what you hold (this would \
+         leave {projected_centi} centicommons)"
+    )]
+    NotEnrolled {
+        /// The balance the key would be committed to if this debit were
         /// accepted, in centicommons.
         projected_centi: i64,
     },

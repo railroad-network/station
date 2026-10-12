@@ -304,15 +304,32 @@ station pair-mobile <the-phone's-rrn1-address>
 and the member confirms on their phone. Done: the phone now syncs with the
 station, receives push updates, and can transact.
 
+Confirming the pair also **enrolls** the member on the community's log
+(ADR-0038). Only an enrolled member can go into debt, down to the community's
+debt floor; a key nobody enrolled can spend only what it holds. That is what
+stops someone minting credit by generating fresh keys and walking away from
+them. Your in-person code comparison is the enrollment ceremony, so it is worth
+the care.
+
 If the codes *don't* match, refuse: something on the network answered in the
 station's place. Find out what before pairing anyone.
 
 Housekeeping commands you'll use over the community's life:
 
 ```sh
-station list-mobiles          # who is paired
-station unpair <rrn1-addr>    # revoke a lost or departed member's phone
+station list-mobiles                    # who is paired
+station unpair <rrn1-addr>              # revoke a lost or departed member's phone
+station enroll --list                   # who is enrolled (may go into debt), and how
+station enroll --revoke <rrn1-addr>     # end a member's credit: from now on they can
+                                        # spend only what they hold
 ```
+
+Unpairing removes a phone from the channel but **leaves the member enrolled**;
+revoking enrollment is a separate, deliberate step. A revoked member keeps
+whatever they hold and any certificate already issued to them is still honored.
+If you revoke someone, unpair them too: a recurring contract charge is not yet
+floor-checked, so a revoked member who stays paired could still agree one as a
+buyer.
 
 ### 2.4 Members without a smartphone — the CLI wallet
 
@@ -337,6 +354,7 @@ rrn wallet pair  --url 192.168.4.1:7500                 # shows an 8-char SAS
 
 **Confirm the pair as in §2.3:** compare the SAS the wallet prints with what
 `station pair-mobile` lists, then `station pair-mobile <their-rrn1-address>`.
+As with a phone, confirming the pair enrolls them.
 The member then runs `rrn wallet sync` to pull their nonce, balance, and any
 receipts. To pay offline they `rrn wallet pay …` and `rrn wallet export qr
 --out <dir>` (or `rrn wallet export bundle --out <dir>` for a raw bundle a
@@ -354,6 +372,18 @@ encrypts its key file, but the decrypted key is in memory while a command runs.
 If a member restores from a backup, they must reach the station's LAN once and
 run `rrn wallet sync` before they can sign again (this re-anchors their chain so
 it cannot fork).
+
+**Members who never pair** — someone who only ever transacts on paper, or only
+over radio — still need enrolling before they can go into debt. Do the same
+in-person check you would for pairing (they show you their `rrn1…` address,
+from their wallet, face to face), then:
+
+```sh
+station enroll <their-rrn1-address>
+```
+
+Until then they can receive, and spend what they have received, but not go
+below zero.
 
 ---
 
@@ -563,6 +593,11 @@ thief holds the same key until you act): `station unpair <addr>` first, *then* l
 the member recover and re-pair. Every holder must confirm the fingerprint out of
 band before contributing — a recovery request is exactly as trustworthy as the
 person showing it. See the member docs for the step-by-step.
+
+**A member who cannot recover** (no circle, or not enough holders) starts again
+with a new identity. Revoke the old key with `station enroll --revoke <old-addr>`
+and pair (or `station enroll`) the new one. Any debt stays on the old key — the
+debt floor bounds it — and the new key starts from zero.
 
 ### 4.4 Seizure resistance — the encrypted profile (optional, Linux)
 
@@ -1163,7 +1198,12 @@ station run                       # serve (prompts passphrase, or RRN_PASSPHRASE
 station pair-mobile               # list pending pair requests + codes
 station pair-mobile <rrn1-addr>   # confirm one, after comparing codes in person
 station list-mobiles              # who is paired
-station unpair <rrn1-addr>        # revoke a phone
+station unpair <rrn1-addr>        # revoke a phone (the member stays enrolled)
+
+# enrollment — who may go into debt (pairing enrolls automatically)
+station enroll <rrn1-addr>        # enroll a member who never pairs, after an in-person check
+station enroll --revoke <rrn1-addr>   # end a member's credit; they keep what they hold
+station enroll --list             # the enrolled members, with basis and log position
 
 # founding
 rrn governance charter-begin --community-id <id> --principle … --right … --founder <addr> …

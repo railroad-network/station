@@ -1,0 +1,31 @@
+{
+  "_comment": "Enrollment wire fixture (ADR-0038 §1): the station-signed rrn.member.enrollment kind — a founder enroll, a pairing enroll and an operator revoke. `canonical_hex` is the record's canonical dCBOR (== From<T> for CBOR); `signature_hex` is the station's Ed25519 signature over those bytes. Station-only: no member device signs or verifies this kind, so the mobile repo keeps no copy. Deterministic (blake3-derived seeds, RFC 8032); regenerate with RRN_REGEN=1.",
+  "station_seed": "c3d5e17e51159a31dc48123de64ed1c97adc4feaf92628f761f22476ce34e1cb",
+  "station_pubkey": "20baba9be2328d3b404c04065cc9616b77adc0bc3a52e48da6e1d63125fbec1f",
+  "vectors": [
+    {
+      "member_pubkey": "35bc89fcff96b2b6c1ebfcd4a324bedd46a4539edf7d5dc6d1aa2e13d8d9679e",
+      "action": "enroll",
+      "basis": "founder",
+      "recorded_at": "1700000000",
+      "canonical_hex": "a5646b696e647572726e2e6d656d6265722e656e726f6c6c6d656e7465626173697367666f756e64657266616374696f6e66656e726f6c6c666d656d626572582035bc89fcff96b2b6c1ebfcd4a324bedd46a4539edf7d5dc6d1aa2e13d8d9679e6b7265636f726465645f61741a6553f100",
+      "signature_hex": "77a85bfbb91d37a94ab13fe933083cf70e7e45fc8293f5ec7b58d1848acf2b93b3b5f1322939100ed071a3ebb890a98d83b4554bff4dd095e3f71eb702bc120c"
+    },
+    {
+      "member_pubkey": "a74943d67f1b796d7f2cba33c16e35de0c8af3f6bbfb88b4109a5ec3947e98af",
+      "action": "enroll",
+      "basis": "pairing",
+      "recorded_at": "1700000100",
+      "canonical_hex": "a5646b696e647572726e2e6d656d6265722e656e726f6c6c6d656e746562617369736770616972696e6766616374696f6e66656e726f6c6c666d656d6265725820a74943d67f1b796d7f2cba33c16e35de0c8af3f6bbfb88b4109a5ec3947e98af6b7265636f726465645f61741a6553f164",
+      "signature_hex": "820b3addad8dd4d0c688f0a95ed4cf18e131190713b0f9b7b67054203590711e90762b9395b385ebad32253db0db3cc1a1c7aa8e1087db73d4467d30f7c9fa05"
+    },
+    {
+      "member_pubkey": "a74943d67f1b796d7f2cba33c16e35de0c8af3f6bbfb88b4109a5ec3947e98af",
+      "action": "revoke",
+      "basis": "operator",
+      "recorded_at": "1700000200",
+      "canonical_hex": "a5646b696e647572726e2e6d656d6265722e656e726f6c6c6d656e74656261736973686f70657261746f7266616374696f6e667265766f6b65666d656d6265725820a74943d67f1b796d7f2cba33c16e35de0c8af3f6bbfb88b4109a5ec3947e98af6b7265636f726465645f61741a6553f1c8",
+      "signature_hex": "138501d1ef9414f35baf7860d209b8d2b8ea5ec36e5a43cf4fac75e78d09f6056c37f3fe1015d5b98d63cdf6d83b669a748bd65ea5d115ba7d9e6f4e8e78d40c"
+    }
+  ]
+}

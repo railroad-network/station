@@ -269,12 +269,24 @@ async fn run_cert_spend_over_sms() {
 #[tokio::test]
 async fn sms_binding_admits_via_ingest_and_flips_the_registry() {
     let dir = tempfile::tempdir().unwrap();
-    let (station, _operator, _client) = spawn_station(dir.path()).await;
+    let (station, _operator, client) = spawn_station(dir.path()).await;
     let now = station.clock().now();
     let member = Msisdn::parse(MEMBER).unwrap();
 
     let b = Keypair::generate();
     let b_addr = addr(&b);
+    let mallory = Keypair::generate();
+    // Both are enrolled members (ADR-0038): an unenrolled key's binding is
+    // refused before the self-signed check this test exercises.
+    for k in [&b, &mallory] {
+        client
+            .call(
+                "enroll",
+                serde_json::json!({ "address": addr(k).to_string() }),
+            )
+            .await
+            .unwrap();
+    }
 
     // Before any binding, the registry is empty.
     assert!(station.core().sms_bound_senders().await.is_empty());
@@ -283,7 +295,6 @@ async fn sms_binding_admits_via_ingest_and_flips_the_registry() {
     // Mallory's own number) is refused — the register-me statement must be its
     // owner's. A distinct number so it is a distinct record, not a byte-identical
     // re-presentation of B's own binding below.
-    let mallory = Keypair::generate();
     let forged = SignedPayload::sign(SmsBinding::new(b_addr, "+15558887777", now), &mallory);
     let forged_bundle = Bundle::new(
         vec![EntryEnvelope::from_signed(&outbox_entry(

@@ -55,3 +55,19 @@ RRN_REGEN=1 cargo test -p rrn-ledger --test it cross_platform_certificates
 cp crates/rrn-ledger/tests/fixtures/cross_platform_certificates.json \
    ../mobile/__tests__/fixtures/cross_platform_certificates.json
 ```
+
+## `cross_platform_enrollment.json` — enrollment wire stability
+
+Locks the canonical dCBOR of the station-signed `rrn.member.enrollment` kind
+(ADR-0038 §1): a `founder` enroll, a `pairing` enroll and an `operator` revoke,
+each with its `canonical_hex` (== `From<EnrollmentRecord> for CBOR`) and the
+station's `signature_hex` over those bytes. **No member device signs or verifies
+this kind** — the writer appends it and replay pins it to the station key — so,
+unlike the other fixtures here, the mobile repo keeps no copy. Generated and
+verified by
+[`tests/it/cross_platform_enrollment.rs`](../it/cross_platform_enrollment.rs).
+Deterministic (blake3 seeds + RFC 8032 Ed25519). Regenerate:
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-ledger --test it cross_platform_enrollment
+```

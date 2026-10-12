@@ -11,7 +11,8 @@
 //! [`LedgerSnapshot::derive_to_reference`] (trial decode) over randomly generated
 //! logs that mix every ledger kind — proposals, confirmations, settlements,
 //! cancellations, disputes, certificate requests/certificates/returns,
-//! cert-backed spends, equivocations and their verdicts — with vouches and
+//! cert-backed spends, equivocations and their verdicts, enrollments and
+//! revocations (including member-signed and station-naming ones) — with vouches and
 //! synthetic marketplace/governance records (wrong-kind for the ledger),
 //! forged-signer station records, malformed bytes, and maps carrying a known
 //! `kind` over the wrong shape. Equality is asserted at the whole log and at a
@@ -32,6 +33,7 @@ use rrn_crypto::serialize::to_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
+use rrn_ledger::enrollment::{EnrollmentAction, EnrollmentBasis, EnrollmentRecord};
 use rrn_ledger::escrow::{
     CertId, CertificateRequest, CertificateReturn, EquivocationBasis, EquivocationRecord,
     EquivocationVerdictRecord, EvidenceItem, HeadroomCertificate, VerdictDecision,
@@ -295,6 +297,17 @@ enum Action {
     Malformed {
         which: usize,
     },
+    /// An enrollment record: `signer` 0 = the station, 1 = the member itself
+    /// (signer-pin skip); `basis` picks founder / pairing / operator; `revoke`
+    /// picks the action (a non-operator revoke is malformed and skipped);
+    /// `station_member` names the station's own address (a no-op).
+    Enrollment {
+        m: usize,
+        signer: usize,
+        basis: usize,
+        revoke: bool,
+        station_member: bool,
+    },
 }
 
 fn action_strategy(n: usize) -> impl Strategy<Value = Action> {
@@ -317,8 +330,24 @@ fn action_strategy(n: usize) -> impl Strategy<Value = Action> {
             .prop_map(|(m, cap, verdict)| Action::Equivocate { m, cap, verdict }),
         (idx.clone(), 0..n).prop_map(|(voucher, subject)| Action::Vouch { voucher, subject }),
         (idx, 0..n).prop_map(|(s, r)| Action::ForgedSettlement { s, r }),
-        (0usize..8).prop_map(|which| Action::Garbage { which }),
+        (0usize..GARBAGE_KINDS.len()).prop_map(|which| Action::Garbage { which }),
         (0usize..4).prop_map(|which| Action::Malformed { which }),
+        (
+            0..n,
+            0usize..2,
+            0usize..3,
+            any::<bool>(),
+            prop::bool::weighted(0.1)
+        )
+            .prop_map(
+                |(m, signer, basis, revoke, station_member)| Action::Enrollment {
+                    m,
+                    signer,
+                    basis,
+                    revoke,
+                    station_member,
+                }
+            ),
     ]
 }
 
@@ -340,9 +369,9 @@ impl Nonces {
     }
 }
 
-/// The eight `kinded_garbage` variants: real non-ledger kinds, known ledger kinds
-/// over the wrong shape, and an unknown kind — all of which replay must skip.
-const GARBAGE_KINDS: [&str; 8] = [
+/// The `kinded_garbage` variants: real non-ledger kinds, known ledger kinds over
+/// the wrong shape, and an unknown kind — all of which replay must skip.
+const GARBAGE_KINDS: [&str; 9] = [
     "rrn.marketplace.listing.v1",
     "rrn.marketplace.listing_updated.v1",
     "rrn.tx.dispute.response",
@@ -350,6 +379,7 @@ const GARBAGE_KINDS: [&str; 8] = [
     "vouch",
     "rrn.tx.proposal",   // known ledger kind, wrong shape → matched TryFrom rejects
     "rrn.tx.settlement", // known ledger kind, wrong shape
+    "rrn.member.enrollment", // known ledger kind, wrong shape
     "rrn.unknown.kind.v1", // unknown kind
 ];
 
@@ -456,6 +486,35 @@ fn build_log(db: &Database, members: &[Keypair], station: &Keypair, plan: &[Acti
                 };
                 append_raw_signed(db, station, bytes);
             }
+            Action::Enrollment {
+                m,
+                signer,
+                basis,
+                revoke,
+                station_member,
+            } => {
+                let record = EnrollmentRecord {
+                    member: if *station_member {
+                        addr(station)
+                    } else {
+                        addr(&members[*m])
+                    },
+                    action: if *revoke {
+                        EnrollmentAction::Revoke
+                    } else {
+                        EnrollmentAction::Enroll
+                    },
+                    basis: [
+                        EnrollmentBasis::Founder,
+                        EnrollmentBasis::Pairing,
+                        EnrollmentBasis::Operator,
+                    ][*basis],
+                    recorded_at: 0,
+                };
+                let key = if *signer == 0 { station } else { &members[*m] };
+                // Raw so a malformed (non-operator) revoke still reaches the log.
+                append_raw_signed(db, key, to_canonical_bytes(record));
+            }
         }
     }
     AppendLog::new(db)
@@ -548,6 +607,33 @@ fn a_deterministic_rich_log_matches_and_is_non_empty() {
         Some(VerdictDecision::Confirm),
     );
 
+    // Enrollment: enroll → founder upgrade → revoke → re-enroll, plus a
+    // member-signed one (pin skip) and a malformed pairing-basis revoke.
+    for (signer, action, basis) in [
+        (&station, EnrollmentAction::Enroll, EnrollmentBasis::Pairing),
+        (&station, EnrollmentAction::Enroll, EnrollmentBasis::Founder),
+        (&station, EnrollmentAction::Revoke, EnrollmentBasis::Pairing),
+        (
+            &station,
+            EnrollmentAction::Revoke,
+            EnrollmentBasis::Operator,
+        ),
+        (&alice, EnrollmentAction::Enroll, EnrollmentBasis::Founder),
+        (
+            &station,
+            EnrollmentAction::Enroll,
+            EnrollmentBasis::Operator,
+        ),
+    ] {
+        let record = EnrollmentRecord {
+            member: addr(&alice),
+            action,
+            basis,
+            recorded_at: 0,
+        };
+        append_raw_signed(&db, signer, to_canonical_bytes(record));
+    }
+
     // Garbage of every flavour.
     for k in GARBAGE_KINDS {
         append_raw_signed(&db, &station, kinded_garbage(k));
@@ -560,11 +646,10 @@ fn a_deterministic_rich_log_matches_and_is_non_empty() {
 
     // The whole-log snapshot must be non-empty, or the equivalence below is vacuous.
     let whole = LedgerSnapshot::derive(&log, &station_pub).unwrap();
-    assert_ne!(
-        whole,
-        LedgerSnapshot::default(),
-        "the fixture must derive state"
-    );
+    let empty_db = Database::open_in_memory().unwrap();
+    migrations::run(&empty_db).unwrap();
+    let empty = LedgerSnapshot::derive(&AppendLog::new(&empty_db), &station_pub).unwrap();
+    assert_ne!(whole, empty, "the fixture must derive state");
 
     for max_seq in [0, 3, 6, 9, tail, u64::MAX] {
         let dispatched = LedgerSnapshot::derive_to(&log, max_seq, &station_pub).unwrap();

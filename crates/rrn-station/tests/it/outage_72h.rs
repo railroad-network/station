@@ -33,13 +33,12 @@
 //!   makes the harness a pure function of its seed and independent of the
 //!   reputation formula, so determinism (assertion 9) is exact. The near-floor and
 //!   double-spend mechanics do not need Tier-2 amounts.
-//! - **The "unknown-key" adversarial input is admitted, not refused.** The ledger
-//!   is permissionless (ADR-0020): a self-consistent proposal from a key with no
-//!   standing is a valid proposal. It is admitted but, with no counterparty
-//!   confirmation, never settles and moves no credit (see `outage_unknown_key_inert`).
-//!   The ticket's "no trace beyond refusals" is upheld by the forged-authorship,
-//!   tampered-record, and replay cases, which DO refuse; the unknown-key case is
-//!   asserted for its true behavior instead of routed around (PROCESS.md rule 3).
+//! - **The "unknown-key" adversarial input is refused `not-enrolled`.** Carriage
+//!   is permissionless (ADR-0020), but credit is not: only an identity the
+//!   community enrolled may sign itself below zero (ADR-0038). Every cast member
+//!   is enrolled by the operator at setup, as pairing or `station enroll` would;
+//!   an outsider's self-consistent proposal from a zero balance is refused and
+//!   leaves no trace (see `outage_unknown_key_refused`).
 //! - **The activity structure is fixed; the seed varies keypairs, content-id
 //!   ordering, and the mock-carrier fault pattern.** The scenario is a fixed matrix
 //!   rather than a randomly drawn one, so the exact-count invariants (one planted
@@ -170,8 +169,9 @@ fn outsider_key(seed: u64) -> Keypair {
 }
 
 /// An outsider proposes to member 17 with a self-consistent (author == signer)
-/// entry: admitted (permissionless), but never confirmed, so it never settles.
-async fn outage_unknown_key_inert(h: &mut Harness) {
+/// entry. The outsider was never enrolled and holds nothing, so the debit is
+/// refused `not-enrolled` (ADR-0038 §4) and nothing reaches the log.
+async fn outage_unknown_key_refused(h: &mut Harness) {
     let expires = START + 100 * OUTAGE_SECS;
     let outsider = outsider_key(h.seed);
     let outsider_addr = Address::from_public_key(outsider.public_key());
@@ -196,9 +196,12 @@ async fn outage_unknown_key_inert(h: &mut Harness) {
     );
     let signed = SignedPayload::sign(entry, &outsider);
     let r = h.submit(&[signed]).await;
-    h.reconcile("unknown-key proposal (inert)", &r, &[Expect::Admit]);
-    // No confirmation is ever authored, so this proposal cannot settle: member 17's
-    // balance stays 0, which the final reconciliation checks.
+    h.reconcile(
+        "unknown-key proposal (refused)",
+        &r,
+        &[Expect::Refuse(RefusalReason::NotEnrolled)],
+    );
+    // Member 17's balance stays 0, which the final reconciliation checks.
 }
 
 /// Per-member outbox-chain builder: tracks each device's next position and
@@ -347,6 +350,18 @@ impl Harness {
         .unwrap();
         let client = UnixClient::new(station.socket_path());
         let db_path = dir.path().join(DB_FILE);
+        // The operator enrolls every member (ADR-0038), as pairing or `station
+        // enroll` would; the operator (index 0) is the station identity, enrolled
+        // by derivation.
+        for i in 1..MEMBER_COUNT {
+            client
+                .call(
+                    "enroll",
+                    serde_json::json!({ "address": cast.addr(i).to_string() }),
+                )
+                .await
+                .unwrap();
+        }
 
         Harness {
             _dir: dir,
@@ -670,12 +685,15 @@ async fn run_and_assert(seed: u64) -> Hash {
     );
 
     // -- Unknown-key proposal: an outsider's *self-consistent* proposal (author ==
-    //    signer) is ADMITTED — the ledger is permissionless (ADR-0020) — but with no
-    //    counterparty confirmation it never settles and moves no value. Documented
-    //    divergence from the ticket's "no trace beyond refusals": an unknown key can
-    //    write a proposal, it just cannot move credit. (Its receiver, member 17,
+    //    signer) is refused `not-enrolled` — carriage is permissionless (ADR-0020),
+    //    credit is not (ADR-0038). It leaves no trace. (Its receiver, member 17,
     //    stays at 0, verified by the final reconciliation.) --------------------
-    outage_unknown_key_inert(&mut h).await;
+    let unknown_admitted_before = h.admitted;
+    outage_unknown_key_refused(&mut h).await;
+    assert_eq!(
+        h.admitted, unknown_admitted_before,
+        "an unenrolled key's debit must admit nothing"
+    );
 
     // -- Lost-forever bundle re-exported at reconnect. ------------------------
     // Member 4 pays member 5; the first carriage is "lost" (never submitted), so

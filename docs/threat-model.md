@@ -1035,6 +1035,65 @@ transition; the derivability of all state from the log.
   a community does about a *departed* member's bounded debt remains a
   governance question the floor caps but does not answer.
 
+#### Enrollment — who may go into debt (ADR-0038)
+
+The debt floor bounded debt per *key*, and keys cost nothing to make: the
+delay-tolerant door admitted a self-consistent debit from any key, so a person
+could mint credit by generating throwaway keys, each taken to the floor
+(RRN-A-016). Enrollment binds the floor to a person.
+
+- *Asset:* the walk-away bound ADR-0018 sets — at most one floor's worth of
+  unrecoverable debt per person, not per key.
+- *The record:* `rrn.member.enrollment` (`rrn-ledger::enrollment`), station-signed,
+  with `member`, `action` (`enroll`/`revoke`), `basis` (`founder`/`pairing`/
+  `operator`) and a display-only `recorded_at`. The writer appends it at an
+  in-person ceremony: at `pair_confirm` (before the paired list is written), at
+  `station enroll <address>`, and for the root founder charter's founders in the
+  same `LogBatch` as the append at which that charter first clears its threshold.
+  An idempotent startup backfill enrolls the founders and paired addresses a log
+  written before enrollment never recorded. Only `station enroll --revoke`
+  revokes; unpairing does not. Canonical fixture:
+  `crates/rrn-ledger/tests/fixtures/cross_platform_enrollment.json`.
+- *The pin:* replay derives the enrolled set from these records alone, in log
+  order, and counts a record only when its envelope signer is the community
+  station key; any other signer, or a malformed record (a revoke whose basis is
+  not `operator`), is skipped — never a halt. The station's own identity is
+  enrolled at every position by derivation and never has a record. A replica,
+  deriving under its own key, reads the enrolled set as empty (the same
+  loud-failure residual as every station-signed kind until ADR-0035 lineage
+  pinning lands).
+- *The floor rule:* in `Engine::check_debt_floor` only — the one check every debit
+  door (proposal, payment-request confirmation, certificate issuance) already
+  calls, so every carrier gets it by construction. An identity enrolled at the
+  admission position runs the configured floor and its breach is
+  `DebtFloorExceeded`; any other key's floor is
+  `max(UNENROLLED_FLOOR_CENTI, debt_floor_centi)` with
+  `UNENROLLED_FLOOR_CENTI = 0` a protocol constant, and its breach is
+  `NotEnrolled` (receipt slug `not-enrolled`). A cert-backed spend still skips
+  the floor (ADR-0021 §4), so a revoked member's outstanding certificate is
+  honored.
+- *The doors:* DTN ingest over every carrier, the paired channel and the operator
+  socket all reach the engine. The only door-level checks are for the two binding
+  kinds: an `rrn.net.binding` or `rrn.net.sms_binding` from a key that is not
+  enrolled is refused `not-enrolled` (routing-directory pollution, no credit). An
+  `rrn.member.enrollment` is never carried: a bundle carrying one is refused
+  `unroutable-kind`.
+- *What an unenrolled key can do:* receive; spend what it holds, including
+  confirming a payment request within it; raise and answer disputes on its own
+  transactions; return a certificate, and request one only against positive
+  settled headroom. It cannot go below zero or land a binding.
+- *Residual:* the operator is the enrollment authority and can enroll one person
+  twice — two keys double that person's walk-away exposure; the only control is
+  social (every enrollment is on the log, listed by `station enroll --list`).
+- *Residual:* a replaced key's debt stays on the old key — a member who lost a
+  phone with no recovery has the old key revoked and the new one enrolled; the
+  old debt is ADR-0018's exit-with-debt residual, now bounded per person.
+- *Residual:* the recurring contract charge is station-signed and not
+  floor-checked, so it also bypasses revocation: a revoked member who stays
+  paired and agrees a contract as buyer can still be charged below zero. Until
+  that floor decision lands, an operator who revokes an identity should also
+  unpair it.
+
 #### Elevation of privilege — offline overspend and reserved headroom (ADR-0021)
 
 Headroom certificates (`rrn-ledger::escrow`) extend the debt floor to survive a
@@ -3403,6 +3462,21 @@ availability of the single-threaded core.
   because ADR-0020 §3 lets any device carry any bundle; the pairing gate is the
   DoS/accountability boundary, the per-entry signatures the integrity boundary.
 
+#### Elevation of privilege — debits and bindings from keys nobody enrolled
+
+- *Threat:* anyone who can reach a carrier — a courier, a paper sheet the
+  operator ingests, a radio in range — signs debits from fresh keys, each
+  self-consistent, and mints credit by walking away from all of them
+  (RRN-A-016).
+- *Mitigation:* membership is enforced in the ledger: only an enrolled identity
+  may sign itself below zero (ADR-0038; see the `rrn-ledger` subsection
+  "Enrollment — who may go into debt"). Ingest adds no debit check of its own —
+  the engine refuses an unenrolled key's debit below zero as `not-enrolled` on
+  every carrier. A transport or SMS binding from an unenrolled key is refused
+  `not-enrolled` before it reaches the routing directory, and a carried
+  enrollment record is refused `unroutable-kind`. The outage harness leg
+  `outage_unknown_key_refused` asserts an outsider's proposal admits nothing.
+
 #### Tampering — outbox forks and gaps (equivocation)
 
 - *Threat:* an author equivocates — signs two different records at the same
@@ -3900,9 +3974,10 @@ communication-metadata privacy.
   it controls. Impersonating the station *toward* a member likewise forges nothing —
   a fake "receipt" text is just bytes that fail the station-signature check the member
   applies. Note that `"paired"` is **not a membership gate**: it means only "a number
-  some identity self-bound over some carrier," so any keypair that has landed one
-  self-signed binding in the log is "paired." Standing/membership is enforced where it
-  matters — at ingest and in the ledger — not by the registry.
+  some enrolled identity self-bound over some carrier" — an unenrolled key's binding is
+  refused `not-enrolled` at ingest (ADR-0038 §3). Membership is enforced in the ledger:
+  only an enrolled identity may sign itself below zero (ADR-0038); the registry is spam
+  control only.
 
 #### Denial of service — SMS-flood, truncation, and receipt-cost amplification
 
