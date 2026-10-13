@@ -684,11 +684,11 @@ async fn transient_refusal_of_a_confirmation_stays_pending_and_retries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_confirmation_of_a_paid_transaction_can_be_abandoned() {
+async fn a_second_confirmation_of_a_paid_transaction_is_refused_for_good() {
     // B confirms A's payment twice (two different confirmations of one id).
-    // The first is admitted; the second is answered `not-proposed` every time —
-    // the transaction is no longer open, so it can never succeed. The wallet
-    // keeps it pending, says why, and lets B abandon it.
+    // The first is admitted; the transaction is then no longer open, so the
+    // second is refused `tx-closed` — a final answer the wallet acks at once
+    // instead of carrying it forever.
     let h = Harness::start(false).await;
     let dir = tempfile::tempdir().unwrap();
     let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
@@ -709,8 +709,43 @@ async fn a_second_confirmation_of_a_paid_transaction_can_be_abandoned() {
     wjson(&home_b, &["submit"]).await;
     assert_eq!(
         pending_rows(&home_b, &b),
+        0,
+        "the refusal is final, so acked"
+    );
+    assert_eq!(wjson(&home_b, &["status"]).await["refused_for_now"], 0);
+    let shown = wjson(&home_b, &["show", "--all"]).await;
+    let rows = shown["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.last().unwrap()["disposition"],
+        "refused (tx-closed)",
+        "got: {shown}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmation_whose_payment_never_arrives_can_be_abandoned() {
+    // A signs a payment to B offline and never submits it (say A's laptop is
+    // lost). B confirms the id; the station has never seen the proposal, so it
+    // answers `not-proposed` — transient, because the proposal could still
+    // arrive. The wallet keeps it pending, says why, and lets B abandon it.
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_b, b) = init_wallet(dir.path(), "b", &h.station_addr).await;
+    pair_and_confirm(&h, &home_a, &a).await;
+    pair_and_confirm(&h, &home_b, &b).await;
+    wjson(&home_a, &["sync"]).await;
+    wjson(&home_b, &["sync"]).await;
+
+    let paid = wjson(&home_a, &["pay", &b, "1.00"]).await;
+    let tx_id = paid["tx_id"].as_str().unwrap().to_string();
+    wjson(&home_b, &["confirm", &tx_id]).await;
+    wjson(&home_b, &["submit"]).await;
+    assert_eq!(
+        pending_rows(&home_b, &b),
         1,
-        "the second confirmation stays pending"
+        "the confirmation stays pending"
     );
     assert_eq!(wjson(&home_b, &["status"]).await["refused_for_now"], 1);
 

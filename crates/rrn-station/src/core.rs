@@ -7392,10 +7392,14 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         LE::DebtFloorExceeded { .. } => RefusalReason::DebtFloor,
         // An unenrolled signer held at its zero floor (ADR-0038 §4).
         LE::NotEnrolled { .. } => RefusalReason::NotEnrolled,
-        // The referenced transaction is absent or not in the state the record
-        // needs — most commonly a confirmation whose proposal has not yet been
-        // admitted (couriers must keep outbox order, ADR-0020 §4).
-        LE::UnknownTransaction | LE::NotProposed => RefusalReason::NotProposed,
+        // The referenced transaction is absent — most commonly a confirmation
+        // whose proposal has not yet been admitted (couriers must keep outbox
+        // order, ADR-0020 §4). Transient: it may still arrive.
+        LE::UnknownTransaction => RefusalReason::NotProposed,
+        // The transaction exists but is past `Proposed` (confirmed by another
+        // confirmation, settled, cancelled, disputed). It never returns, so the
+        // refusal is final.
+        LE::NotProposed => RefusalReason::TransactionClosed,
         // Certificate-backed spend / return refusals (ADR-0021 §3–§5). Each has a
         // machine-stable slug so a courier's owner (and the evidence
         // assembly) can branch on the exact cause. `UnknownCertificate` and
@@ -10664,6 +10668,111 @@ mod tests {
             dtn.receipt_for(&row.receipt_presentation).unwrap(),
             Some(receipt::encode_signed(&later)),
             "the row points at the new receipt"
+        );
+    }
+
+    /// A confirmation of a transaction that is no longer open — already
+    /// confirmed by another confirmation, or settled — is refused `tx-closed`, a
+    /// final answer: re-presenting it is served the stored receipt verbatim. A
+    /// confirmation whose proposal is merely absent stays `not-proposed`.
+    #[test]
+    fn a_confirmation_of_a_settled_transaction_is_refused_for_good() {
+        let mut core = test_core(); // clock = 1000
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        enroll(&core, &alice);
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let first = member_confirmation(&bob, &proposal, 950);
+        let receipt = submit_bundle(
+            &mut core,
+            &[
+                outbox_entry(&alice, 0, zero(), &proposal, 900),
+                outbox_entry(&bob, 0, zero(), &first, 950),
+            ],
+            1000,
+        );
+        assert!(matches!(
+            receipt.payload.outcomes[1].disposition,
+            Disposition::Admitted { .. }
+        ));
+        let bob_head = outbox_entry(&bob, 0, zero(), &first, 950)
+            .payload
+            .entry_hash();
+
+        // A second confirmation while the transaction is Confirmed.
+        let second = member_confirmation(&bob, &proposal, 960);
+        let closed = Disposition::Refused {
+            reason: RefusalReason::TransactionClosed,
+        };
+        let r = submit_bundle(
+            &mut core,
+            &[outbox_entry(&bob, 1, bob_head, &second, 960)],
+            1000,
+        );
+        assert_eq!(r.payload.outcomes[0].disposition, closed);
+
+        // Settle it, then a third confirmation.
+        core.clock.advance(86_400 + 10);
+        core.do_sweep();
+        assert!(matches!(
+            tx_state(&core, &proposal.payload.id),
+            Some(TransactionState::Settled { .. })
+        ));
+        let third = member_confirmation(&bob, &proposal, 970);
+        let entries = [outbox_entry(
+            &bob,
+            2,
+            outbox_entry(&bob, 1, bob_head, &second, 960)
+                .payload
+                .entry_hash(),
+            &third,
+            970,
+        )];
+        let bundle_hex = encode_bundle(&entries, 1000);
+        let first_answer = call(
+            &mut core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": bundle_hex }),
+        );
+        let decoded =
+            receipt::decode_signed(&unhex(first_answer["receipt_hex"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(decoded.payload.outcomes[0].disposition, closed);
+        let record_hash = decoded.payload.outcomes[0].record_hash.to_bytes();
+        assert!(
+            DtnStore::new(&core.db)
+                .delivery_of(&record_hash, &bob.public_key().to_bytes())
+                .unwrap()
+                .unwrap()
+                .outcome_final,
+            "a tx-closed answer is final"
+        );
+
+        // Final: re-presented later, the stored receipt is re-issued verbatim.
+        let tail = core.tail_seq();
+        core.clock.advance(3600);
+        let again = call(
+            &mut core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": bundle_hex }),
+        );
+        assert_eq!(first_answer["receipt_hex"], again["receipt_hex"]);
+        assert_eq!(core.tail_seq(), tail);
+
+        // An absent proposal is still the transient `not-proposed`.
+        let carol = Keypair::generate();
+        let unseen = member_proposal(&carol, &bob, 100, 0, 900, 900 + 1_000_000);
+        let orphan = member_confirmation(&bob, &unseen, 980);
+        let r = submit_bundle(
+            &mut core,
+            &[outbox_entry(&carol, 0, zero(), &orphan, 980)],
+            1000,
+        );
+        assert_eq!(
+            r.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::NotProposed
+            }
         );
     }
 
