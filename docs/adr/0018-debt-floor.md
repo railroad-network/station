@@ -176,8 +176,9 @@ The "−20 Commons per departing member" bound now holds per person.
 
 ## Clarification (2026-10-12) — what the floor reads, and contract charges
 
-*(1) is in force with the change that appends this section. (2) is **pending
-ratification** — drafted, not implemented.*
+*(1) is in force with the change that appends this section. (2) was ratified
+by the maintainer on 2026-10-12 (option A below) and is in force with the
+change that implements it.*
 
 1. **The settled balance in Decision point 2 is the log-derived balance** —
    station-signed settlement records once per transaction plus station-signed
@@ -190,8 +191,7 @@ ratification** — drafted, not implemented.*
    Rows the ledger wrote to the table before this change are deleted by a
    migration; the table survives only as the generic PN-Counter store.
 
-2. **A contract charge cannot take its debtor below the floor** *(pending
-   ratification)*. Point 1's "where the signature happens" still holds: a
+2. **A contract charge cannot take its debtor below the floor**. Point 1's "where the signature happens" still holds: a
    period is due at the **start** of its period (period 0 at the contract's
    admission), so refusing a charge precedes the delivery it pays for, and
    the Alternatives' objection to settlement-time refusal — that it punishes
@@ -209,9 +209,12 @@ ratification** — drafted, not implemented.*
    - **Visibility:** the station's contract views report a contract as *in
      arrears* when a period is due and uncharged. This is a read-side field, not
      a signed-record change.
-   - **Residual, accepted:** a provider who ends an in-arrears contract early
-     still owes the penalty, and a catch-up sweep charges every overdue period
-     once headroom returns.
+   - **Residual, accepted for now:** a provider who ends an in-arrears contract
+     early still owes the penalty, and a catch-up sweep charges every overdue
+     period once headroom returns. Because the penalty waits for the backlog to
+     clear, the provider pays it to a buyer who fell behind. Waiving the
+     provider's penalty when a period is due and uncharged at the termination's
+     admission is a tracked follow-up, not part of this Clarification.
 
    Alternatives considered for (2): reserving the next period in the committed
    position (needs a contract hook in a ledger that cannot see contracts, and
