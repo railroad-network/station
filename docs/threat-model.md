@@ -3543,14 +3543,38 @@ availability of the single-threaded core.
 
 - *Threat:* a captured bundle or receipt is replayed, hoping to double-admit a
   record or to make the station contradict a receipt it already issued.
-- *Mitigation:* re-ingesting a byte-identical **presentation** (the ordered
-  record-hash list, Blake3-keyed in `issued_receipts`) returns the stored receipt
-  **verbatim** — deterministic re-issue is harmless by design, admitting nothing.
-  A *different* bundle re-carrying already-admitted records yields `known`
-  outcomes via the log dedup, equally safe. A receipt is transport state, never
-  appended to the log (ADR-0020 §3), so replaying one changes no community state.
-  Over the mobile channel a replayed *request* additionally dies at the sealed
-  channel's monotonic nonce check before ingest even runs.
+- *Mitigation:* ingestion never admits a record twice (ADR-0020 §3 and its
+  2026-10-13 Clarification). A **presentation** is identified by its exact entry
+  envelopes — `issued_receipts` is keyed by the Blake3 of a domain tag and each
+  carried envelope's hash (signer, signature and body), in order — so a forged or
+  re-wrapped copy of a record is a *different* presentation and can never answer
+  for the genuine one. A stored receipt is re-issued **verbatim** only when every
+  outcome in it is final (admitted, known, or a refusal re-presentation cannot
+  change — `RefusalReason::is_final`, the **Final?** column of
+  `docs/spec/dtn-bundles.md` §3). A receipt carrying a *transient* refusal
+  (`nonce-gap`, `debt-floor`, `not-enrolled`, `not-proposed`, `tier2-stake`,
+  `rejected`) is re-evaluated on re-presentation and the new receipt replaces it,
+  so a courier who delivers a confirmation ahead of its proposal does not freeze
+  it out forever. Re-evaluation cannot double-admit: an already-admitted record
+  answers `known` from the log dedup, and the engine's duplicate guard backs it. A
+  receipt is transport state, never appended to the log (ADR-0020 §3), so
+  replaying one changes no community state. Over the mobile channel a replayed
+  *request* additionally dies at the sealed channel's monotonic nonce check before
+  ingest even runs.
+- *Threat (spoofing a delivery row):* whoever first presents a record under their
+  own valid entry signature (`record_signer` need not equal `author`, spec §1)
+  takes over the record's receipt delivery, so its real author's fetch comes up
+  empty.
+- *Mitigation:* `receipt_deliveries` rows are per `(record_hash, author)`, where
+  `author` is the attested outer author of the presenting entry — each presenter's
+  answer travels back to that presenter. A row whose answer was transient is
+  re-pointed at the re-evaluated receipt and re-armed for delivery; a row whose
+  answer was final never has its delivery progress reset.
+- *Residual:* a re-evaluated presentation is re-validated in full, so a peer who
+  repeatedly re-presents a bundle whose receipt carries a transient refusal costs
+  the core a full validation each time — the same per-request work bound as a
+  fresh bundle (below), no worse. `issued_receipts` rows are never pruned
+  (retention of that cache is a separate follow-up).
 
 #### Denial of service — bundle spam on a single-threaded core
 
@@ -3711,10 +3735,11 @@ core against malformed scanned input; the invariant that the CLI remains a
   per-payload error, never a process abort. Ingest of a bundle is then bounded by
   the existing DTN ingest limits (`MAX_BUNDLE_ENTRIES`/`MAX_BUNDLE_BYTES`).
 - *Repudiation / replay — re-scanning the same sheet.* Re-ingesting an identical
-  sheet is idempotent: the station returns its stored receipt verbatim for a
-  repeated *presentation* (the DTN presentation-hash guarantee, ADR-0020 §3), and
-  a different sheet re-carrying an already-admitted record yields a `known`
-  outcome from the log's own dedup. Paper cannot double-admit.
+  sheet never double-admits: the station returns its stored receipt verbatim for
+  a repeated *presentation* when every outcome in it is final, re-evaluates one
+  carrying a transient refusal (ADR-0020 §3 Clarification), and a different sheet
+  re-carrying an already-admitted record yields a `known` outcome from the log's
+  own dedup. Paper cannot double-admit.
 - *Repudiation — a dropped receipt sheet.* Paper-carried receipts are **never
   marked delivered** at the station (`export-receipts` uses the courier fetch,
   which only bumps a diagnostic counter). A lost sheet is a delay, not a loss:
@@ -3924,8 +3949,10 @@ correctness of identity→destination routing.
   `dtn_pushes` row and marks it delivered only when a returned receipt clears
   **every** check: the receipt must verify, be signed by the very station it names
   (`signer == payload.station`), enumerate the **exact presented record set** (its
-  presentation hash — a pure function of the ordered record hashes — is the push
-  id, so a receipt for a different record set correlates to nothing), arrive from
+  record-list hash — a pure function of the ordered record hashes — is the push
+  id, so a receipt for a different record set correlates to nothing; it is
+  deliberately not the receiver's envelope-keyed receipt-cache key, which a
+  receipt cannot reproduce), arrive from
   the **peer we pushed to** (`Completed.source`), and — when the push was addressed
   by `rrn_address` — be signed by the **expected station** resolved from the
   binding directory. Any mismatch is logged and ignored (dumb carrier; ADR-0013).
@@ -4290,7 +4317,7 @@ property of any one signature but of the *log + ledger* enforcing single use:
 acting on two stations, or cross-replica nonce coordination generally, is a
 Phase 3 federation problem; within a community ADR-0020 guarantees one writer
 and one order. Under DTN the same protections apply to carried records, and
-ingest adds a third layer: the presentation-hash receipt cache and the log's
+ingest adds a third layer: the envelope-keyed receipt cache and the log's
 `admission_of` dedup, so re-carriage can only ever produce `known`.
 
 ### Log fork / rollback
@@ -4600,7 +4627,7 @@ above; this is the index. Anticipated mitigations from the design overview
 - **Replay attack** → per-sender monotonic nonce + ±5-minute future-dating bound
   + content-addressed ids in `rrn-ledger`, idempotent exactly-once settlement,
   content-hash dedupe on replication (`append_raw`) and on DTN ingest
-  (`admission_of`, the presentation-hash receipt cache). See [Replay across
+  (`admission_of`, the envelope-keyed receipt cache). See [Replay across
   crates](#replay-across-crates).
 - **Tampering / forgery** → `verify_strict` over canonical CBOR via
   `SignedPayload`, re-verified at the log write; hash-chained log detected by

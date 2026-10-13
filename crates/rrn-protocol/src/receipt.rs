@@ -49,8 +49,8 @@ pub enum RefusalReason {
     /// it holds, and this record would take it below zero (ADR-0038 §4); or an
     /// unenrolled key presented a transport/SMS binding (ADR-0038 §3). Like
     /// `debt-floor` it depends on state: the record can be admitted later, after
-    /// an inflow or after enrollment, in a new presentation (a byte-identical one
-    /// is answered from the stored receipt).
+    /// an inflow or after enrollment — re-presenting the same bytes re-evaluates
+    /// it (a transient refusal, [`RefusalReason::is_final`]).
     NotEnrolled,
     /// The proposal had expired by the admission clock (ADR-0022 §4).
     Expired,
@@ -170,6 +170,53 @@ impl RefusalReason {
             _ => None,
         }
     }
+
+    /// Whether re-presenting the same entry envelopes can never change this
+    /// answer (ADR-0020 Clarification, receipt idempotency).
+    ///
+    /// A **final** refusal is a fact about the presented bytes or about a
+    /// commitment that only grows (a bad signature, an expired proposal, a
+    /// fork, a returned certificate, a dead declaration), so a station re-issues
+    /// the stored receipt verbatim. A **transient** refusal depends on community
+    /// state that can still change in the record's favor — an earlier nonce
+    /// arriving, an inflow, the proposal landing, standing rising, enrollment —
+    /// so a station re-evaluates the presentation instead of serving it.
+    ///
+    /// Exhaustive with no wildcard arm on purpose: a new reason must declare its
+    /// finality to compile, and `docs/spec/dtn-bundles.md` §3 registers it.
+    pub fn is_final(&self) -> bool {
+        match self {
+            RefusalReason::BadSignature
+            | RefusalReason::Expired
+            | RefusalReason::UnroutableKind
+            | RefusalReason::OutboxFork
+            | RefusalReason::Duplicate
+            | RefusalReason::TierUnsupported
+            | RefusalReason::CertMisuse
+            | RefusalReason::CertUnknown
+            | RefusalReason::CertReturned
+            | RefusalReason::CertWrongMember
+            | RefusalReason::CertExpired
+            | RefusalReason::CertOverspent
+            | RefusalReason::DeclarationDead
+            | RefusalReason::DeclarationExpired
+            | RefusalReason::AlreadyActivated => true,
+            RefusalReason::NonceGap
+            | RefusalReason::DebtFloor
+            | RefusalReason::NotEnrolled
+            | RefusalReason::NotProposed
+            | RefusalReason::Tier2Stake
+            | RefusalReason::Rejected => false,
+        }
+    }
+}
+
+/// Whether every outcome in `receipt` is one re-presentation cannot change:
+/// `admitted`, `known`, or a [final](RefusalReason::is_final) refusal. Only a
+/// final receipt is re-issued verbatim; any other is re-evaluated, which never
+/// admits a record twice (an already-admitted record answers `known`).
+pub fn receipt_is_final(receipt: &DeliveryReceipt) -> bool {
+    receipt.outcomes.iter().all(|o| o.disposition.is_final())
 }
 
 /// What the station did with one presented record.
@@ -199,6 +246,15 @@ pub enum Disposition {
 }
 
 impl Disposition {
+    /// Whether re-presentation can never change this outcome: `admitted`,
+    /// `known`, or a [final](RefusalReason::is_final) refusal.
+    pub fn is_final(&self) -> bool {
+        match self {
+            Disposition::Admitted { .. } | Disposition::Known { .. } => true,
+            Disposition::Refused { reason } => reason.is_final(),
+        }
+    }
+
     /// The wire slug for the `outcome` field.
     fn outcome_slug(&self) -> &'static str {
         match self {
@@ -515,6 +571,71 @@ mod tests {
             assert_eq!(RefusalReason::from_slug(reason.as_slug()), Some(reason));
         }
         assert_eq!(RefusalReason::from_slug("not-a-reason"), None);
+    }
+
+    #[test]
+    fn refusal_finality_is_classified() {
+        use RefusalReason::*;
+        let finals = [
+            BadSignature,
+            Expired,
+            UnroutableKind,
+            OutboxFork,
+            Duplicate,
+            TierUnsupported,
+            CertMisuse,
+            CertUnknown,
+            CertReturned,
+            CertWrongMember,
+            CertExpired,
+            CertOverspent,
+            DeclarationDead,
+            DeclarationExpired,
+            AlreadyActivated,
+        ];
+        let transients = [
+            NonceGap,
+            DebtFloor,
+            NotEnrolled,
+            NotProposed,
+            Tier2Stake,
+            Rejected,
+        ];
+        for r in finals {
+            assert!(r.is_final(), "{} must be final", r.as_slug());
+        }
+        for r in transients {
+            assert!(!r.is_final(), "{} must be transient", r.as_slug());
+        }
+        // Every slug is classified exactly once across the two lists.
+        assert_eq!(finals.len() + transients.len(), 21);
+    }
+
+    #[test]
+    fn a_receipt_is_final_only_when_every_outcome_is() {
+        let h = Hash::of(b"r");
+        let receipt = |dispositions: &[Disposition]| DeliveryReceipt {
+            station: station(),
+            outcomes: dispositions
+                .iter()
+                .map(|&disposition| Outcome {
+                    record_hash: h,
+                    disposition,
+                })
+                .collect(),
+            received_at: 0,
+        };
+        let refused = |reason| Disposition::Refused { reason };
+        assert!(receipt_is_final(&receipt(&[])));
+        assert!(receipt_is_final(&receipt(&[
+            Disposition::Admitted { seq: 1 },
+            Disposition::Known { seq: 0 },
+            refused(RefusalReason::Expired),
+        ])));
+        assert!(!receipt_is_final(&receipt(&[
+            Disposition::Admitted { seq: 1 },
+            refused(RefusalReason::NotProposed),
+        ])));
     }
 
     #[test]

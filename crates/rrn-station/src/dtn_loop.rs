@@ -58,7 +58,7 @@ pub enum DtnOutbound {
 /// from the `dtn_pushes` table (a loop start / wake, or a periodic re-scan).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushToSend {
-    /// The push id (the bundle's presentation hash).
+    /// The push id (the bundle's record-list hash: Blake3 over its ordered record hashes).
     pub push_id: [u8; 32],
     /// The carrier destination to send to.
     pub to: Endpoint,

@@ -74,6 +74,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_ledger_balances",
         sql: include_str!("../migrations/0010_retire_ledger_balances.sql"),
     },
+    Migration {
+        version: 11,
+        name: "receipt_deliveries_per_author",
+        sql: include_str!("../migrations/0011_receipt_deliveries_per_author.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
@@ -82,6 +87,13 @@ const MIGRATIONS: &[Migration] = &[
 /// runs in its own transaction, so a failure leaves the database at the last
 /// fully-applied version rather than half-migrated.
 pub fn run(db: &Database) -> Result<()> {
+    run_through(db, i64::MAX)
+}
+
+/// Applies every unrecorded migration whose version is at most `max_version`.
+/// [`run`] is this with no bound; tests use a bound to stage data under an
+/// older schema before a later migration rewrites it.
+pub(crate) fn run_through(db: &Database, max_version: i64) -> Result<()> {
     let conn = db.conn();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -91,7 +103,7 @@ pub fn run(db: &Database) -> Result<()> {
         ) STRICT;",
     )?;
 
-    for m in MIGRATIONS {
+    for m in MIGRATIONS.iter().take_while(|m| m.version <= max_version) {
         let already: Option<i64> = conn
             .query_row(
                 "SELECT version FROM _migrations WHERE version = ?1",
