@@ -79,6 +79,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "receipt_deliveries_per_author",
         sql: include_str!("../migrations/0011_receipt_deliveries_per_author.sql"),
     },
+    Migration {
+        version: 12,
+        name: "outbox_transient_refusals",
+        sql: include_str!("../migrations/0012_outbox_transient_refusals.sql"),
+    },
 ];
 
 /// Applies every migration that has not yet been recorded, in order.
