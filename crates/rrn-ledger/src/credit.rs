@@ -28,6 +28,7 @@
 use rrn_identity::address::Address;
 
 use crate::state::{LedgerSnapshot, TransactionState};
+use crate::{Error, Result};
 
 /// The default debt floor: −20 Commons (−2,000 centicommons).
 ///
@@ -207,6 +208,45 @@ pub fn committed_debits_centi(
         total = total.saturating_add(remaining.max(0));
     }
     total
+}
+
+/// Rejects a new `debit_centi` (> 0) against `debtor` that would commit them
+/// below the debt floor: their settled balance, minus the pending debits they
+/// have already signed, minus this one (ADR-0018).
+///
+/// The settled balance is [`LedgerSnapshot::balance_of`] — derived from the
+/// log's station-signed settlement records and contract charges, the same
+/// number members see — so the check needs no table and no replay beyond the
+/// snapshot the caller already holds.
+///
+/// The configured floor applies only to an identity enrolled at the admission
+/// position — the end of `snapshot`'s prefix, where this record would land.
+/// Any other key's floor is [`UNENROLLED_FLOOR_CENTI`], and its breach is
+/// [`Error::NotEnrolled`] (ADR-0038 §4).
+pub fn check_floor(
+    snapshot: &LedgerSnapshot,
+    debtor: &Address,
+    debit_centi: i64,
+    now: i64,
+    config: &CreditConfig,
+) -> Result<()> {
+    let projected = snapshot
+        .balance_of(debtor)
+        .saturating_sub(committed_debits_centi(snapshot, debtor, now, config))
+        .saturating_sub(debit_centi);
+    if snapshot.is_enrolled(debtor) {
+        if projected < config.debt_floor_centi {
+            return Err(Error::DebtFloorExceeded {
+                floor_centi: config.debt_floor_centi,
+                projected_centi: projected,
+            });
+        }
+    } else if projected < UNENROLLED_FLOOR_CENTI.max(config.debt_floor_centi) {
+        return Err(Error::NotEnrolled {
+            projected_centi: projected,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

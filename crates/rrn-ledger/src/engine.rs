@@ -24,14 +24,14 @@ use rrn_storage::log::AppendLog;
 
 use rrn_identity::address::Address;
 
-use crate::credit::{committed_debits_centi, CreditConfig, UNENROLLED_FLOOR_CENTI};
+use crate::credit::{check_floor, CreditConfig};
 use crate::dispute::{dispute_responses, SignedDispute, SignedDisputeResponse};
 use crate::escrow::{
     spend_admissible_until, CertId, CertificateStatus, HeadroomCertificate,
     SignedCertificateRequest, SignedCertificateReturn, SignedHeadroomCertificate,
     MAX_EVIDENCE_ITEMS,
 };
-use crate::settlement::{BalanceView, SettlementConfig};
+use crate::settlement::SettlementConfig;
 use crate::state::{CancelReason, CancellationRecord, LedgerSnapshot, TransactionState};
 use crate::transaction::{SignedConfirmation, SignedProposal, TransactionId};
 use crate::{Error, Result};
@@ -69,15 +69,10 @@ impl<'db> Engine<'db> {
     }
 
     /// Rejects a new `debit_centi` (> 0) against `debtor` that would commit
-    /// them below the debt floor: settled balance, minus the pending debits
-    /// they have already signed, minus this one (ADR-0018; see [`crate::credit`]).
-    ///
-    /// The configured floor applies only to an identity enrolled at the
-    /// admission position — the end of `snapshot`'s prefix, where this record
-    /// would land. Any other key's floor is [`UNENROLLED_FLOOR_CENTI`], and its
-    /// breach is [`Error::NotEnrolled`] (ADR-0038 §4). Every debit door —
-    /// proposal, payment-request confirmation, certificate issuance — reaches
-    /// this one check, so every carrier gets the rule by construction.
+    /// them below the debt floor, under this engine's [`CreditConfig`] — see
+    /// [`check_floor`] (ADR-0018, ADR-0038 §4). Every debit door — proposal,
+    /// payment-request confirmation, certificate issuance — reaches this one
+    /// check, so every carrier gets the rule by construction.
     fn check_debt_floor(
         &self,
         snapshot: &LedgerSnapshot,
@@ -85,23 +80,7 @@ impl<'db> Engine<'db> {
         debit_centi: i64,
         now: i64,
     ) -> Result<()> {
-        let settled = BalanceView::new(self.db).balance_of(debtor)?;
-        let projected = settled
-            .saturating_sub(committed_debits_centi(snapshot, debtor, now, &self.credit))
-            .saturating_sub(debit_centi);
-        if snapshot.is_enrolled(debtor) {
-            if projected < self.credit.debt_floor_centi {
-                return Err(Error::DebtFloorExceeded {
-                    floor_centi: self.credit.debt_floor_centi,
-                    projected_centi: projected,
-                });
-            }
-        } else if projected < UNENROLLED_FLOOR_CENTI.max(self.credit.debt_floor_centi) {
-            return Err(Error::NotEnrolled {
-                projected_centi: projected,
-            });
-        }
-        Ok(())
+        check_floor(snapshot, debtor, debit_centi, now, &self.credit)
     }
 
     /// Validates a cert-backed spend against the certificate it names (ADR-0021

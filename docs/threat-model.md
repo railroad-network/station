@@ -379,8 +379,9 @@ of committed writes.
 - *Mitigation:* the append-only log chains each entry to the Blake3
   `content_hash` of the previous one (`prev_hash`), so any in-place edit,
   reorder, or deletion breaks the chain and is detected by
-  `AppendLog::verify_chain`. CRDT state is rebuilt from the log, so a tampered derived row (e.g. `balances`) is overwritten by replay
-  — the log wins. Append operations are wrapped in a single SQLite transaction
+  `AppendLog::verify_chain`. The ledger reads no balance table; every balance,
+  including the one the debt floor reads, is derived from the log on each
+  operation, so there is no derived balance row to tamper with — the log wins. Append operations are wrapped in a single SQLite transaction
   so an entry is never half-written.
 - *Threat (schema drift):* the on-disk schema silently diverges from the code's
   expectations — a hand-edited table, a skipped or reordered migration, a partly
@@ -832,7 +833,8 @@ settlement; the per-sender nonce sequence; the authenticity of every lifecycle
 transition; the derivability of all state from the log.
 
 > Populated with the ledger. The engine derives all transaction state by replaying the
-> append-only log; the materialized `balances` table is a cache. Settlement and
+> append-only log, and every balance is a fold over its station-signed settlement
+> and contract-charge records — no balance is stored (ADR-0018). Settlement and
 > cancellation entries are signed by the local station — see
 > [ADR-0005](adr/0005-station-signed-settlement.md).
 
@@ -863,11 +865,11 @@ transition; the derivability of all state from the log.
   from a mutable status column, and the log is hash-chained
   (`verify_chain`), so an edited or reordered entry is detected. A `Settled`
   state is only ever derived from a `Confirmed` state plus a station settlement
-  record; the balance table is a cache that replay can rebuild (the log wins).
-- *Residual risk:* a direct SQL edit of the `balances` cache is not detected
-  until the next replay rebuilds it; like `rrn-storage`, integrity is enforced
-  on read (replay) rather than prevented at write. Phase 0 logs are plaintext on
-  disk per the device-trust assumption.
+  record. The ledger reads no balance table; every balance, including the one
+  the debt floor reads, is derived from the log on each operation.
+- *Residual risk:* integrity is enforced on read (replay and `verify_chain`)
+  rather than prevented at write, as in `rrn-storage`. Logs are plaintext on
+  disk under the default profile per the device-trust assumption.
 
 #### Repudiation
 
@@ -883,7 +885,7 @@ transition; the derivability of all state from the log.
 - *Threat:* the transaction graph (who paid whom, how much, with what memo) is a
   privacy-sensitive social/economic graph; reading the database exposes it.
 - *Mitigation:* this crate stores no secret keys. Amounts and memos live in the
-  log and `transactions`/`balances` tables; whole-database encryption is the
+  log; whole-database encryption is the
   station's optional encrypted at-rest profile (ADR-0024, noted under
   `rrn-storage`).
 - *Residual risk:* under the default plaintext profile the ledger is plaintext
@@ -898,9 +900,10 @@ transition; the derivability of all state from the log.
   state by full log replay is O(N) per operation.
 - *Mitigation:* all engine/settler operations return `Result` and never panic on
   malformed records (unrecognized log payloads are ignored during replay).
-  Replay is O(N) but Phase 0 logs are small; the materialized `balances` cache
-  already avoids re-summing on every read, and a `transactions` snapshot/index
-  is the natural optimization when logs grow (reserved, not yet needed).
+  Replay is O(N) but logs are small; every balance read, including the debt
+  floor's, folds the log once inside the snapshot the operation already
+  derives, and a persisted snapshot/index is the natural optimization when
+  logs grow (reserved, not yet needed).
 - *Residual risk:* unbounded log growth and the O(N) replay cost are real at
   scale; snapshotting and rate-limiting are post-Phase-0 work.
 
@@ -1015,7 +1018,9 @@ transition; the derivability of all state from the log.
 - *Mitigation:* the **debt floor** (`rrn-ledger::credit`, default −20 Commons,
   `[credit] debt_floor_centi`). The engine refuses any debit whose signer
   would be committed below the floor, evaluated against the *committed
-  position*: settled balance minus every pending
+  position*: settled balance — derived from the log, counting contract
+  charges against the buyer and contract income toward the provider
+  (ADR-0018 Clarification (2026-10-12) point 1) — minus every pending
   (`Proposed`/`Confirmed`/`Disputed`) debit they already signed. Enforcement
   follows the debtor's signature — proposal time for a sender, confirmation
   time for a payment request's receiver — and pending inflows never add
@@ -1023,14 +1028,23 @@ transition; the derivability of all state from the log.
   tolerance) stops counting: the engine refuses its confirmation by the
   station's own clock past that boundary, so a counterparty who ignores a
   proposal cannot permanently consume the sender's headroom.
-- *Residual risk:* the recurring-contract charge path (`ContractCharge`)
-  is not floor-checked, so contract periods can land a buyer below the
-  floor (the buyer did sign the contract; folding contract exposure into the
-  committed position is the named follow-up). Contract terms are now bounded
+- *Mitigation (shipped):* **contract charges are floor-checked** (ADR-0018
+  Clarification (2026-10-12) point 2). A service contract is refused at
+  signing, at both doors (operator RPC and the paired-member channel), unless
+  the buyer's committed position covers its first period. Before the sweep
+  appends a period or an early-termination penalty it runs the same floor
+  check against the debtor (the buyer, or the provider for a penalty the
+  provider owes), counting the charges that sweep already appended. A charge
+  that does not fit is not appended; it is retried on later sweeps while due,
+  and the contract views report the contract `in_arrears`.
+- *Residual risk:* a provider who ends an in-arrears contract early still owes
+  the penalty; because the penalty waits for the overdue periods to be charged,
+  they pay it to the buyer who fell behind once that buyer has headroom again.
+  A waiver is a tracked follow-up. Contract terms are now bounded
   — at most 366 periods, each in 1..=49.99 Commons, so under the Tier-3 floor,
   and at most 24 period charges per contract per sweep (see
-  [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep));
-  the floor check itself is unchanged. The floor is per-station
+  [Recurring contracts and the charge sweep](#recurring-contracts-and-the-charge-sweep)).
+  The floor is per-station
   config until a governance surface exists, so an operator can weaken it. What
   a community does about a *departed* member's bounded debt remains a
   governance question the floor caps but does not answer.
@@ -1092,11 +1106,10 @@ could mint credit by generating throwaway keys, each taken to the floor
 - *Residual:* a replaced key's debt stays on the old key — a member who lost a
   phone with no recovery has the old key revoked and the new one enrolled; the
   old debt is ADR-0018's exit-with-debt residual, now bounded per person.
-- *Residual:* the recurring contract charge is station-signed and not
-  floor-checked, so it also bypasses revocation: a revoked member who stays
-  paired and agrees a contract as buyer can still be charged below zero. Until
-  that floor decision lands, an operator who revokes an identity should also
-  unpair it.
+- *Mitigation (shipped):* the recurring contract charge is floor-checked
+  against its debtor before the sweep appends it (ADR-0018 Clarification
+  (2026-10-12) point 2), so a revoked member's floor of zero holds for contract
+  charges too: a charge that would take them below zero is held back.
 
 #### Elevation of privilege — offline overspend and reserved headroom (ADR-0021)
 
@@ -2273,11 +2286,13 @@ credit and never delivers.
   is the listing's own provider is refused at the front door (before the
   requirements gate, so the error names the reason) and skipped on replay. One
   identity can no longer agree a contract with itself.
-- *Residual risk:* contract charges are not floor-checked (ADR-0018; see
-  [unbounded debt](#elevation-of-privilege--unbounded-debt-adr-0018)). The
-  bounds above cap what one contract can move per period and over its
-  lifetime; they do not stop a buyer who signs several contracts from being
-  charged below the floor.
+- *Mitigation (shipped):* contract charges count toward the debt floor and are
+  floor-checked themselves (ADR-0018 Clarification (2026-10-12) point 2; see
+  [unbounded debt](#elevation-of-privilege--unbounded-debt-adr-0018)): a
+  contract is refused at signing unless its first period fits, and each period
+  or penalty is checked against its debtor before it is appended, so a buyer
+  with several contracts is held at the floor across all of them. A held-back
+  period is retried while due and shows as `in_arrears`.
 - *Residual risk:* an inquiry's TTL still runs on party timestamps
   (`opened_at`, `sent_at`) — only its arithmetic saturates — so a party can
   keep a quiet inquiry from reading stale by dating a message in the future.
@@ -4265,7 +4280,7 @@ property of any one signature but of the *log + ledger* enforcing single use:
 - A proposal is valid only inside `proposed_at ≤ now ≤ expires_at` (±5 min skew,
   `CLOCK_SKEW_TOLERANCE_SECS`), so a stale capture cannot be replayed forever.
 - Settlement is **idempotent**: `Settler::settle` checks the derived state is not
-  already `Settled` *before* any balance write, and balances are derived from
+  already `Settled` before appending, and balances are derived from
   settlement records keyed by `proposal_id`, so a duplicated settlement entry
   (including one re-delivered over gossip) cannot double-apply.
 - Replicated entries arrive via `AppendLog::append_raw`, which **dedupes by
@@ -4497,9 +4512,10 @@ entry citing its ADR or the section that owns it.
   (ADR-0021). Juror ballots and re-seats are not DTN-routable and have no mobile
   surface, so in Phase 2 the operator wallet is the only juror that can act.
 - **Debt is bounded, not managed.** The debt floor (ADR-0018) caps how far a
-  member can sign themselves into debt, but the contract-charge path is not
-  floor-checked, the floor and the certificate caps are operator config rather
-  than governance (ADR-0021), and exit-with-debt policy is unanswered.
+  member can sign themselves into debt, counts contract charges, and holds
+  each charge to it (ADR-0018 Clarification (2026-10-12) point 2), but the
+  floor and the certificate caps are operator config rather than governance
+  (ADR-0021), and exit-with-debt policy is unanswered.
 
 ### Resilience surface (standing, opened by Phase 2)
 

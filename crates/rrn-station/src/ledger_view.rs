@@ -1,35 +1,25 @@
 //! Deriving balances from the log, the way two replicas can agree on.
 //!
-//! `rrn-ledger`'s [`Settler`](rrn_ledger::settlement::Settler) maintains a
-//! materialized PN-Counter as a side effect of the station that *performs* a
-//! settlement. That is fine for a lone station, but in the two-station demo a
-//! settlement record can arrive over gossip from the *other* station — and a
-//! replicated record never runs through the local settler's balance write, so
-//! the materialized counter would miss it. Worse, with independent wall clocks
-//! both stations may each author a settlement record for the same transaction
+//! A balance is never stored: it is a fold over the log's station-signed balance
+//! records, computed by [`LedgerSnapshot`] on replay — the same fold the debt
+//! floor reads (ADR-0018), so a member is never shown one number and judged
+//! against another. In the two-station demo a settlement record can arrive over
+//! gossip from the *other* station, and with independent wall clocks both
+//! stations may each author a settlement record for the same transaction
 //! (different `settled_at` ⇒ different bytes ⇒ both survive dedup-by-content).
-//!
-//! So for queries we do the robust thing the design docs call for — *derive
-//! balances from the log* — and we key the derivation on `proposal_id`, applying
-//! each settled transaction's amount exactly once no matter how many settlement
-//! records reference it. The log is the source of truth; this is just a fold over
-//! it. Phase 0 logs are small, so a full scan per query is fine.
+//! So the fold is keyed on `proposal_id`, applying each settled transaction's
+//! amount exactly once no matter how many settlement records reference it.
 //!
 //! A recurring service contract charges through a second station-signed balance
-//! record, [`ContractCharge`]: a direct debit with no settlement window.
-//! It is folded here alongside settlements, keyed on `(contract_ref,
-//! period_index)` so each period counts once — the same once-only discipline the
-//! settlement fold applies per `proposal_id`, and the backstop that lets the
-//! station's charge sweep re-run safely.
-
-use std::collections::BTreeSet;
+//! record, [`ContractCharge`](rrn_ledger::contract::ContractCharge): a direct
+//! debit with no settlement window. It is folded alongside settlements, keyed on
+//! `(contract_ref, period_index)` so each period counts once — the same
+//! once-only discipline the settlement fold applies per `proposal_id`, and the
+//! backstop that lets the station's charge sweep re-run safely.
 
 use rrn_crypto::keypair::PublicKey;
-use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_identity::address::Address;
-use rrn_ledger::contract::{ContractCharge, ContractRef};
-use rrn_ledger::settlement::SettlementRecord;
-use rrn_ledger::transaction::TransactionId;
+use rrn_ledger::state::LedgerSnapshot;
 use rrn_storage::db::Database;
 use rrn_storage::log::AppendLog;
 
@@ -42,54 +32,11 @@ use rrn_storage::log::AppendLog;
 /// can never debit or credit an account here. This is the highest-value pin — this
 /// function is what a wallet balance is read from.
 pub fn balance_of(db: &Database, who: &Address, station: &PublicKey) -> rrn_storage::Result<i64> {
-    let log = AppendLog::new(db);
-    let mut settled: BTreeSet<TransactionId> = BTreeSet::new();
-    let mut charged: BTreeSet<(ContractRef, u32)> = BTreeSet::new();
-    let mut total: i64 = 0;
-
-    for entry in log.iter_from(1) {
-        let entry = entry?;
-        // A balance record only counts when the community station signed it.
-        let signed_by_station = entry.payload.signer == *station;
-        let bytes = &entry.payload.bytes;
-
-        if let Ok(rec) = from_canonical_bytes::<SettlementRecord>(bytes) {
-            if !signed_by_station {
-                continue;
-            }
-            // Each transaction settles once; ignore redundant records for it.
-            if !settled.insert(rec.proposal_id) {
-                continue;
-            }
-            if &rec.sender == who {
-                total = total.saturating_sub(rec.amount_centi);
-            }
-            if &rec.receiver == who {
-                total = total.saturating_add(rec.amount_centi);
-            }
-            continue;
-        }
-
-        if let Ok(charge) = from_canonical_bytes::<ContractCharge>(bytes) {
-            if !signed_by_station {
-                continue;
-            }
-            // Each contract period charges once; a re-swept, replayed, or gossiped
-            // duplicate for the same `(contract, period)` is ignored. The buyer is
-            // debited and the provider credited (a contract only ever charges in
-            // that direction).
-            if !charged.insert((charge.contract_ref, charge.period_index)) {
-                continue;
-            }
-            if &charge.buyer == who {
-                total = total.saturating_sub(charge.amount_centi);
-            }
-            if &charge.provider == who {
-                total = total.saturating_add(charge.amount_centi);
-            }
-        }
-    }
-    Ok(total)
+    let snapshot = LedgerSnapshot::derive(&AppendLog::new(db), station).map_err(|e| match e {
+        rrn_ledger::Error::Storage(e) => e,
+        other => rrn_storage::Error::Corrupt(other.to_string()),
+    })?;
+    Ok(snapshot.balance_of(who))
 }
 
 #[cfg(test)]
@@ -97,6 +44,9 @@ mod tests {
     use super::*;
     use rrn_crypto::keypair::Keypair;
     use rrn_crypto::signed::SignedPayload;
+    use rrn_ledger::contract::{ContractCharge, ContractRef};
+    use rrn_ledger::settlement::SettlementRecord;
+    use rrn_ledger::transaction::TransactionId;
     use rrn_ledger::transaction::TransactionProposal;
     use rrn_storage::migrations;
 

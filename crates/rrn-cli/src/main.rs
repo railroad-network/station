@@ -2405,7 +2405,8 @@ fn message_line(body: &str, offer_centi: Option<i64>) -> String {
 }
 
 /// Renders `contracts` rows: state, the caller's role, the per-period price, how
-/// many periods have been charged, the counterparty, and the listing title.
+/// many periods have been charged, the counterparty, and the listing title. A
+/// contract with a due period not yet charged is marked `in-arrears`.
 fn render_contracts(contracts: &serde_json::Value, color: ColorMode) -> String {
     let Some(rows) = contracts.as_array() else {
         return "no contracts".to_string();
@@ -2417,14 +2418,16 @@ fn render_contracts(contracts: &serde_json::Value, color: ColorMode) -> String {
         .map(|row| {
             let charged = i(row, "periods_charged").unwrap_or(0);
             let total = charged + i(row, "periods_remaining").unwrap_or(0);
+            let arrears = if in_arrears(row) { " (in-arrears)" } else { "" };
             format!(
-                "{}  {:<11} {:<9} {:>10}/period  {}/{} charged  {}  {}",
+                "{}  {:<11} {:<9} {:>10}/period  {}/{} charged{}  {}  {}",
                 s(row, "contract_id"),
                 s(row, "state"),
                 s(row, "role"),
                 fmt_commons(i(row, "commons_per_period_centi").unwrap_or(0)),
                 charged,
                 total,
+                arrears,
                 s(row, "counterparty"),
                 paint(color, BOLD, &s(row, "listing_title")),
             )
@@ -2480,6 +2483,12 @@ fn render_contract(v: &serde_json::Value, color: ColorMode) -> String {
     if let Some(t) = i(v, "next_charge_due") {
         out.push(format!("{:<24}{}", "next_charge_due", t));
     }
+    if in_arrears(v) {
+        out.push(format!(
+            "{:<24}a due period is not yet charged (awaiting the sweep, or held at the debt floor)",
+            "in_arrears"
+        ));
+    }
     if let Some(t) = i(v, "terminating_effective_at") {
         out.push(format!("{:<24}{}", "terminating_at", t));
     }
@@ -2505,6 +2514,13 @@ fn render_contract(v: &serde_json::Value, color: ColorMode) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Whether a contract view reports a due period not yet charged.
+fn in_arrears(v: &serde_json::Value) -> bool {
+    v.get("in_arrears")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
 }
 
 /// Parses a `key=value` metric pair for `rrn contract --metric`. The key may not

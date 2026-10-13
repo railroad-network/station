@@ -173,3 +173,51 @@ to identities enrolled by a station-signed `rrn.member.enrollment` record. Any
 other key's floor is `max(0, debt_floor_centi)`, which is not configurable and
 is refused as `Error::NotEnrolled` with the receipt slug `not-enrolled` (§4).
 The "−20 Commons per departing member" bound now holds per person.
+
+## Clarification (2026-10-12) — what the floor reads, and contract charges
+
+*(1) is in force with the change that appends this section. (2) was ratified
+by the maintainer on 2026-10-12 (option A below) and is in force with the
+change that implements it.*
+
+1. **The settled balance in Decision point 2 is the log-derived balance** —
+   station-signed settlement records once per transaction plus station-signed
+   contract charges once per period — derived on replay; the `balances`
+   PN-Counter table is no longer read or written by the ledger. It is the
+   same fold a member's balance is shown from, so the floor and the wallet
+   always agree: contract charges count against the buyer's committed
+   position, contract income counts toward the provider's, and a settlement
+   record on the log counts whether or not anything was written after it.
+   Rows the ledger wrote to the table before this change are deleted by a
+   migration; the table survives only as the generic PN-Counter store.
+
+2. **A contract charge cannot take its debtor below the floor**. Point 1's "where the signature happens" still holds: a
+   period is due at the **start** of its period (period 0 at the contract's
+   admission), so refusing a charge precedes the delivery it pays for, and
+   the Alternatives' objection to settlement-time refusal — that it punishes
+   a creditor who already delivered — does not arise.
+   - **At signing**, a service contract is refused (`DebtFloorExceeded`) unless
+     the buyer's committed position covers its first period. This holds at
+     every door a contract is admitted through.
+   - **At each charge**, before the station appends a period's charge or an
+     early-termination penalty, the same floor check runs against the
+     **debtor** — the buyer for a period or a buyer-terminated penalty, the
+     provider for a provider-terminated penalty. A charge that would cross the
+     floor is not appended: that contract stops for the sweep and is retried on
+     the next sweep while the period is still due, inside the existing
+     per-contract per-sweep cap. No new record kind exists.
+   - **Visibility:** the station's contract views report a contract as *in
+     arrears* when a period is due and uncharged. This is a read-side field, not
+     a signed-record change.
+   - **Residual, accepted for now:** a provider who ends an in-arrears contract
+     early still owes the penalty, and a catch-up sweep charges every overdue
+     period once headroom returns. Because the penalty waits for the backlog to
+     clear, the provider pays it to a buyer who fell behind. Waiving the
+     provider's penalty when a period is due and uncharged at the termination's
+     admission is a tracked follow-up, not part of this Clarification.
+
+   Alternatives considered for (2): reserving the next period in the committed
+   position (needs a contract hook in a ledger that cannot see contracts, and
+   bounds nothing over many periods alone); reserving the whole remaining
+   obligation at signing (exact, but a member at zero could hold only a few
+   weeks of contract); keeping the residual and documenting it.

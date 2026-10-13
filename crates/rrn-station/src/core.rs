@@ -2400,6 +2400,8 @@ impl Core {
         )
         .map_err(|e| invalid_params(e.to_string()))?;
         let contract_id = contract.contract_id;
+        self.first_period_fits(&contract, now)
+            .map_err(|e| invalid_params(e.to_string()))?;
 
         let mut log = AppendLog::new(&self.db);
         append_service_contract(
@@ -2834,6 +2836,15 @@ impl Core {
     ///
     /// A charge that races a duplicate (a gossiped record, an overlapping sweep)
     /// costs at most a redundant log entry that folds to nothing.
+    ///
+    /// No charge takes its debtor below the debt floor (ADR-0018 Clarification
+    /// 2026-10-12, point 2): before each period or penalty is appended, the
+    /// floor check runs against whoever it debits. A charge that does not fit is
+    /// not appended; that contract stops for this sweep and the period is retried
+    /// on the next one while it is still due. The snapshot the check reads is
+    /// derived once per sweep, and the charges this sweep appends are carried
+    /// beside it so a debtor with several contracts is checked against all of
+    /// them.
     fn do_charge_contracts(&mut self) -> usize {
         let now = self.clock.now();
         let station = self.station_keypair();
@@ -2857,6 +2868,7 @@ impl Core {
             )
         };
 
+        let mut floor = SweepFloor::default();
         let mut appended = 0;
         for (id, records) in contracts {
             let contract_ref = ContractRef(id.to_bytes());
@@ -2884,9 +2896,13 @@ impl Core {
                     period_index: index,
                     charged_at: now,
                 };
+                if !self.charge_fits(&mut floor, &charge, now) {
+                    break;
+                }
                 if !self.append_contract_charge(charge, &station, now) {
                     break;
                 }
+                floor.record(&charge);
                 appended += 1;
                 periods_charged += 1;
                 this_sweep += 1;
@@ -2926,13 +2942,82 @@ impl Core {
                         period_index: PENALTY_PERIOD_INDEX,
                         charged_at: now,
                     };
-                    if self.append_contract_charge(charge, &station, now) {
+                    if self.charge_fits(&mut floor, &charge, now)
+                        && self.append_contract_charge(charge, &station, now)
+                    {
+                        floor.record(&charge);
                         appended += 1;
                     }
                 }
             }
         }
         appended
+    }
+
+    /// Refuses a service contract whose buyer's committed position does not cover
+    /// its first period (ADR-0018 Clarification 2026-10-12, point 2). Period 0 is
+    /// due at admission, so this is the floor check for the charge the contract
+    /// makes first; every later period is checked when the sweep charges it.
+    /// Runs at every door a contract is admitted through.
+    fn first_period_fits(&self, contract: &ServiceContract, now: i64) -> rrn_ledger::Result<()> {
+        let snapshot = LedgerSnapshot::derive(&AppendLog::new(&self.db), &self.station_pubkey())?;
+        rrn_ledger::credit::check_floor(
+            &snapshot,
+            &contract.buyer,
+            contract.terms.commons_per_period_centi,
+            now,
+            &self.credit,
+        )
+    }
+
+    /// Whether `charge` keeps its debtor at or above the debt floor — the buyer
+    /// for a period or a buyer-paid penalty, the provider for a provider-paid one
+    /// (a negative amount). Reads the sweep's snapshot, derived on first use, plus
+    /// the charges this sweep has already appended. A charge that does not fit,
+    /// or a log that cannot be read, is logged and reported as not fitting.
+    fn charge_fits(&self, floor: &mut SweepFloor, charge: &ContractCharge, now: i64) -> bool {
+        if floor.derive_failed {
+            return false;
+        }
+        if floor.snapshot.is_none() {
+            match LedgerSnapshot::derive(&AppendLog::new(&self.db), &self.station_pubkey()) {
+                Ok(snapshot) => floor.snapshot = Some(snapshot),
+                Err(e) => {
+                    tracing::warn!(error = %e, "contract charge sweep could not derive the ledger");
+                    floor.derive_failed = true;
+                    return false;
+                }
+            }
+        }
+        let Some(snapshot) = floor.snapshot.as_ref() else {
+            return false;
+        };
+        let (debtor, debit) = if charge.amount_centi >= 0 {
+            (charge.buyer, charge.amount_centi)
+        } else {
+            (charge.provider, charge.amount_centi.saturating_neg())
+        };
+        // A charge appended earlier in this sweep moved the debtor's balance
+        // after the snapshot was taken: fold it in as part of this debit.
+        let moved = floor.moved.get(&debtor).copied().unwrap_or(0);
+        match rrn_ledger::credit::check_floor(
+            snapshot,
+            &debtor,
+            debit.saturating_sub(moved),
+            now,
+            &self.credit,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::info!(
+                    contract = %hex(&charge.contract_ref.0),
+                    period = charge.period_index,
+                    error = %e,
+                    "contract charge deferred: it would cross the debtor's debt floor"
+                );
+                false
+            }
+        }
     }
 
     /// Appends one station-signed [`ContractCharge`], returning whether it landed.
@@ -6413,6 +6498,17 @@ impl Core {
         let station_pk = self.wallet.address.public_key();
         let contract_id = signed.payload.contract_id;
         let admits = self.inquiry_admits(now);
+        // The append refuses a contract its buyer did not sign; refuse it here
+        // first, so the floor check below never answers for someone else's
+        // committed position.
+        if Address::from_public_key(signed.signer) != signed.payload.buyer {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "the contract's buyer is not its signer".into(),
+            ));
+        }
+        self.first_period_fits(&signed.payload, now)
+            .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         let mut log = AppendLog::new(&self.db);
         rrn_marketplace::contract::append_service_contract(
             &mut log, signed, station_pk, &admits, now,
@@ -7841,6 +7937,29 @@ const MAX_CHARGES_PER_CONTRACT_PER_SWEEP: u32 = 24;
 /// genuine charge the sweep owes (the station would see the period already charged
 /// and never debit the buyer), the inverse of the inert behavior the pin exists to
 /// give. Mirrors the pin in `ledger_view::balance_of`, which reads the same record.
+/// What one charge sweep's floor checks read: the ledger snapshot, derived the
+/// first time a charge is due, and each party's balance movement from the charges
+/// this sweep has appended since.
+#[derive(Default)]
+struct SweepFloor {
+    snapshot: Option<LedgerSnapshot>,
+    /// The derive failed once this sweep: refuse every charge without
+    /// replaying the log again.
+    derive_failed: bool,
+    moved: std::collections::HashMap<Address, i64>,
+}
+
+impl SweepFloor {
+    /// Folds an appended charge: the buyer pays `amount_centi` to the provider
+    /// (a negative amount is the provider paying the buyer).
+    fn record(&mut self, charge: &ContractCharge) {
+        let buyer = self.moved.entry(charge.buyer).or_insert(0);
+        *buyer = buyer.saturating_sub(charge.amount_centi);
+        let provider = self.moved.entry(charge.provider).or_insert(0);
+        *provider = provider.saturating_add(charge.amount_centi);
+    }
+}
+
 fn charged_periods_by_contract(
     log: &AppendLog,
     station: &PublicKey,
@@ -11308,6 +11427,9 @@ mod tests {
     const CONTRACT_NOTICE_DAYS: u32 = 7;
     const CONTRACT_PENALTY: i64 = 300;
     const WEEK_SECS: i64 = 7 * 86_400;
+    /// A debt floor deep enough that a long contract's charges never reach it,
+    /// for the tests about billing cadence rather than the floor.
+    const DEEP_FLOOR: i64 = -1_000_000;
 
     /// A recurring weekly services listing in the station's own community, so the
     /// sweep's real requirements gate admits a fresh buyer (min reputation 0).
@@ -11419,7 +11541,11 @@ mod tests {
         }
     }
 
+    /// Seeds a weekly contract between `provider` and an enrolled `buyer`, so the
+    /// buyer's -20.00 floor covers all four 5.00 periods and the charge sweep's
+    /// floor check passes until a test spends that headroom elsewhere.
     fn seed_contract(core: &Core, provider: &Keypair, buyer: &Keypair) -> ContractId {
+        enroll(core, buyer);
         let (listing, inquiry_id) = seed_agreed_inquiry(core, provider, buyer);
         let buyer_addr = Address::from_public_key(buyer.public_key());
         let provider_addr = Address::from_public_key(provider.public_key());
@@ -11614,6 +11740,350 @@ mod tests {
 
         let err = core.handle_call(&settle_req(&inquiry_id)).unwrap_err();
         assert!(err.message.contains("buyer"), "{}", err.message);
+    }
+
+    /// A spend of `amount` from `kp` at `nonce`, through the engine directly at
+    /// the core's clock — the debt-floor door every carrier reaches.
+    fn floor_checked_spend(
+        core: &Core,
+        kp: &Keypair,
+        amount: i64,
+        nonce: u64,
+    ) -> rrn_ledger::Result<()> {
+        let now = core.clock.now();
+        let proposal = TransactionProposal::new(
+            Address::from_public_key(kp.public_key()),
+            Address::from_public_key(Keypair::generate().public_key()),
+            amount,
+            None,
+            nonce,
+            now,
+            now + 3_600,
+        );
+        Engine::new(&core.db, core.station_keypair())
+            .with_credit_config(core.credit)
+            .submit_proposal(SignedProposal::sign(proposal, kp), now)
+    }
+
+    #[test]
+    fn the_floor_counts_contract_charges_against_the_buyer() {
+        // Three weekly charges (periods 0, 1, 2) put the buyer at -1500. The
+        // debt floor reads the same log-derived balance the member sees, so
+        // only 500 of headroom remains: a 400 spend admits (-1900) and a second
+        // one is refused at -2300.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        seed_contract(&core, &provider, &buyer);
+        core.clock.set(NOW + 2 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 3);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -1_500
+        );
+
+        floor_checked_spend(&core, &buyer, 400, 0).unwrap();
+        let err = floor_checked_spend(&core, &buyer, 400, 1).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rrn_ledger::Error::DebtFloorExceeded {
+                    projected_centi: -2_300,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_floor_credits_contract_income_to_the_provider() {
+        // The provider's +1500 of subscription income is headroom like any
+        // settled credit: five pending 450 spends project to -750, inside the
+        // -2000 floor.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        seed_contract(&core, &provider, &buyer);
+        enroll(&core, &provider);
+        core.clock.set(NOW + 2 * WEEK_SECS);
+        assert_eq!(core.do_charge_contracts(), 3);
+
+        for nonce in 0..5 {
+            floor_checked_spend(&core, &provider, 450, nonce).unwrap();
+        }
+    }
+
+    /// Past the expiry of a spend `floor_checked_spend` made at `at`, when it no
+    /// longer binds its sender.
+    fn after_spend_expiry(at: i64) -> i64 {
+        at + 3_600 + CLOCK_SKEW_TOLERANCE_SECS + 1
+    }
+
+    #[test]
+    fn a_charge_that_would_cross_the_floor_is_deferred_then_retried() {
+        // A pending 16.00 spend leaves the buyer 4.00 of headroom: period 0's
+        // 5.00 would cross the -20.00 floor, so the sweep appends nothing and the
+        // contract reads in arrears. Once the spend expires the headroom returns
+        // and the next sweep charges the period it deferred.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let contract_id = seed_contract(&core, &provider, &buyer);
+        let cid = hex(&contract_id.to_bytes());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        floor_checked_spend(&core, &buyer, 1_600, 0).unwrap();
+
+        let before = core.tail_seq();
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert_eq!(core.tail_seq(), before, "a deferred charge appends nothing");
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["periods_charged"], 0);
+        assert_eq!(detail["in_arrears"], true);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            0
+        );
+
+        core.clock.set(after_spend_expiry(NOW));
+        assert_eq!(core.do_charge_contracts(), 1);
+        let detail = core.run_contract_detail(&cid, buyer_addr).unwrap();
+        assert_eq!(detail["periods_charged"], 1);
+        assert_eq!(detail["in_arrears"], false);
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -CONTRACT_PRICE
+        );
+    }
+
+    #[test]
+    fn one_sweep_checks_a_debtor_against_every_charge_it_appends() {
+        // Two contracts from one buyer, both due at once, with 9.00 of headroom:
+        // the first period (5.00) fits, the second (another 5.00) would not once
+        // the first is counted, though each alone would. The sweep carries its
+        // own charges beside the snapshot it derived once.
+        let mut core = test_core();
+        let buyer = Keypair::generate();
+        let first = seed_contract(&core, &Keypair::generate(), &buyer);
+        let second = seed_contract(&core, &Keypair::generate(), &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        floor_checked_spend(&core, &buyer, 1_100, 0).unwrap();
+
+        assert_eq!(core.do_charge_contracts(), 1);
+        let arrears: Vec<bool> = [first, second]
+            .iter()
+            .map(|id| {
+                core.run_contract_detail(&hex(&id.to_bytes()), buyer_addr)
+                    .unwrap()["in_arrears"]
+                    .as_bool()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(arrears.iter().filter(|&&a| a).count(), 1, "{arrears:?}");
+    }
+
+    #[test]
+    fn a_contract_is_refused_when_the_first_period_does_not_fit() {
+        // The channel door: a buyer with 4.00 of headroom cannot sign a 5.00
+        // weekly contract, and an unenrolled buyer (floor zero, nothing held)
+        // cannot sign one at all.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        enroll(&core, &buyer);
+        let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &buyer);
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        floor_checked_spend(&core, &buyer, 1_600, 0).unwrap();
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            buyer_addr,
+            listing.provider,
+            seed_contract_terms(),
+            NOW,
+        )
+        .unwrap();
+        let env = envelope(
+            &buyer,
+            "submit_contract",
+            serde_json::json!({ "signed_contract": record_hex(contract.clone(), &buyer) }),
+        );
+        let before = core.tail_seq();
+        let (code, message) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("debt floor exceeded"), "{message}");
+        assert!(message.contains("-2100"), "{message}");
+        assert_eq!(core.tail_seq(), before, "nothing is appended");
+
+        // Once the spend expires the same signed contract fits and is admitted.
+        core.clock.set(after_spend_expiry(NOW));
+        let result = core.route_channel_method(&env).unwrap();
+        assert_eq!(result["state"], "active");
+
+        let stranger = Keypair::generate();
+        let (listing, inquiry_id) = seed_agreed_inquiry(&core, &Keypair::generate(), &stranger);
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            Address::from_public_key(stranger.public_key()),
+            listing.provider,
+            seed_contract_terms(),
+            core.clock.now(),
+        )
+        .unwrap();
+        let env = envelope(
+            &stranger,
+            "submit_contract",
+            serde_json::json!({ "signed_contract": record_hex(contract, &stranger) }),
+        );
+        let (code, message) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("not enrolled"), "{message}");
+
+        // The operator door: the station wallet is the buyer, and a pending spend
+        // leaves it the same 4.00 of headroom.
+        let station = core.station_keypair();
+        enroll(&core, &station);
+        let (_, inquiry_id) = seed_agreed_inquiry(&core, &Keypair::generate(), &station);
+        floor_checked_spend(&core, &station, 1_600, 0).unwrap();
+        let err = core
+            .handle_call(&rpc::Request {
+                id: "1".into(),
+                method: "marketplace_contract".into(),
+                params: serde_json::json!({ "inquiry_id": hex(&inquiry_id.to_bytes()) }),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, rpc::INVALID_PARAMS);
+        assert!(
+            err.message.contains("debt floor exceeded"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_contract_naming_another_buyer_never_reaches_the_floor_check() {
+        // A paired member signs a contract naming someone else as buyer, at a
+        // price above that buyer's headroom. The refusal must not be the floor's,
+        // whose message would state the named buyer's committed position.
+        let mut core = test_core();
+        let (provider, victim, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        enroll(&core, &victim);
+        let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &victim);
+        floor_checked_spend(&core, &victim, 1_600, 0).unwrap();
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            Address::from_public_key(victim.public_key()),
+            listing.provider,
+            seed_contract_terms(),
+            NOW,
+        )
+        .unwrap();
+        let env = envelope(
+            &mallory,
+            "submit_contract",
+            serde_json::json!({ "signed_contract": record_hex(contract, &mallory) }),
+        );
+        let (code, message) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("buyer is not its signer"), "{message}");
+        assert!(!message.contains("debt floor"), "{message}");
+    }
+
+    #[test]
+    fn a_provider_terminated_penalty_is_floor_checked_against_the_provider() {
+        // The provider ends a daily contract early; the 3.00 penalty is theirs to
+        // pay. With a pending spend leaving them 1.00 of headroom the penalty is
+        // deferred, then charged once the spend expires.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        enroll(&core, &provider);
+        let contract_id = seed_daily_contract(&core, &provider, &buyer, 10, 1, CONTRACT_PENALTY);
+        let provider_addr = Address::from_public_key(provider.public_key());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+
+        // Terminated 100s after admission: notice closes at NOW + DAY + 100, so
+        // periods 0 and 1 bill and the penalty falls due after them.
+        core.clock.set(NOW + 100);
+        append_contract_termination(
+            &mut AppendLog::new(&core.db),
+            rrn_crypto::signed::SignedPayload::sign(
+                ContractTermination {
+                    contract_id,
+                    terminated_by: TerminatedBy::Provider,
+                    requested_at: NOW + 100,
+                },
+                &provider,
+            ),
+            &core.station_pubkey(),
+            &|_: &Listing, _: &Address| true,
+            NOW + 100,
+        )
+        .unwrap();
+        core.clock.set(NOW + DAY);
+        assert_eq!(core.do_charge_contracts(), 2);
+        // +10.00 of income, so a 29.00 spend projects to -19.00.
+        floor_checked_spend(&core, &provider, 2_900, 0).unwrap();
+
+        core.clock.set(NOW + DAY + 100);
+        assert_eq!(
+            core.do_charge_contracts(),
+            0,
+            "the penalty would reach -22.00"
+        );
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
+            2 * CONTRACT_PRICE
+        );
+
+        core.clock.set(after_spend_expiry(NOW + DAY));
+        assert_eq!(core.do_charge_contracts(), 1);
+        assert_eq!(core.do_charge_contracts(), 0, "levied once");
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &provider_addr, &core.station_pubkey()).unwrap(),
+            2 * CONTRACT_PRICE - CONTRACT_PENALTY
+        );
+        assert_eq!(
+            ledger_view::balance_of(&core.db, &buyer_addr, &core.station_pubkey()).unwrap(),
+            -2 * CONTRACT_PRICE + CONTRACT_PENALTY
+        );
+    }
+
+    #[test]
+    fn contract_view_reports_in_arrears() {
+        // In arrears means a period is due and uncharged: true for a fresh
+        // contract before the sweep, false once it bills, and true again for a
+        // period the floor holds back — in the detail view and in both parties'
+        // list rows.
+        let mut core = test_core();
+        let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        let contract_id = seed_contract(&core, &provider, &buyer);
+        let cid = hex(&contract_id.to_bytes());
+        let buyer_addr = Address::from_public_key(buyer.public_key());
+        let provider_addr = Address::from_public_key(provider.public_key());
+        let arrears = |core: &Core| {
+            let detail = core.run_contract_detail(&cid, buyer_addr).unwrap()["in_arrears"].clone();
+            let buyer_row =
+                core.run_my_contracts(buyer_addr).unwrap()["contracts"][0]["in_arrears"].clone();
+            let provider_row =
+                core.run_my_contracts(provider_addr).unwrap()["contracts"][0]["in_arrears"].clone();
+            assert_eq!(detail, buyer_row);
+            assert_eq!(detail, provider_row);
+            detail.as_bool().unwrap()
+        };
+
+        assert!(arrears(&core), "period 0 is due at admission");
+        assert_eq!(core.do_charge_contracts(), 1);
+        assert!(!arrears(&core));
+
+        // Period 1 falls due with 14.50 committed beside the 5.00 charged: it
+        // would reach -24.50, so it waits.
+        core.clock.set(NOW + WEEK_SECS);
+        floor_checked_spend(&core, &buyer, 1_450, 0).unwrap();
+        assert_eq!(core.do_charge_contracts(), 0);
+        assert!(arrears(&core));
     }
 
     #[test]
@@ -11975,6 +12445,7 @@ mod tests {
         notice_days: u32,
         penalty_centi: i64,
     ) -> ContractId {
+        enroll(core, buyer);
         let buyer_addr = Address::from_public_key(buyer.public_key());
         let daily = RecurringTerms {
             frequency: Frequency::Daily,
@@ -12070,6 +12541,7 @@ mod tests {
     #[test]
     fn a_catch_up_sweep_appends_at_most_the_cap_per_contract() {
         let mut core = test_core();
+        core.credit.debt_floor_centi = DEEP_FLOOR;
         let (provider, buyer) = (Keypair::generate(), Keypair::generate());
         let buyer_addr = Address::from_public_key(buyer.public_key());
         let contract_id = seed_daily_contract(&core, &provider, &buyer, 60, 0, 0);
@@ -12099,6 +12571,7 @@ mod tests {
         // station down for the whole run must reach the same ledger, even though
         // its first capped sweep sees only 24 periods charged.
         let mut core = test_core();
+        core.credit.debt_floor_centi = DEEP_FLOOR;
         let (provider, buyer) = (Keypair::generate(), Keypair::generate());
         let buyer_addr = Address::from_public_key(buyer.public_key());
         let contract_id = seed_daily_contract(&core, &provider, &buyer, 60, 59, CONTRACT_PENALTY);
@@ -12124,6 +12597,7 @@ mod tests {
         // A fresh core: the log keeps admission monotonic, so a contract seeded
         // after the first core's clock moved would be admitted at that later time.
         let mut core = test_core();
+        core.credit.debt_floor_centi = DEEP_FLOOR;
         let (provider, buyer) = (Keypair::generate(), Keypair::generate());
         let buyer_addr = Address::from_public_key(buyer.public_key());
         let contract_id = seed_daily_contract(&core, &provider, &buyer, 60, 30, CONTRACT_PENALTY);
@@ -12383,6 +12857,7 @@ mod tests {
     fn contract_schedule_runs_from_admission_not_started_at() {
         let mut core = test_core();
         let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        enroll(&core, &buyer);
         let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &buyer);
         let buyer_addr = Address::from_public_key(buyer.public_key());
 
@@ -12525,6 +13000,7 @@ mod tests {
     fn a_paired_mobile_signs_reads_and_terminates_a_contract_over_the_channel() {
         let mut core = test_core();
         let (provider, buyer) = (Keypair::generate(), Keypair::generate());
+        enroll(&core, &buyer);
         let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &buyer);
         let buyer_addr = Address::from_public_key(buyer.public_key());
         let provider_addr = Address::from_public_key(provider.public_key());

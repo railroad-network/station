@@ -72,7 +72,7 @@ impl TryFrom<CBOR> for ContractRef {
 /// station.
 ///
 /// It restates the parties and amount so that balances are fully re-derivable
-/// from the log alone (the materialized balance is just a cache). The idempotency
+/// from the log alone — no balance is stored anywhere. The idempotency
 /// key is `(contract_ref, period_index)`: a balance fold applies each period once,
 /// no matter how many charge records reference it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
