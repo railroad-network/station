@@ -263,10 +263,11 @@ pub enum WalletCmd {
         #[command(subcommand)]
         cmd: WalletReceiptsCmd,
     },
-    /// Stop carrying a pending record that can never succeed — e.g. a
-    /// confirmation of a payment that was cancelled — so it no longer holds up
+    /// Stop carrying a pending record that can never succeed — e.g. a second
+    /// confirmation of a payment already confirmed — so it no longer holds up
     /// the outbox. Not a revocation: a copy already carried can still be
-    /// admitted, and a later receipt will show it. A proposal cannot be
+    /// admitted. A record the station never received leaves its chain position
+    /// empty there for good, which `sync` reports. A proposal cannot be
     /// abandoned. Local only: no passphrase, no station.
     Abandon {
         /// The record hash (hex), or a unique prefix of at least 8 hex
@@ -1618,7 +1619,18 @@ impl Wallet {
         if !store.abandon(&author, &row.record_hash)? {
             bail!("{short} is not pending; there is nothing to abandon");
         }
-        store.prune_acked(&author)?;
+        // No prune here: the row stays until the next receipt application, so
+        // a receipt saying it was admitted after all can still replace the mark.
+        if row.last_refusal_reason.is_none() {
+            // Never answered, so most likely never presented: the station has
+            // not seen this position and never will.
+            eprintln!(
+                "note: {short} has had no answer from the station, so it may never have \
+                 reached it. If so, its position in your chain stays empty there for good, \
+                 and `rrn wallet sync` will report a gap below your head; new records are \
+                 still admitted."
+            );
+        }
         crate::emit(
             fmt,
             &json!({
@@ -1630,7 +1642,7 @@ impl Wallet {
                 Ok(format!(
                     "abandoned {short}: this wallet stops carrying it. It is not a revocation — \
                      a copy already handed to a courier or the station can still be admitted, \
-                     and a later receipt will show it."
+                     and `rrn wallet transactions` will show it."
                 ))
             },
         )
@@ -1765,6 +1777,11 @@ impl Wallet {
             .filter(|r| r.acked_outcome.is_none())
             .map(|r| r.record_hash)
             .collect();
+        let abandoned_before: std::collections::HashSet<[u8; 32]> = rows
+            .iter()
+            .filter(|r| r.acked_outcome == Some(AckOutcome::Abandoned))
+            .map(|r| r.record_hash)
+            .collect();
         let kind_of: std::collections::HashMap<[u8; 32], String> = rows
             .into_iter()
             .map(|r| (r.record_hash, r.record_kind))
@@ -1824,6 +1841,16 @@ impl Wallet {
                 Ok(matched) => {
                     if matched && pending_before.contains(&record_hash) {
                         applied += 1;
+                    } else if matched
+                        && abandoned_before.contains(&record_hash)
+                        && matches!(ack, AckOutcome::Admitted | AckOutcome::Known)
+                    {
+                        // The truth replaced the member's abandon.
+                        applied += 1;
+                        eprintln!(
+                            "{}: a record you abandoned was admitted after all",
+                            short_hex(&record_hash)
+                        );
                     }
                 }
                 Err(rrn_storage::Error::ConflictingAck) => {

@@ -1754,8 +1754,13 @@ cursors); the wallet's trust anchor (the pinned station address).
   `a_second_confirmation_of_a_paid_transaction_can_be_abandoned`). Abandon is
   local bookkeeping, **not a revocation** — the signed record still exists, a copy
   already carried can still be admitted, and a later `admitted`/`known` receipt
-  replaces the abandoned mark. A proposal can never be abandoned (its nonce is in
-  flight; test: `abandon_refuses_a_proposal`). *Residual:* until the member
+  replaces the abandoned mark while the row is still retained (a receipt for a row
+  already pruned is dropped; `rrn wallet transactions` still shows the station's
+  view). Abandoning a record the station never received leaves that chain position
+  empty on the station for good — the ADR-0028 §7 "hole below the head", which
+  `sync` reports and the abandon command warns about; admission continues. A
+  proposal can never be abandoned (its nonce is in flight; test:
+  `abandon_refuses_a_proposal`). *Residual:* until the member
   abandons it, a stuck row still takes one bundle slot per submit and costs the
   station a re-validation per presentation; a confirmation of a transaction that
   is no longer open still answers the transient `not-proposed` (a final slug for

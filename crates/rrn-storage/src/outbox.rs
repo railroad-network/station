@@ -326,6 +326,9 @@ impl<'a> OutboxStore<'a> {
         seq: Option<u64>,
         reason: Option<&str>,
     ) -> Result<bool> {
+        if outcome == AckOutcome::Abandoned {
+            return Err(Error::ConflictingAck);
+        }
         // A single read; under the single-writer model no transaction is needed,
         // and the unknown / idempotent / conflict paths then do no write at all
         // (no wasted write-transaction on the receipt-replay hot path).
@@ -349,10 +352,6 @@ impl<'a> OutboxStore<'a> {
             AckOutcome::Refused => reason,
             _ => None,
         };
-
-        if outcome == AckOutcome::Abandoned {
-            return Err(Error::ConflictingAck);
-        }
 
         if let Some(prior) = prior_outcome {
             let prior = AckOutcome::from_column(&prior)?;

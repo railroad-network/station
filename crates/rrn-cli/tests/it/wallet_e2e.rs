@@ -725,7 +725,9 @@ async fn a_second_confirmation_of_a_paid_transaction_can_be_abandoned() {
     wjson(&home_b, &["submit"]).await;
     assert_eq!(pending_rows(&home_b, &b), 1);
 
-    let abandoned = wjson(&home_b, &["abandon", &record_hash[..12]]).await;
+    // A prefix in any case resolves to the row.
+    let prefix = record_hash[..12].to_ascii_uppercase();
+    let abandoned = wjson(&home_b, &["abandon", &prefix]).await;
     assert_eq!(abandoned["abandoned"], record_hash.as_str());
     assert_eq!(abandoned["last_refusal"], "not-proposed");
     assert_eq!(pending_rows(&home_b, &b), 0, "no longer carried");
