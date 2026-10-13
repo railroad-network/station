@@ -638,6 +638,52 @@ async fn nonce_refusal_resets_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_refusal_of_a_confirmation_stays_pending_and_retries() {
+    // B confirms A's offline payment and submits before A does: the station
+    // answers `not-proposed`, a refusal that can change, so B's confirmation
+    // stays pending. Once A's proposal lands, B's next submit carries the same
+    // entry again and it is admitted (ADR-0020 Clarification).
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_b, b) = init_wallet(dir.path(), "b", &h.station_addr).await;
+    pair_and_confirm(&h, &home_a, &a).await;
+    pair_and_confirm(&h, &home_b, &b).await;
+    wjson(&home_a, &["sync"]).await;
+    wjson(&home_b, &["sync"]).await;
+
+    let paid = wjson(&home_a, &["pay", &b, "1.00"]).await;
+    let tx_id = paid["tx_id"].as_str().unwrap().to_string();
+    wjson(&home_b, &["confirm", &tx_id]).await;
+
+    let first_b = {
+        let home_b = home_b.clone();
+        tokio::task::spawn_blocking(move || run_wallet(&home_b, Some(PASS), &["submit"]))
+            .await
+            .unwrap()
+    };
+    assert!(first_b.0, "submit failed: {}", first_b.2);
+    assert!(
+        first_b.2.contains("refused for now (not-proposed)"),
+        "expected the retry notice, got: {}",
+        first_b.2
+    );
+    assert_eq!(
+        pending_rows(&home_b, &b),
+        1,
+        "the confirmation stays pending"
+    );
+
+    let submitted_a = wjson(&home_a, &["submit"]).await;
+    assert_eq!(submitted_a["applied"].as_u64().unwrap(), 1);
+
+    let submitted_b = wjson(&home_b, &["submit"]).await;
+    assert_eq!(submitted_b["applied"].as_u64().unwrap(), 1);
+    assert_eq!(pending_rows(&home_b, &b), 0, "admitted on retry");
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_into_gap_still_admits_and_warns() {
     // The station has seen an entry ahead of a gap (position 3, 0..2 absent). A
     // wallet restored onto that key re-anchors at the highest seen, warns about

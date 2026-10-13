@@ -140,10 +140,12 @@ model is re-send driven, exactly like paper:
   need **not** be byte-identical: re-encoding an outbox produces a fresh
   `payload_id8` (the bundle's `assembled_at` is in the bytes), so the station relay
   treats the re-sent payload as a *new* one — it supersedes any stalled partial from
-  that sender rather than colliding with it. The station **re-ingests idempotently**
-  (a byte-identical presentation returns the cached receipt; already-admitted records
-  answer `known` — ADR-0020 §3), and re-queues the same receipt, which the carrier
-  eventually carries back intact.
+  that sender rather than colliding with it. The station **never admits twice**
+  (ADR-0020 §3 and its 2026-10-13 Clarification): a presentation with the same entry
+  envelopes gets its stored receipt back verbatim when every outcome in it is final,
+  and is re-evaluated when it carries a refusal that can change; already-admitted
+  records answer `known`. The receipt is re-queued, and the carrier eventually
+  carries it back intact.
 - Outbound (station → member) is **paced money-first**: a strict-priority queue
   (economic before governance before bulk) drained through a per-message token
   bucket, so a delivery receipt never waits behind a bulk message on a
@@ -153,7 +155,9 @@ model is re-send driven, exactly like paper:
 
 - **A sender number is forgeable.** The registry is spam control; the security
   boundary is the per-record signature re-verified at ingest. A spoofed sender can at
-  most re-carry someone's already-public signed bundle (idempotent, harmless) or junk
+  most re-carry someone's already-public signed bundle (never a second admission; a
+  copy under a different outer signature is a different presentation with its own
+  receipt and delivery row, so it cannot answer for the genuine one) or junk
   (refused).
 - **SMS is cleartext to the carrier.** The carrier sees the sender/recipient numbers,
   the timing, and the payload bytes. The payloads are already community-public signed

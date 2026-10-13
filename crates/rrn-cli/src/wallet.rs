@@ -1679,11 +1679,16 @@ impl Wallet {
         let mut store = OutboxStore::new(&self.db);
         // Which rows are still pending *before* this receipt, so a re-applied
         // (idempotent) receipt reports zero newly-applied outcomes.
-        let pending_before: std::collections::HashSet<[u8; 32]> = store
-            .all_rows(&author)?
-            .into_iter()
+        // Also each row's record kind, for the transient-refusal retry rule.
+        let rows = store.all_rows(&author)?;
+        let pending_before: std::collections::HashSet<[u8; 32]> = rows
+            .iter()
             .filter(|r| r.acked_outcome.is_none())
             .map(|r| r.record_hash)
+            .collect();
+        let kind_of: std::collections::HashMap<[u8; 32], String> = rows
+            .into_iter()
+            .map(|r| (r.record_hash, r.record_kind))
             .collect();
         let mut applied = 0usize;
         let mut nonce_gap = false;
@@ -1701,6 +1706,25 @@ impl Wallet {
                 nonce_gap = true;
             }
             let record_hash = outcome.record_hash.to_bytes();
+            // A refusal that can change (the confirmation's proposal has not
+            // landed yet, the debt floor, standing…) leaves a nonce-free record
+            // pending, so the next submit carries the same bytes again and the
+            // station re-evaluates them (ADR-0020 Clarification, receipt
+            // idempotency). A proposal is always acked: its nonce and the
+            // cursor reset that follows a refusal depend on it.
+            if let Disposition::Refused { reason } = &outcome.disposition {
+                let is_proposal = kind_of.get(&record_hash).map(String::as_str)
+                    == Some(rrn_ledger::transaction::PROPOSAL_KIND);
+                if !reason.is_final() && kind_of.contains_key(&record_hash) && !is_proposal {
+                    eprintln!(
+                        "{}: refused for now ({}); it stays pending and is retried on the \
+                         next submit",
+                        short_hex(&record_hash),
+                        reason.as_slug()
+                    );
+                    continue;
+                }
+            }
             // A `receipts_fetch` marks its whole page delivered on the station
             // *before* replying (ADR-0020 §3), so one bad outcome must not abort
             // the rest. A `ConflictingAck` here is a row already terminally acked

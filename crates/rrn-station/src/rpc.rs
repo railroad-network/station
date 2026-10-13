@@ -991,7 +991,7 @@ pub struct DtnPushParams {
 /// see `dtn_pushes`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DtnPushResult {
-    /// The push id (the bundle's presentation hash), hex-encoded.
+    /// The push id (the bundle's record-list hash), hex-encoded.
     pub push_id_hex: String,
     /// Whether the push is now awaiting delivery (`true` for a freshly-queued or
     /// still-pending row; `false` when an identical bundle to the same peer was
@@ -1028,7 +1028,7 @@ pub struct DtnBindResult {
 /// One tracked outbound push, for `rrn dtn status` (`dtn_pushes` result).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DtnPushRow {
-    /// The push id (presentation hash), hex-encoded.
+    /// The push id (record-list hash), hex-encoded.
     pub push_id_hex: String,
     /// The carrier destination the push was sent to.
     pub peer: String,

@@ -1564,10 +1564,12 @@ impl Core {
         let bundle_bytes =
             unhex(&params.bundle_hex).ok_or_else(|| invalid_params("bundle_hex is not hex"))?;
 
-        // Decode + compute the presentation hash (the push id), the ordered record
-        // hashes, and the airtime class. A malformed bundle is INVALID_PARAMS,
-        // never queued. This mirrors the ingest side (the push id is the same
-        // presentation hash the receiver keys its receipt on).
+        // Decode + compute the record-list hash (the push id: Blake3 over the
+        // ordered record hashes) and the airtime class. A malformed bundle is
+        // INVALID_PARAMS, never queued. The push id is deliberately NOT the key
+        // the receiver caches its receipt under (that covers the entry envelopes):
+        // a receipt carries only record hashes, so correlation can only rebuild
+        // this one.
         let bundle = Bundle::decode(&bundle_bytes)
             .map_err(|e| invalid_params(format!("bundle does not decode: {e}")))?;
         let records = bundle.entries.len();
@@ -4434,8 +4436,7 @@ impl Core {
         let pending = dtn
             .pending_receipts_for(&authors, params.since, MAX_RECEIPTS_PER_FETCH)
             .map_err(internal)?;
-        dtn.bump_fetched(&pending.record_hashes, now)
-            .map_err(internal)?;
+        dtn.bump_fetched(&pending.rows, now).map_err(internal)?;
         ok(&rpc::ReceiptsFetchResult {
             receipts_hex: pending.receipts.iter().map(|r| hex(r)).collect(),
             truncated: pending.truncated,
@@ -4445,18 +4446,21 @@ impl Core {
     /// `receipts_ack` (operator / Unix socket): the operator confirms delivery of
     /// the receipts for records authored on this station's **own wallet** — the
     /// author-path counterpart to the courier `receipts_fetch`, so the retention
-    /// sweep may reclaim those rows (ADR-0020 §3). Confirming an unknown or
+    /// sweep may reclaim those rows (ADR-0020 §3). Delivery rows are per
+    /// (record, presenting author), and this confirms only the rows this
+    /// station's own wallet presented. Confirming an unknown or
     /// already-confirmed record hash is a no-op, not an error.
     fn m_receipts_ack(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         let params: rpc::ReceiptsAckParams = parse_params(req)?;
-        let hashes = params
+        let own = self.station_pubkey().to_bytes();
+        let rows = params
             .record_hashes
             .iter()
-            .map(|s| parse_record_hash(s))
+            .map(|s| parse_record_hash(s).map(|h| (h, own)))
             .collect::<Result<Vec<_>, _>>()?;
         let now = self.clock.now();
         let acked = DtnStore::new(&self.db)
-            .mark_confirmed(&hashes, now)
+            .mark_confirmed(&rows, now)
             .map_err(internal)?;
         ok(&rpc::ReceiptsAckResult {
             acked: acked as u64,
@@ -4487,7 +4491,7 @@ impl Core {
         let pending = dtn
             .pending_receipts_for(&[author], since, MAX_RECEIPTS_PER_FETCH)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
-        dtn.mark_confirmed(&pending.record_hashes, now)
+        dtn.mark_confirmed(&pending.rows, now)
             .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(serde_json::json!({
             "receipts_hex": pending.receipts.iter().map(|r| hex(r)).collect::<Vec<_>>(),
@@ -4587,10 +4591,15 @@ impl Core {
     /// the **same** engine front door the live path uses — and answer with one
     /// station-signed [`SignedReceipt`], returned as its portable envelope bytes.
     ///
-    /// Idempotent: a byte-identical *presentation* (the same ordered record
-    /// hashes) returns the stored receipt verbatim; a different bundle
-    /// re-carrying already-admitted records yields `known` outcomes via the log's
-    /// own dedup. Neither path re-admits a record.
+    /// Never admits a record twice (ADR-0020 Clarification, receipt
+    /// idempotency). A presentation is identified by its exact entry envelopes
+    /// ([`ingest_presentation_key`]). If that presentation was answered before
+    /// and every outcome in the stored receipt is final, the stored receipt is
+    /// returned verbatim. Otherwise — never answered, or answered with a refusal
+    /// that can change (a nonce gap, the debt floor, a confirmation ahead of its
+    /// proposal…) — the whole presentation is evaluated afresh: an
+    /// already-admitted record answers `known` via the log's own dedup, and the
+    /// new receipt replaces the stored one.
     ///
     /// The whole operation reads and writes only through `&self.db` (SQLite
     /// interior mutability), so it takes `&self`; the caller supplies `now` from
@@ -4620,31 +4629,36 @@ impl Core {
             });
         }
 
-        // Presentation hash: Blake3 over the ordered record-hash list — the
-        // idempotency key. Independent of how the records were bundled.
-        let mut pres = Vec::with_capacity(entries.len() * 32);
-        for pe in &entries {
-            pres.extend_from_slice(&pe.record_hash.to_bytes());
-        }
-        let presentation_hash = Hash::of(&pres);
+        // The receipt-cache key covers every entry's signer, signature and body,
+        // in order, so a forged or re-wrapped copy of a record can never answer
+        // for the genuine presentation.
+        let presentation_hash =
+            ingest_presentation_key(entries.iter().map(|pe| pe.envelope_bytes.as_slice()));
 
-        // Idempotent replay: if this exact presentation was already answered,
-        // return that receipt's bytes verbatim (byte-identical guarantee).
+        // Re-issue a stored answer verbatim only when nothing in it can change.
         if let Some(stored) = DtnStore::new(&self.db)
             .receipt_for(&presentation_hash.to_bytes())
             .map_err(|e| BundleIngestError::Internal(e.to_string()))?
         {
-            return Ok(stored);
+            match receipt::decode_signed(&stored) {
+                Ok(prior) if receipt::receipt_is_final(&prior.payload) => return Ok(stored),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "stored DTN receipt does not decode; re-evaluating the presentation"
+                ),
+            }
         }
 
         let mut outcomes = Vec::with_capacity(entries.len());
-        // Delivery-tracking candidates (record_hash, author), queued after the
-        // receipt is signed. Only entries that passed `outbox::validate`
+        // Delivery-tracking candidates (record_hash, author, index of the
+        // record's outcome), queued after the receipt is signed. Only entries
+        // that passed `outbox::validate`
         // are added: validation enforces `author == outer signer`, so their author
         // is cryptographically attested. A bad-signature entry's `author` field is
         // attacker-controlled — never enqueue a delivery row under it, or a courier
         // could inject junk "refused" receipts into any victim's pending queue.
-        let mut deliveries: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(entries.len());
+        let mut deliveries: Vec<([u8; 32], [u8; 32], usize)> = Vec::with_capacity(entries.len());
         for pe in &entries {
             let entry = &pe.signed.payload;
             let record_hash = pe.record_hash;
@@ -4664,8 +4678,9 @@ impl Core {
             let author = entry.author.public_key().to_bytes();
             // The author is attested from here on (validate passed), so this record
             // is a legitimate delivery-tracking candidate whatever its outcome
-            // below (fork, known, admitted, or a routing refusal).
-            deliveries.push((record_hash.to_bytes(), author));
+            // below (fork, known, admitted, or a routing refusal). Every branch
+            // below pushes exactly one outcome, at this index.
+            deliveries.push((record_hash.to_bytes(), author, outcomes.len()));
             let entry_hash = entry.entry_hash().to_bytes();
             {
                 let mut dtn = DtnStore::new(&self.db);
@@ -4760,8 +4775,9 @@ impl Core {
             });
         }
 
-        // Build, sign, persist (keyed by presentation hash), and return the
-        // receipt as portable envelope bytes.
+        // Build, sign, persist (keyed by presentation hash, replacing any earlier
+        // non-final answer), and return the receipt as portable envelope bytes.
+        let finality: Vec<bool> = outcomes.iter().map(|o| o.disposition.is_final()).collect();
         let receipt = DeliveryReceipt {
             station: self.wallet.address,
             outcomes,
@@ -4778,13 +4794,15 @@ impl Core {
             // `deliveries` holds only entries that passed validation (see
             // its construction above), so a bad-signature entry's spoofable author
             // never gets a row. Must follow `put_receipt`: the row's foreign key
-            // references the receipt just stored. Idempotent on `record_hash` — a
-            // re-ingest keeps the first row and its delivery progress.
-            for (record_hash, author) in &deliveries {
+            // references the receipt just stored. Rows are per (record, author):
+            // a final row keeps its first receipt and delivery progress; a
+            // transient one is re-pointed here and re-armed.
+            for (record_hash, author, at) in &deliveries {
                 dtn.record_receipt_delivery(
                     record_hash,
                     author,
                     &presentation_hash.to_bytes(),
+                    finality[*at],
                     now,
                 )
                 .map_err(|e| BundleIngestError::Internal(e.to_string()))?;
@@ -5190,7 +5208,7 @@ impl Core {
     /// Correlates an inbound signed delivery receipt to a tracked outbound push
     /// and marks it delivered. Never trusts the carrier: the receipt must
     /// verify, be signed by the station it names, list the exact presented record
-    /// set (its presentation hash is the push id), arrive from the peer we pushed
+    /// set (its record-list hash is the push id), arrive from the peer we pushed
     /// to, and — when the push was addressed by identity — be signed by the
     /// expected station. Any mismatch is logged and ignored (dumb carrier,
     /// ADR-0013). Idempotent: a re-sent receipt after a lost ack is a no-op.
@@ -5212,14 +5230,16 @@ impl Core {
             tracing::warn!("DTN receipt signer is not the station it names; dropped");
             return false;
         }
-        // The presentation hash — a pure function of the ordered record hashes —
+        // The record-list hash — a pure function of the ordered record hashes —
         // is the push id. Receipts key on `record_hash`, never a bundle id
-        // (dtn-bundles.md §2), so this correlates for any bundling.
-        let mut pres = Vec::with_capacity(signed.payload.outcomes.len() * 32);
+        // (dtn-bundles.md §2), so this correlates for any bundling. Not the
+        // receiver's receipt-cache key, which covers the entry envelopes the
+        // receipt does not carry.
+        let mut record_list = Vec::with_capacity(signed.payload.outcomes.len() * 32);
         for outcome in &signed.payload.outcomes {
-            pres.extend_from_slice(&outcome.record_hash.to_bytes());
+            record_list.extend_from_slice(&outcome.record_hash.to_bytes());
         }
-        let push_id = Hash::of(&pres).to_bytes();
+        let push_id = Hash::of(&record_list).to_bytes();
 
         let mut store = PushStore::new(&self.db);
         let row = match store.get(&push_id) {
@@ -5227,7 +5247,7 @@ impl Core {
             Ok(None) => {
                 tracing::debug!(
                     push = %hex(&push_id),
-                    "DTN receipt for an unknown presentation; ignored"
+                    "DTN receipt for an unknown push; ignored"
                 );
                 return false;
             }
@@ -7394,6 +7414,24 @@ fn map_refusal(e: &rrn_ledger::Error) -> RefusalReason {
         // `EquivocationBlocked`) — none of which warrant a new wire slug.
         _ => RefusalReason::Rejected,
     }
+}
+
+/// The receipt-cache key of an ingested presentation (ADR-0020 Clarification,
+/// receipt idempotency): Blake3 over a domain tag and the Blake3 of each carried
+/// entry envelope's canonical bytes (signer, signature and body), in presented
+/// order. Two presentations share a key only if they carry the exact same
+/// envelopes in the same order — a copy of a record under a different (or
+/// forged) outer signature is a different presentation.
+///
+/// Deliberately distinct from the DTN push id, which hashes only the ordered
+/// record hashes: a receipt carries record hashes and nothing else, so receipt
+/// correlation can rebuild that one and never this one.
+fn ingest_presentation_key<'a>(envelopes: impl IntoIterator<Item = &'a [u8]>) -> Hash {
+    let mut preimage = b"rrn.dtn.presentation.v2".to_vec();
+    for envelope in envelopes {
+        preimage.extend_from_slice(&Hash::of(envelope).to_bytes());
+    }
+    Hash::of(&preimage)
 }
 
 /// A refused [`Outcome`] for `record_hash` with `reason`.
@@ -10438,8 +10476,12 @@ mod tests {
         assert!(tx_state(&core, &good.payload.id).is_some());
     }
 
-    /// Re-ingesting a byte-identical presentation returns the stored receipt
-    /// verbatim and admits nothing new.
+    /// Re-ingesting a byte-identical presentation returns a byte-identical
+    /// receipt and admits nothing new. (Alice is not enrolled here, so her
+    /// outcome is a transient `not-enrolled` and the second submit is a
+    /// re-evaluation that reproduces the same bytes on an unmoved clock; the
+    /// verbatim re-issue of a final receipt is
+    /// `a_final_receipt_is_reissued_verbatim`.)
     #[test]
     fn dtn_ingest_is_idempotent() {
         let mut core = test_core();
@@ -10470,6 +10512,229 @@ mod tests {
             len_after_first,
             "no record is re-admitted on re-ingest"
         );
+    }
+
+    /// A third party re-presents a member's record bytes under a forged outer
+    /// signature. The forged copy is refused `bad-signature`, and the member's
+    /// genuine presentation is still evaluated (not answered from the forged
+    /// copy's cached refusal): the receipt cache keys on the entry envelopes.
+    #[test]
+    fn a_forged_presentation_cannot_poison_the_genuine_one() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        enroll(&core, &alice);
+        let before = core.tail_seq();
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let genuine = outbox_entry(&alice, 0, zero(), &proposal, 900);
+        let mut forged = genuine.clone();
+        forged.signature = rrn_crypto::keypair::Signature::from_bytes([0u8; 64]).unwrap();
+
+        let first = submit_bundle(&mut core, &[forged], 1000);
+        assert_eq!(
+            first.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::BadSignature
+            }
+        );
+        let second = submit_bundle(&mut core, &[genuine], 1000);
+        assert_eq!(
+            second.payload.outcomes[0].disposition,
+            Disposition::Admitted { seq: before + 1 }
+        );
+        assert_eq!(core.tail_seq(), before + 1, "admitted exactly once");
+    }
+
+    /// Mallory wraps Alice's signed proposal in Mallory's own (valid) outbox
+    /// entry and presents it first. Alice's genuine presentation afterwards gets
+    /// its own delivery row, and Alice's fetch returns the receipt of *her*
+    /// presentation — the first presenter does not own the record's row.
+    #[test]
+    fn a_rewrapped_record_does_not_answer_for_its_author() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let mallory = Keypair::generate();
+        enroll(&core, &alice);
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+
+        let rewrapped = submit_bundle(
+            &mut core,
+            &[outbox_entry(&mallory, 0, zero(), &proposal, 900)],
+            1000,
+        );
+        let record_hash = rewrapped.payload.outcomes[0].record_hash.to_bytes();
+        assert!(matches!(
+            rewrapped.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+        let genuine = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &proposal, 900)],
+            1000,
+        );
+        assert!(matches!(
+            genuine.payload.outcomes[0].disposition,
+            Disposition::Known { .. }
+        ));
+
+        let (alice_key, mallory_key) = (
+            alice.public_key().to_bytes(),
+            mallory.public_key().to_bytes(),
+        );
+        let dtn = DtnStore::new(&core.db);
+        assert!(dtn
+            .delivery_of(&record_hash, &mallory_key)
+            .unwrap()
+            .is_some());
+        assert!(dtn.delivery_of(&record_hash, &alice_key).unwrap().is_some());
+        let pending = dtn.pending_receipts_for(&[alice_key], None, 256).unwrap();
+        assert_eq!(
+            pending.receipts,
+            vec![receipt::encode_signed(&genuine)],
+            "Alice gets the receipt of her own presentation"
+        );
+        assert_eq!(pending.rows, vec![(record_hash, alice_key)]);
+    }
+
+    /// A confirmation carried ahead of its proposal is refused `not-proposed`.
+    /// Once the proposal lands, the **same bytes** re-presented are evaluated
+    /// afresh and admitted; Bob's delivery row is re-pointed at the new answer
+    /// and re-armed, even though he had already fetched the refusal.
+    #[test]
+    fn an_order_dependent_refusal_is_re_evaluated() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        enroll(&core, &alice);
+        let proposal = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let confirmation = member_confirmation(&bob, &proposal, 950);
+        let bob_bundle = encode_bundle(&[outbox_entry(&bob, 0, zero(), &confirmation, 950)], 990);
+        let submit = |core: &mut Core| {
+            let r = call(
+                core,
+                "bundle_submit",
+                serde_json::json!({ "bundle_hex": bob_bundle }),
+            );
+            receipt::decode_signed(&unhex(r["receipt_hex"].as_str().unwrap()).unwrap()).unwrap()
+        };
+
+        let early = submit(&mut core);
+        assert_eq!(
+            early.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::NotProposed
+            }
+        );
+        let record_hash = early.payload.outcomes[0].record_hash.to_bytes();
+        let bob_key = bob.public_key().to_bytes();
+        // Bob's device picks up the refusal and confirms its delivery.
+        let env = envelope(&bob, "receipts_fetch", serde_json::json!({}));
+        core.route_channel_method(&env).unwrap();
+        let row = DtnStore::new(&core.db)
+            .delivery_of(&record_hash, &bob_key)
+            .unwrap()
+            .unwrap();
+        assert!(row.confirmed_delivered);
+        assert!(!row.outcome_final);
+
+        submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &proposal, 900)],
+            1000,
+        );
+        core.clock.advance(60);
+        let later = submit(&mut core);
+        assert!(
+            matches!(
+                later.payload.outcomes[0].disposition,
+                Disposition::Admitted { .. }
+            ),
+            "the same bytes are re-evaluated once the proposal has landed"
+        );
+
+        let dtn = DtnStore::new(&core.db);
+        let row = dtn.delivery_of(&record_hash, &bob_key).unwrap().unwrap();
+        assert!(row.outcome_final);
+        assert!(
+            !row.confirmed_delivered,
+            "the changed answer is delivered again"
+        );
+        assert_eq!(
+            dtn.receipt_for(&row.receipt_presentation).unwrap(),
+            Some(receipt::encode_signed(&later)),
+            "the row points at the new receipt"
+        );
+    }
+
+    /// A receipt whose every outcome is final (admitted, expired, outbox-fork)
+    /// is re-issued byte-identical on re-presentation — even with the clock
+    /// moved on, so a re-evaluation would have shown — and admits nothing new.
+    #[test]
+    fn a_final_receipt_is_reissued_verbatim() {
+        let mut core = test_core();
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let dave = Keypair::generate();
+        enroll(&core, &alice);
+
+        // Dave's position 0 is first carried with one record; the presentation
+        // below carries a different entry at the same position — a fork.
+        let dave_first = member_proposal(&dave, &bob, 1, 0, 900, 900 + 1_000_000);
+        submit_bundle(
+            &mut core,
+            &[outbox_entry(&dave, 0, zero(), &dave_first, 900)],
+            1000,
+        );
+        let dave_second = member_proposal(&dave, &bob, 2, 0, 900, 900 + 1_000_000);
+
+        let admitted = member_proposal(&alice, &bob, 300, 0, 900, 900 + 1_000_000);
+        let expired = member_proposal(&bob, &alice, 100, 0, 0, 1);
+        let entries = [
+            outbox_entry(&alice, 0, zero(), &admitted, 900),
+            outbox_entry(&bob, 0, zero(), &expired, 900),
+            outbox_entry(&dave, 0, zero(), &dave_second, 900),
+        ];
+        let bundle_hex = encode_bundle(&entries, 1000);
+        let first = call(
+            &mut core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": bundle_hex }),
+        );
+        let decoded =
+            receipt::decode_signed(&unhex(first["receipt_hex"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let dispositions: Vec<_> = decoded
+            .payload
+            .outcomes
+            .iter()
+            .map(|o| o.disposition)
+            .collect();
+        assert!(matches!(dispositions[0], Disposition::Admitted { .. }));
+        assert_eq!(
+            dispositions[1..],
+            [
+                Disposition::Refused {
+                    reason: RefusalReason::Expired
+                },
+                Disposition::Refused {
+                    reason: RefusalReason::OutboxFork
+                },
+            ]
+        );
+        let tail = core.tail_seq();
+
+        core.clock.advance(3600);
+        let second = call(
+            &mut core,
+            "bundle_submit",
+            serde_json::json!({ "bundle_hex": bundle_hex }),
+        );
+        assert_eq!(
+            first["receipt_hex"], second["receipt_hex"],
+            "a final receipt is re-issued byte-identical"
+        );
+        assert_eq!(core.tail_seq(), tail, "nothing admitted on re-presentation");
     }
 
     /// Two validly-signed entries from one author at the same position with
@@ -10584,6 +10849,7 @@ mod tests {
         let entry = outbox_entry(&bob, 0, zero(), &proposal, 900);
         let issued = submit_bundle(&mut core, std::slice::from_ref(&entry), 1000);
         let record_hash = issued.payload.outcomes[0].record_hash.to_bytes();
+        let bob_key = bob.public_key().to_bytes();
         let bob_addr = Address::from_public_key(bob.public_key()).to_string();
 
         // A courier fetches Bob's pending receipt (operator/Unix-socket surface).
@@ -10605,7 +10871,7 @@ mod tests {
         // A courier fetch bumps the count but does NOT confirm — a courier is not
         // the author (ADR-0020 §3). The row is still pending.
         let row = DtnStore::new(&core.db)
-            .delivery_of(&record_hash)
+            .delivery_of(&record_hash, &bob_key)
             .unwrap()
             .unwrap();
         assert_eq!(row.fetched_count, 1);
@@ -10620,7 +10886,7 @@ mod tests {
         let mine = core.route_channel_method(&env).unwrap();
         assert_eq!(mine["receipts_hex"].as_array().unwrap().len(), 1);
         let row = DtnStore::new(&core.db)
-            .delivery_of(&record_hash)
+            .delivery_of(&record_hash, &bob_key)
             .unwrap()
             .unwrap();
         assert!(
@@ -10643,7 +10909,7 @@ mod tests {
         core.clock.advance(DEFAULT_RECEIPT_RETENTION_SECS - 100); // still within
         assert_eq!(core.do_prune_receipts(), 0, "kept before retention");
         assert!(DtnStore::new(&core.db)
-            .delivery_of(&record_hash)
+            .delivery_of(&record_hash, &bob_key)
             .unwrap()
             .is_some());
 
@@ -10651,22 +10917,52 @@ mod tests {
         core.clock.advance(200);
         assert_eq!(core.do_prune_receipts(), 1, "pruned after retention");
         assert!(DtnStore::new(&core.db)
-            .delivery_of(&record_hash)
+            .delivery_of(&record_hash, &bob_key)
             .unwrap()
             .is_none());
     }
 
     /// The operator's own-wallet author path: `receipts_ack` confirms a receipt by
-    /// record hash, the CLI counterpart to the mobile author fetch.
+    /// record hash, the CLI counterpart to the mobile author fetch. It confirms
+    /// only the rows the station's own wallet presented.
     #[test]
     fn dtn_receipts_ack_confirms_by_record_hash() {
         let mut core = test_core();
+        let operator = core.station_keypair();
+        let own = operator.public_key().to_bytes();
         let alice = Keypair::generate();
         let bob = Keypair::generate();
-        let proposal = member_proposal(&alice, &bob, 150, 0, 900, 900 + 1_000_000);
-        let entry = outbox_entry(&alice, 0, zero(), &proposal, 900);
+        let proposal = member_proposal(&operator, &bob, 150, 0, 900, 900 + 1_000_000);
+        let entry = outbox_entry(&operator, 0, zero(), &proposal, 900);
         let issued = submit_bundle(&mut core, std::slice::from_ref(&entry), 1000);
         let record_hash = issued.payload.outcomes[0].record_hash;
+
+        // A member's record is not the operator's to confirm.
+        let theirs = outbox_entry(
+            &alice,
+            0,
+            zero(),
+            &member_proposal(&alice, &bob, 150, 0, 900, 900 + 1_000_000),
+            900,
+        );
+        let theirs_hash = submit_bundle(&mut core, std::slice::from_ref(&theirs), 1000)
+            .payload
+            .outcomes[0]
+            .record_hash
+            .to_bytes();
+        let none = call(
+            &mut core,
+            "receipts_ack",
+            serde_json::json!({ "record_hashes": [hex(&theirs_hash)] }),
+        );
+        assert_eq!(none["acked"], 0, "only the operator wallet's own rows");
+        assert!(
+            !DtnStore::new(&core.db)
+                .delivery_of(&theirs_hash, &alice.public_key().to_bytes())
+                .unwrap()
+                .unwrap()
+                .confirmed_delivered
+        );
 
         // Ack by hash confirms exactly that delivery row.
         let acked = call(
@@ -10676,7 +10972,7 @@ mod tests {
         );
         assert_eq!(acked["acked"], 1);
         let row = DtnStore::new(&core.db)
-            .delivery_of(&record_hash.to_bytes())
+            .delivery_of(&record_hash.to_bytes(), &own)
             .unwrap()
             .unwrap();
         assert!(row.confirmed_delivered);
@@ -10720,7 +11016,7 @@ mod tests {
         // No delivery row, and nothing pending for anyone.
         assert!(
             DtnStore::new(&core.db)
-                .delivery_of(&record_hash)
+                .delivery_of(&record_hash, &bob.public_key().to_bytes())
                 .unwrap()
                 .is_none(),
             "a bad-signature entry must not seed a delivery row"
@@ -10751,7 +11047,7 @@ mod tests {
         assert!(carol_result["receipts_hex"].as_array().unwrap().is_empty());
         assert!(
             !DtnStore::new(&core.db)
-                .delivery_of(&record_hash)
+                .delivery_of(&record_hash, &bob.public_key().to_bytes())
                 .unwrap()
                 .unwrap()
                 .confirmed_delivered,
@@ -13357,8 +13653,9 @@ mod tests {
 
     // --- station-originated DTN push (ADR-0013, ADR-0020) -----------------
 
-    /// The presentation hash (push id) of a bundle of entries — the same value the
-    /// receiver keys its receipt on, computed here on the sender side.
+    /// The record-list hash (push id) of a bundle of entries — what receipt
+    /// correlation rebuilds from a receipt's outcomes, computed here on the
+    /// sender side.
     fn push_id_of(entries: &[SignedOutboxEntry]) -> [u8; 32] {
         let mut pres = Vec::with_capacity(entries.len() * 32);
         for e in entries {
@@ -13490,7 +13787,7 @@ mod tests {
         let status = call(&mut core, "dtn_pushes", serde_json::json!({}));
         assert_eq!(status["pushes"].as_array().unwrap().len(), 1);
 
-        // The same bundle to a DIFFERENT peer collides on the presentation-hash
+        // The same bundle to a DIFFERENT peer collides on the record-list-hash
         // row and is refused (a push is keyed by its record set), not silently
         // kept on the first peer.
         let conflict = call_err(

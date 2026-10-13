@@ -186,6 +186,40 @@ Making a replica's derived views match the writer's would require a
 replica-supplied expected-writer key at the pinning boundary; that is left as a
 follow-up, not part of this clarification.
 
+## Clarification (2026-10-13) — receipt idempotency
+
+Decision §3 says "re-submitting a bundle can only produce the same receipt
+content, never a duplicate admission." The guarantee the design needs is the
+second half; the first was over-strong, and implementing it literally let one
+presentation answer for another. The internal security review (RRN-A-018)
+showed a third party re-presenting a member's record under a forged outer
+signature: the station cached the forged copy's `bad-signature` refusal under
+a key built from record hashes alone (which cover neither the presenter nor
+the signature) and served it, unevaluated, to the member's genuine
+presentation. The same cache froze order-dependent answers: a confirmation
+carried ahead of its proposal kept its `not-proposed` refusal forever. This
+narrows §3 and does not change the decision.
+
+Ingestion never admits a record twice. A station re-issues a stored receipt
+verbatim only when every outcome in it is final (admitted, known, or a refusal
+re-presentation cannot change); a presentation whose receipt carries a refusal
+that can change (nonce gap, debt floor, not enrolled, not proposed, Tier-2
+stake, the catch-all) is re-evaluated, so the same bytes may later be admitted.
+A presentation is identified by its exact entry envelopes, never by record
+hashes alone.
+
+In code: each refusal slug declares its finality (`RefusalReason::is_final`,
+an exhaustive match, and the **Final?** column of the registry in
+`docs/spec/dtn-bundles.md` §3), so a new slug cannot be added without deciding
+it. Re-evaluation cannot double-admit: an already-admitted record answers
+`known` from the log's own dedup, and the engine's duplicate guard backs it.
+The outbound push id is unchanged — it still hashes the ordered record hashes,
+because a receipt carries only record hashes and correlation must rebuild it
+from one. Receipt-delivery rows are per `(record, presenting author)`, so a
+record re-wrapped by someone else never takes over its author's row; a row
+whose answer was transient is re-pointed at the re-evaluated receipt and
+delivered again.
+
 ## Alternatives Considered
 
 - **Per-node chains (a small set of co-equal station-class writers), merged
