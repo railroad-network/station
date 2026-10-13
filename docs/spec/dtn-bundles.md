@@ -201,7 +201,8 @@ compile until it does.
 | `outbox-fork` | final | the entry is one side of an outbox fork (ADR-0020 §2 / ADR-0021) |
 | `duplicate` | final | a record content-identical to one already on the log was re-presented as a *new* admission (distinct from the benign `known` outcome) |
 | `tier-unsupported` | final | the record's oracle tier is above what this phase admits — blocked, never clamped (ADR-0011) |
-| `not-proposed` | transient | the referenced transaction is absent or not in the state the record needs (couriers must keep outbox order, ADR-0020 §4) |
+| `not-proposed` | transient | the referenced transaction is absent from the log — e.g. a confirmation whose proposal has not been admitted yet (couriers must keep outbox order, ADR-0020 §4); it may still arrive |
+| `tx-closed` | final | a confirmation names a transaction that exists but is no longer open to confirmation — already confirmed by another confirmation, settled, cancelled, or disputed; a transaction never returns to the proposed state (ADR-0020 Clarification, 2026-10-13) |
 | `tier2-stake` | transient | a Tier-2 confirmer does not clear the Member band past bootstrap grace |
 | `cert-misuse` | final | a cert-backed proposal is not a positive-amount spend — a payment request cannot ride an escrow (ADR-0021 §3–§4) |
 | `cert-unknown` | final | a cert-backed proposal (or return) names a certificate the station never issued (ADR-0021 §3) |
@@ -220,8 +221,9 @@ A reader that does not recognise a slug treats the outcome as an unknown refusal
 `rrn.member.enrollment` (ADR-0038 §1) is a station-only record: the writer appends
 it at an in-person ceremony, so a carried one is refused `unroutable-kind`, and a
 member-signed one that reaches a log by any other path is inert under the
-station-signer pin. `not-enrolled` was added with ADR-0038; a receipt decoder
-built before it rejects a receipt carrying the slug.
+station-signer pin. `not-enrolled` was added with ADR-0038, and `tx-closed` with
+the ADR-0020 receipt-idempotency Clarification; a receipt decoder built before
+either rejects a receipt carrying that slug.
 
 ---
 

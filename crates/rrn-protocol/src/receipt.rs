@@ -66,10 +66,15 @@ pub enum RefusalReason {
     /// The record's oracle tier is above what this phase admits (ADR-0011): the
     /// amount is too large, and is *blocked*, never clamped.
     TierUnsupported,
-    /// The referenced transaction is absent or not in the state the record needs
-    /// (e.g. a confirmation whose proposal has not been admitted — couriers must
-    /// keep outbox order, ADR-0020 §4).
+    /// The referenced transaction is absent from the log (e.g. a confirmation
+    /// whose proposal has not been admitted yet — couriers must keep outbox
+    /// order, ADR-0020 §4). Transient: the proposal may still arrive.
     NotProposed,
+    /// A confirmation names a transaction that exists but is no longer open to
+    /// confirmation — already confirmed (by another confirmation), settled,
+    /// cancelled, or disputed. Final: a transaction never returns to the
+    /// proposed state (ADR-0020 Clarification, receipt idempotency).
+    TransactionClosed,
     /// The confirmer of a Tier-2 payment does not clear the Member band and the
     /// community is past bootstrap grace, so the reputation-staking gate
     /// refuses the confirmation. An eligibility fault, not a signature or state
@@ -127,6 +132,7 @@ impl RefusalReason {
             RefusalReason::Duplicate => "duplicate",
             RefusalReason::TierUnsupported => "tier-unsupported",
             RefusalReason::NotProposed => "not-proposed",
+            RefusalReason::TransactionClosed => "tx-closed",
             RefusalReason::Tier2Stake => "tier2-stake",
             RefusalReason::CertMisuse => "cert-misuse",
             RefusalReason::CertUnknown => "cert-unknown",
@@ -156,6 +162,7 @@ impl RefusalReason {
             "duplicate" => Some(RefusalReason::Duplicate),
             "tier-unsupported" => Some(RefusalReason::TierUnsupported),
             "not-proposed" => Some(RefusalReason::NotProposed),
+            "tx-closed" => Some(RefusalReason::TransactionClosed),
             "tier2-stake" => Some(RefusalReason::Tier2Stake),
             "cert-misuse" => Some(RefusalReason::CertMisuse),
             "cert-unknown" => Some(RefusalReason::CertUnknown),
@@ -200,7 +207,8 @@ impl RefusalReason {
             | RefusalReason::CertOverspent
             | RefusalReason::DeclarationDead
             | RefusalReason::DeclarationExpired
-            | RefusalReason::AlreadyActivated => true,
+            | RefusalReason::AlreadyActivated
+            | RefusalReason::TransactionClosed => true,
             RefusalReason::NonceGap
             | RefusalReason::DebtFloor
             | RefusalReason::NotEnrolled
@@ -556,6 +564,7 @@ mod tests {
             RefusalReason::Duplicate,
             RefusalReason::TierUnsupported,
             RefusalReason::NotProposed,
+            RefusalReason::TransactionClosed,
             RefusalReason::Tier2Stake,
             RefusalReason::CertMisuse,
             RefusalReason::CertUnknown,
@@ -592,6 +601,7 @@ mod tests {
             DeclarationDead,
             DeclarationExpired,
             AlreadyActivated,
+            TransactionClosed,
         ];
         let transients = [
             NonceGap,
@@ -608,7 +618,7 @@ mod tests {
             assert!(!r.is_final(), "{} must be transient", r.as_slug());
         }
         // Every slug is classified exactly once across the two lists.
-        assert_eq!(finals.len() + transients.len(), 21);
+        assert_eq!(finals.len() + transients.len(), 22);
     }
 
     #[test]

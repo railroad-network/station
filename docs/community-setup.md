@@ -364,8 +364,12 @@ apply`. Online, `rrn wallet submit` does the whole round trip. A record the
 station refuses *for now* (a confirmation that arrived before its payment, a
 spend over the debt floor) stays pending and is retried on the next submit;
 `rrn wallet show --pending` says why. If one can never succeed — say the member
-confirmed the same payment twice — `rrn wallet abandon <hash>` stops carrying it.
-That is not a revocation: a copy already carried can still be admitted. A member
+confirmed a payment whose sender lost their laptop before sending it —
+`rrn wallet abandon <hash>` stops carrying it.
+That is not a revocation: a copy already carried can still be admitted. When you
+upgrade the station, have laptop members upgrade `rrn wallet` too: a station can
+answer with a refusal reason an older wallet does not know (such as `tx-closed`),
+and an older wallet then rejects the whole receipt until it is upgraded. A member
 who loses the laptop rebuilds their key from their recovery circle with
 `rrn wallet recover` (§4.3).
 

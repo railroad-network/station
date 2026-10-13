@@ -220,6 +220,43 @@ record re-wrapped by someone else never takes over its author's row; a row
 whose answer was transient is re-pointed at the re-evaluated receipt and
 delivered again.
 
+## Clarification (2026-10-13) — a confirmation of a closed transaction
+
+The receipt-idempotency Clarification above re-evaluates a presentation whose
+receipt carries a transient refusal. One transient slug, `not-proposed`, covered
+two different facts: the referenced transaction is *absent* (its proposal may
+still arrive, so a re-evaluation can admit the confirmation), or it *exists but
+is past the proposed state* — already confirmed by another confirmation,
+settled, cancelled, or disputed. The second never changes: a transaction never
+returns to the proposed state. Answered as transient, it kept a member's wallet
+carrying the confirmation forever.
+
+The two facts now have two slugs. An absent transaction stays `not-proposed`
+(transient). A confirmation of a transaction that exists but is no longer open
+is refused **`tx-closed`**, which is **final**: its receipt is re-issued verbatim
+and a wallet acks it on the first answer. `tx-closed` is added to the closed
+refusal set and its registry (`docs/spec/dtn-bundles.md` §3); a receipt decoder
+built before it rejects a receipt carrying the slug, as with `not-enrolled`. A
+command-line wallet should therefore be upgraded with its station: an older one
+still carrying such a confirmation would get that slug in every receipt and fail
+to apply any of them. (The phone app signs online only and parses no delivery
+receipts.)
+ADR-0031 §10's late-confirmation walkthrough (a confirmation reaching a home that has
+already cancelled the transaction, "refused `not-proposed`") reads `tx-closed`
+under this rule, and `tx-closed` joins the domestic slugs that ADR-0031 §13 says
+apply unchanged at either front door.
+
+The Tier-2 staking gate, which runs before the engine on every confirmation
+door, judges only a transaction still open to confirmation, so a confirmation of
+a closed Tier-2 transaction by a confirmer below the Member band is answered
+`tx-closed`, not the transient `tier2-stake`.
+
+The other permanent faults the catch-all `rejected` carries (a confirmer who is
+not the receiver, a self-payment, inconsistent timestamps) stay on the transient
+`rejected`: a member's wallet can stop carrying such a record by abandoning it
+(`rrn wallet abandon`), and a second, final catch-all slug was judged not worth
+its wire cost.
+
 ## Alternatives Considered
 
 - **Per-node chains (a small set of co-equal station-class writers), merged

@@ -263,9 +263,9 @@ pub enum WalletCmd {
         #[command(subcommand)]
         cmd: WalletReceiptsCmd,
     },
-    /// Stop carrying a pending record that can never succeed — e.g. a second
-    /// confirmation of a payment already confirmed — so it no longer holds up
-    /// the outbox. Not a revocation: a copy already carried can still be
+    /// Stop carrying a pending record that can never succeed — e.g. a
+    /// confirmation of a payment whose sender never delivers it — so it no
+    /// longer holds up the outbox. Not a revocation: a copy already carried can still be
     /// admitted. A record the station never received leaves its chain position
     /// empty there for good, which `sync` reports. A proposal cannot be
     /// abandoned. Local only: no passphrase, no station.
