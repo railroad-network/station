@@ -2976,11 +2976,15 @@ impl Core {
     /// the charges this sweep has already appended. A charge that does not fit,
     /// or a log that cannot be read, is logged and reported as not fitting.
     fn charge_fits(&self, floor: &mut SweepFloor, charge: &ContractCharge, now: i64) -> bool {
+        if floor.derive_failed {
+            return false;
+        }
         if floor.snapshot.is_none() {
             match LedgerSnapshot::derive(&AppendLog::new(&self.db), &self.station_pubkey()) {
                 Ok(snapshot) => floor.snapshot = Some(snapshot),
                 Err(e) => {
                     tracing::warn!(error = %e, "contract charge sweep could not derive the ledger");
+                    floor.derive_failed = true;
                     return false;
                 }
             }
@@ -6494,6 +6498,15 @@ impl Core {
         let station_pk = self.wallet.address.public_key();
         let contract_id = signed.payload.contract_id;
         let admits = self.inquiry_admits(now);
+        // The append refuses a contract its buyer did not sign; refuse it here
+        // first, so the floor check below never answers for someone else's
+        // committed position.
+        if Address::from_public_key(signed.signer) != signed.payload.buyer {
+            return Err((
+                rpc::INVALID_PARAMS,
+                "the contract's buyer is not its signer".into(),
+            ));
+        }
         self.first_period_fits(&signed.payload, now)
             .map_err(|e| (rpc::INVALID_PARAMS, e.to_string()))?;
         let mut log = AppendLog::new(&self.db);
@@ -7930,6 +7943,9 @@ const MAX_CHARGES_PER_CONTRACT_PER_SWEEP: u32 = 24;
 #[derive(Default)]
 struct SweepFloor {
     snapshot: Option<LedgerSnapshot>,
+    /// The derive failed once this sweep: refuse every charge without
+    /// replaying the log again.
+    derive_failed: bool,
     moved: std::collections::HashMap<Address, i64>,
 }
 
@@ -11940,6 +11956,40 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn a_contract_naming_another_buyer_never_reaches_the_floor_check() {
+        // A paired member signs a contract naming someone else as buyer, at a
+        // price above that buyer's headroom. The refusal must not be the floor's,
+        // whose message would state the named buyer's committed position.
+        let mut core = test_core();
+        let (provider, victim, mallory) = (
+            Keypair::generate(),
+            Keypair::generate(),
+            Keypair::generate(),
+        );
+        enroll(&core, &victim);
+        let (listing, inquiry_id) = seed_agreed_inquiry(&core, &provider, &victim);
+        floor_checked_spend(&core, &victim, 1_600, 0).unwrap();
+        let contract = ServiceContract::new(
+            inquiry_id,
+            listing.id,
+            Address::from_public_key(victim.public_key()),
+            listing.provider,
+            seed_contract_terms(),
+            NOW,
+        )
+        .unwrap();
+        let env = envelope(
+            &mallory,
+            "submit_contract",
+            serde_json::json!({ "signed_contract": record_hex(contract, &mallory) }),
+        );
+        let (code, message) = core.route_channel_method(&env).unwrap_err();
+        assert_eq!(code, rpc::INVALID_PARAMS);
+        assert!(message.contains("buyer is not its signer"), "{message}");
+        assert!(!message.contains("debt floor"), "{message}");
     }
 
     #[test]
