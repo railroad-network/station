@@ -74,6 +74,10 @@ pub struct ContractDetailView {
     pub periods_charged: u32,
     /// How many periods are still to run.
     pub periods_remaining: u32,
+    /// Whether a period is due at `now` and not yet charged — the sweep has not
+    /// reached it, or charging it would take the debtor below the debt floor and
+    /// it is waiting for headroom (ADR-0018 Clarification 2026-10-12, point 2).
+    pub in_arrears: bool,
     /// When the next unbilled period falls due, while the contract is billing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_charge_due: Option<i64>,
@@ -117,6 +121,10 @@ pub struct ContractRow {
     pub periods_charged: u32,
     /// How many are still to run.
     pub periods_remaining: u32,
+    /// Whether a period is due at `now` and not yet charged — the sweep has not
+    /// reached it, or charging it would take the debtor below the debt floor and
+    /// it is waiting for headroom (ADR-0018 Clarification 2026-10-12, point 2).
+    pub in_arrears: bool,
     /// When the next unbilled period falls due, while billing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_charge_due: Option<i64>,
@@ -149,6 +157,7 @@ pub fn detail(records: &ContractRecords, periods_charged: u32, now: i64) -> Cont
         state: state.tag(),
         periods_charged,
         periods_remaining: records.total_periods().saturating_sub(periods_charged),
+        in_arrears: records.next_due_charge(now, periods_charged).is_some(),
         next_charge_due: None,
         terminating_effective_at: None,
         ended_reason: None,
@@ -218,6 +227,7 @@ where
                 commons_per_period_centi: records.contract.terms.commons_per_period_centi,
                 periods_charged,
                 periods_remaining: records.total_periods().saturating_sub(periods_charged),
+                in_arrears: records.next_due_charge(now, periods_charged).is_some(),
                 next_charge_due,
                 started_at: records.admitted_at,
             })
