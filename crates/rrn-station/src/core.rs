@@ -10476,8 +10476,12 @@ mod tests {
         assert!(tx_state(&core, &good.payload.id).is_some());
     }
 
-    /// Re-ingesting a byte-identical presentation returns the stored receipt
-    /// verbatim and admits nothing new.
+    /// Re-ingesting a byte-identical presentation returns a byte-identical
+    /// receipt and admits nothing new. (Alice is not enrolled here, so her
+    /// outcome is a transient `not-enrolled` and the second submit is a
+    /// re-evaluation that reproduces the same bytes on an unmoved clock; the
+    /// verbatim re-issue of a final receipt is
+    /// `a_final_receipt_is_reissued_verbatim`.)
     #[test]
     fn dtn_ingest_is_idempotent() {
         let mut core = test_core();

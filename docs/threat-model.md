@@ -1737,6 +1737,19 @@ cursors); the wallet's trust anchor (the pinned station address).
   door), and one read, `outbox_head` (a read, served on a replica). Neither is a
   new record kind or fixture; the write is refused with `READ_REPLICA` on a
   replica (test: `replica_serves_outbox_head_but_refuses_cert_request`).
+- *Denial of service — a refusal that never resolves.* A non-proposal record
+  refused with a transient slug stays pending and is re-carried on every submit
+  (ADR-0020 Clarification, receipt idempotency; test:
+  `transient_refusal_of_a_confirmation_stays_pending_and_retries`). *Residual:*
+  some faults behind a transient slug are permanent for that record — a
+  confirmation whose proposal was cancelled, settled, or never reaches the writer
+  answers `not-proposed` forever, and several catch-all `rejected` faults (a
+  confirmer mismatch, a closed dispute window) never clear. Such a row stays
+  pending indefinitely: it takes one bundle slot per submit, holds back
+  `prune_acked` for the rows after it, and costs the station a re-validation per
+  presentation. The wallet has no command to abandon a pending row; a dedicated
+  final answer for a terminally closed transaction, or an explicit abandon, is a
+  follow-up (it needs a slug or CLI change).
 
 **Known limitations.** Concurrent use of one key on two devices cannot be
 prevented and is a self-fork (ADR-0028 §2 forbids it by policy, not by mechanism)
