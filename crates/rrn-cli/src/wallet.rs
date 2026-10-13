@@ -263,6 +263,17 @@ pub enum WalletCmd {
         #[command(subcommand)]
         cmd: WalletReceiptsCmd,
     },
+    /// Stop carrying a pending record that can never succeed — e.g. a second
+    /// confirmation of a payment already confirmed — so it no longer holds up
+    /// the outbox. Not a revocation: a copy already carried can still be
+    /// admitted. A record the station never received leaves its chain position
+    /// empty there for good, which `sync` reports. A proposal cannot be
+    /// abandoned. Local only: no passphrase, no station.
+    Abandon {
+        /// The record hash (hex), or a unique prefix of at least 8 hex
+        /// characters, as `rrn wallet show` prints it.
+        record_hash: String,
+    },
     /// Show local outbox rows and their dispositions.
     Show {
         /// Only still-pending rows.
@@ -390,6 +401,7 @@ pub async fn cmd_wallet(
         WalletCmd::Receipts { cmd } => match cmd {
             WalletReceiptsCmd::Apply { input } => wallet.cmd_receipts_apply(fmt, &input),
         },
+        WalletCmd::Abandon { record_hash } => wallet.cmd_abandon(fmt, &record_hash),
         WalletCmd::Show { pending, all } => wallet.cmd_show(fmt, color, pending, all),
         WalletCmd::Transactions => wallet.cmd_transactions(fmt, color).await,
     }
@@ -1102,7 +1114,12 @@ impl Wallet {
         let author = self.author()?;
         let store = OutboxStore::new(&self.db);
         let head_pos = store.head(&author)?.map(|h| h.position);
-        let pending = store.pending(&author, None)?.len();
+        let pending_rows = store.pending(&author, None)?;
+        let pending = pending_rows.len();
+        let refused_for_now = pending_rows
+            .iter()
+            .filter(|r| r.last_refusal_reason.is_some())
+            .count();
         let certs = self.held_cert_ids()?.len();
 
         let text = format!(
@@ -1113,6 +1130,7 @@ impl Wallet {
              chain: {chain_state}\n\
              head position: {}\n\
              pending: {pending}\n\
+             refused for now: {refused_for_now}\n\
              nonce cursor: {cursor}\n\
              certificates held: {certs}\n\
              last sync: {last_sync}",
@@ -1130,6 +1148,7 @@ impl Wallet {
                 "chain_state": chain_state,
                 "head_position": head_pos,
                 "pending": pending,
+                "refused_for_now": refused_for_now,
                 "nonce_cursor": cursor,
                 "certificates_held": certs,
                 "last_sync_at": last_sync,
@@ -1572,6 +1591,63 @@ impl Wallet {
         })
     }
 
+    /// Marks one pending, non-proposal outbox row abandoned (local only).
+    fn cmd_abandon(&self, fmt: Format, wanted: &str) -> Result<()> {
+        let wanted = wanted.trim().to_ascii_lowercase();
+        if wanted.len() < 8 || !wanted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("give the record hash, or a prefix of at least 8 hex characters");
+        }
+        let author = self.author()?;
+        let mut store = OutboxStore::new(&self.db);
+        let matches: Vec<OutboxRow> = store
+            .all_rows(&author)?
+            .into_iter()
+            .filter(|r| hex(&r.record_hash).starts_with(&wanted))
+            .collect();
+        let row = match matches.as_slice() {
+            [] => bail!("no outbox record matches {wanted}"),
+            [one] => one,
+            _ => bail!("{wanted} matches more than one record; give more of the hash"),
+        };
+        let short = short_hex(&row.record_hash);
+        if row.record_kind == rrn_ledger::transaction::PROPOSAL_KIND {
+            bail!("a proposal cannot be abandoned: its nonce is in flight — wait for its receipt");
+        }
+        if row.acked_outcome.is_some() {
+            bail!("{short} is not pending; there is nothing to abandon");
+        }
+        if !store.abandon(&author, &row.record_hash)? {
+            bail!("{short} is not pending; there is nothing to abandon");
+        }
+        // No prune here: the row stays until the next receipt application, so
+        // a receipt saying it was admitted after all can still replace the mark.
+        if row.last_refusal_reason.is_none() {
+            // Never answered, so most likely never presented: the station has
+            // not seen this position and never will.
+            eprintln!(
+                "note: {short} has had no answer from the station, so it may never have \
+                 reached it. If so, its position in your chain stays empty there for good, \
+                 and `rrn wallet sync` will report a gap below your head; new records are \
+                 still admitted."
+            );
+        }
+        crate::emit(
+            fmt,
+            &json!({
+                "abandoned": hex(&row.record_hash),
+                "record_kind": row.record_kind,
+                "last_refusal": row.last_refusal_reason,
+            }),
+            || {
+                Ok(format!(
+                    "abandoned {short}: this wallet stops carrying it. It is not a revocation — \
+                     a copy already handed to a courier or the station can still be admitted, \
+                     and `rrn wallet transactions` will show it."
+                ))
+            },
+        )
+    }
+
     fn cmd_show(&self, fmt: Format, _color: ColorMode, pending: bool, all: bool) -> Result<()> {
         let author = self.author()?;
         let store = OutboxStore::new(&self.db);
@@ -1591,16 +1667,31 @@ impl Wallet {
                 (Some(AckOutcome::Known), _) => "known".to_string(),
                 (Some(AckOutcome::Refused), Some(why)) => format!("refused ({why})"),
                 (Some(AckOutcome::Refused), None) => "refused".to_string(),
+                (Some(AckOutcome::Abandoned), _) => "abandoned".to_string(),
+            };
+            // A pending row that was refused for now says why, so a member can
+            // spot one that will never succeed and abandon it.
+            let shown = match (&r.acked_outcome, &r.last_refusal_reason) {
+                (None, Some(why)) => format!(
+                    "refused for now ({why}, last {})",
+                    r.last_refused_at.unwrap_or_default()
+                ),
+                _ => disposition.clone(),
             };
             lines.push(format!(
-                "{}\t{}\t{}",
-                r.position, r.record_kind, disposition
+                "{}\t{}\t{}\t{}",
+                r.position,
+                r.record_kind,
+                shown,
+                short_hex(&r.record_hash)
             ));
             json_rows.push(json!({
                 "position": r.position,
                 "record_kind": r.record_kind,
                 "disposition": disposition,
                 "record_hash": hex(&r.record_hash),
+                "last_refusal_reason": r.last_refusal_reason,
+                "last_refused_at": r.last_refused_at,
             }));
         }
         crate::emit(fmt, &json!({ "rows": json_rows }), || Ok(lines.join("\n")))
@@ -1686,6 +1777,11 @@ impl Wallet {
             .filter(|r| r.acked_outcome.is_none())
             .map(|r| r.record_hash)
             .collect();
+        let abandoned_before: std::collections::HashSet<[u8; 32]> = rows
+            .iter()
+            .filter(|r| r.acked_outcome == Some(AckOutcome::Abandoned))
+            .map(|r| r.record_hash)
+            .collect();
         let kind_of: std::collections::HashMap<[u8; 32], String> = rows
             .into_iter()
             .map(|r| (r.record_hash, r.record_kind))
@@ -1716,12 +1812,22 @@ impl Wallet {
                 let is_proposal = kind_of.get(&record_hash).map(String::as_str)
                     == Some(rrn_ledger::transaction::PROPOSAL_KIND);
                 if !reason.is_final() && kind_of.contains_key(&record_hash) && !is_proposal {
-                    eprintln!(
-                        "{}: refused for now ({}); it stays pending and is retried on the \
-                         next submit",
-                        short_hex(&record_hash),
-                        reason.as_slug()
-                    );
+                    // Remember why it is still pending (`show`, `status`). A row
+                    // the member already abandoned is left alone, silently.
+                    if store.note_transient_refusal(
+                        &author,
+                        &record_hash,
+                        reason.as_slug(),
+                        now(),
+                    )? {
+                        let short = short_hex(&record_hash);
+                        eprintln!(
+                            "{short}: refused for now ({}); it stays pending and is retried on \
+                             the next submit — run `rrn wallet abandon {short}` if it can never \
+                             succeed",
+                            reason.as_slug()
+                        );
+                    }
                     continue;
                 }
             }
@@ -1735,6 +1841,16 @@ impl Wallet {
                 Ok(matched) => {
                     if matched && pending_before.contains(&record_hash) {
                         applied += 1;
+                    } else if matched
+                        && abandoned_before.contains(&record_hash)
+                        && matches!(ack, AckOutcome::Admitted | AckOutcome::Known)
+                    {
+                        // The truth replaced the member's abandon.
+                        applied += 1;
+                        eprintln!(
+                            "{}: a record you abandoned was admitted after all",
+                            short_hex(&record_hash)
+                        );
                     }
                 }
                 Err(rrn_storage::Error::ConflictingAck) => {

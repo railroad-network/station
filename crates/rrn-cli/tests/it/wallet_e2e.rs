@@ -684,6 +684,91 @@ async fn transient_refusal_of_a_confirmation_stays_pending_and_retries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_confirmation_of_a_paid_transaction_can_be_abandoned() {
+    // B confirms A's payment twice (two different confirmations of one id).
+    // The first is admitted; the second is answered `not-proposed` every time —
+    // the transaction is no longer open, so it can never succeed. The wallet
+    // keeps it pending, says why, and lets B abandon it.
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_b, b) = init_wallet(dir.path(), "b", &h.station_addr).await;
+    pair_and_confirm(&h, &home_a, &a).await;
+    pair_and_confirm(&h, &home_b, &b).await;
+    wjson(&home_a, &["sync"]).await;
+    wjson(&home_b, &["sync"]).await;
+
+    let paid = wjson(&home_a, &["pay", &b, "1.00"]).await;
+    let tx_id = paid["tx_id"].as_str().unwrap().to_string();
+    wjson(&home_a, &["submit"]).await;
+    wjson(&home_b, &["confirm", &tx_id]).await;
+    // A confirmation's bytes carry a seconds timestamp; wait so the second one
+    // is a different record.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    wjson(&home_b, &["confirm", &tx_id]).await;
+    wjson(&home_b, &["submit"]).await;
+    assert_eq!(
+        pending_rows(&home_b, &b),
+        1,
+        "the second confirmation stays pending"
+    );
+    assert_eq!(wjson(&home_b, &["status"]).await["refused_for_now"], 1);
+
+    // `show` says why, and gives the hash to abandon.
+    let shown = wjson(&home_b, &["show", "--pending"]).await;
+    let row = &shown["rows"][0];
+    assert_eq!(row["last_refusal_reason"], "not-proposed");
+    assert!(row["last_refused_at"].as_i64().is_some());
+    let record_hash = row["record_hash"].as_str().unwrap().to_string();
+
+    // A re-submit carries it again and it is refused again; still pending.
+    wjson(&home_b, &["submit"]).await;
+    assert_eq!(pending_rows(&home_b, &b), 1);
+
+    // A prefix in any case resolves to the row.
+    let prefix = record_hash[..12].to_ascii_uppercase();
+    let abandoned = wjson(&home_b, &["abandon", &prefix]).await;
+    assert_eq!(abandoned["abandoned"], record_hash.as_str());
+    assert_eq!(abandoned["last_refusal"], "not-proposed");
+    assert_eq!(pending_rows(&home_b, &b), 0, "no longer carried");
+    assert_eq!(wjson(&home_b, &["status"]).await["refused_for_now"], 0);
+    let stderr = wfail(&home_b, Some(PASS), &["submit"]).await;
+    assert!(stderr.contains("nothing pending"), "got: {stderr}");
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandon_refuses_a_proposal() {
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home, member) = init_wallet(dir.path(), "w", &h.station_addr).await;
+    pair_and_confirm(&h, &home, &member).await;
+    wjson(&home, &["sync"]).await;
+    wjson(&home, &["pay", &h.station_addr, "1"]).await;
+    let shown = wjson(&home, &["show", "--pending"]).await;
+    let record_hash = shown["rows"][0]["record_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let stderr = wfail(&home, Some(PASS), &["abandon", &record_hash]).await;
+    assert!(
+        stderr.contains("a proposal cannot be abandoned"),
+        "got: {stderr}"
+    );
+    let stderr = wfail(&home, Some(PASS), &["abandon", &record_hash[..6]]).await;
+    assert!(stderr.contains("at least 8 hex"), "got: {stderr}");
+    let stderr = wfail(&home, Some(PASS), &["abandon", "0123456789abcdef"]).await;
+    assert!(stderr.contains("no outbox record matches"), "got: {stderr}");
+    assert_eq!(
+        pending_rows(&home, &member),
+        1,
+        "the proposal is still pending"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_into_gap_still_admits_and_warns() {
     // The station has seen an entry ahead of a gap (position 3, 0..2 absent). A
     // wallet restored onto that key re-anchors at the highest seen, warns about

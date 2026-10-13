@@ -43,6 +43,11 @@ pub enum AckOutcome {
     /// The record was refused at the front door (bad signature, nonce, floor,
     /// tier, expiry, …); the reason slug is carried alongside.
     Refused,
+    /// Not a station answer: the member told the wallet to stop carrying this
+    /// record ([`OutboxStore::abandon`]). Acked for pruning and bundling; a later
+    /// `Admitted` or `Known` answer replaces it, since a copy already carried may
+    /// still be admitted.
+    Abandoned,
 }
 
 impl AckOutcome {
@@ -52,6 +57,7 @@ impl AckOutcome {
             AckOutcome::Admitted => "admitted",
             AckOutcome::Known => "known",
             AckOutcome::Refused => "refused",
+            AckOutcome::Abandoned => "abandoned",
         }
     }
 
@@ -61,6 +67,7 @@ impl AckOutcome {
             "admitted" => Ok(AckOutcome::Admitted),
             "known" => Ok(AckOutcome::Known),
             "refused" => Ok(AckOutcome::Refused),
+            "abandoned" => Ok(AckOutcome::Abandoned),
             other => Err(Error::Corrupt(format!("unknown ack outcome {other:?}"))),
         }
     }
@@ -94,6 +101,12 @@ pub struct OutboxRow {
     pub acked_outcome: Option<AckOutcome>,
     /// Refusal reason slug, present iff the outcome is [`AckOutcome::Refused`].
     pub refusal_reason: Option<String>,
+    /// The last transient refusal slug received while the row stayed pending
+    /// ([`OutboxStore::note_transient_refusal`]). A display cache; never decides
+    /// an ack.
+    pub last_refusal_reason: Option<String>,
+    /// The caller's clock when that refusal was noted.
+    pub last_refused_at: Option<i64>,
 }
 
 /// The columns needed to append the next entry to an author's chain. The caller
@@ -238,7 +251,8 @@ impl<'a> OutboxStore<'a> {
             .conn()
             .query_row(
                 "SELECT author, position, entry_hash, prev_hash, record_hash, \
-                 record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason \
+                 record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason, \
+                 last_refusal_reason, last_refused_at \
                  FROM outbox_entries WHERE author = ?1 ORDER BY position DESC LIMIT 1",
                 [author.as_slice()],
                 row_to_outbox,
@@ -261,7 +275,8 @@ impl<'a> OutboxStore<'a> {
         };
         let mut stmt = conn.prepare(
             "SELECT author, position, entry_hash, prev_hash, record_hash, \
-             record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason \
+             record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason, \
+             last_refusal_reason, last_refused_at \
              FROM outbox_entries WHERE author = ?1 AND acked_outcome IS NULL \
              ORDER BY position LIMIT ?2",
         )?;
@@ -293,6 +308,13 @@ impl<'a> OutboxStore<'a> {
     /// `refusal_reason` is stored only for [`AckOutcome::Refused`]; it is dropped
     /// for other outcomes.
     ///
+    /// A row the member [abandoned](Self::abandon) is not a station answer, so it
+    /// never conflicts: a later `Admitted` or `Known` answer **replaces** it (a
+    /// copy already carried may still be admitted, and the truth wins), and a
+    /// later `Refused` leaves it abandoned. Both return `Ok(true)`. Passing
+    /// [`AckOutcome::Abandoned`] here is a caller bug and is refused as
+    /// [`Error::ConflictingAck`]; use [`abandon`](Self::abandon).
+    ///
     /// Returns `false` when no row matches `record_hash` (a receipt for someone
     /// else's record — ignore it upstream); `true` when the row was found and is
     /// now acked.
@@ -304,6 +326,9 @@ impl<'a> OutboxStore<'a> {
         seq: Option<u64>,
         reason: Option<&str>,
     ) -> Result<bool> {
+        if outcome == AckOutcome::Abandoned {
+            return Err(Error::ConflictingAck);
+        }
         // A single read; under the single-writer model no transaction is needed,
         // and the unknown / idempotent / conflict paths then do no write at all
         // (no wasted write-transaction on the receipt-replay hot path).
@@ -329,16 +354,24 @@ impl<'a> OutboxStore<'a> {
         };
 
         if let Some(prior) = prior_outcome {
-            // Already acked. Re-applying the identical answer is an idempotent
-            // no-op; anything else is the station changing its answer.
             let prior = AckOutcome::from_column(&prior)?;
-            if prior == outcome && prior_reason.as_deref() == stored_reason {
-                return Ok(true);
+            match (prior, outcome) {
+                // The member's abandon yields to a real admission ...
+                (AckOutcome::Abandoned, AckOutcome::Admitted | AckOutcome::Known) => {}
+                // ... and a refusal changes nothing for a row already dropped.
+                (AckOutcome::Abandoned, _) => return Ok(true),
+                // Already acked. Re-applying the identical answer is an
+                // idempotent no-op; anything else is the station changing its
+                // answer.
+                _ if prior == outcome && prior_reason.as_deref() == stored_reason => {
+                    return Ok(true)
+                }
+                _ => return Err(Error::ConflictingAck),
             }
-            return Err(Error::ConflictingAck);
         }
 
-        // Pending → record the outcome. A lone UPDATE is atomic on its own.
+        // Pending (or abandoned) → record the outcome. A lone UPDATE is atomic on
+        // its own.
         conn.execute(
             "UPDATE outbox_entries \
              SET acked_seq = ?3, acked_outcome = ?4, refusal_reason = ?5 \
@@ -352,6 +385,45 @@ impl<'a> OutboxStore<'a> {
             ],
         )?;
         Ok(true)
+    }
+
+    /// Remembers a transient refusal on a still-pending row without acking it:
+    /// the row stays pending (and is carried again), and the slug and `now` are
+    /// kept so the member can see why. Returns `false` — and writes nothing — for
+    /// an unknown or already-acked row. A display cache only; it never decides
+    /// an ack.
+    pub fn note_transient_refusal(
+        &mut self,
+        author: &[u8; 32],
+        record_hash: &[u8; 32],
+        reason: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = self.db.conn().execute(
+            "UPDATE outbox_entries SET last_refusal_reason = ?3, last_refused_at = ?4 \
+             WHERE author = ?1 AND record_hash = ?2 AND acked_outcome IS NULL",
+            rusqlite::params![author.as_slice(), record_hash.as_slice(), reason, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Marks a still-pending row [`AckOutcome::Abandoned`]: the member's
+    /// decision to stop carrying it. Local bookkeeping, not a revocation — the
+    /// signed record still exists, and a later `Admitted`/`Known` answer replaces
+    /// the mark ([`apply_ack`](Self::apply_ack)). Returns `false` — and writes
+    /// nothing — for an unknown or already-acked row. Which kinds may be
+    /// abandoned is the caller's policy (this layer cannot read record kinds).
+    pub fn abandon(&mut self, author: &[u8; 32], record_hash: &[u8; 32]) -> Result<bool> {
+        let changed = self.db.conn().execute(
+            "UPDATE outbox_entries SET acked_outcome = ?3 \
+             WHERE author = ?1 AND record_hash = ?2 AND acked_outcome IS NULL",
+            rusqlite::params![
+                author.as_slice(),
+                record_hash.as_slice(),
+                AckOutcome::Abandoned.as_str()
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Deletes acked rows below the retained suffix, keeping the chain
@@ -412,7 +484,8 @@ impl<'a> OutboxStore<'a> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
             "SELECT author, position, entry_hash, prev_hash, record_hash, \
-             record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason \
+             record_kind, envelope, authored_at, acked_seq, acked_outcome, refusal_reason, \
+             last_refusal_reason, last_refused_at \
              FROM outbox_entries WHERE author = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map([author.as_slice()], row_to_outbox)?;
@@ -459,6 +532,8 @@ fn row_to_outbox(row: &rusqlite::Row) -> rusqlite::Result<Result<OutboxRow>> {
     let acked_seq: Option<i64> = row.get(8)?;
     let acked_outcome: Option<String> = row.get(9)?;
     let refusal_reason: Option<String> = row.get(10)?;
+    let last_refusal_reason: Option<String> = row.get(11)?;
+    let last_refused_at: Option<i64> = row.get(12)?;
 
     Ok((|| {
         Ok(OutboxRow {
@@ -476,6 +551,8 @@ fn row_to_outbox(row: &rusqlite::Row) -> rusqlite::Result<Result<OutboxRow>> {
                 .map(AckOutcome::from_column)
                 .transpose()?,
             refusal_reason,
+            last_refusal_reason,
+            last_refused_at,
         })
     })())
 }
@@ -555,6 +632,114 @@ mod tests {
             self.prev = entry_hash;
             Ok(())
         }
+    }
+
+    #[test]
+    fn abandoned_row_is_pruned_and_a_later_admission_overwrites_it() {
+        let db = fresh_db();
+        let mut store = OutboxStore::new(&db);
+        let mut c = Chain::new(7);
+        for _ in 0..3 {
+            c.push(&mut store).unwrap();
+        }
+        let (r0, r1, r2) = (
+            c.record_hash_at(0),
+            c.record_hash_at(1),
+            c.record_hash_at(2),
+        );
+        store
+            .apply_ack(&c.author, &r0, AckOutcome::Admitted, Some(1), None)
+            .unwrap();
+
+        // The stuck middle row is abandoned: it is no longer pending, so the
+        // prune can move past it while the chain stays contiguous.
+        assert!(store.abandon(&c.author, &r1).unwrap());
+        assert!(!store.abandon(&c.author, &r1).unwrap(), "already acked");
+        assert!(!store.abandon(&c.author, &h(99)).unwrap(), "unknown row");
+        let pending: Vec<u64> = store
+            .pending(&c.author, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.position)
+            .collect();
+        assert_eq!(pending, vec![2]);
+        assert_eq!(store.prune_acked(&c.author).unwrap(), 2);
+        assert_eq!(
+            store.all_rows(&c.author).unwrap()[0].position,
+            2,
+            "rows below the first pending are pruned"
+        );
+
+        // Abandon a row that is still retained, then let receipts arrive.
+        assert!(store.abandon(&c.author, &r2).unwrap());
+        // A refusal for an abandoned row is a no-op, never a conflict.
+        assert!(store
+            .apply_ack(
+                &c.author,
+                &r2,
+                AckOutcome::Refused,
+                None,
+                Some("not-proposed")
+            )
+            .unwrap());
+        let row = &store.all_rows(&c.author).unwrap()[0];
+        assert_eq!(row.acked_outcome, Some(AckOutcome::Abandoned));
+        assert_eq!(row.refusal_reason, None);
+        // A later admission replaces the member's abandon: the truth wins.
+        assert!(store
+            .apply_ack(&c.author, &r2, AckOutcome::Admitted, Some(9), None)
+            .unwrap());
+        let row = &store.all_rows(&c.author).unwrap()[0];
+        assert_eq!(row.acked_outcome, Some(AckOutcome::Admitted));
+        assert_eq!(row.acked_seq, Some(9));
+        // ... and is then final like any admission.
+        assert!(matches!(
+            store.apply_ack(&c.author, &r2, AckOutcome::Refused, None, Some("expired")),
+            Err(Error::ConflictingAck)
+        ));
+        // Abandoning goes through `abandon`, never `apply_ack`.
+        assert!(matches!(
+            store.apply_ack(&c.author, &r2, AckOutcome::Abandoned, None, None),
+            Err(Error::ConflictingAck)
+        ));
+    }
+
+    #[test]
+    fn note_transient_refusal_touches_only_pending_rows() {
+        let db = fresh_db();
+        let mut store = OutboxStore::new(&db);
+        let mut c = Chain::new(8);
+        c.push(&mut store).unwrap();
+        c.push(&mut store).unwrap();
+        let (r0, r1) = (c.record_hash_at(0), c.record_hash_at(1));
+
+        assert!(store
+            .note_transient_refusal(&c.author, &r1, "not-proposed", 500)
+            .unwrap());
+        assert!(store
+            .note_transient_refusal(&c.author, &r1, "debt-floor", 600)
+            .unwrap());
+        let row = store.pending(&c.author, None).unwrap()[1].clone();
+        assert_eq!(row.last_refusal_reason.as_deref(), Some("debt-floor"));
+        assert_eq!(row.last_refused_at, Some(600));
+        assert_eq!(row.acked_outcome, None, "noting never acks");
+
+        store
+            .apply_ack(&c.author, &r0, AckOutcome::Admitted, Some(1), None)
+            .unwrap();
+        assert!(
+            !store
+                .note_transient_refusal(&c.author, &r0, "not-proposed", 700)
+                .unwrap(),
+            "an acked row is left alone"
+        );
+        assert!(!store
+            .note_transient_refusal(&c.author, &h(42), "not-proposed", 700)
+            .unwrap());
+        assert_eq!(
+            store.all_rows(&c.author).unwrap()[0].last_refusal_reason,
+            None
+        );
     }
 
     #[test]

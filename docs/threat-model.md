@@ -1744,12 +1744,27 @@ cursors); the wallet's trust anchor (the pinned station address).
   some faults behind a transient slug are permanent for that record — a
   confirmation whose proposal was cancelled, settled, or never reaches the writer
   answers `not-proposed` forever, and several catch-all `rejected` faults (a
-  confirmer mismatch, a closed dispute window) never clear. Such a row stays
-  pending indefinitely: it takes one bundle slot per submit, holds back
-  `prune_acked` for the rows after it, and costs the station a re-validation per
-  presentation. The wallet has no command to abandon a pending row; a dedicated
-  final answer for a terminally closed transaction, or an explicit abandon, is a
-  follow-up (it needs a slug or CLI change).
+  confirmer mismatch, a closed dispute window) never clear. The wallet never
+  gives up on its own (an absent proposal legitimately arrives days later under
+  DTN), but it remembers the last transient refusal on the row, `rrn wallet
+  status` counts such rows (`refused for now`), `rrn wallet show` gives each
+  one's slug, time and hash, and the submit notice names the command:
+  `rrn wallet abandon <hash>` marks the row abandoned, after which it is no longer
+  carried and no longer holds back `prune_acked` (test:
+  `a_second_confirmation_of_a_paid_transaction_can_be_abandoned`). Abandon is
+  local bookkeeping, **not a revocation** — the signed record still exists, a copy
+  already carried can still be admitted, and a later `admitted`/`known` receipt
+  replaces the abandoned mark while the row is still retained (a receipt for a row
+  already pruned is dropped; `rrn wallet transactions` still shows the station's
+  view). Abandoning a record the station never received leaves that chain position
+  empty on the station for good — the ADR-0028 §7 "hole below the head", which
+  `sync` reports and the abandon command warns about; admission continues. A
+  proposal can never be abandoned (its nonce is in flight; test:
+  `abandon_refuses_a_proposal`). *Residual:* until the member
+  abandons it, a stuck row still takes one bundle slot per submit and costs the
+  station a re-validation per presentation; a confirmation of a transaction that
+  is no longer open still answers the transient `not-proposed` (a final slug for
+  that case is a separate change).
 
 **Known limitations.** Concurrent use of one key on two devices cannot be
 prevented and is a self-fork (ADR-0028 §2 forbids it by policy, not by mechanism)
