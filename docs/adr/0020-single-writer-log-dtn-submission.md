@@ -236,11 +236,20 @@ The two facts now have two slugs. An absent transaction stays `not-proposed`
 is refused **`tx-closed`**, which is **final**: its receipt is re-issued verbatim
 and a wallet acks it on the first answer. `tx-closed` is added to the closed
 refusal set and its registry (`docs/spec/dtn-bundles.md` §3); a receipt decoder
-built before it rejects a receipt carrying the slug, as with `not-enrolled`.
+built before it rejects a receipt carrying the slug, as with `not-enrolled`. A
+command-line wallet should therefore be upgraded with its station: an older one
+still carrying such a confirmation would get that slug in every receipt and fail
+to apply any of them. (The phone app signs online only and parses no delivery
+receipts.)
 ADR-0031 §10's late-confirmation walkthrough (a confirmation reaching a home that has
 already cancelled the transaction, "refused `not-proposed`") reads `tx-closed`
 under this rule, and `tx-closed` joins the domestic slugs that ADR-0031 §13 says
 apply unchanged at either front door.
+
+The Tier-2 staking gate, which runs before the engine on every confirmation
+door, judges only a transaction still open to confirmation, so a confirmation of
+a closed Tier-2 transaction by a confirmer below the Member band is answered
+`tx-closed`, not the transient `tier2-stake`.
 
 The other permanent faults the catch-all `rejected` carries (a confirmer who is
 not the receiver, a self-payment, inconsistent timestamps) stay on the transient

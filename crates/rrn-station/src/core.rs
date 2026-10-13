@@ -5665,13 +5665,18 @@ impl Core {
             &AppendLog::new(&self.db),
             &self.station_pubkey(),
         )?;
-        let tier = snapshot
-            .get(proposal_id)
-            .and_then(proposal_of)
+        let tier = match snapshot.get(proposal_id) {
+            Some(rrn_ledger::state::TransactionState::Proposed { proposal }) => {
+                proposal.payload.effective_tier()
+            }
+            // A transaction past `Proposed` can never be confirmed: let the
+            // engine refuse it (`NotProposed`, carried as the final `tx-closed`)
+            // rather than answer the transient `tier2-stake` for it.
+            Some(_) => return Ok(None),
             // An unknown proposal falls through as Tier 1; the engine is what
             // rejects it authoritatively (UnknownTransaction).
-            .map(|p| p.effective_tier())
-            .unwrap_or(rrn_ledger::tier::MIN_TIER);
+            None => rrn_ledger::tier::MIN_TIER,
+        };
         if tier < 2 {
             return Ok(None);
         }
@@ -11253,6 +11258,54 @@ mod tests {
             tx_state(&core, &proposal.payload.id),
             Some(TransactionState::Proposed { .. })
         ));
+    }
+
+    /// The Tier-2 staking gate judges only a transaction still open to
+    /// confirmation: a confirmation of a closed Tier-2 transaction by a confirmer
+    /// below the Member band is refused the final `tx-closed`, never the
+    /// transient `tier2-stake` (which would keep a wallet carrying it forever).
+    #[test]
+    fn a_tier2_confirmation_of_a_closed_transaction_is_tx_closed_not_tier2_stake() {
+        let mut core = established_core(); // clock = TEN_MONTHS
+        let now = core.clock.now();
+        rrn_reputation::testutil::establish_members(&core.db, &core.station_keypair(), 3, now);
+
+        let sender = Keypair::generate();
+        let alice = Keypair::generate(); // fresh — below the Member band
+        enroll(&core, &sender);
+        enroll(&core, &alice);
+        let proposal = member_proposal(&sender, &alice, 1000, 0, now - 1000, now + 1_000_000);
+        assert_eq!(proposal.payload.effective_tier(), 2);
+        let r = submit_bundle(
+            &mut core,
+            &[outbox_entry(&sender, 0, zero(), &proposal, now - 1000)],
+            now,
+        );
+        assert!(matches!(
+            r.payload.outcomes[0].disposition,
+            Disposition::Admitted { .. }
+        ));
+        // The sender withdraws it: the transaction is closed.
+        Engine::new(&core.db, core.station_keypair())
+            .cancel_proposal(
+                &proposal.payload.id,
+                rrn_ledger::state::CancelReason::WithdrawnBySender,
+                now,
+            )
+            .unwrap();
+
+        let confirmation = member_confirmation(&alice, &proposal, now - 500);
+        let r = submit_bundle(
+            &mut core,
+            &[outbox_entry(&alice, 0, zero(), &confirmation, now - 500)],
+            now,
+        );
+        assert_eq!(
+            r.payload.outcomes[0].disposition,
+            Disposition::Refused {
+                reason: RefusalReason::TransactionClosed
+            }
+        );
     }
 
     /// The params a `rrn list` invocation sends for a plain Goods listing.
