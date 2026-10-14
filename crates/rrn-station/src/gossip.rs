@@ -1,17 +1,21 @@
-//! The Phase 0 gossip stub: replicate log entries between two communities.
+//! The peer port: a writer serves its chain to read-replicas, and a replica
+//! pulls it (ADR-0020 §7).
 //!
-//! This is deliberately the dumbest thing that works for a two-station demo.
 //! Every [`gossip_interval`](crate::config::TimersSection) seconds, for each
-//! configured peer, a station opens a TCP connection, asks "what's your log
-//! tail?", pulls the peer's entries, and appends the ones it doesn't already
-//! have — verifying every signature on the way in (peer bytes are never
-//! trusted). Connections are one-shot: open, one request, one response, close.
+//! configured peer, a replica opens a TCP connection per request, asks "what's
+//! your log tail?", pulls the entries after its per-peer cursor in bounded pages
+//! (`log_range`), and appends the ones it doesn't already have — verifying every
+//! signature on the way in (peer bytes are never trusted). Connections are
+//! one-shot: open, one request, one response, close.
 //!
-//! It does **not** scale and it does **not** resolve forks — if a peer's chain
-//! diverges, [`do_append_entries`](crate::core::Core) simply drops the entries
-//! it can't verify and logs a warning. Phase 2 replaces this wholesale. The wire
-//! envelope is the same line-delimited JSON as the CLI protocol ([`crate::rpc`]),
-//! with its own method set (`peer_handshake`, `log_tail`, `log_range`).
+//! It does **not** resolve forks — if a peer's chain diverges,
+//! [`do_append_entries`](crate::core::Core) simply drops the entries it can't
+//! verify and logs a warning. The wire envelope is the same line-delimited JSON
+//! as the CLI protocol ([`crate::rpc`]), with its own method set
+//! (`peer_handshake`, `log_tail`, `log_range`). Both sides bound what they read:
+//! request and response lines are capped ([`crate::rpc_client`]), the server
+//! caps concurrent connections and idle reads, and one `log_range` reads at
+//! most one bounded page of the log.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -19,15 +23,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use rrn_storage::log::StoredPayload;
 
 use crate::clock::Clock;
 use crate::core::{stored_from_parts, CoreHandle};
 use crate::rpc::{self, Request, Response};
-use crate::rpc_client::request_response;
+use crate::rpc_client::{
+    read_line_bounded, request_response, LineError, MAX_LOG_RANGE_ENTRIES, MAX_PAGES_PER_ROUND,
+    MAX_PEER_CONNECTIONS, PEER_IDLE_TIMEOUT, PEER_REQUEST_LINE_LIMIT, PEER_RESPONSE_LINE_LIMIT,
+};
 
 /// How long a single peer exchange (TCP connect **and** the one request/response)
 /// may take before it is abandoned as unreachable. A station on a loopback-only
@@ -35,6 +43,13 @@ use crate::rpc_client::request_response;
 /// OS TCP SYN timeout of a routable-but-dead peer (~75s macOS / ~127s Linux). The
 /// bound keeps a round proportional to `peers.len()` and shutdown prompt (ADR-0020).
 pub const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long one `log_range` page may take to arrive once connected. A full page
+/// is about 4 MiB of JSON, which a slow link (a VPN or SSH tunnel to an
+/// off-site replica) cannot carry inside [`PEER_DIAL_TIMEOUT`]; the connect
+/// itself stays bounded by that, and a pull in flight is abandoned the moment
+/// shutdown is signalled.
+pub const PEER_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The health of one peer, as last observed by the gossip loop. Derived, in-memory
 /// only (never logged/persisted state) — the `status` connectivity block reads it.
@@ -168,36 +183,54 @@ struct LogTailResult {
     seq: u64,
 }
 
+/// `log_range` params. `limit` is required (no serde default): a puller that
+/// predates paging is refused with `INVALID_PARAMS` rather than silently
+/// stalling at its first page — writer and replicas upgrade together.
 #[derive(Serialize, Deserialize)]
 struct LogRangeParams {
     from_seq: u64,
     to_seq: u64,
+    /// Requested page size; the server clamps it to `1..=MAX_LOG_RANGE_ENTRIES`.
+    limit: u32,
 }
 
+/// One `log_range` page.
 #[derive(Serialize, Deserialize)]
-struct LogRangeResult {
-    entries: Vec<WireEntry>,
+pub(crate) struct LogRangeResult {
+    /// The entries served, ascending by the server's seq.
+    pub(crate) entries: Vec<WireEntry>,
+    /// The seq after the last entry served — where the next page starts
+    /// (`from_seq` when the page is empty).
+    pub(crate) next_from_seq: u64,
 }
 
 // --- server side: handle inbound peer connections ---------------------------
 
 /// Serves the peer protocol on `listener` until `shutdown` resolves, dispatching
-/// each request to `core`.
+/// each request to `core`. At most [`MAX_PEER_CONNECTIONS`] connections are
+/// served at once; one accepted beyond that is dropped immediately.
 pub async fn serve_peers(
     listener: TcpListener,
     core: CoreHandle,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let slots = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
+                        let Ok(permit) = slots.clone().try_acquire_owned() else {
+                            tracing::debug!(peer = %addr, "peer port full; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let core = core.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_peer_conn(stream, core).await {
                                 tracing::debug!(error = %e, "peer connection ended");
                             }
+                            drop(permit);
                         });
                     }
                     Err(e) => tracing::warn!(error = %e, "peer accept failed"),
@@ -211,18 +244,47 @@ pub async fn serve_peers(
 }
 
 /// Reads requests line-by-line from one peer connection and answers each.
+///
+/// Each line is capped at [`PEER_REQUEST_LINE_LIMIT`] bytes and must arrive
+/// within [`PEER_IDLE_TIMEOUT`]. An oversize line is answered with one
+/// `INVALID_REQUEST` and the connection closed (the stream cannot be
+/// resynchronized mid-line); an idle connection is closed without a reply, and
+/// one that stops reading a reply is closed after the same timeout.
 async fn handle_peer_conn(stream: TcpStream, core: CoreHandle) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let read = tokio::time::timeout(
+            PEER_IDLE_TIMEOUT,
+            read_line_bounded(&mut reader, &mut line, PEER_REQUEST_LINE_LIMIT),
+        )
+        .await;
+        let n = match read {
+            Err(_) => return Ok(()), // idle: close without a reply
+            Ok(Ok(n)) => n,
+            Ok(Err(LineError::TooLong { max })) => {
+                let response = Response::err(
+                    "",
+                    rpc::INVALID_REQUEST,
+                    format!("request line exceeds {max} bytes"),
+                );
+                write_line(&mut write_half, &response).await?;
+                return Ok(());
+            }
+            Ok(Err(LineError::NotUtf8)) => {
+                let response = Response::err("", rpc::INVALID_REQUEST, "bad request: not UTF-8");
+                write_line(&mut write_half, &response).await?;
+                continue;
+            }
+            Ok(Err(LineError::Io(e))) => return Err(e.into()),
+        };
         if n == 0 {
             return Ok(()); // peer closed
         }
-        let trimmed = line.trim_end();
+        // `read_line_bounded` checked the bytes are UTF-8.
+        let trimmed = std::str::from_utf8(&line).unwrap_or_default().trim_end();
         if trimmed.is_empty() {
             continue;
         }
@@ -231,11 +293,26 @@ async fn handle_peer_conn(stream: TcpStream, core: CoreHandle) -> anyhow::Result
             Ok(req) => dispatch_peer(&req, &core).await,
             Err(e) => Response::err("", rpc::INVALID_REQUEST, format!("bad request: {e}")),
         };
-        let mut out = serde_json::to_string(&response)?;
-        out.push('\n');
-        write_half.write_all(out.as_bytes()).await?;
-        write_half.flush().await?;
+        write_line(&mut write_half, &response).await?;
     }
+}
+
+/// Writes `response` as one JSON line and flushes it, within
+/// [`PEER_IDLE_TIMEOUT`]: a peer that stops reading cannot hold a connection
+/// slot forever.
+async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    response: &Response,
+) -> anyhow::Result<()> {
+    let mut out = serde_json::to_string(response)?;
+    out.push('\n');
+    tokio::time::timeout(PEER_IDLE_TIMEOUT, async {
+        w.write_all(out.as_bytes()).await?;
+        w.flush().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("peer stopped reading; closing after {PEER_IDLE_TIMEOUT:?}"))??;
+    Ok(())
 }
 
 /// Maps one peer request to a core query and builds the response.
@@ -258,10 +335,18 @@ async fn dispatch_peer(req: &Request, core: &CoreHandle) -> Response {
             reply(req, &LogTailResult { seq })
         }
         "log_range" => match serde_json::from_value::<LogRangeParams>(req.params.clone()) {
-            Ok(p) => {
-                let entries = core.log_range(p.from_seq, p.to_seq).await;
-                reply(req, &LogRangeResult { entries })
-            }
+            Ok(p) => match core.log_range(p.from_seq, p.to_seq, p.limit).await {
+                Some((entries, next_from_seq)) => reply(
+                    req,
+                    &LogRangeResult {
+                        entries,
+                        next_from_seq,
+                    },
+                ),
+                // Fail the puller's round visibly rather than serve an empty
+                // page it would read as "nothing more".
+                None => Response::err(req.id.clone(), rpc::INTERNAL_ERROR, "log read failed"),
+            },
             Err(e) => Response::err(req.id.clone(), rpc::INVALID_PARAMS, format!("{e}")),
         },
         other => Response::err(
@@ -298,6 +383,9 @@ pub async fn gossip_loop(
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Per-peer pull cursor: the peer's next seq to fetch. In memory only — a
+    // restart re-pulls once from 1, and `append_raw` dedups what we hold.
+    let mut cursors: HashMap<String, u64> = HashMap::new();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -307,14 +395,18 @@ pub async fn gossip_loop(
                     if *shutdown.borrow() {
                         break;
                     }
-                    // The network work — connect and each request/response — is
-                    // bounded *inside* `peer_call` by `PEER_DIAL_TIMEOUT`, which is
-                    // what stops a black-holed peer from hanging the round. The local
+                    // The network work is bounded *inside* `peer_call`: every
+                    // connect by `PEER_DIAL_TIMEOUT`, which is what stops a
+                    // black-holed peer from hanging the round, and each exchange by
+                    // `PEER_DIAL_TIMEOUT` (or `PEER_PAGE_TIMEOUT` for a page, which
+                    // shutdown interrupts). The local
                     // apply (`append_entries`) is deliberately NOT under that budget:
                     // pulling and verifying a large log is legitimate work, and
                     // timing it out here would falsely report a reachable peer as
                     // unreachable.
-                    let outcome = gossip_with_peer(peer, &our_address, &core).await;
+                    let cursor = cursors.entry(peer.clone()).or_insert(1);
+                    let outcome =
+                        gossip_with_peer(peer, &our_address, &core, cursor, &shutdown).await;
                     let ok = outcome.is_ok();
                     if let Err(e) = &outcome {
                         tracing::debug!(peer = %peer, error = %e, "gossip round failed");
@@ -334,8 +426,20 @@ pub async fn gossip_loop(
 }
 
 /// One gossip exchange with a single peer: handshake, then pull and apply the
-/// peer's entries.
-async fn gossip_with_peer(peer: &str, our_address: &str, core: &CoreHandle) -> anyhow::Result<()> {
+/// peer's entries from `cursor` in bounded pages.
+///
+/// The round ends when the cursor passes the handshake tail, a page comes back
+/// empty, [`MAX_PAGES_PER_ROUND`] pages have been pulled, or shutdown is
+/// signalled. The cursor advances past a page only once the core reports it
+/// fully applied, so a failed round re-pulls rather than skipping entries.
+async fn gossip_with_peer(
+    peer: &str,
+    our_address: &str,
+    core: &CoreHandle,
+    cursor: &mut u64,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut shutdown = shutdown.clone();
     // 1. Handshake — learn the peer's log tail.
     let handshake: HandshakeResult = peer_call(
         peer,
@@ -345,30 +449,59 @@ async fn gossip_with_peer(peer: &str, our_address: &str, core: &CoreHandle) -> a
         })?,
     )
     .await?;
+    let tail = handshake.their_log_tail_seq;
 
-    if handshake.their_log_tail_seq == 0 {
-        return Ok(()); // nothing to pull
+    // A tail below what we already pulled means the peer's log shrank (a writer
+    // restored from an older backup): start over rather than wait for seqs we
+    // already passed. `append_raw` dedups what we hold.
+    let pulled_to = *cursor;
+    if rewind_if_shrunk(cursor, tail) {
+        tracing::warn!(
+            peer = %peer,
+            tail,
+            cursor = pulled_to,
+            "peer's log tail is behind what this replica already pulled; re-pulling from the start"
+        );
     }
 
-    // 2. Pull the peer's whole log. Dedup-by-content on our side makes re-pulling
-    //    cheap-enough for a two-station Phase 0 demo; a smarter delta sync is a
-    //    later concern.
-    let range: LogRangeResult = peer_call(
-        peer,
-        "log_range",
-        serde_json::to_value(LogRangeParams {
-            from_seq: 1,
-            to_seq: handshake.their_log_tail_seq,
-        })?,
-    )
-    .await?;
-
-    // 3. Apply — the core verifies signatures and dedups before appending.
-    if !range.entries.is_empty() {
-        let n = core.append_entries(range.entries).await;
-        if n > 0 {
-            tracing::info!(peer = %peer, appended = n, "gossip: pulled new entries");
+    // 2. Pull pages from the cursor; 3. apply each — the core verifies
+    //    signatures and dedups before appending.
+    let mut appended = 0usize;
+    for _ in 0..MAX_PAGES_PER_ROUND {
+        if *cursor > tail || *shutdown.borrow() {
+            break;
         }
+        let params = serde_json::to_value(LogRangeParams {
+            from_seq: *cursor,
+            to_seq: tail,
+            limit: MAX_LOG_RANGE_ENTRIES,
+        })?;
+        let page: LogRangeResult = tokio::select! {
+            page = peer_call_within(peer, "log_range", params, PEER_PAGE_TIMEOUT) => page?,
+            _ = shutdown_signalled(&mut shutdown) => break,
+        };
+        if page.entries.is_empty() {
+            break;
+        }
+        // An honest page moves forward and never past the tail we asked about.
+        if page.next_from_seq <= *cursor || page.next_from_seq > tail.saturating_add(1) {
+            anyhow::bail!(
+                "peer returned next_from_seq {} for a page from {} to {tail}",
+                page.next_from_seq,
+                *cursor
+            );
+        }
+        let Some(n) = core.append_entries(page.entries).await else {
+            anyhow::bail!(
+                "page from seq {} was not fully applied; will retry",
+                *cursor
+            );
+        };
+        appended += n;
+        *cursor = page.next_from_seq;
+    }
+    if appended > 0 {
+        tracing::info!(peer = %peer, appended, "gossip: pulled new entries");
     }
     Ok(())
 }
@@ -380,26 +513,62 @@ async fn peer_call<T: for<'de> Deserialize<'de>>(
     method: &str,
     params: serde_json::Value,
 ) -> anyhow::Result<T> {
+    peer_call_within(peer, method, params, PEER_DIAL_TIMEOUT).await
+}
+
+/// [`peer_call`] whose request/response exchange may take up to `exchange`.
+/// The TCP connect is always bounded by [`PEER_DIAL_TIMEOUT`], so a
+/// black-holed peer cannot hang the round on the OS SYN timeout; a longer
+/// `exchange` only lets a reachable peer's large reply arrive over a slow link.
+async fn peer_call_within<T: for<'de> Deserialize<'de>>(
+    peer: &str,
+    method: &str,
+    params: serde_json::Value,
+    exchange: Duration,
+) -> anyhow::Result<T> {
     let request = Request {
         id: uuid::Uuid::new_v4().to_string(),
         method: method.to_string(),
         params,
     };
-    // Bound the whole exchange — connect and the single request/response — so a
-    // black-holed peer cannot hang the round on the OS SYN timeout. The
-    // caller also wraps the round in `PEER_DIAL_TIMEOUT`; this inner bound protects
-    // any direct `peer_call` and keeps the failure mode a clean typed error.
-    let response = tokio::time::timeout(PEER_DIAL_TIMEOUT, async {
-        let mut stream = TcpStream::connect(peer).await?;
-        request_response(&mut stream, &request).await
-    })
+    let mut stream = tokio::time::timeout(PEER_DIAL_TIMEOUT, TcpStream::connect(peer))
+        .await
+        .map_err(|_| anyhow::anyhow!("peer {peer} timed out after {PEER_DIAL_TIMEOUT:?}"))??;
+    let response = tokio::time::timeout(
+        exchange,
+        request_response(&mut stream, &request, PEER_RESPONSE_LINE_LIMIT),
+    )
     .await
-    .map_err(|_| anyhow::anyhow!("peer {peer} timed out after {PEER_DIAL_TIMEOUT:?}"))??;
+    .map_err(|_| anyhow::anyhow!("peer {peer} timed out after {exchange:?}"))??;
     if let Some(err) = response.error {
         anyhow::bail!("peer error: {} (code {})", err.message, err.code);
     }
     let value = response.result.unwrap_or(serde_json::Value::Null);
     Ok(serde_json::from_value(value)?)
+}
+
+/// Resolves once `shutdown` reads `true` (never, if its sender is gone).
+async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Rewinds `cursor` to 1 when the peer's `tail` is below what was already
+/// pulled (`cursor - 1`) — a writer restored from an older backup. Returns
+/// whether it rewound.
+fn rewind_if_shrunk(cursor: &mut u64, tail: u64) -> bool {
+    if tail < cursor.saturating_sub(1) {
+        *cursor = 1;
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +601,21 @@ mod tests {
         // Last success is the most recent reachable round (t=103), not the flip.
         assert_eq!(h.last_success_at, Some(103));
         assert_eq!(h.last_attempt_at, Some(104));
+    }
+
+    #[test]
+    fn cursor_rewinds_only_when_the_peer_tail_shrinks() {
+        // Pulled through 600 (cursor 601): a tail of 600 or more is not a shrink.
+        let mut cursor = 601;
+        assert!(!rewind_if_shrunk(&mut cursor, 600));
+        assert!(!rewind_if_shrunk(&mut cursor, 900));
+        assert_eq!(cursor, 601);
+        // A tail below what was pulled (writer restored from an older backup).
+        assert!(rewind_if_shrunk(&mut cursor, 599));
+        assert_eq!(cursor, 1);
+        // A fresh cursor never rewinds, even against an empty log.
+        assert!(!rewind_if_shrunk(&mut cursor, 0));
+        assert_eq!(cursor, 1);
     }
 
     #[test]

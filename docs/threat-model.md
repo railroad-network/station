@@ -1857,8 +1857,9 @@ core, a panic restarts the station (see the denial-of-service entry below).
   admits nothing, so this corrupts only that replica's view (fork detection
   across replicas remains out of scope, below). The peer TCP port still has no
   transport authentication or encryption at all (Phase 3); a replica pulls only
-  from the peers its operator configured. Cross-community authority/fork
-  resolution is Phase 3.
+  from the peers its operator configured. Who may *read* the chain over that
+  port is the [replica-copy disclosure](#information-disclosure--the-replica-copy)
+  entry below. Cross-community authority/fork resolution is Phase 3.
 
 #### Tampering — the IPC channel, and peer-supplied entries
 
@@ -1906,6 +1907,27 @@ core, a panic restarts the station (see the denial-of-service entry below).
   used, is visible in the process environment. Phase 0 does not lock memory or
   guard against swap.
 
+#### Information disclosure — the replica copy
+
+- *Threat:* someone who can reach a station's peer port (`[network] listen`)
+  copies the whole chain with `log_range` — the vouch graph, payment memos,
+  dispute statements, inquiry threads — without being a replica the operator
+  runs.
+- *Mitigation:* the default `listen` is loopback, so out of the box only the
+  host itself can read the chain; the runbook tells an operator who binds a LAN
+  address to firewall the port to the replica's address. **Proposed, pending
+  maintainer ratification** (ADR-0020 Clarification, 2026-10-14): the replica
+  method set is served only to loopback and to the addresses listed in
+  `[network] replicas`; every other source gets a typed refusal and is served
+  nothing.
+- *Residual risk:* until that Clarification is ratified and implemented,
+  **anyone who reaches a non-loopback peer port is served the whole chain**. Once
+  it is, a source address is network position, not cryptographic identity — an
+  attacker who takes over a listed address on the LAN is served the chain — and
+  the TCP stream is plaintext either way, so a replica off the LAN should connect
+  through a VPN or SSH tunnel. Cryptographic replica authentication waits for the
+  Phase 3 hello (ADR-0029 §6).
+
 #### Denial of service — malformed input, peer flooding, the single writer
 
 - *Threat:* a malformed CLI line or peer message crashes the daemon; a peer
@@ -1926,18 +1948,23 @@ core, a panic restarts the station (see the denial-of-service entry below).
   with a dead command loop: a panic may have left the core's in-memory state or
   an open SQLite transaction half-applied, and the log on disk is the source of
   truth, so a supervisor restart that re-derives from the log is the recovery
-  (the runbook runs `station` under `systemd` with `Restart=on-failure`). Peer
-  reads are bounded by line framing, and a peer that errors only fails *that*
-  gossip round.
+  (the runbook runs `station` under `systemd` with `Restart=on-failure`). Every
+  line-JSON surface caps its line (peer requests 4 KiB, local socket ≈ 8.25 MiB,
+  peer responses ≈ 34 MiB) and closes the connection on overflow; the peer port
+  also caps concurrent connections at 8, and closes a connection that sends no
+  request, or stops reading its reply, for 10 s; one `log_range`
+  call reads at most 256 entries / 1 MiB in one bounded SQL page, and a replica
+  pulls in pages from a cursor (RRN-A-025, covered by `peer_port`). A peer that
+  errors only fails *that* gossip round.
 - *Residual risk (panic → restart):* a request that reliably panics a handler
   still costs a restart each time it is sent — availability, not integrity. No
   such input is known; one found is a bug to fix, not a mitigation gap to accept.
-- *Residual risk:* there is no rate-limiting or connection cap on the socket,
-  the peer port, or the mobile listener, and a **replica** still pulls the
-  writer's whole log each round (`gossip::gossip_with_peer`; only a replica
-  pulls now — a writer runs no gossip client), which does not scale
-  (delta/cursor sync is out of scope). Phase 2 bounded the *size* of what each
-  surface accepts (bundle caps,
+- *Residual risk:* there is no rate-limiting on the socket, the peer port, or
+  the mobile listener: the peer port's connection cap bounds how many are served
+  at once, not how often one source reconnects, so a flood of connections can
+  still crowd out a replica's round. A replica's pull cursor is in memory, so a
+  replica restart re-pulls the chain once (deduplicated on append). Phase 2
+  bounded the *size* of what each surface accepts (bundle caps,
   `MOBILE_BODY_LIMIT`, framing/paper/SMS reassembly bounds) and the *time* an
   unreachable peer can cost (`PEER_DIAL_TIMEOUT`), but did **not** add rate
   limiting; that remains a [known limitation](#known-limitations).
@@ -4686,8 +4713,9 @@ entry citing its ADR or the section that owns it.
   marketplace, governance, vouches, the socket, the peer port — limits how
   *often* one identity may call it. The transport-level exceptions are the SMS
   per-sender cap and the LoRa airtime budget. The pairing gate bounds *who*, not
-  *how often*; at pilot scale that is the accepted bound. The gossip stub still
-  pulls a peer's whole log each round; `seen_outbox_*`/`outbox_forks` are never
+  *how often*; at pilot scale that is the accepted bound. A replica pulls in
+  bounded pages from an in-memory cursor, so a replica restart re-pulls the chain
+  once; `seen_outbox_*`/`outbox_forks` are never
   pruned; O(N) replay has no snapshotting.
 - **Some Phase 2 deliverables stop at a software seam.** The SMS *modem
   gateway* is not built (only the codec, registry, relay, and a mock gateway);

@@ -152,7 +152,8 @@ telling you to remove the peers or set `role = "replica"`). You do not need
 Two practical notes:
 
 - **Firewall:** if the machine runs one, allow inbound TCP **7500** from your
-  LAN. Port 7400 should stay unreachable from other machines.
+  LAN. Port 7400 should stay unreachable from other machines — except from a
+  read-replica you run (below).
 - **`advertise = true`** is what makes the station appear automatically in
   the app's "Join your community" list. Leave it on unless your network
   blocks mDNS/Bonjour — in that case members type the station's IP and port
@@ -163,8 +164,17 @@ read-only *replica*: a warm second copy of the writer's chain, useful for a live
 off-site backup or an audit workstation. A replica pulls the writer's log and
 re-derives from it, but **admits nothing** — every attempt to write to it (a
 payment, a vouch, a courier bundle) is refused with a "this station is a
-read-replica" message, so it can never accidentally fork the community. Point it
-at the writer and set the role:
+read-replica" message, so it can never accidentally fork the community. On the
+**writer**, bind the station-to-station port to the LAN address the replica will
+dial (the loopback default only serves the same machine):
+
+```toml
+[network]
+listen = "192.168.1.10:7400"   # the writer's LAN address
+role = "writer"
+```
+
+Then point the replica at the writer and set its role:
 
 ```toml
 [peers]
@@ -174,6 +184,15 @@ list = ["192.168.1.10:7400"]   # the writer's station-to-station address
 listen = "127.0.0.1:7401"
 role = "replica"
 ```
+
+A replica receives **every record on the log** — who vouched for whom, payment
+memos, dispute statements, marketplace inquiry threads — and today the writer
+serves the chain to anything that can reach port 7400, so firewall that port to
+the replica's address only. The connection is not encrypted: for a replica off
+your LAN, connect the two machines through a VPN or an SSH tunnel rather than
+opening the port to the internet. Upgrade the writer and its replicas
+together — a replica and a writer on different versions cannot copy the chain,
+and the writer shows as unreachable in the replica's `rrn status`.
 
 `station peers list` prints the role and peers of whichever station you run it
 against, and `rrn status` shows the role at the top. A replica is **not** a

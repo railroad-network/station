@@ -5,7 +5,10 @@
 //! request is forwarded to the single-threaded [`core`](crate::core), so there
 //! is no shared-state race. A malformed line is answered with an
 //! [`INVALID_REQUEST`](crate::rpc::INVALID_REQUEST) error and the connection
-//! kept open — one bad line never takes down the daemon.
+//! kept open — one bad line never takes down the daemon. A line longer than
+//! [`LOCAL_REQUEST_LINE_LIMIT`] is answered with one `INVALID_REQUEST` and the
+//! connection closed: the stream cannot be resynchronized mid-line. There is no
+//! idle timeout here — the socket is owner-only.
 //!
 //! The socket file is the authorization boundary: it is created with owner-only
 //! permissions, so only the user who started the station can call it (there is
@@ -13,11 +16,12 @@
 
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::core::CoreHandle;
 use crate::rpc::{self, Request, Response};
+use crate::rpc_client::{read_line_bounded, LineError, LOCAL_REQUEST_LINE_LIMIT};
 
 /// Binds a Unix listener at `path`, replacing any stale socket file, and sets
 /// owner-only (`0o600`) permissions on it.
@@ -75,15 +79,33 @@ pub async fn serve(
 async fn handle_conn(stream: UnixStream, core: CoreHandle) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = match read_line_bounded(&mut reader, &mut line, LOCAL_REQUEST_LINE_LIMIT).await {
+            Ok(n) => n,
+            Err(LineError::TooLong { max }) => {
+                let response = Response::err(
+                    "",
+                    rpc::INVALID_REQUEST,
+                    format!("request line exceeds {max} bytes"),
+                );
+                write_response(&mut write_half, &response).await?;
+                return Ok(()); // cannot resync mid-line: close
+            }
+            Err(LineError::NotUtf8) => {
+                let response =
+                    Response::err("", rpc::INVALID_REQUEST, "malformed request: not UTF-8");
+                write_response(&mut write_half, &response).await?;
+                continue;
+            }
+            Err(LineError::Io(e)) => return Err(e.into()),
+        };
         if n == 0 {
             return Ok(()); // client closed
         }
-        let trimmed = line.trim_end();
+        // `read_line_bounded` checked the bytes are UTF-8.
+        let trimmed = std::str::from_utf8(&line).unwrap_or_default().trim_end();
         if trimmed.is_empty() {
             continue;
         }
@@ -102,10 +124,18 @@ async fn handle_conn(stream: UnixStream, core: CoreHandle) -> anyhow::Result<()>
             }
             Err(e) => Response::err("", rpc::INVALID_REQUEST, format!("malformed request: {e}")),
         };
-
-        let mut out = serde_json::to_string(&response)?;
-        out.push('\n');
-        write_half.write_all(out.as_bytes()).await?;
-        write_half.flush().await?;
+        write_response(&mut write_half, &response).await?;
     }
+}
+
+/// Writes `response` as one JSON line and flushes it.
+async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    response: &Response,
+) -> anyhow::Result<()> {
+    let mut out = serde_json::to_string(response)?;
+    out.push('\n');
+    w.write_all(out.as_bytes()).await?;
+    w.flush().await?;
+    Ok(())
 }
