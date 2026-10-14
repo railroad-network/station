@@ -760,16 +760,23 @@ requester's device before it is re-sealed under a new passphrase.
   *different* ceremonies (the attacker's and a real one) have no built-in way to
   notice.
 - *Mitigation:* every request carries a **ceremony fingerprint** —
-  `blake3("rrn.recovery.fingerprint" ‖ ephemeral pubkey)`, rendered
-  `xxxxx-xxxxx` (`ceremony::fingerprint`). Every requester prints it (`rrn wallet
-  recover`, `station recovery restore`) and every holder's confirm screen shows
-  it. The **normative procedure** is: a holder contributes a share *only* after
-  confirming, in person or over a channel they already trust, that the person is
-  who they claim and is really recovering their own key, and after reading the
-  fingerprint aloud with them — two holders comparing the same code detect a
-  split ceremony. A recovery request is exactly as trustworthy as the person
-  presenting it; the fingerprint makes a mismatch *detectable*, it is not itself
-  an authenticator.
+  `blake3("rrn.ceremony.fingerprint.v2" ‖ canonical request)`, 80 bits rendered
+  `XXXX-XXXX-XXXX-XXXX` (`ceremony::fingerprint`), binding the ephemeral key and
+  the target address; a key search for a colliding code costs ~2^80 (ADR-0016's
+  2026-10-14 Clarification). It is the one algorithm every ceremony uses: every
+  requester prints it (`rrn wallet recover`, the phone's `RecoverySession`,
+  `station recovery restore`, the encrypted profile's unlock console) and every
+  holder's confirm screen shows it, through the mobile FFI. The **normative
+  procedure** is: a holder contributes a share *only* after confirming, in person
+  or over a channel they already trust, that the person is who they claim and is
+  really recovering their own key, and after confirming all four groups of the
+  fingerprint match their screen. A relayed request (sent as a message) is
+  confirmed by the holder reading the code back over a voice channel they already
+  trust to reach that person; a code sent in the same message as the request
+  proves nothing. Two holders comparing the same code detect a split ceremony. A
+  recovery request is exactly as trustworthy as the person presenting it; the
+  fingerprint proves holder and requester see the same request, it does not
+  prove ownership.
 - *Residual risk (accepted):* an attacker who convinces `K` holders in person —
   impersonating the owner well enough that they skip the out-of-band check — can
   still reconstruct the key. That is the social-recovery trust model, bounded by
@@ -4375,15 +4382,18 @@ the boot-dir descriptor.
 - *Spoofing (forged ceremony):* the boot ceremony is unauthenticated by necessity —
   no station keypair exists before unlock — and the `RecoveryRequest` is itself
   unsigned. A seizer who imaged the boot dir could mint their own ephemeral key and
-  phish shares. *Mitigation:* the **console fingerprint** (blake3 over the ephemeral
-  key + VMK address, `ceremony_fingerprint`, pinned in `docs/spec/vmk-boot-ceremony.md`)
-  is the authenticator — holders confirm it out-of-band against the operator's console
-  before responding, and a forged ceremony shows a different fingerprint. As shipped,
+  phish shares. *Mitigation:* the **ceremony fingerprint** the console prints (the same
+  function every holder's device shows, `ceremony::fingerprint`, 80 bits over the whole
+  request, pinned in `docs/spec/vmk-boot-ceremony.md`; ADR-0024's 2026-10-14
+  Clarification) is the authenticator — holders confirm it out-of-band against the
+  operator's console before responding, and a forged ceremony shows a different
+  fingerprint. As shipped,
   the ceremony runs at the physical console only (the operator pastes holders'
   responses); the ADR's optional pre-unlock LAN endpoint is a documented divergence,
   not yet implemented, so there is no network listener before unlock. *Residual:*
-  relies on holders actually checking the fingerprint, and on a mobile client that
-  reproduces the pinned algorithm; a lazy holder is the weak link, stated plainly.
+  relies on holders actually checking the fingerprint; a lazy holder is the weak
+  link, stated plainly. A holder on an app older than the 80-bit fingerprint sees a
+  code that never matches, and must update before responding.
 - *Information disclosure (the whole point):* powered off, the container is a LUKS2
   brick with **zero keyslots** — no wrapped copy of the key on the device (the VMK is
   the volume key). Provisioning kills the throwaway `luksFormat` keyslot and
@@ -4579,7 +4589,7 @@ picture; the boundaries that now exist, each analyzed in its own section:
 | SMS gateway (mock today) | GSM-7 `rrnp:` chunks from a forgeable number | nothing at the SMS layer; the registry is spam control; signatures at ingest | [SMS as a DTN carrier](#sms-as-a-dtn-carrier-station) |
 | Paper (`rrn paper ingest` on scanned QR text) | `rrnp:`/`rrncert:`/`rrnspend:` text lines | bounded reassembly, then the same ingest | [Paper credential layer](#paper-credential-layer-station--cli) |
 | Gossip peer TCP — **replica-only pull** (`[network] role`; a writer never pulls and takes no peers; loopback by default, no peers in the pilot) | line-JSON `WireEntry` | signature + content hash in `append_raw`; a **replica** re-derives but admits nothing, and the **writer** never reads this boundary at all (ADR-0020 §7 Clarification) | [`rrn-station`](#rrn-station--rrn-cli) |
-| Encrypted volume: `sudo -n` mount helper, the console unlock ceremony | holders' pasted `rrnrecover-resp:` lines | the console fingerprint, then the reconstructed VMK's address | [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) |
+| Encrypted volume: `sudo -n` mount helper, the console unlock ceremony | holders' pasted `rrnrecover-resp:` lines | the ceremony fingerprint, then the reconstructed VMK's address | [Encrypted at-rest storage](#encrypted-at-rest-storage-and-the-boot-ceremony-station-adr-0024) |
 
 Every carrier row shares one property: **the carrier establishes no trust**.
 Whatever it delivers is untrusted bytes until `rrn-crypto` verifies the
@@ -4706,7 +4716,7 @@ entry citing its ADR or the section that owns it.
   graph on disk in the clear. The encrypted profile costs a `K`-of-`N` holder
   ceremony after every power loss, requires operator hardening the daemon does
   not enforce (no swap, no core dumps, destroy the old card), relies on holders
-  checking the console fingerprint, and does **not** defend a node seized while
+  checking the ceremony fingerprint, and does **not** defend a node seized while
   running (ADR-0024 "Not covered").
 - **No memory hardening beyond `zeroize`.** Keys are plaintext in RAM while in
   use; no `mlock`. `RRN_PASSPHRASE`, if used, is visible in the process

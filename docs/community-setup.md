@@ -649,14 +649,18 @@ runs entirely on the member's device and never touches the station (their key is
 theirs alone). On a new phone: **Welcome → Recover an existing identity → From my
 recovery circle**, then scan at least the threshold number of holder responses.
 On a laptop: `rrn wallet recover --station rrn1<station> --address rrn1<theirs>`,
-which prints a request QR and a **ceremony fingerprint** for the holders to
-confirm, then reads their pasted responses. Either way the recovered wallet is
+which prints a request QR and a 16-character **ceremony fingerprint**
+(`XXXX-XXXX-XXXX-XXXX`) for the holders to confirm, then reads their pasted
+responses. Either way the recovered wallet is
 treated as restored — it refuses to sign until one `rrn wallet sync` (or the
 app's first sync) re-anchors it. Order matters when a phone was **stolen** (the
 thief holds the same key until you act): `station unpair <addr>` first, *then* let
-the member recover and re-pair. Every holder must confirm the fingerprint out of
-band before contributing — a recovery request is exactly as trustworthy as the
-person showing it. See the member docs for the step-by-step.
+the member recover and re-pair. Every holder must confirm all four groups of the
+fingerprint before contributing — in person, or, when the request was sent as a
+message, by reading the code back over a voice call to a number they already
+had; a code sent along with the request proves nothing. A recovery request is
+exactly as trustworthy as the person showing it. A holder whose app shows a
+shorter code must update the app before responding. See the member docs for the step-by-step.
 
 **A member who cannot recover** (no circle, or not enough holders) starts again
 with a new identity. Revoke the old key with `station enroll --revoke <old-addr>`
@@ -743,17 +747,19 @@ station will not start until K holders help:
 
 ```sh
 station status          # shows "state volume: LOCKED (not mounted)"
-station unlock          # prints a request QR + a short console fingerprint
-#   Read the fingerprint aloud. Each holder confirms it matches on their end,
+station unlock          # prints a request QR + a 16-character fingerprint (XXXX-XXXX-XXXX-XXXX)
+#   Read all four groups aloud. Each holder confirms it matches on their end,
 #   THEN scans the request in their wallet's "help recover" flow and reads you
 #   back a response line. Paste K responses; the volume mounts.
 station run             # now the daemon starts normally
 ```
 
-The console fingerprint is the safety check: it stops anyone who stole a copy of
-the machine from tricking your holders into unlocking it for them. If the
-fingerprint a holder sees does not match yours, **stop** — someone else is
-running the ceremony.
+The fingerprint is the safety check: it stops anyone who stole a copy of the
+machine from tricking your holders into unlocking it for them. It is the same
+code each holder's app shows for the request it scanned. If the fingerprint a
+holder sees does not match yours, all sixteen characters, **stop** — someone
+else is running the ceremony. A holder whose app shows a shorter code must
+update the app before responding.
 
 **Rotating who holds keys.** When a relationship changes, re-split to a new set —
 the volume must be unlocked first:

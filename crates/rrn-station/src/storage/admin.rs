@@ -194,7 +194,7 @@ pub fn encrypt_in_place(
 
 /// Begins a boot ceremony for `station unlock` / `vmk refresh`: loads the boot-dir
 /// descriptor and returns the session, the `rrnrecover-req:` request QR string, and
-/// the console fingerprint to read aloud. Cross-platform (the ceremony is pure key
+/// the ceremony fingerprint to read aloud. Cross-platform (the ceremony is pure key
 /// material); mounting happens later in [`finish_unlock_and_mount`].
 pub fn begin_unlock(data_dir: &Path) -> Result<(UnlockSession, String, String, VmkDescriptor)> {
     let descriptor =

@@ -19,8 +19,10 @@
 //!
 //! The boot ceremony is **wallet-free**: no station keypair exists pre-unlock, so
 //! the authenticated mobile channel cannot run. The station mints an ephemeral key,
-//! shows a **console fingerprint** holders confirm out-of-band (the fingerprint,
-//! not the unsigned request, is the authenticator), collects sealed
+//! shows the **ceremony fingerprint** of the request it publishes — the same code
+//! every holder's device shows for that request — which holders confirm
+//! out-of-band (the fingerprint, not the unsigned request, is the
+//! authenticator), collects sealed
 //! `rrnrecover-resp:` shares, and reconstructs the VMK in memory — verified against
 //! the descriptor's address, so wrong or insufficient shards fail loudly.
 
@@ -33,7 +35,6 @@ use zeroize::Zeroizing;
 
 use dcbor::prelude::*;
 
-use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, PublicKey, SecretKey};
 use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_identity::address::Address;
@@ -306,9 +307,11 @@ impl UnlockSession {
 
 /// Begins a boot ceremony from the boot-dir descriptor: mints an ephemeral recovery
 /// key and returns the session, the `rrnrecover-req:` request string to show
-/// holders as a QR, and the **console fingerprint** the operator reads aloud so
+/// holders as a QR, and the **ceremony fingerprint** the operator reads aloud so
 /// holders can confirm they are responding to *this* station and not a seizer who
-/// imaged the descriptor and minted their own ephemeral key.
+/// imaged the descriptor and minted their own ephemeral key. It is
+/// [`ceremony::fingerprint`] of the published request — exactly the code each
+/// holder's device computes from the request it scans.
 pub fn begin_unlock(descriptor: &VmkDescriptor) -> (UnlockSession, String, String) {
     let recovery = Keypair::generate();
     let request = RecoveryRequest {
@@ -319,7 +322,7 @@ pub fn begin_unlock(descriptor: &VmkDescriptor) -> (UnlockSession, String, Strin
         "{REQUEST_QR_PREFIX}{}",
         base64::engine::general_purpose::STANDARD.encode(request.to_bytes())
     );
-    let fingerprint = ceremony_fingerprint(&recovery.public_key(), &descriptor.vmk_address);
+    let fingerprint = ceremony::fingerprint(&request);
     (
         UnlockSession {
             recovery,
@@ -354,24 +357,6 @@ pub fn finish_unlock(session: &UnlockSession, responses: &[String]) -> Result<Vm
          or a response did not belong to this ceremony",
     )?;
     Ok(Vmk(wallet.secret_key.clone()))
-}
-
-/// A short, human-comparable fingerprint of a ceremony, derived from the ephemeral
-/// recovery public key and the VMK address. Two groups of five base32 characters
-/// (`ABCDE-FGHIJ`) — enough to distinguish this ceremony from a seizer's forged one
-/// when a holder confirms it out-of-band against the operator's console.
-pub fn ceremony_fingerprint(recovery_pubkey: &PublicKey, vmk_address: &Address) -> String {
-    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut input = Vec::with_capacity(64);
-    input.extend_from_slice(&recovery_pubkey.to_bytes());
-    input.extend_from_slice(&vmk_address.public_key().to_bytes());
-    let digest = Hash::of(&input).to_bytes();
-    let chars: String = digest
-        .iter()
-        .take(10)
-        .map(|b| ALPHABET[(*b % 32) as usize] as char)
-        .collect();
-    format!("{}-{}", &chars[..5], &chars[5..])
 }
 
 #[cfg(test)]
@@ -545,37 +530,37 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_pinned_test_vector() {
-        // Pins the exact algorithm so a holder's app (mobile repo) can reproduce it
-        // from the scanned request and compare against the operator's console. See
-        // docs/spec/vmk-boot-ceremony.md. Inputs: ephemeral pubkey from seed [1;32],
+    fn console_fingerprint_equals_the_holder_fingerprint() {
+        // The code the console prints must be the one a holder's device derives
+        // from the request it scans, or no legitimate unlock can ever be
+        // confirmed.
+        let vmk = Vmk::generate();
+        let (_kps, addrs) = holders(3);
+        let (_pkg, descriptor, _shards) = arm(&vmk, &addrs, 2).unwrap();
+        let (_session, request_qr, console_fp) = begin_unlock(&descriptor);
+        let body = request_qr.strip_prefix(REQUEST_QR_PREFIX).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        let scanned = RecoveryRequest::from_bytes(&bytes).unwrap();
+        assert_eq!(scanned.target_address, descriptor.vmk_address);
+        assert_eq!(console_fp, ceremony::fingerprint(&scanned));
+    }
+
+    #[test]
+    fn fingerprint_pinned_spec_vector() {
+        // Pins the vector in docs/spec/vmk-boot-ceremony.md and the mobile
+        // fixture's `vmk-spec-vector`: ephemeral key from seed [1;32], target the
         // VMK address from seed [2;32].
-        use rrn_crypto::keypair::SecretKey;
         let eph = Keypair::from_secret(SecretKey::from_bytes([1u8; 32]));
         let vmk_addr = Address::from_public_key(
             Keypair::from_secret(SecretKey::from_bytes([2u8; 32])).public_key(),
         );
-        assert_eq!(
-            ceremony_fingerprint(&eph.public_key(), &vmk_addr),
-            "B523J-DY6LH"
-        );
-    }
-
-    #[test]
-    fn fingerprint_is_deterministic_and_binds_both_inputs() {
-        let vmk = Vmk::generate();
-        let eph = Keypair::generate();
-        let fp1 = ceremony_fingerprint(&eph.public_key(), &vmk.address());
-        let fp2 = ceremony_fingerprint(&eph.public_key(), &vmk.address());
-        assert_eq!(fp1, fp2, "deterministic");
-        assert_eq!(fp1.len(), 11, "AAAAA-BBBBB shape");
-        // A different ephemeral key (a seizer's forged ceremony) yields a
-        // different fingerprint holders would catch.
-        let other = Keypair::generate();
-        assert_ne!(
-            fp1,
-            ceremony_fingerprint(&other.public_key(), &vmk.address())
-        );
+        let request = RecoveryRequest {
+            recovery_pubkey: eph.public_key(),
+            target_address: vmk_addr,
+        };
+        assert_eq!(ceremony::fingerprint(&request), "E26N-ZE0W-1TX8-Z4KF");
     }
 
     #[test]

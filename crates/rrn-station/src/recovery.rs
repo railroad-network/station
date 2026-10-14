@@ -565,11 +565,15 @@ mod tests {
         let fp = session.fingerprint();
         assert_eq!(fp, rrn_identity::recovery::ceremony::fingerprint(&request));
 
-        // `xxxxx-xxxxx` of lowercase hex.
+        // `XXXX-XXXX-XXXX-XXXX` of Crockford base32 (80 bits).
         let bytes = fp.as_bytes();
-        assert_eq!(bytes.len(), 11);
-        assert_eq!(bytes[5], b'-');
-        assert!(bytes[..5].iter().all(|b| b.is_ascii_hexdigit()));
-        assert!(bytes[6..].iter().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(bytes.len(), 19);
+        for (i, b) in bytes.iter().enumerate() {
+            if i % 5 == 4 {
+                assert_eq!(*b, b'-');
+            } else {
+                assert!(rrn_identity::human_code::ALPHABET.contains(b));
+            }
+        }
     }
 }

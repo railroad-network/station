@@ -59,15 +59,26 @@ cp crates/rrn-mobile-ffi/tests/fixtures/cross_platform_dtn_certs.json \
 
 ## `recovery_fingerprint.json` — recovery ceremony fingerprint (ADR-0016)
 
-Locks the human-comparable **ceremony fingerprint** (`xxxxx-xxxxx`) the app
-displays when rebuilding a lost key, and every holder confirms out-of-band before
-contributing a share. Each vector is a fixed ephemeral recovery public key and
-the fingerprint it must render to; `rrn_identity::recovery::ceremony::fingerprint`
-(the first ten hex chars of `blake3("rrn.recovery.fingerprint" ‖ recovery pubkey)`)
-is the source of truth, reached on mobile through `parse_recovery_request` and
-`RecoverySession.fingerprint()`. If the two platforms rendered different codes,
-the out-of-band check would be worthless, so the mobile repo asserts its displayed
-code against this table.
+Locks the human-comparable **ceremony fingerprint** (`XXXX-XXXX-XXXX-XXXX`) that
+every ceremony shows — the app rebuilding a lost key, a holder's confirm screen,
+`rrn wallet recover`, `station recovery restore`, and the encrypted profile's
+unlock console — and that every holder confirms before contributing a share.
+`rrn_identity::recovery::ceremony::fingerprint` is the source of truth:
+`blake3("rrn.ceremony.fingerprint.v2" ‖ request canonical bytes)`, the first
+80 bits in Crockford base32, four groups of four (ADR-0016's and ADR-0024's
+2026-10-14 Clarifications; `docs/spec/vmk-boot-ceremony.md`). The app reaches it
+through `parse_recovery_request` and `RecoverySession.fingerprint()` and never
+computes it itself. If two platforms rendered different codes, the check would be
+worthless, so the mobile repo asserts its displayed code against this table.
+
+Schema: `{"construction", "vectors": [{"label", "recovery_pubkey_hex",
+"target_address", "request_hex", "fingerprint"}]}`. `request_hex` is the
+request's canonical bytes (what a `rrnrecover-req:` QR carries); passing it to
+`parse_recovery_request` must return `fingerprint` and `target_address`. Vectors:
+three member ceremonies with distinct keys and targets; `member-0-other-target`,
+which reuses `member-0`'s recovery key against another target and so has a
+different code; and `vmk-spec-vector` (recovery seed `[1;32]`, VMK seed `[2;32]`),
+the value the spec and `rrn-station`'s unlock test pin.
 
 Generated and verified by
 [`tests/it/recovery_ceremony.rs`](../it/recovery_ceremony.rs). Reproducible

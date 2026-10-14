@@ -26,11 +26,13 @@
 //!
 //! A response is exactly as trustworthy as the person showing the request:
 //! nothing in the wire format proves the requester is the identity's true owner.
-//! [`fingerprint`] derives a short, human-comparable code from the request's
-//! ephemeral key; every requester prints it and every holder's confirm screen
-//! shows it, so two holders can notice they were shown *different* ceremonies
-//! and a holder can read the code aloud to confirm they are helping the right
-//! recovery before contributing a share.
+//! [`fingerprint`] derives a human-comparable code from the whole request — the
+//! ephemeral key and the target address. Every requester prints it (the member
+//! wallet, the phone, station-key recovery, and the encrypted profile's unlock
+//! console) and every holder's confirm screen shows it. A holder responds only
+//! once the code on their screen equals the requester's, compared in person or
+//! read back over a voice channel they already trust; two holders comparing
+//! codes can also notice they were shown *different* ceremonies.
 
 use dcbor::prelude::*;
 use zeroize::Zeroize;
@@ -46,25 +48,38 @@ use super::flow::{parse_shard_payload, reconstruct_wallet_for_address_at, Recove
 use super::shamir::{RawShard, ShardIndex};
 
 /// blake3 domain separator for the ceremony [`fingerprint`], distinct from every
-/// other blake3 use so the code can never collide with another short hash.
-pub const FINGERPRINT_TAG: &[u8] = b"rrn.recovery.fingerprint";
+/// other blake3 use so the code can never collide with another short hash. The
+/// `.v2` suffix keeps it disjoint from the earlier 40-bit key-only code.
+pub const FINGERPRINT_TAG: &[u8] = b"rrn.ceremony.fingerprint.v2";
 
-/// A short, human-comparable fingerprint of a recovery ceremony: the first ten
-/// hex characters of `blake3(FINGERPRINT_TAG ‖ recovery pubkey)`, rendered
-/// `xxxxx-xxxxx`.
+/// Characters in a ceremony [`fingerprint`]: 16 × 5 = 80 bits of the digest.
+const FINGERPRINT_CHARS: usize = 16;
+
+/// Characters per hyphen-separated group: `XXXX-XXXX-XXXX-XXXX`.
+const FINGERPRINT_GROUP: usize = 4;
+
+/// The ceremony fingerprint every requester and every holder shows:
+/// `blake3(FINGERPRINT_TAG ‖ request.to_bytes())`, its first 80 bits rendered
+/// in Crockford base32 as `XXXX-XXXX-XXXX-XXXX` ([`crate::human_code`]).
 ///
-/// It binds the request's ephemeral key, so a forged parallel ceremony (a
-/// different ephemeral key) yields a different code. Requester and holders
-/// compare it out-of-band — the same ritual as the pairing code — to confirm they
-/// are taking part in the *same* recovery before any share is contributed. It is
-/// not a secret and not an authenticator on its own; it only lets humans detect
-/// a mismatch.
+/// It hashes the request's canonical encoding, so it commits to every field —
+/// the ephemeral key *and* the target address: a forged ceremony (a different
+/// key, or the same key aimed at a different identity) shows a different code.
+/// A holder decodes the request (which enforces canonical form) and re-encodes
+/// it, so both sides hash the same bytes. Matching a genuine code with a fresh
+/// ephemeral key is a ~2^80 search. It is not a secret and does not prove the
+/// requester owns the identity; it proves holder and requester see the same
+/// request. This is the only fingerprint algorithm: the encrypted profile's
+/// unlock console uses it too (`docs/spec/vmk-boot-ceremony.md`).
 pub fn fingerprint(request: &RecoveryRequest) -> String {
     let mut hasher = rrn_crypto::hash::Hasher::new();
     hasher.update(FINGERPRINT_TAG);
-    hasher.update(&request.recovery_pubkey.to_bytes());
-    let hex = hasher.finalize().to_hex();
-    format!("{}-{}", &hex[..5], &hex[5..10])
+    hasher.update(&request.to_bytes());
+    crate::human_code::render(
+        &hasher.finalize().to_bytes(),
+        FINGERPRINT_CHARS,
+        FINGERPRINT_GROUP,
+    )
 }
 
 /// blake3 KDF domain separator for sealing a raw shard to the recovery key.
@@ -406,30 +421,56 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_stable_and_well_formed() {
+    fn fingerprint_is_80_bits_crockford_4x4() {
         let recovery = Keypair::generate();
         let target = WalletContents::create_new().address;
         let req = request_for(&recovery, target);
         let fp = fingerprint(&req);
 
-        // Stable across calls, and the documented `xxxxx-xxxxx` hex shape.
+        // Stable across calls, and the documented `XXXX-XXXX-XXXX-XXXX` shape:
+        // 16 Crockford characters (80 bits), hyphens after every fourth.
         assert_eq!(fp, fingerprint(&req));
-        let re = regex_like(&fp);
-        assert!(re, "unexpected fingerprint shape: {fp}");
-
-        // The same key recovering a *different* target yields the same code (the
-        // fingerprint binds the ephemeral key, which is what a forgery changes).
-        let other = WalletContents::create_new().address;
-        assert_eq!(fp, fingerprint(&request_for(&recovery, other)));
+        assert_eq!(fp.len(), 19, "unexpected fingerprint shape: {fp}");
+        for (i, b) in fp.bytes().enumerate() {
+            if i % 5 == 4 {
+                assert_eq!(b, b'-', "unexpected fingerprint shape: {fp}");
+            } else {
+                assert!(
+                    crate::human_code::ALPHABET.contains(&b),
+                    "non-Crockford character in {fp}"
+                );
+            }
+        }
+        // A typed-back copy normalizes to the same characters.
+        assert_eq!(
+            crate::human_code::normalize(&fp.to_lowercase()),
+            fp.replace('-', "")
+        );
     }
 
-    /// `^[0-9a-f]{5}-[0-9a-f]{5}$` without pulling in a regex crate.
-    fn regex_like(s: &str) -> bool {
-        let bytes = s.as_bytes();
-        bytes.len() == 11
-            && bytes[5] == b'-'
-            && bytes[..5].iter().all(|b| b.is_ascii_hexdigit())
-            && bytes[6..].iter().all(|b| b.is_ascii_hexdigit())
+    #[test]
+    fn fingerprint_binds_the_target_address() {
+        // The same ephemeral key aimed at a different identity is a different
+        // ceremony, and must show a different code.
+        let recovery = Keypair::generate();
+        let a = WalletContents::create_new().address;
+        let b = WalletContents::create_new().address;
+        assert_ne!(
+            fingerprint(&request_for(&recovery, a)),
+            fingerprint(&request_for(&recovery, b))
+        );
+    }
+
+    #[test]
+    fn fingerprint_hashes_the_canonical_request_under_the_tag() {
+        let req = request_for(&Keypair::generate(), WalletContents::create_new().address);
+        let mut input = FINGERPRINT_TAG.to_vec();
+        input.extend_from_slice(&req.to_bytes());
+        let digest = rrn_crypto::hash::Hash::of(&input).to_bytes();
+        assert_eq!(fingerprint(&req), crate::human_code::render(&digest, 16, 4));
+        // A holder re-decoding the request bytes reaches the same code.
+        let decoded = RecoveryRequest::from_bytes(&req.to_bytes()).unwrap();
+        assert_eq!(fingerprint(&decoded), fingerprint(&req));
     }
 
     #[test]
