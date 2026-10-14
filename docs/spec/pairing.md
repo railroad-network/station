@@ -176,8 +176,10 @@ has an unexpired session:
   `requested_at` is strictly later than the current session's; otherwise it is
   refused as a replay and the session is kept. A captured older start from the
   same device therefore cannot evict a newer session. (A device that restarts
-  pairing within the same second waits a second and tries again.) The operator's pending list (`station pair-mobile` with no address)
-shows only sessions awaiting the operator, as address, code, and age.
+  pairing within the same second waits a second and tries again.)
+
+The operator's pending list (`station pair-mobile` with no address) shows only
+sessions awaiting the operator, as address, code, and age.
 
 The operator confirms with `station pair-mobile <address> --code <code>`
 (RPC `pair_confirm {address, code}`). A normalized match pairs the device and,

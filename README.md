@@ -65,7 +65,10 @@ in [`scripts/`](scripts/) or an integration test.
 
 - **Mobile transport**: sealed-envelope RPC over local HTTP (ADR-0008),
   in-person pairing with a short code comparison, long-poll push, and the
-  `rrn-mobile-ffi` uniffi bindings the app builds on.
+  `rrn-mobile-ffi` uniffi bindings the app builds on. Pairing is a
+  commit-then-reveal handshake (ADR-0008, Clarification 2026-10-14); the phone
+  app does not speak it yet, so until an updated app ships, new members pair
+  with `rrn wallet` (already-paired phones keep working).
 - **Vouching and standing** (`rrn-reputation`): one locked scoring formula
   derived from the log and never stored authoritatively (ADR-0009), decay,
   staking gates, Sybil velocity limits, identity anchoring.

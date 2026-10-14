@@ -279,6 +279,17 @@ step that proves to the phone it's talking to the real station, and to the
 station that this phone is welcome — the code comparison below is the actual
 security boundary, so do it face to face, reading the code aloud.
 
+> **Note (2026-10-14): phone pairing is unavailable until the app is
+> updated.** The station now speaks only the new pairing handshake (a
+> 10-character code, `XXXXX-XXXXX`); the old one, with an 8-character code,
+> was retired because its code could be forged (security review finding
+> RRN-A-023). The current phone app still speaks the old one, so a phone
+> pairing attempt fails with "pairing protocol v1 is retired; update the app",
+> and no updated app has shipped yet. Phones paired before the station update
+> keep working. Until the app ships, a new member pairs with the
+> command-line wallet (§2.4, `rrn wallet pair`), which already speaks the new
+> handshake. The steps below describe the phone once it does.
+
 **On the phone:** after creating the wallet, the member taps **Join your
 community** (or later: Settings → Station pairing). The station appears in
 the list by name — or they tap *Add by address* and type the station's IP and
