@@ -3453,16 +3453,24 @@ pipeline enforces.
   gap-free nonce (see [Replay across crates](#replay-across-crates)). The nonce
   high-water mark is persisted **before** dispatch, so a replay cannot slip in
   even if the method then fails. The station never lowers a member's nonce
-  high-water mark, across re-pairing or unpairing, and clients send
-  `max(last + 1, unix milliseconds)`, so a restored device resumes above it
-  (ADR-0008, Clarification 2026-10-14, Part B; before it, a re-pair reset the
-  mark to 0 and reopened every recorded request — RRN-A-024, RRN-A-039).
+  high-water mark, across re-pairing or unpairing, and `rrn wallet` sends
+  `max(last + 1, unix milliseconds)`, so a restored wallet resumes above it; the
+  phone app adopts the same rule in its own change (ADR-0008, Clarification
+  2026-10-14, Part B; before it, a re-pair reset the mark to 0 and reopened
+  every recorded request — RRN-A-024, RRN-A-039).
   *Residual risk:* replay within the ±5-minute
   window is bounded by its width; a request whose transport nonce was burned but
   never reached the ledger is simply refused on retry (the mobile skips to the
   next nonce). A phone app that predates the time-floored nonce and resets its
   counter when it re-pairs is refused as a replay until it counts past the mark
-  the station kept.
+  the station kept. A mark set from a client clock far in the future stays set:
+  unpairing no longer clears it and no command shows or resets it, so a device
+  that later loses its counter is refused until real time catches up, and the
+  only remedy is editing `paired_mobiles.json` by hand. The retained marks also
+  make that file a lasting list of every address ever paired (inside the
+  container on the encrypted profile, in the clear otherwise). Restoring an
+  older backup restores older marks, so "never decreases" does not hold across a
+  restore; the client time floor covers `rrn wallet` there.
 - **Station impersonation.** *Threat:* a rogue host poses as the member's paired
   station. *Mitigation (shipped):* the request is sealed to the
   paired station's public key, so only the real station can open it; the
