@@ -2545,15 +2545,17 @@ impl Core {
     // --- internal operations ------------------------------------------------
 
     /// Settles every transaction whose window has closed, and — for a settled
-    /// marketplace payment — attests the sale against its listing: one settled,
-    /// listing-linked payment consumes one unit of stock.
+    /// payment that names a listing — attests the sale against that listing when
+    /// it is a purchase the provider agreed to (see [`Core::attest_sale`]). Any
+    /// other listing-linked payment settles all the same and consumes no stock.
     fn do_sweep(&mut self) -> usize {
         let now = self.clock.now();
 
-        // Which transactions are due, and the listing each marketplace one pays
-        // for — captured from the snapshot *before* settling, since settling
-        // changes it. A direct pay carries no link and settles as it always has.
-        let due: Vec<(TransactionId, Option<ListingId>)> = {
+        // Which transactions are due, and the sale each listing-linked one claims
+        // — captured from the snapshot *before* settling, since settling changes
+        // it. The same snapshot later resolves the payments behind earlier
+        // attestations. A direct pay carries no link and settles as it always has.
+        let (snapshot, due) = {
             let log = AppendLog::new(&self.db);
             let snapshot =
                 match rrn_ledger::state::LedgerSnapshot::derive(&log, &self.station_pubkey()) {
@@ -2564,54 +2566,129 @@ impl Core {
                     }
                 };
             let settler = Settler::new(&self.db, self.station_keypair(), self.settlement);
-            match settler.find_eligible(now) {
+            let due: Vec<(TransactionId, Option<SaleClaim>)> = match settler.find_eligible(now) {
                 Ok(ids) => ids
                     .into_iter()
-                    .map(|id| (id, snapshot.get(&id).and_then(linked_listing)))
+                    .map(|id| (id, snapshot.get(&id).and_then(sale_claim)))
                     .collect(),
                 Err(e) => {
                     tracing::warn!(error = %e, "settlement sweep: find_eligible failed");
                     return 0;
                 }
-            }
+            };
+            (snapshot, due)
         };
 
         let mut settled = 0;
-        for (tx_id, listing_id) in due {
+        for (tx_id, claim) in due {
             let mut settler = Settler::new(&self.db, self.station_keypair(), self.settlement);
             if let Err(e) = settler.settle(&tx_id, now) {
                 tracing::warn!(error = %e, tx = ?tx_id, "could not settle a transaction");
                 continue;
             }
             settled += 1;
-            if let Some(listing_id) = listing_id {
-                self.attest_sale(listing_id, tx_id, now);
+            if let Some(claim) = claim {
+                self.attest_sale(&claim, tx_id, &snapshot, now);
             }
         }
         settled
     }
 
-    /// Appends a station-signed [`StockConsumed`] for a settled marketplace
-    /// payment, and refreshes the listing in browse. Only a listing still on
-    /// offer that *tracks* stock is decremented — a service slot, a commons
-    /// offer, or an already-closed listing has no unit to take, so nothing is
-    /// written for it. A duplicate would be inert anyway (state counts distinct
-    /// transactions), so a race here costs at most a redundant record.
-    fn attest_sale(&mut self, listing_id: ListingId, tx_id: TransactionId, now: i64) {
+    /// Appends a station-signed [`StockConsumed`] for a settled payment that is a
+    /// purchase the provider agreed to, and refreshes the listing in browse.
+    ///
+    /// The station signs this under its ADR-0005 authority, so it attests only
+    /// what the provider consented to (ADR-0010 "Linking transactions to
+    /// listings"): a positive payment from the buyer to the listing's provider,
+    /// matching an agreed inquiry on that listing at exactly that price which no
+    /// earlier attested payment has used. A `listing_id` on a proposal is only the
+    /// payer's claim, so any other payment naming a listing — to someone else, a
+    /// payment request, a price nobody agreed — consumes nothing. Only a listing
+    /// still on offer that *tracks* stock is decremented at all.
+    ///
+    /// `snapshot` is the sweep's pre-settle ledger view, which holds every
+    /// payment an earlier attestation names. The listing's attestations are
+    /// re-read on every call, so two payments settling in one sweep against one
+    /// agreement consume one unit. Declining to attest is not an error: the
+    /// settlement it follows already stands.
+    fn attest_sale(
+        &mut self,
+        claim: &SaleClaim,
+        tx_id: TransactionId,
+        snapshot: &rrn_ledger::state::LedgerSnapshot,
+        now: i64,
+    ) {
         let station = self.station_keypair();
         let station_pk = station.public_key();
 
         let log = AppendLog::new(&self.db);
-        let tracks_stock = matches!(
-            rrn_marketplace::lifecycle::compute_state(&log, &listing_id, &station_pk, now),
-            Ok(Some(ListingState::Active(ref l))) if l.availability.capacity.is_some()
-        );
-        if !tracks_stock {
+        let listing = match rrn_marketplace::lifecycle::compute_state(
+            &log,
+            &claim.listing_id,
+            &station_pk,
+            now,
+        ) {
+            Ok(Some(ListingState::Active(l))) if l.availability.capacity.is_some() => l,
+            _ => return,
+        };
+
+        // Whether the provider signed consent to this sale — not whether the
+        // buyer would pass the listing's requirements if asked again today
+        // against the reputation cache. A real sale that failed a re-check would
+        // keep its unit on offer and oversell, so every agreed inquiry counts.
+        let admit_all = |_: &Listing, _: &Address| true;
+        let entitled =
+            match rrn_marketplace::inquiry::all_inquiry_records(&log, &station_pk, &admit_all) {
+                Ok(inquiries) => rrn_marketplace::inquiry::purchases_entitled(
+                    &inquiries,
+                    &listing,
+                    &claim.buyer,
+                    &claim.payee,
+                    claim.amount_centi,
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read inquiries to attest a sale");
+                    return;
+                }
+            };
+        let consumed =
+            match rrn_marketplace::lifecycle::listing_records(&log, &claim.listing_id, &station_pk)
+            {
+                Ok(records) => records.consumed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read a listing to attest a sale");
+                    return;
+                }
+            };
+        // Units this buyer's agreements at this price have already taken: every
+        // distinct attested payment that resolves to the same payer and amount. An
+        // attestation whose payment the snapshot does not hold counts toward nothing.
+        let mut prior_txs = BTreeSet::new();
+        for c in &consumed {
+            let same_purchase = snapshot
+                .get(&c.tx_id)
+                .and_then(proposal_of)
+                .is_some_and(|p| p.sender == claim.buyer && p.amount_centi == claim.amount_centi);
+            if same_purchase {
+                prior_txs.insert(c.tx_id);
+            }
+        }
+        if prior_txs.contains(&tx_id) {
+            return; // already attested; a second record would be inert
+        }
+        if prior_txs.len() >= entitled {
+            tracing::info!(
+                tx = ?tx_id,
+                listing = ?claim.listing_id,
+                prior = prior_txs.len(),
+                entitled,
+                "listing-linked payment consumes no stock: not an agreed purchase from the provider"
+            );
             return;
         }
 
         let record = StockConsumed {
-            listing_id,
+            listing_id: claim.listing_id,
             tx_id,
             consumed_at: now,
         };
@@ -2622,7 +2699,7 @@ impl Core {
             &station_pk,
             now,
         ) {
-            Ok(_) => self.reindex_listing(&listing_id),
+            Ok(_) => self.reindex_listing(&claim.listing_id),
             Err(e) => tracing::warn!(error = %e, "could not attest a sale"),
         }
     }
@@ -8127,13 +8204,28 @@ fn proposal_of(state: &TransactionState) -> Option<&TransactionProposal> {
     }
 }
 
-/// The listing a transaction pays for, if it is a marketplace payment:
-/// the `listing_id` the buyer signed into the proposal, named as a marketplace
-/// [`ListingId`]. `None` for a direct pay.
-fn linked_listing(state: &TransactionState) -> Option<ListingId> {
-    proposal_of(state)?
-        .listing_id
-        .map(|ListingRef(bytes)| ListingId(Hash::from_bytes(bytes)))
+/// The sale a settled payment claims: the listing its payer signed into the
+/// proposal, and who paid whom how much. Only a claim — the settlement sweep
+/// attests it against the listing's agreed inquiries before consuming stock.
+struct SaleClaim {
+    listing_id: ListingId,
+    buyer: Address,
+    payee: Address,
+    amount_centi: i64,
+}
+
+/// The sale a transaction claims, if it names a listing: the `listing_id` the
+/// payer signed into the proposal, as a marketplace [`ListingId`], with the
+/// proposal's parties and amount. `None` for a direct pay.
+fn sale_claim(state: &TransactionState) -> Option<SaleClaim> {
+    let proposal = proposal_of(state)?;
+    let ListingRef(bytes) = proposal.listing_id?;
+    Some(SaleClaim {
+        listing_id: ListingId(Hash::from_bytes(bytes)),
+        buyer: proposal.sender,
+        payee: proposal.receiver,
+        amount_centi: proposal.amount_centi,
+    })
 }
 
 /// The `pending` / `delivered` / `abandoned` label for a tracked push.
@@ -12150,7 +12242,7 @@ mod tests {
         assert_eq!(proposal.sender, core.wallet.address);
         assert_eq!(proposal.receiver, provider_addr);
         assert_eq!(proposal.amount_centi, 400);
-        assert_eq!(linked_listing(state), Some(listing.id));
+        assert_eq!(sale_claim(state).map(|c| c.listing_id), Some(listing.id));
         assert!(proposal
             .memo
             .as_deref()
@@ -12198,6 +12290,253 @@ mod tests {
 
         let err = core.handle_call(&settle_req(&inquiry_id)).unwrap_err();
         assert!(err.message.contains("buyer"), "{}", err.message);
+    }
+
+    // --- which settled payments consume stock -----------------------------
+
+    /// Proposes `amount` from `payer` to `payee` naming `listing`, and has the
+    /// payee confirm it, both at the core's clock. Returns the transaction.
+    fn pay_naming_listing(
+        core: &Core,
+        payer: &Keypair,
+        payee: &Keypair,
+        amount: i64,
+        listing: &Listing,
+    ) -> TransactionId {
+        let now = core.clock.now();
+        let nonce = rrn_ledger::state::LedgerSnapshot::derive(
+            &AppendLog::new(&core.db),
+            &core.station_pubkey(),
+        )
+        .unwrap()
+        .next_nonce(&payer.public_key().to_bytes());
+        let proposal = TransactionProposal::new(
+            Address::from_public_key(payer.public_key()),
+            Address::from_public_key(payee.public_key()),
+            amount,
+            None,
+            nonce,
+            now,
+            now + PROPOSAL_TTL_SECS,
+        )
+        .with_listing(ListingRef(listing.id.to_bytes()));
+        let tx_id = proposal.id;
+        Engine::new(&core.db, core.station_keypair())
+            .submit_proposal(SignedProposal::sign(proposal, payer), now)
+            .unwrap();
+        confirm_as(core, payee, tx_id);
+        tx_id
+    }
+
+    /// The receiver `kp` confirms `tx_id` at the core's clock.
+    fn confirm_as(core: &Core, kp: &Keypair, tx_id: TransactionId) {
+        let now = core.clock.now();
+        let confirmation = TransactionConfirmation {
+            proposal_id: tx_id,
+            confirmer: Address::from_public_key(kp.public_key()),
+            confirmed_at: now,
+        };
+        Engine::new(&core.db, core.station_keypair())
+            .submit_confirmation(SignedConfirmation::sign(confirmation, kp), now)
+            .unwrap();
+    }
+
+    /// Runs the settlement sweep once every confirmed payment is due: a 10 s
+    /// window, then 11 s on, so the seeded listing (on offer until
+    /// `NOW + 10_000`) is still active when the sweep attests.
+    fn sweep_after_window(core: &mut Core) -> usize {
+        core.settlement = SettlementConfig::uniform(10);
+        core.clock.advance(11);
+        core.do_sweep()
+    }
+
+    /// The listing's remaining stock, read from the log; panics unless it is
+    /// still on offer.
+    fn stock_left(core: &Core, listing: &Listing) -> u32 {
+        match rrn_marketplace::lifecycle::compute_state(
+            &AppendLog::new(&core.db),
+            &listing.id,
+            &core.station_pubkey(),
+            core.clock.now(),
+        )
+        .unwrap()
+        {
+            Some(ListingState::Active(l)) => l.availability.capacity.unwrap(),
+            other => panic!("listing is not on offer: {other:?}"),
+        }
+    }
+
+    /// How many sale attestations the log holds for `listing`.
+    fn attestations(core: &Core, listing: &Listing) -> usize {
+        rrn_marketplace::lifecycle::listing_records(
+            &AppendLog::new(&core.db),
+            &listing.id,
+            &core.station_pubkey(),
+        )
+        .unwrap()
+        .consumed
+        .len()
+    }
+
+    fn is_settled(core: &Core, tx_id: &TransactionId) -> bool {
+        matches!(
+            rrn_ledger::state::LedgerSnapshot::derive(
+                &AppendLog::new(&core.db),
+                &core.station_pubkey()
+            )
+            .unwrap()
+            .get(tx_id),
+            Some(TransactionState::Settled { .. })
+        )
+    }
+
+    /// The station wallet pays `provider` the agreed price of `inquiry_id`
+    /// through `marketplace_settle_inquiry`, and the provider confirms.
+    fn settle_and_confirm(
+        core: &mut Core,
+        provider: &Keypair,
+        inquiry_id: &rrn_marketplace::inquiry::InquiryId,
+    ) -> TransactionId {
+        let v = core.handle_call(&settle_req(inquiry_id)).unwrap();
+        let tx_id = parse_tx_id(v["tx_id"].as_str().unwrap()).unwrap();
+        confirm_as(core, provider, tx_id);
+        tx_id
+    }
+
+    #[test]
+    fn a_payment_naming_someone_elses_listing_consumes_no_stock() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, _) = seed_station_inquiry(&core, &provider, None);
+        // Two keys of one member: the first pays the second, naming a
+        // competitor's listing each time.
+        let (a1, a2) = (Keypair::generate(), Keypair::generate());
+        enroll(&core, &a1);
+        enroll(&core, &a2);
+        let txs: Vec<_> = (0..5)
+            .map(|_| pay_naming_listing(&core, &a1, &a2, 1, &listing))
+            .collect();
+
+        assert_eq!(sweep_after_window(&mut core), 5);
+        for tx in &txs {
+            assert!(is_settled(&core, tx), "every payment still settles");
+        }
+        assert_eq!(attestations(&core, &listing), 0);
+        assert_eq!(stock_left(&core, &listing), 12);
+    }
+
+    #[test]
+    fn a_payment_to_the_provider_without_an_agreement_consumes_no_stock() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, _) = seed_station_inquiry(&core, &provider, None);
+        let a = Keypair::generate();
+        enroll(&core, &a);
+        let tx = pay_naming_listing(&core, &a, &provider, 1, &listing);
+
+        assert_eq!(sweep_after_window(&mut core), 1);
+        assert!(is_settled(&core, &tx));
+        assert_eq!(attestations(&core, &listing), 0);
+        assert_eq!(stock_left(&core, &listing), 12);
+    }
+
+    #[test]
+    fn an_agreed_purchase_consumes_exactly_one_unit() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, inquiry_id) = seed_station_inquiry(&core, &provider, Some(400));
+        settle_and_confirm(&mut core, &provider, &inquiry_id);
+        assert_eq!(sweep_after_window(&mut core), 1);
+        assert_eq!(stock_left(&core, &listing), 11);
+
+        // A second payment at the agreed price, made directly rather than through
+        // the idempotent settle call, finds the one agreement already used.
+        let station = core.station_keypair();
+        let again = pay_naming_listing(&core, &station, &provider, 400, &listing);
+        assert_eq!(sweep_after_window(&mut core), 1);
+        assert!(is_settled(&core, &again));
+        assert_eq!(attestations(&core, &listing), 1);
+        assert_eq!(stock_left(&core, &listing), 11);
+    }
+
+    #[test]
+    fn two_agreed_purchases_settling_in_one_sweep_consume_two_units() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, first) = seed_station_inquiry(&core, &provider, Some(400));
+        // A second agreement on the same listing, opened by hand with its own
+        // message so it is a distinct inquiry rather than the same content address.
+        let station = core.station_keypair();
+        let opened = InquiryOpened::new(
+            listing.id,
+            core.wallet.address,
+            "And another, please.".into(),
+            Some(400),
+            NOW,
+        )
+        .unwrap();
+        let second = opened.inquiry_id;
+        let mut log = AppendLog::new(&core.db);
+        append_inquiry_opened(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(opened, &station),
+            &listing,
+            0.0,
+            true,
+            NOW,
+        )
+        .unwrap();
+        append_inquiry_closed(
+            &mut log,
+            rrn_crypto::signed::SignedPayload::sign(
+                InquiryClosed {
+                    inquiry_id: second,
+                    outcome: InquiryOutcome::Agreed {
+                        final_price_centi: 400,
+                    },
+                    closed_at: NOW,
+                },
+                &provider,
+            ),
+            &station.public_key(),
+            &|_: &Listing, _: &Address| true,
+            NOW,
+        )
+        .unwrap();
+
+        settle_and_confirm(&mut core, &provider, &first);
+        settle_and_confirm(&mut core, &provider, &second);
+        assert_eq!(sweep_after_window(&mut core), 2);
+        assert_eq!(attestations(&core, &listing), 2);
+        assert_eq!(stock_left(&core, &listing), 10);
+    }
+
+    #[test]
+    fn two_payments_against_one_agreement_in_one_sweep_consume_one_unit() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, inquiry_id) = seed_station_inquiry(&core, &provider, Some(400));
+        settle_and_confirm(&mut core, &provider, &inquiry_id);
+        let station = core.station_keypair();
+        pay_naming_listing(&core, &station, &provider, 400, &listing);
+
+        assert_eq!(sweep_after_window(&mut core), 2);
+        assert_eq!(attestations(&core, &listing), 1);
+        assert_eq!(stock_left(&core, &listing), 11);
+    }
+
+    #[test]
+    fn a_payment_at_other_than_the_agreed_price_consumes_no_stock() {
+        let mut core = test_core();
+        let provider = Keypair::generate();
+        let (listing, _) = seed_station_inquiry(&core, &provider, Some(400));
+        let station = core.station_keypair();
+        let tx = pay_naming_listing(&core, &station, &provider, 399, &listing);
+
+        assert_eq!(sweep_after_window(&mut core), 1);
+        assert!(is_settled(&core, &tx));
+        assert_eq!(attestations(&core, &listing), 0);
+        assert_eq!(stock_left(&core, &listing), 12);
     }
 
     /// A spend of `amount` from `kp` at `nonce`, through the engine directly at

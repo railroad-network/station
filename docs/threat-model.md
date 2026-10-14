@@ -2073,6 +2073,33 @@ credit and never delivers.
   one that is attributable in the log and cannot be disguised as a member's
   decision.
 
+#### Tampering — a sale attested for a payment that bought nothing
+
+- *Threat:* a proposal's `listing_id` is the payer's own claim, and every settled
+  payment naming a listing used to consume a unit of its stock. A member could
+  sell out a competitor's listing — and push it out of browse — by paying a
+  second key of their own one centicommon at a time, with the station signing
+  each false sale under the authority members trust it with (ADR-0005).
+- *Mitigation (shipped):* the settlement sweep signs a `StockConsumed` only for a
+  positive payment from a buyer to the listing's provider that matches an agreed
+  inquiry on that listing, by that buyer, at exactly that price, which no earlier
+  attested payment of the same buyer and amount has used
+  (`inquiry::purchases_entitled`, checked in `Core::attest_sale`). The check asks
+  only whether the provider signed the agreement, not whether the buyer would
+  still pass the listing's requirements today, so a real sale never fails to
+  consume stock. Every other listing-linked payment settles normally and consumes
+  nothing; the attestations are re-read per payment, so two payments against one
+  agreement in one sweep take one unit. Tested in `rrn-station`'s core tests.
+- *Residual risk:* attestations already on a log stand — replay still counts every
+  station-signed `StockConsumed`, and station-signed history is not rewritten.
+  `listing_id` on a proposal remains an unvalidated claim at admission (the
+  ledger sits below the marketplace); only the attestation is gated. A zero-price
+  goods listing is never decremented by a payment (its provider closes it), and
+  neither is a negative-priced commons pool paid as a subsidy (a payment request,
+  never a purchase). The
+  agreement must exist when the payment settles, not before the payment in log
+  order.
+
 #### Tampering — the derived index disagreeing with the log
 
 - *Threat:* search answers from two derived stores rather than from the log. If
