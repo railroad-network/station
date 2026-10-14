@@ -46,8 +46,10 @@ a2                      map, 2 entries
 ```
 
 The holder hashes the canonical re-encoding of the request it decoded, not the
-received bytes as they arrived. Decoding enforces canonical form, so for any
-request a holder accepts, the two are equal to the requester's bytes.
+received bytes as they arrived, so both sides hash the same `{rk, addr}` bytes.
+Decoding rejects a map that is not in canonical form, and ignores keys other
+than `rk` and `addr`: such a key is in neither side's input, and a holder seals
+to the same `rk` the code was computed over.
 
 ## Algorithm
 
