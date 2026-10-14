@@ -149,6 +149,94 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
   sentence true. Converting its *planned* mitigations to shipped ones is
   the request layer's job.
 
+## Clarification (2026-10-14) — pairing commits before it reveals; channel replies are bound to their request
+
+*Proposed 2026-10-14; not in force until the maintainer ratifies it. Part A
+is in force with the change that implements the new handshake; Part B with
+the change that implements reply binding.*
+
+The internal security review of October 2026 found two gaps in what this ADR
+promises. **RRN-A-023:** the confirmation code was the first eight hex
+characters (32 bits) of a hash of the two static public keys, with no fresh
+randomness and no commitment, and the pairing request did not name the station
+it was for. A party on the pairing LAN who learns one key can search about
+2^32 keys offline for one whose code collides with the genuine pair's, and
+then either sit in the middle or plant a second pending request carrying the
+genuine code, which the operator confirmed by address alone. The Consequences'
+claim that a man-in-the-middle "could not reproduce this code" holds only
+against an attacker who does not search. **RRN-A-024:** a station-signed reply
+named neither the member nor the request it answered, so a reply issued to one
+member verifies as the answer to another's request with the same nonce, and a
+re-pair, which reset the nonce, let recorded replies verify again.
+
+This narrows how the code is derived and what a reply's signature covers.
+Pairing still binds the two static keys and nothing else (Decision), the
+station persists nothing new for a pairing, and the envelope remains the
+security boundary.
+
+### Part A — commit-then-reveal pairing
+
+1. **Two rounds.** The mobile picks a fresh 32-byte nonce and sends a
+   **start** that carries only a commitment to it:
+   `commitment = blake3("rrn-pair-commit-v2" ‖ mobile_pk ‖ mobile_nonce)`.
+   The station answers with an **offer** carrying its own fresh 32-byte nonce,
+   signed over the station key, the mobile key, the commitment, and its nonce.
+   The mobile then sends a **finish** that reveals its nonce, signed over the
+   station key, the mobile key, the commitment, and both nonces. The station
+   refuses a finish whose nonce does not open the commitment. Neither side can
+   choose its nonce after seeing the other's: the mobile's is fixed by the
+   commitment before the station's is known, and the station's is fixed by its
+   signed offer before the mobile's is revealed.
+2. **The code** is derived from both static keys and both nonces,
+   `blake3("rrn-pair-code-v2" ‖ station_pk ‖ mobile_pk ‖ mobile_nonce ‖ station_nonce)`,
+   rendered as **10 Crockford base32 characters** (`XXXXX-XXXXX`, 50 bits). It
+   still authenticates the two static keys: a substituted key on either side
+   changes it. Because it also depends on a nonce each side fixed before seeing
+   the other's, an offline key search cannot target it, and an online attacker
+   matches the genuine code with probability **2^-50 per operator-confirmed
+   attempt**. The station never sends the code; each side computes it.
+3. **The station-bound request.** The start names no station, because a phone
+   that reached the station by a typed IP address knows none yet. The finish,
+   the request that creates the operator's pending row, is signed over the
+   station's key, so it cannot be replayed to another station. A client checks
+   the offer's station address against what it expected (a pinned key, or a
+   discovery claim when it has one) before it verifies the offer's signature.
+4. **The operator confirms by code.** Confirming a pending request takes the
+   address *and* the code read from the device; the station compares the
+   normalized code with its own and refuses a mismatch, leaving the request in
+   place. Because pairing is also the enrollment ceremony (ADR-0038 §1), a row
+   planted under another address cannot be confirmed by address alone.
+5. **v1 is retired with no compatibility window.** The `/pair` route answers
+   `410 Gone`; if v1 still worked, an attacker would simply use it. Pairings
+   made before this change are unaffected and keep authenticating on the
+   request channel. A device that has not been updated cannot pair until it is.
+6. **Reading this ADR.** The Consequences' "8-hex confirmation code from the two
+   static keys" reads as the 10-character code of point 2, and ADR-0028 §5's
+   "`/pair` route" reads as `/pair/start` + `/pair/finish`. Routes, JSON
+   bodies, byte layouts, the code alphabet, and error strings are in
+   [`docs/spec/pairing.md`](../spec/pairing.md).
+
+### Part B — channel replies are bound to their request and recipient
+
+1. **A v2 reply names who and what it answers.** A version-2 channel request
+   gets a reply that carries the requesting member's public key and
+   `blake3("rrn-channel-request-v2" ‖ request payload)`, the hash of the exact
+   signed request payload it answers. The station signs
+   `"rrn-channel-resp-v2" ‖ reply JSON`; the tag separates these signatures from
+   every other station signature. The same binding covers the long-poll
+   (`/subscribe`), heartbeats included. A v2 client accepts only a v2 reply
+   whose recipient is itself and whose hash matches the request it sent, and the
+   request's version is inside the member's signature, so nobody can downgrade a
+   v2 client.
+2. **Transition.** A version-1 request still gets an unbound version-1 reply
+   until the app that consumes v2 ships; v1 replies are then retired by a
+   separate change. The unbound v1 reply is a recorded residual until then.
+3. **The nonce high-water mark never decreases.** The station never lowers a
+   member's request-nonce high-water mark, on re-pair or on unpair followed by
+   a new pairing. Clients send `max(last + 1, unix_millis)`, so a restored or
+   re-paired device stays above any mark it set before, with no extra round
+   trip.
+
 ## Alternatives Considered
 
 - **HTTPS with self-signed per-station certs, fingerprint-pinned at pairing**
