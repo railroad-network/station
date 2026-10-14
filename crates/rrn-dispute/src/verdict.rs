@@ -30,7 +30,10 @@ pub struct JurorVerdict {
     /// `true` to uphold the dispute (void the transfer), `false` to reject it
     /// (let the transaction settle as confirmed).
     pub uphold: bool,
-    /// Unix seconds when the verdict was cast.
+    /// Unix seconds when the juror says they cast the verdict — testimony only
+    /// (ADR-0022 §3). The panel seats and times the verdict by its admission time;
+    /// this value is refused only when dated into the future beyond the clock-skew
+    /// tolerance.
     pub cast_at: i64,
 }
 
@@ -77,17 +80,29 @@ impl TryFrom<CBOR> for JurorVerdict {
     }
 }
 
-/// Every juror's verdict on `tx_id`, keyed by juror, as `(uphold, cast_at)`.
+/// Every juror's verdict on `tx_id`, keyed by juror, as `(uphold, admitted_at)` —
+/// the map [`resolve_panel`](crate::panel::resolve_panel) consumes.
 ///
-/// Replay derivation: scans the log for verdicts naming this transaction, keeping
-/// the **first** each juror cast (a verdict is final — a later one from the same
-/// juror is ignored). This is a thin read; whether a verdict *counts* is decided
-/// by the panel, which only credits a verdict whose juror holds a seat within
-/// their response window.
-pub fn verdicts(db: &Database, tx_id: &TransactionId) -> Result<HashMap<Address, (bool, i64)>> {
+/// The time is the verdict's **admission** time (its log entry's `created_at`),
+/// never the juror-signed [`cast_at`](JurorVerdict::cast_at) (ADR-0022 §1, §5): a
+/// party-asserted timestamp must not enter seat-window or ruling-time arithmetic, or
+/// a juror past their deadline could date a verdict back inside their lapsed seat.
+///
+/// Replay derivation: scans the log after `after_seq` (pass the dispute's admission
+/// `seq`; a verdict cannot precede the dispute it rules on) for verdicts naming this
+/// transaction, from a signer who is the juror they name, keeping the **first**
+/// admitted per juror (a verdict is final — a later one from the same juror is
+/// ignored). This is a thin read; whether a verdict *counts* is decided by the
+/// panel, which only credits a verdict whose juror holds a seat within their
+/// response window.
+pub fn verdicts(
+    db: &Database,
+    tx_id: &TransactionId,
+    after_seq: u64,
+) -> Result<HashMap<Address, (bool, i64)>> {
     let log = AppendLog::new(db);
     let mut out: HashMap<Address, (bool, i64)> = HashMap::new();
-    for entry in log.iter_from(1) {
+    for entry in log.iter_from(after_seq.saturating_add(1)) {
         let entry = entry?;
         let Ok(verdict) = from_canonical_bytes::<JurorVerdict>(&entry.payload.bytes) else {
             continue;
@@ -95,8 +110,12 @@ pub fn verdicts(db: &Database, tx_id: &TransactionId) -> Result<HashMap<Address,
         if verdict.proposal_id != *tx_id {
             continue;
         }
+        // The signer must be the named juror (defends a hostile log copy).
+        if Address::from_public_key(entry.payload.signer) != verdict.juror {
+            continue;
+        }
         out.entry(verdict.juror)
-            .or_insert((verdict.uphold, verdict.cast_at));
+            .or_insert((verdict.uphold, entry.created_at));
     }
     Ok(out)
 }

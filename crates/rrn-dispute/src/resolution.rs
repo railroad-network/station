@@ -2,7 +2,7 @@
 //! ballot, and enacting (or lapsing) a dispute.
 //!
 //! [`append_verdict`] is the jury write gate: it accepts a signed verdict only from
-//! a juror who holds a live seat as of the moment they cast it. [`open_escalation`]
+//! a juror who holds a live seat as of the verdict's admission (ADR-0022 §5). [`open_escalation`]
 //! and [`append_escalation_ballot`] are the escalation write gates (ADR-0014 §5): a
 //! party opens an escalation when the jury cannot seat a panel or to appeal its
 //! ruling, and established members vote on it. [`resolve`] is the read-then-enact
@@ -15,7 +15,7 @@
 
 use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_identity::address::Address;
-use rrn_ledger::engine::Engine;
+use rrn_ledger::engine::{Engine, CLOCK_SKEW_TOLERANCE_SECS};
 use rrn_ledger::settlement::{SettlementConfig, Settler};
 use rrn_ledger::state::{LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::TransactionId;
@@ -29,7 +29,7 @@ use crate::escalation::{
 use crate::panel::{resolve_panel, ruling_reached_at, tally, DisputeOutcome};
 use crate::sortition::{disputed_info, draw_sequence, eligible_pool, sortition_seed, DisputedInfo};
 use crate::verdict::{verdicts, SignedVerdict};
-use crate::{DisputeParams, Error, Result};
+use crate::{admission_instant, DisputeParams, Error, Result};
 
 /// The state of a dispute after a [`resolve`] pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,11 +69,17 @@ pub fn find_disputed(db: &Database, station: &PublicKey) -> Result<Vec<Transacti
 
 /// Records a juror's signed verdict, after checking they hold a live seat.
 ///
+/// Seats and windows are judged at the verdict's **admission** instant — the time
+/// the log will stamp it with — never the juror-signed `cast_at`, which is
+/// testimony (ADR-0022 §1, §3, §5). An old `cast_at` is legal (a verdict may be
+/// carried late); a late *admission* is not.
+///
 /// Errors — without writing — on a bad signature or signer/juror mismatch, a
 /// transaction that is not disputed, a second verdict from the same juror, a
-/// verdict cast after the resolution window closed, or a juror who does not occupy
-/// a live seat as of their `cast_at` (never drawn, already redrawn around, or past
-/// their own response deadline).
+/// verdict admitted after the resolution window closed, a `cast_at` dated into the
+/// future beyond the clock-skew tolerance, or a juror who does not occupy a live
+/// seat as of the admission (never drawn, already redrawn around, or past their
+/// own response deadline).
 pub fn append_verdict(
     db: &Database,
     founders: &[Address],
@@ -97,23 +103,26 @@ pub fn append_verdict(
     }
 
     let info = disputed_info(db, &proposal_id, station)?;
-    // A verdict cannot predate the dispute, be dated into the future, or land
-    // after the resolution window has closed (the dispute is lapsing by then).
-    if cast_at < info.opened_at
-        || cast_at > now
-        || cast_at > info.opened_at.saturating_add(params.window_seconds)
+    let admitted_at = admission_instant(db, now)?;
+    // A verdict cannot be dated into the future (beyond clock skew), nor be
+    // admitted after the resolution window has closed (the dispute is lapsing by
+    // then). The signed `cast_at` is bounded only from above; it enters no window.
+    if cast_at > admitted_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS)
+        || admitted_at > info.opened_at.saturating_add(params.window_seconds)
     {
         return Err(Error::NotSeated);
     }
 
-    let existing = verdicts(db, &proposal_id)?;
+    let existing = verdicts(db, &proposal_id, info.opened_seq)?;
     if existing.contains_key(&juror) {
         return Err(Error::AlreadyVoted);
     }
 
-    // Re-derive the panel as of the verdict's own instant. The juror must occupy a
+    // Re-derive the panel as of the verdict's admission. The juror must occupy a
     // seat that is still awaiting a verdict then — which also proves they are
     // within their response window (a lapsed occupant would have been redrawn).
+    // Replay reads the same admission time from the log entry, so a verdict this
+    // gate admits counts identically on replay.
     let pool = eligible_pool(
         db,
         founders,
@@ -124,7 +133,7 @@ pub fn append_verdict(
         station,
     )?;
     let sequence = draw_sequence(&pool, sortition_seed(&proposal_id, anchor));
-    let panel = resolve_panel(&sequence, &existing, info.opened_at, params, cast_at);
+    let panel = resolve_panel(&sequence, &existing, info.opened_at, params, admitted_at);
     match panel.seat_of(&juror) {
         Some(seat) if seat.verdict.is_none() => {}
         _ => return Err(Error::NotSeated),
@@ -168,14 +177,15 @@ pub fn open_escalation(
     if escalation_of(db, &record.proposal_id)?.is_some() {
         return Err(Error::AlreadyEscalated);
     }
-    // Applicability is judged at the admission instant — this record is about to be
-    // appended at `now`, so `now` *is* its admission time (ADR-0022 §5). The signed
-    // `opened_at` is testimony and enters no window arithmetic; a future-dated one is
-    // still rejected as plainly bogus, but that is input hygiene, not a freshness
-    // floor (ADR-0022 drops the floor: an old `opened_at` may be legitimately carried).
+    // Applicability is judged at the admission instant — the time the log will stamp
+    // this record with (ADR-0022 §5). The signed `opened_at` is testimony and enters
+    // no window arithmetic; a future-dated one is still rejected as plainly bogus,
+    // but that is input hygiene, not a freshness floor (ADR-0022 drops the floor: an
+    // old `opened_at` may be legitimately carried).
     if record.opened_at > now {
         return Err(Error::NotEscalatable);
     }
+    let admitted_at = admission_instant(db, now)?;
 
     let jury = jury_view(
         db,
@@ -184,10 +194,10 @@ pub fn open_escalation(
         &info,
         params,
         anchor,
-        now,
+        admitted_at,
         station,
     )?;
-    if !escalation_applies(&record, now, &info, &jury, params) {
+    if !escalation_applies(&record, admitted_at, &info, &jury, params) {
         return Err(Error::NotEscalatable);
     }
 
@@ -201,9 +211,13 @@ pub fn open_escalation(
 /// Errors — without writing — on a bad signature or signer/voter mismatch
 /// ([`Error::BadBallot`]); a transaction that is not disputed
 /// ([`Error::NotDisputed`]); no open escalation ([`Error::NotEscalated`]); a voter
-/// who is not in the escalation electorate or a ballot cast outside the escalation
-/// window ([`Error::NotEligible`]); or a second ballot from the same voter
+/// who is not in the escalation electorate, a ballot admitted outside the
+/// escalation window, or a `cast_at` dated into the future beyond the clock-skew
+/// tolerance ([`Error::NotEligible`]); or a second ballot from the same voter
 /// ([`Error::AlreadyVoted`]).
+///
+/// The window is judged at the ballot's **admission** instant, never the
+/// voter-signed `cast_at`, which is testimony (ADR-0022 §1, §3, §5).
 pub fn append_escalation_ballot(
     db: &Database,
     founders: &[Address],
@@ -228,12 +242,16 @@ pub fn append_escalation_ballot(
     let close = escalation_close(esc_admitted_at, &info, params);
 
     let electorate = escalation_electorate(db, founders, &info, esc_admitted_at, esc_seq, station)?;
-    if !electorate.contains(&voter) || cast_at < esc_admitted_at || cast_at > close || cast_at > now
+    let admitted_at = admission_instant(db, now)?;
+    if !electorate.contains(&voter)
+        || admitted_at < esc_admitted_at
+        || admitted_at > close
+        || cast_at > admitted_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS)
     {
         return Err(Error::NotEligible);
     }
 
-    if escalation_ballots(db, &proposal_id)?.contains_key(&voter) {
+    if escalation_ballots(db, &proposal_id, esc_seq)?.contains_key(&voter) {
         return Err(Error::AlreadyVoted);
     }
 
@@ -350,7 +368,7 @@ fn decide(
 struct JuryView {
     /// The tallied outcome, once a majority of seated jurors agree.
     outcome: Option<DisputeOutcome>,
-    /// When the ruling formed (the deciding verdict's instant), if it has.
+    /// When the ruling formed (the deciding verdict's admission time), if it has.
     ruled_at: Option<i64>,
     /// How many members were eligible for the draw.
     pool_len: usize,
@@ -380,7 +398,7 @@ fn jury_view(
         station,
     )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
-    let existing = verdicts(db, tx_id)?;
+    let existing = verdicts(db, tx_id, info.opened_seq)?;
     let panel = resolve_panel(&sequence, &existing, info.opened_at, params, now);
     Ok(JuryView {
         outcome: tally(&panel, params),
@@ -447,7 +465,7 @@ fn decide_escalation(
         return Ok(Resolution::EscalationPending);
     }
     let electorate = escalation_electorate(db, founders, info, admitted_at, admitted_seq, station)?;
-    let ballots = escalation_ballots(db, tx_id)?;
+    let ballots = escalation_ballots(db, tx_id, admitted_seq)?;
     let tallied = count_escalation(&ballots, &electorate, params, admitted_at, close);
     Ok(match tallied.terminal_outcome() {
         Some(DisputeOutcome::Upheld) => Resolution::EscalationUpheld,

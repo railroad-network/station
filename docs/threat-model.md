@@ -989,7 +989,27 @@ transition; the derivability of all state from the log.
   window, signed `opened_at` diverging in both directions) and
   `jury.rs::escalation_opened_at_is_ignored_for_the_window_and_electorate` (a
   backdated escalation whose ballot lands outside the lie's window but inside the
-  admitted one still counts). Beyond the *time* anchor, the *membership*
+  admitted one still counts). **Verdicts and ballots are anchored the same
+  way.** A juror verdict and an escalation ballot count, seat, and time a ruling
+  by their log entry's admission time; the signed `cast_at` is testimony, refused
+  only when future-dated beyond `CLOCK_SKEW_TOLERANCE_SECS`. A juror past their
+  response deadline is refused even if they date the verdict inside it, and the
+  appeal window runs from the majority verdict's admission. The write gates judge
+  at the instant the log will stamp (the monotone clamp of ADR-0022 §6) and replay
+  reads the stamped value, so a gated record counts identically on replay; a
+  verdict or ballot put on the log without the gate is judged by the same rule
+  (so a late one is inert), and
+  `verdicts`/`escalation_ballots` count only entries after the dispute or
+  escalation they answer, signed by the juror or voter they name. The
+  equivocation ballot carries the same future-dating bound. Regression coverage:
+  `jury.rs::a_late_juror_cannot_backdate_a_verdict_into_their_lapsed_seat`,
+  `a_raw_appended_backdated_verdict_is_inert_on_replay`,
+  `jurors_cannot_backdate_a_ruling_to_erase_the_appeal_window`,
+  `a_late_voter_cannot_backdate_an_escalation_ballot`,
+  `a_future_dated_verdict_is_refused_and_an_old_one_is_admitted`,
+  `a_verdict_entry_before_the_dispute_does_not_count`, and
+  `equivocation.rs::a_future_dated_equivocation_ballot_is_refused`. Beyond the
+  *time* anchor, the *membership*
   computations are now **prefix-bounded at the anchoring admission seq**: the jury
   pool, its recusal (voucher) graph, and every draw weight are computed over the
   log prefix ending at the dispute entry's seq; the escalation electorate over the

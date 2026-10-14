@@ -7,6 +7,7 @@ use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
+use rrn_ledger::engine::CLOCK_SKEW_TOLERANCE_SECS;
 use rrn_ledger::escrow::{
     CertId, CertificateRequest, EquivocationBasis, EquivocationId, EquivocationRecord,
     EvidenceItem, HeadroomCertificate, VerdictDecision,
@@ -812,4 +813,34 @@ impl Fixture {
         let req = CertificateRequest::new(addr(&self.subject), CAP, 100, T);
         HeadroomCertificate::new(addr(&self.subject), CAP, req.request_id, T, T + 1_000_000).cert_id
     }
+}
+
+#[test]
+fn a_future_dated_equivocation_ballot_is_refused() {
+    let fx = setup();
+    // A seated juror (members[2..5] sit) dates a ballot beyond the clock-skew
+    // tolerance: refused (ADR-0022 §3)...
+    assert!(matches!(
+        cast(
+            &fx.db,
+            fx.id,
+            &fx.members[2],
+            0,
+            VerdictDecision::Confirm,
+            T + 10 + CLOCK_SKEW_TOLERANCE_SECS + 1,
+            T + 10
+        ),
+        Err(Error::NotSeated)
+    ));
+    // ...while the same juror's honestly dated ballot is admitted.
+    cast(
+        &fx.db,
+        fx.id,
+        &fx.members[2],
+        0,
+        VerdictDecision::Confirm,
+        T + 10,
+        T + 10,
+    )
+    .unwrap();
 }
