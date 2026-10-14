@@ -151,9 +151,9 @@ separate decision (Phase 2, likely libp2p) and is not settled here.
 
 ## Clarification (2026-10-14) — pairing commits before it reveals; channel replies are bound to their request
 
-*Proposed 2026-10-14; not in force until the maintainer ratifies it. Part A
-is in force with the change that implements the new handshake; Part B with
-the change that implements reply binding.*
+*Ratified by the maintainer on 2026-10-14. Part A is in force with the change
+that implements the new handshake; Part B with the change that implements
+reply binding.*
 
 The internal security review of October 2026 found two gaps in what this ADR
 promises. **RRN-A-023:** the confirmation code was the first eight hex
@@ -186,7 +186,11 @@ security boundary.
    refuses a finish whose nonce does not open the commitment. Neither side can
    choose its nonce after seeing the other's: the mobile's is fixed by the
    commitment before the station's is known, and the station's is fixed by its
-   signed offer before the mobile's is revealed.
+   signed offer before the mobile's is revealed. A replayed start cannot
+   evict a session: a start that repeats the session's commitment is answered
+   idempotently while the reveal is awaited and refused once it has happened,
+   and a start with a different commitment replaces the session only if its
+   `requested_at` is later than the session's.
 2. **The code** is derived from both static keys and both nonces,
    `blake3("rrn-pair-code-v2" ‖ station_pk ‖ mobile_pk ‖ mobile_nonce ‖ station_nonce)`,
    rendered as **10 Crockford base32 characters** (`XXXXX-XXXXX`, 50 bits). It

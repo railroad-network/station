@@ -166,11 +166,17 @@ The station holds pending sessions in memory only, keyed by mobile address:
 - **AwaitingOperator** `{code}` — after a valid finish.
 
 Each session expires 300 seconds after it entered its current stage (the
-reveal resets the clock). A new start for an address replaces that address's
-session, except when its commitment equals the current one: a session still
-awaiting its reveal answers with the same offer (a retried start is
-idempotent), and a session awaiting the operator refuses it as a replay and
-is kept. The operator's pending list (`station pair-mobile` with no address)
+reveal resets the clock). When a start arrives for an address that already
+has an unexpired session:
+
+- **Same commitment:** a session still awaiting its reveal answers with the
+  same offer (a retried start is idempotent); a session awaiting the operator
+  refuses it as a replay and is kept.
+- **Different commitment:** it replaces the session only if its
+  `requested_at` is strictly later than the current session's; otherwise it is
+  refused as a replay and the session is kept. A captured older start from the
+  same device therefore cannot evict a newer session. (A device that restarts
+  pairing within the same second waits a second and tries again.) The operator's pending list (`station pair-mobile` with no address)
 shows only sessions awaiting the operator, as address, code, and age.
 
 The operator confirms with `station pair-mobile <address> --code <code>`
@@ -198,7 +204,7 @@ which a client may show to the user.
 | `request names a different station` | 400 | finish only: `station_address` is not this station |
 | `no pairing in progress for this address; start again` | 400 | finish only: no session awaiting a reveal (never started, expired, or already revealed) |
 | `revealed nonce does not open the commitment` | 400 | finish only |
-| `pairing request already used` | 400 | start only: same commitment as a session already awaiting the operator |
+| `pairing request already used` | 400 | start only: same commitment as a session already awaiting the operator, or a different commitment not later than the current session's `requested_at` |
 | `pairing protocol v1 is retired; update the app` | 410 | `POST /pair` |
 | `station unavailable` | 503 | the station is shutting down |
 
