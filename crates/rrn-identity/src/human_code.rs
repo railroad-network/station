@@ -9,7 +9,8 @@
 //!
 //! The rendering is a cross-implementation contract: the phone reaches it
 //! through the mobile FFI rather than re-implementing it, and
-//! `docs/spec/pairing.md` pins it.
+//! `docs/spec/pairing.md` (the pairing code) and `docs/spec/vmk-boot-ceremony.md`
+//! (the recovery-ceremony fingerprint) pin it.
 
 /// Crockford base32: digits, then the uppercase letters without `I`, `L`, `O`,
 /// and `U`.

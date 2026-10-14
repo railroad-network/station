@@ -659,7 +659,13 @@ fn cmd_recover(
     eprintln!("or paste this line to each holder:");
     eprintln!("{request_line}\n");
     eprintln!("Ceremony fingerprint: {}", session.fingerprint());
-    eprintln!("Every holder must see this exact code on their screen before responding.\n");
+    eprintln!(
+        "Read all four groups aloud. Every holder must see exactly this code before responding."
+    );
+    eprintln!(
+        "A holder who got the request as a message reads the code back to you by voice; \
+         never send the code with the request.\n"
+    );
     eprintln!(
         "Paste each holder's response line below as it comes in. Press Enter on an empty line \
          when you have enough:"

@@ -209,8 +209,9 @@ needs its own ADR.
 
 ## Clarification (2026-10-14) — the ceremony fingerprint commits to the whole request and is 80 bits
 
-*Proposed 2026-10-14 — awaiting maintainer ratification. In force, once
-ratified, with the change that implements it.*
+*Ratified by the maintainer on 2026-10-14 (the construction as written, and
+relayed ceremonies kept with a full read-back); in force with the change that
+implements it.*
 
 This supersedes the fingerprint paragraph ("Holder confirmation is procedural…")
 of the 2026-09-17 Clarification, which stays above as the record of what shipped

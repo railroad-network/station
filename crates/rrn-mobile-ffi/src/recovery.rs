@@ -226,8 +226,10 @@ pub fn parse_recovery_request(
 pub struct RecoveryRequestInfo {
     /// The `rrn1…` address of the identity being recovered.
     pub target_address: String,
-    /// The ceremony fingerprint (`xxxxx-xxxxx`) the holder confirms out-of-band
-    /// against the requester's screen before contributing a share (ADR-0016).
+    /// The ceremony fingerprint (`XXXX-XXXX-XXXX-XXXX`, 80 bits over the whole
+    /// request) the holder confirms against the requester's screen — all four
+    /// groups, in person or read back by voice — before contributing a share
+    /// (ADR-0016). Display it as given; never recompute it in the app.
     pub fingerprint: String,
 }
 
@@ -266,8 +268,9 @@ impl RecoverySession {
             .to_bytes()
     }
 
-    /// The ceremony fingerprint (`xxxxx-xxxxx`) to display in large type so every
-    /// holder can confirm they are helping the same recovery.
+    /// The ceremony fingerprint (`XXXX-XXXX-XXXX-XXXX`) to display in large type
+    /// so every holder can confirm, all four groups, that they are helping the
+    /// same recovery (ADR-0016).
     pub fn fingerprint(&self) -> String {
         self.inner
             .lock()

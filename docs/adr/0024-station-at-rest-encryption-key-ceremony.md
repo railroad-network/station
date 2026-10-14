@@ -386,8 +386,8 @@ converge to contribute shards. Rough MTTR: where holders are co-located
 
 ## Clarification (2026-10-14) — the console fingerprint is the ceremony fingerprint
 
-*Proposed 2026-10-14 — awaiting maintainer ratification. In force, once
-ratified, with the change that implements it.*
+*Ratified by the maintainer on 2026-10-14; in force with the change that
+implements it.*
 
 Decision step 1 of the boot ceremony has `station unlock` show "a short
 **ceremony fingerprint** on the physical console", and step 2 makes the holder's

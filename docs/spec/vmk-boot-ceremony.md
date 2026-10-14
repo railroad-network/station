@@ -1,10 +1,5 @@
 # Ceremony fingerprint (ADR-0016, ADR-0024)
 
-> **Draft, awaiting ratification** of the 2026-10-14 Clarifications to ADR-0016
-> and ADR-0024. Until the change that implements them lands, the shipped code
-> still uses the earlier fingerprints. The vector values below are filled in
-> from that implementation.
-
 Every key-recovery ceremony runs the same way: the requester mints an ephemeral
 recovery keypair, publishes a `rrnrecover-req:` request (a `RecoveryRequest`,
 `rrn_identity::recovery::ceremony`), and collects holders' `rrnrecover-resp:`
@@ -100,10 +95,10 @@ fixture byte-for-byte and asserts the code its screens display.
 
 | input | value |
 | --- | --- |
-| recovery key | Ed25519 public key derived from the 32-byte seed `01 01 … 01` |
-| target | the address of the Ed25519 public key derived from the seed `02 02 … 02` (a VMK address) |
-| `request_bytes` | TBD |
-| **fingerprint** | TBD |
+| recovery key | Ed25519 public key derived from the 32-byte seed `01 01 … 01`: `8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c` |
+| target | the address of the Ed25519 public key derived from the seed `02 02 … 02` (a VMK address): `rrn1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qtx73gq` |
+| `request_bytes` | `a262726b58208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c646164647258208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394` |
+| **fingerprint** | `E26N-ZE0W-1TX8-Z4KF` |
 
 This vector is the fixture's `vmk-spec-vector`, and `rrn-station`'s
 `vmk::tests::fingerprint_pinned_spec_vector` asserts it.

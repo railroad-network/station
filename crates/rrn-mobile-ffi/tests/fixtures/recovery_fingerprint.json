@@ -1,16 +1,40 @@
 {
+  "construction": "blake3(\"rrn.ceremony.fingerprint.v2\" ‖ request canonical bytes), first 80 bits, Crockford base32, 4×4",
   "vectors": [
     {
+      "label": "member-0",
       "recovery_pubkey_hex": "8063ddeabce8ac10e97e5488548f69121a3d2cbc732b2feea38aa7d2d1ef9c93",
-      "fingerprint": "3dffd-e60ea"
+      "target_address": "rrn1w7kqyvxunn5hptvgjfl825f2etac90hmt4vgg2aplfa2pftdp5yss3h85r",
+      "request_hex": "a262726b58208063ddeabce8ac10e97e5488548f69121a3d2cbc732b2feea38aa7d2d1ef9c936461646472582077ac0230dc9ce970ad88927e75512acafb82befb5d58842ba1fa7aa0a56d0d09",
+      "fingerprint": "47TF-5080-RBVQ-DNH3"
     },
     {
+      "label": "member-1",
       "recovery_pubkey_hex": "7bdf95d042dc4914b5d4066952800659e99f95b3fba3c83cffd0ada931bade92",
-      "fingerprint": "9138c-c208d"
+      "target_address": "rrn1yhhqu4fs03ulxltarc3g0lf5frzvqrtwafysmgdt9g7zh4ylnhjq859ttk",
+      "request_hex": "a262726b58207bdf95d042dc4914b5d4066952800659e99f95b3fba3c83cffd0ada931bade926461646472582025ee0e55307c79f37d7d1e2287fd3448c4c00d6eea490da1ab2a3c2bd49f9de4",
+      "fingerprint": "04HE-WHK2-7NV0-R011"
     },
     {
+      "label": "member-2",
       "recovery_pubkey_hex": "78de4b916e69aa6ab6fb8580c4f0b8112b9c9eca9c2e1cc0baf47e404129afa3",
-      "fingerprint": "0d429-7a763"
+      "target_address": "rrn1zhjpkdwf2f5kvsmhpx0cc5z3d7w446tm0zd9xc9xm5zsmal3c8rquhuxj4",
+      "request_hex": "a262726b582078de4b916e69aa6ab6fb8580c4f0b8112b9c9eca9c2e1cc0baf47e404129afa36461646472582015e41b35c95269664377099f8c50516f9d5ae97b789a5360a6dd050df7f1c1c6",
+      "fingerprint": "92Q5-CYWZ-Q5PT-NQTQ"
+    },
+    {
+      "label": "member-0-other-target",
+      "recovery_pubkey_hex": "8063ddeabce8ac10e97e5488548f69121a3d2cbc732b2feea38aa7d2d1ef9c93",
+      "target_address": "rrn1knz6ufzyt94g03s4ld8pt694c9nt5m7dc233tumvke508ey5sglsq87aax",
+      "request_hex": "a262726b58208063ddeabce8ac10e97e5488548f69121a3d2cbc732b2feea38aa7d2d1ef9c9364616464725820b4c5ae2444596a87c615fb4e15e8b5c166ba6fcdc2a315f36cb668f3e494823f",
+      "fingerprint": "AWGH-JVK6-FZX7-018T"
+    },
+    {
+      "label": "vmk-spec-vector",
+      "recovery_pubkey_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "target_address": "rrn1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qtx73gq",
+      "request_hex": "a262726b58208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c646164647258208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "fingerprint": "E26N-ZE0W-1TX8-Z4KF"
     }
   ]
 }

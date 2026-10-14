@@ -319,8 +319,8 @@ enum RecoveryError {
 
 // Non-secret description of a recovery request, for a holder's confirm screen
 // (via `parse_recovery_request`). Names the identity being recovered and the
-// ceremony `fingerprint` (xxxxx-xxxxx) the holder confirms against the
-// requester's screen out-of-band before contributing a share (ADR-0016).
+// ceremony `fingerprint` (XXXX-XXXX-XXXX-XXXX) the holder confirms against the
+// requester's screen, all four groups, before contributing a share (ADR-0016).
 dictionary RecoveryRequestInfo {
     string target_address;
     string fingerprint;
@@ -341,8 +341,8 @@ interface RecoverySession {
     // The request bytes to render as a `rrnrecover-req:<base64>` QR.
     bytes request_payload();
 
-    // The ceremony fingerprint (xxxxx-xxxxx) to show in large type; every holder
-    // must see this exact code.
+    // The ceremony fingerprint (XXXX-XXXX-XXXX-XXXX) to show in large type;
+    // every holder must see this exact code.
     string fingerprint();
 
     // Opens a scanned holder response and adds it, returning the count gathered

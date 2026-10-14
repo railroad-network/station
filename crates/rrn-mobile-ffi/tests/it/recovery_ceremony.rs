@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use rrn_crypto::hash::Hash;
 use rrn_crypto::keypair::{Keypair, SecretKey};
+use rrn_identity::address::Address;
 use rrn_identity::recovery::ceremony::{fingerprint, RecoveryRequest};
 use rrn_mobile_ffi::{
     parse_recovery_request, respond_to_recovery, RecoveryError, RecoveryPackage, RecoverySession,
@@ -40,16 +41,33 @@ fn keypair(label: &str, i: u32) -> Keypair {
 
 // --- fixture ----------------------------------------------------------------
 
+/// The construction, stated in the fixture so a reader on either platform sees
+/// what the vectors pin (`docs/spec/vmk-boot-ceremony.md`).
+const CONSTRUCTION: &str = "blake3(\"rrn.ceremony.fingerprint.v2\" ‖ request canonical bytes), \
+                            first 80 bits, Crockford base32, 4×4";
+
+/// The fixture's `vmk-spec-vector` value, also pinned by the spec and by
+/// `rrn-station`'s `vmk::tests::fingerprint_pinned_spec_vector`.
+const VMK_SPEC_FINGERPRINT: &str = "E26N-ZE0W-1TX8-Z4KF";
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct FingerprintVector {
-    /// The ephemeral recovery public key, hex — the only input to the code.
+    /// What the vector exercises.
+    label: String,
+    /// The ephemeral recovery public key, hex.
     recovery_pubkey_hex: String,
-    /// The rendered `xxxxx-xxxxx` fingerprint.
+    /// The identity the request targets (`rrn1…`).
+    target_address: String,
+    /// The request's canonical bytes, hex — what the app decodes from the QR,
+    /// and what the fingerprint hashes.
+    request_hex: String,
+    /// The rendered `XXXX-XXXX-XXXX-XXXX` fingerprint.
     fingerprint: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Fixture {
+    construction: String,
     vectors: Vec<FingerprintVector>,
 }
 
@@ -57,27 +75,52 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recovery_fingerprint.json")
 }
 
-/// Builds the fixture deterministically: three fixed ephemeral keys and the
-/// fingerprint each yields. The target address does not affect the code (the
-/// fingerprint binds the ephemeral key only), so a fixed placeholder is used.
+fn vector(label: &str, recovery: &Keypair, target: Address) -> FingerprintVector {
+    let request = RecoveryRequest {
+        recovery_pubkey: recovery.public_key(),
+        target_address: target,
+    };
+    FingerprintVector {
+        label: label.to_string(),
+        recovery_pubkey_hex: hex::encode(recovery.public_key().to_bytes()),
+        target_address: target.to_string(),
+        request_hex: hex::encode(request.to_bytes()),
+        fingerprint: fingerprint(&request),
+    }
+}
+
+fn address(kp: &Keypair) -> Address {
+    Address::from_public_key(kp.public_key())
+}
+
+/// Builds the fixture deterministically: three member ceremonies (distinct
+/// recovery keys and distinct targets), one that reuses the first recovery key
+/// against a different target (its code must differ — the fingerprint binds the
+/// target), and the spec's VMK unlock vector.
 fn build_fixture() -> Fixture {
-    let target = rrn_identity::address::Address::from_public_key(
-        keypair("recovery-fingerprint-target", 0).public_key(),
-    );
-    let vectors = (0..3)
+    let mut vectors: Vec<FingerprintVector> = (0..3)
         .map(|i| {
-            let recovery = keypair("recovery-fingerprint", i);
-            let request = RecoveryRequest {
-                recovery_pubkey: recovery.public_key(),
-                target_address: target,
-            };
-            FingerprintVector {
-                recovery_pubkey_hex: hex::encode(recovery.public_key().to_bytes()),
-                fingerprint: fingerprint(&request),
-            }
+            vector(
+                &format!("member-{i}"),
+                &keypair("recovery-fingerprint", i),
+                address(&keypair("recovery-fingerprint-target", i)),
+            )
         })
         .collect();
-    Fixture { vectors }
+    vectors.push(vector(
+        "member-0-other-target",
+        &keypair("recovery-fingerprint", 0),
+        address(&keypair("recovery-fingerprint-target", 3)),
+    ));
+    vectors.push(vector(
+        "vmk-spec-vector",
+        &Keypair::from_secret(SecretKey::from_bytes([1u8; 32])),
+        address(&Keypair::from_secret(SecretKey::from_bytes([2u8; 32]))),
+    ));
+    Fixture {
+        construction: CONSTRUCTION.to_string(),
+        vectors,
+    }
 }
 
 fn load_committed() -> Fixture {
@@ -104,19 +147,25 @@ fn fingerprint_fixture_is_stable_across_platforms() {
     );
 
     // The FFI's `parse_recovery_request` must surface exactly the committed code
-    // for each vector: this is the value the mobile UI shows the operator.
-    let target = rrn_identity::address::Address::from_public_key(
-        keypair("recovery-fingerprint-target", 0).public_key(),
-    );
-    for (i, v) in committed.vectors.iter().enumerate() {
-        let recovery = keypair("recovery-fingerprint", i as u32);
-        let request = RecoveryRequest {
-            recovery_pubkey: recovery.public_key(),
-            target_address: target,
-        };
-        let info = parse_recovery_request(request.to_bytes()).unwrap();
-        assert_eq!(info.fingerprint, v.fingerprint);
+    // and target for each vector's request bytes: this is what a holder's screen
+    // shows.
+    for v in &committed.vectors {
+        let info = parse_recovery_request(hex::decode(&v.request_hex).unwrap()).unwrap();
+        assert_eq!(info.fingerprint, v.fingerprint, "{}", v.label);
+        assert_eq!(info.target_address, v.target_address, "{}", v.label);
     }
+
+    // Same recovery key, different target: a different ceremony, a different code.
+    let by_label = |l: &str| committed.vectors.iter().find(|v| v.label == l).unwrap();
+    let (base, other) = (by_label("member-0"), by_label("member-0-other-target"));
+    assert_eq!(base.recovery_pubkey_hex, other.recovery_pubkey_hex);
+    assert_ne!(base.fingerprint, other.fingerprint);
+
+    // The VMK vector is the value the spec and the station's unlock test pin.
+    assert_eq!(
+        by_label("vmk-spec-vector").fingerprint,
+        VMK_SPEC_FINGERPRINT
+    );
 }
 
 // --- full requester round trip ---------------------------------------------

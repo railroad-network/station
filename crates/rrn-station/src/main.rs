@@ -131,7 +131,7 @@ enum Command {
     },
     /// Run the boot ceremony and unlock (mount) the encrypted state volume, so the
     /// daemon can then be started (ADR-0024). Linux only. Prints a request QR and a
-    /// console fingerprint for holders to confirm, then reads their responses.
+    /// ceremony fingerprint for holders to confirm, then reads their responses.
     Unlock,
     /// Manage the Volume Master Key custody (encrypted profile, ADR-0024).
     Vmk {
@@ -359,8 +359,15 @@ fn cmd_unlock(data_dir: &std::path::Path) -> Result<()> {
         "Unlocking the encrypted state volume for VMK {}",
         descriptor.vmk_address
     );
-    eprintln!("\nConsole fingerprint (read this aloud so holders confirm it before responding):");
-    eprintln!("    {fingerprint}\n");
+    eprintln!("\nCeremony fingerprint:");
+    eprintln!("    {fingerprint}");
+    eprintln!(
+        "Read all four groups aloud. Every holder must see exactly this code before responding."
+    );
+    eprintln!(
+        "A holder who got the request as a message reads the code back to you by voice; \
+         never send the code with the request.\n"
+    );
     eprintln!(
         "Have each of {} holders scan this request in their wallet's \"help recover\" flow:\n",
         descriptor.threshold
@@ -412,8 +419,13 @@ fn cmd_vmk_refresh(
         "Re-splitting VMK {} to a new holder set",
         descriptor.vmk_address
     );
+    eprintln!("\nCeremony fingerprint:\n    {fingerprint}");
     eprintln!(
-        "\nConsole fingerprint (holders confirm this before responding):\n    {fingerprint}\n"
+        "Read all four groups aloud. Every holder must see exactly this code before responding."
+    );
+    eprintln!(
+        "A holder who got the request as a message reads the code back to you by voice; \
+         never send the code with the request.\n"
     );
     eprintln!(
         "Have {} current holders scan this request:\n",
@@ -733,7 +745,13 @@ fn cmd_recovery_restore(
     println!("{}", rrn_station::recovery::render_qr(&request_qr));
     eprintln!("(or send them this line: {request_qr})\n");
     println!("Ceremony fingerprint: {}", session.fingerprint());
-    eprintln!("Every holder must see this exact code on their screen before responding.\n");
+    eprintln!(
+        "Read all four groups aloud. Every holder must see exactly this code before responding."
+    );
+    eprintln!(
+        "A holder who got the request as a message reads the code back to you by voice; \
+         never send the code with the request.\n"
+    );
     eprintln!(
         "Paste each holder's response line below as it comes in. Press Enter on an empty line \
          when you have enough:"
