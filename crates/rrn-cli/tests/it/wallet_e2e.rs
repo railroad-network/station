@@ -183,15 +183,21 @@ async fn init_wallet(dir: &Path, name: &str, station: &str) -> (PathBuf, String)
     (home, addr)
 }
 
-/// Pairs `home` to the harness and confirms it over the operator socket.
+/// Pairs `home` to the harness and confirms it over the operator socket with
+/// the code `rrn wallet pair` printed, as the operator would type it.
 async fn pair_and_confirm(h: &Harness, home: &Path, member_addr: &str) {
-    wjson(home, &["pair", "--url", &h.url]).await;
-    socket_call(
+    let paired = wjson(home, &["pair", "--url", &h.url]).await;
+    let code = paired["code"].as_str().expect("pair prints a code");
+    assert_eq!(code.len(), 11, "XXXXX-XXXXX: {code}");
+    assert_eq!(code.as_bytes()[5], b'-');
+    assert!(paired.get("sas").is_none());
+    let confirmed = socket_call(
         &h.client(),
         "pair_confirm",
-        serde_json::json!({ "address": member_addr }),
+        serde_json::json!({ "address": member_addr, "code": code }),
     )
     .await;
+    assert_eq!(confirmed["address"], member_addr, "{confirmed}");
 }
 
 /// The number of pending outbox rows for `member_addr` in the wallet's own db.

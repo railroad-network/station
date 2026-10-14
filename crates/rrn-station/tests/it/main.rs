@@ -12,7 +12,6 @@ mod cross_platform_contract;
 mod cross_platform_inquiry;
 mod cross_platform_listing;
 mod cross_platform_listing_update;
-mod cross_platform_pairing;
 mod cross_platform_vouch;
 #[cfg(unix)]
 mod field_test_lora_dryrun;

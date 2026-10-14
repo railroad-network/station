@@ -111,24 +111,24 @@ async fn socket_rpc(socket: &Path, method: &str, params: serde_json::Value) -> s
 
 /// Pairs `mobile` with the station through the promoted [`ChannelClient`] — the
 /// same client the CLI wallet uses (ADR-0028) — then confirms it over the
-/// operator socket. Exercising the module here proves it produces bytes the
-/// station's real `/pair` accepts and that its pin/signature checks pass against
-/// a real station reply.
+/// operator socket with the code the client computed. Exercising the module
+/// here proves it produces bytes the station's real pairing routes accept and
+/// that its pin/signature checks pass against a real station offer.
 async fn pair_mobile(socket: &Path, station_pk: &PublicKey, mobile: &Keypair) {
     let client = ChannelClient::new(format!("127.0.0.1:{MOBILE_PORT}"), *station_pk);
-    let response = client
+    let outcome = client
         .pair(mobile, now_secs())
         .await
         .expect("pair accepted and verified against the pin");
     assert_eq!(
-        response.station_address,
+        outcome.station_address,
         Address::from_public_key(*station_pk).to_string()
     );
     let addr = Address::from_public_key(mobile.public_key()).to_string();
     let confirmed = socket_rpc(
         socket,
         "pair_confirm",
-        serde_json::json!({ "address": addr }),
+        serde_json::json!({ "address": addr, "code": outcome.code }),
     )
     .await;
     assert_eq!(confirmed["result"]["address"], addr);

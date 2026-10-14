@@ -16,8 +16,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rrn_crypto::hash::Hasher;
-use rrn_crypto::keypair::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// File under the station data dir that holds the paired list.
@@ -145,32 +143,9 @@ impl PairedMobiles {
     }
 }
 
-/// Domain-separation tag for the pairing SAS, so this hash can never collide
-/// with any other blake3 use in the system.
-const SAS_TAG: &[u8] = b"rrn-pair-sas-v1";
-
-/// The 8-hex-char short authenticated string both sides display so a human can
-/// confirm the pair in person (ADR-0008).
-///
-/// Derived from **both** static public keys, so it authenticates the pair rather
-/// than a rotatable credential: a network man-in-the-middle would have to
-/// present its own key and could not reproduce this code. The input order is
-/// fixed — station key first, then mobile key — so the station and the mobile
-/// compute an identical value; this ordering is the cross-implementation
-/// contract the mobile's `Pairing` seam must match exactly.
-pub fn confirmation_code(station: &PublicKey, mobile: &PublicKey) -> String {
-    let mut hasher = Hasher::new();
-    hasher.update(SAS_TAG);
-    hasher.update(&station.to_bytes());
-    hasher.update(&mobile.to_bytes());
-    let hex = hasher.finalize().to_hex();
-    hex[..8].to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rrn_crypto::keypair::Keypair;
 
     fn tmp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
@@ -258,30 +233,5 @@ mod tests {
         // Re-pairing the same address starts the window over.
         paired.add("rrn1alice".to_string(), 2_000);
         assert!(paired.accept_nonce("rrn1alice", 1));
-    }
-
-    #[test]
-    fn confirmation_code_is_stable_and_order_fixed() {
-        let station = Keypair::generate().public_key();
-        let mobile = Keypair::generate().public_key();
-
-        let code = confirmation_code(&station, &mobile);
-        assert_eq!(code.len(), 8);
-        assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
-        // Deterministic for the same pair.
-        assert_eq!(code, confirmation_code(&station, &mobile));
-        // Order is load-bearing: swapping the keys is a different pair.
-        assert_ne!(code, confirmation_code(&mobile, &station));
-    }
-
-    #[test]
-    fn confirmation_code_differs_per_pair() {
-        let station = Keypair::generate().public_key();
-        let m1 = Keypair::generate().public_key();
-        let m2 = Keypair::generate().public_key();
-        assert_ne!(
-            confirmation_code(&station, &m1),
-            confirmation_code(&station, &m2)
-        );
     }
 }

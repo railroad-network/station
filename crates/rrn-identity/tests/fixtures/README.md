@@ -61,6 +61,31 @@ cp crates/rrn-identity/tests/fixtures/cross_platform_wallet.json \
    ../mobile/__tests__/fixtures/cross_platform_wallet.json
 ```
 
+## `cross_platform_pairing_v2.json` — pairing handshake parity
+
+Locks the commit-then-reveal pairing handshake (ADR-0008 Clarification
+2026-10-14; [`docs/spec/pairing.md`](../../../../docs/spec/pairing.md)): the
+commitment, the three signed byte layouts (start, offer, finish), and the
+10-character confirmation code. `rrn_identity::pairing` is the source of truth;
+the phone reaches it through the `rrn-mobile-ffi` pairing functions, whose own
+test (`crates/rrn-mobile-ffi/tests/it/pairing_v2.rs`) reproduces every vector.
+
+Generated and checked by
+[`tests/it/cross_platform_pairing_v2.rs`](../it/cross_platform_pairing_v2.rs).
+Contents: one full handshake (seeds, keys, addresses, nonces, commitment, all
+three signed byte strings and their signatures, the code), 9 code vectors (the
+last is the first with the two keys swapped), and start-layout vectors at
+`requested_at` ∈ {0, 1, −1, 2^53−1}. Seeds and nonces are blake3-derived and
+Ed25519 signing is deterministic, so the file is reproducible bit-for-bit.
+
+Regenerate and hand to the mobile repo:
+
+```sh
+RRN_REGEN=1 cargo test -p rrn-identity --test it cross_platform_pairing_v2
+cp crates/rrn-identity/tests/fixtures/cross_platform_pairing_v2.json \
+   ../mobile/__tests__/fixtures/cross_platform_pairing_v2.json
+```
+
 ## `ffi_invariants.json` — consolidated FFI invariants
 
 Rolls the mobile/station invariants that the address, signing, and wallet

@@ -285,7 +285,7 @@ open-source posture, all audit reports are public.
 | `crates/rrn-cli` | The `rrn` client: operator console, paper tools, member wallet. |
 | `docs/adr/` | Architecture decision records 0001 to 0028, the locked-decision record. |
 | `docs/design/` | The design overview, updated in place with dated notes. |
-| `docs/spec/` | Wire formats: QR payloads, DTN bundles, SMS carrier, the boot ceremony fingerprint. |
+| `docs/spec/` | Wire formats: QR payloads, DTN bundles, SMS carrier, the boot ceremony fingerprint, the pairing handshake. |
 | `docs/threat-model.md` | The living STRIDE threat model. |
 | `docs/security/` | The August 2026 audit and the Phase 2 red-team checklist. |
 | `tests/`, `fuzz/` | Cross-crate integration tests and the nightly cargo-fuzz workspace. |

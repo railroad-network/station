@@ -1727,7 +1727,7 @@ cursors); the wallet's trust anchor (the pinned station address).
   and the outbox rows stay pending (test: `forged_receipt_is_rejected`,
   `wrong_station_at_pair_refused`). *Residual:* the pin is learned out of band (the
   operator, in person) — a member who pins the wrong address trusts the wrong
-  station, exactly as the SAS depends on an in-person comparison.
+  station, exactly as the pairing code depends on an in-person comparison.
 - *Tampering / self-fork.* The outbox is a single hash chain over `OutboxStore`,
   which enforces dense positions and prev-hash linkage. A restored wallet
   (`init --restore`) is marked `unknown` and refuses every signing verb until one
@@ -1914,8 +1914,8 @@ core, a panic restarts the station (see the denial-of-service entry below).
   error and the connection kept open — one bad line never takes down the daemon
   (covered by the `ipc` integration test). The same holds one layer in: a
   malformed **hex field** inside an otherwise well-formed request — from the
-  operator socket, a paired mobile, or the unauthenticated `/pair` door — is
-  rejected as invalid input (`/pair` answers `400`), never a panic; the hex
+  operator socket, a paired mobile, or the unauthenticated pairing routes — is
+  rejected as invalid input (`/pair/start` and `/pair/finish` answer `400`), never a panic; the hex
   decoder walks bytes and refuses anything but ASCII hex digit pairs
   (RRN-A-013, covered by `audit_regressions`). Caller-supplied timestamps,
   cursors, and frame lengths use checked or saturating arithmetic. Each
@@ -3494,14 +3494,22 @@ pipeline enforces.
   is out of scope.
 - **Pairing-time TOFU.** *Threat:* pairing is trust-on-first-use, so an attacker
   present at the *first* contact can interpose and become the "trusted" station.
-  *Mitigation (shipped):* an out-of-band **short authentication string** —
-  an 8-hex code derived from *both* static public keys (`blake3(tag ‖ station_pk
-  ‖ mobile_pk)`), displayed by the station operator (`station pair-mobile`) and on
-  the mobile, which a human compares in person. A man-in-the-middle would have to
-  present its own key, which changes the code, so the comparison catches it. (The
-  spec's QR-scanned-by-CLI was rejected — a headless Pi cannot scan, and one QR
-  cannot carry both keys.) *Residual risk:* if users skip the comparison, TOFU is
-  only as safe as the pairing environment; this remains a user-facing risk.
+  *Mitigation (shipped):* a commit-then-reveal handshake (ADR-0008, Clarification
+  2026-10-14; `docs/spec/pairing.md`): each side's fresh 32-byte nonce is fixed
+  before it sees the other's, and the 10-character (50-bit) code is derived from
+  both static keys and both nonces, so a key search cannot target it and an
+  online attacker matches with probability 2^-50 per operator-confirmed attempt.
+  The request that creates the operator's row is signed over the station's key,
+  and the operator confirms by typing the code, which the station checks. A
+  replayed start cannot evict a session, and a session in either stage expires
+  after five minutes. The single-round version-1 handshake (an 8-hex code over
+  the static keys alone, searchable offline — RRN-A-023) is retired: `/pair`
+  answers `410`. (The spec's QR-scanned-by-CLI was rejected — a headless Pi
+  cannot scan, and one QR cannot carry both keys.) *Residual risk:* if users skip
+  the comparison — including an operator who copies the code from the station's
+  own pending list rather than reading it off the device — TOFU is only as safe as
+  the pairing environment; this remains a user-facing risk. The pending table is
+  not yet bounded per caller (RRN-A-039).
 - **Push updates over the long-poll (`/subscribe`).** *Threat:* the push channel
   could leak a member's events to an eavesdropper, deliver a forged event, or be
   used to exhaust the station. *Mitigation (shipped):* `/subscribe` reuses

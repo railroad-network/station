@@ -5,6 +5,7 @@
 //! names keep a `<name>::` prefix; run one former file with
 //! `cargo test -p rrn-identity --test it <name>`.
 mod cross_platform_address;
+mod cross_platform_pairing_v2;
 mod cross_platform_wallet;
 mod ffi_invariants;
 mod shamir_reference_vectors;

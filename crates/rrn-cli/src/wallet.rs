@@ -160,8 +160,8 @@ pub enum WalletCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Pair with the station over the sealed channel; prints the SAS for the
-    /// operator to confirm.
+    /// Pair with the station over the sealed channel; prints the confirmation
+    /// code the operator types to confirm.
     Pair {
         /// The station's mobile listener, `host:port`.
         #[arg(long)]
@@ -895,7 +895,7 @@ impl Wallet {
         let pin = self.pin_address()?;
         let keypair = self.unlock()?;
         let client = ChannelClient::new(url.to_string(), *pin.public_key());
-        let response = client
+        let outcome = client
             .pair(&keypair, now())
             .await
             .map_err(map_channel_error)?;
@@ -904,17 +904,17 @@ impl Wallet {
         self.set_meta(K_STATION_URL, url)?;
         self.set_meta(K_PAIRED, "pending")?;
 
-        let sas = rrn_station::paired::confirmation_code(pin.public_key(), &keypair.public_key());
+        let code = outcome.code;
         let my_addr = Address::from_public_key(keypair.public_key()).to_string();
         let text = format!(
             "paired with {} (pending operator confirmation)\n\
-             SAS: {sas}\n\
-             have the operator run: station pair-mobile {my_addr}",
-            response.station_address
+             code: {code}\n\
+             have the operator run: station pair-mobile {my_addr} --code {code}",
+            outcome.station_address
         );
         crate::emit(
             fmt,
-            &json!({ "station_address": response.station_address, "sas": sas, "member_address": my_addr, "paired": "pending" }),
+            &json!({ "station_address": outcome.station_address, "code": code, "member_address": my_addr, "paired": "pending" }),
             || Ok(text),
         )
     }
@@ -2109,7 +2109,7 @@ fn map_channel_error(e: ChannelClientError) -> anyhow::Error {
     match e {
         ChannelClientError::NotPaired => anyhow!(
             "the station has not confirmed this device is paired yet — ask the operator to \
-             run `station pair-mobile <your rrn1…>`, then retry"
+             run `station pair-mobile <your rrn1…> --code <code>`, then retry"
         ),
         other => anyhow!(other.to_string()),
     }

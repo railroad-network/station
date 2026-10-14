@@ -46,12 +46,18 @@ enum Command {
         #[command(subcommand)]
         cmd: PeersCmd,
     },
-    /// Confirm a mobile's pairing request (ADR-0008). With no address, lists the
-    /// pending requests and their confirmation codes; pass an address to
-    /// confirm it after comparing the code with the mobile's screen in person.
+    /// Confirm a device's pairing request (ADR-0008). With no address, lists the
+    /// pending requests and their confirmation codes; pass an address and the
+    /// code the device shows to confirm it. The station checks the code
+    /// against its own and refuses a mismatch.
     PairMobile {
-        /// The bech32 address of the pending mobile to confirm.
+        /// The bech32 address of the pending device to confirm.
+        #[arg(requires = "code")]
         address: Option<String>,
+        /// The confirmation code shown on the device (`XXXXX-XXXXX`), typed
+        /// from the device's screen.
+        #[arg(long, requires = "address")]
+        code: Option<String>,
     },
     /// List the mobiles currently paired with this station.
     ListMobiles,
@@ -205,7 +211,7 @@ fn main() -> Result<()> {
         Command::Peers { cmd } => match cmd {
             PeersCmd::List => cmd_peers_list(&data_dir),
         },
-        Command::PairMobile { address } => cmd_pair_mobile(&data_dir, address),
+        Command::PairMobile { address, code } => cmd_pair_mobile(&data_dir, address, code),
         Command::ListMobiles => cmd_list_mobiles(&data_dir),
         Command::Unpair { address } => cmd_unpair(&data_dir, address),
         Command::Enroll {
@@ -526,28 +532,38 @@ fn socket_call(
         .with_context(|| format!("call `{method}` (is the station running?)"))
 }
 
-/// `station pair-mobile [address]` — list pending pairing requests, or confirm
-/// one after the operator has compared its code with the mobile's screen.
-fn cmd_pair_mobile(data_dir: &std::path::Path, address: Option<String>) -> Result<()> {
-    match address {
-        None => {
+/// `station pair-mobile [<address> --code <code>]` — list pending pairing
+/// requests, or confirm one with the code typed from the device's screen.
+fn cmd_pair_mobile(
+    data_dir: &std::path::Path,
+    address: Option<String>,
+    code: Option<String>,
+) -> Result<()> {
+    match (address, code) {
+        (None, _) | (_, None) => {
             let result = socket_call(data_dir, "pair_list_pending", json!({}))?;
             let pending = result["pending"].as_array().cloned().unwrap_or_default();
             if pending.is_empty() {
                 eprintln!("(no pending pairing requests)");
                 return Ok(());
             }
-            eprintln!("Pending pairing requests — compare the code with the mobile, then");
-            eprintln!("run `station pair-mobile <address>` to confirm:\n");
+            eprintln!("Pending pairing requests — compare the code with the device, then");
+            eprintln!("run `station pair-mobile <address> --code <code>` with the code");
+            eprintln!("read from the device's screen:\n");
+            eprintln!("  code          address");
             for entry in &pending {
                 let addr = entry["address"].as_str().unwrap_or("?");
-                let sas = entry["sas"].as_str().unwrap_or("?");
+                let code = entry["code"].as_str().unwrap_or("?");
                 let age = entry["age_secs"].as_i64().unwrap_or(0);
-                println!("  {sas}   {addr}   ({age}s ago)");
+                println!("  {code}   {addr}   ({age}s ago)");
             }
         }
-        Some(addr) => {
-            let result = socket_call(data_dir, "pair_confirm", json!({ "address": addr }))?;
+        (Some(addr), Some(code)) => {
+            let result = socket_call(
+                data_dir,
+                "pair_confirm",
+                json!({ "address": addr, "code": code }),
+            )?;
             let confirmed = result["address"].as_str().unwrap_or(&addr);
             println!("{confirmed}");
             eprintln!("Paired.");

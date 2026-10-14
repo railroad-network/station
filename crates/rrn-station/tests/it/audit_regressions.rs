@@ -49,8 +49,10 @@ async fn rpc(socket: &Path, method: &str, params: serde_json::Value) -> String {
     buf
 }
 
-/// The unauthenticated `/pair` multibyte-hex halt: an unpaired client's `/pair` request whose hex `token` holds a
-/// multi-byte character at an odd byte offset. Before the fix, the hex decoder
+/// The unauthenticated pairing multibyte-hex halt: an unpaired client's pairing
+/// request whose hex field holds a multi-byte character at an odd byte offset
+/// (originally the version-1 `/pair` `token`; now the start's `commitment` and
+/// the finish's `mobile_nonce`). Before the fix, the hex decoder
 /// sliced the `&str` mid-character and panicked on the core thread, leaving the
 /// daemon up with a dead command loop ("core stopped"). Now it is a clean `400`
 /// and the core keeps answering.
@@ -78,22 +80,33 @@ async fn unauthenticated_pair_request_with_multibyte_hex() {
     let addr = Address::from_public_key(outsider.public_key()).to_string();
     // Even byte length (1 + 2 + 1), with a two-byte character at byte offset 1.
     let body = serde_json::json!({
+        "v": 2,
         "mobile_address": addr,
-        "token": "a\u{e9}b",
+        "commitment": "a\u{e9}b",
         "requested_at": 0,
         "signature": "00",
     })
     .to_string();
-    let (status, resp) = http_post_json("127.0.0.1:7591", "/pair", &body).await;
-    assert_eq!(status, 400, "malformed /pair -> {status} {resp:?}");
+    let (status, resp) = http_post_json("127.0.0.1:7591", "/pair/start", &body).await;
+    assert_eq!(status, 400, "malformed /pair/start -> {status} {resp:?}");
+    let finish = serde_json::json!({
+        "v": 2,
+        "mobile_address": addr,
+        "station_address": addr,
+        "mobile_nonce": "a\u{e9}b",
+        "signature": "00",
+    })
+    .to_string();
+    let (status, resp) = http_post_json("127.0.0.1:7591", "/pair/finish", &finish).await;
+    assert_eq!(status, 400, "malformed /pair/finish -> {status} {resp:?}");
 
     // The core is alive: the operator socket still answers, and a repeat of the
     // same malformed request is refused the same way.
     let after = rpc(&socket, "whoami", serde_json::json!({})).await;
     assert!(after.contains("\"result\""), "whoami after: {after}");
     assert!(after.contains("address"), "whoami after: {after}");
-    let (status2, resp2) = http_post_json("127.0.0.1:7591", "/pair", &body).await;
-    assert_eq!(status2, 400, "second /pair -> {status2} {resp2:?}");
+    let (status2, resp2) = http_post_json("127.0.0.1:7591", "/pair/start", &body).await;
+    assert_eq!(status2, 400, "second /pair/start -> {status2} {resp2:?}");
 
     station.shutdown().await;
 }

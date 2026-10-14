@@ -99,8 +99,10 @@ use crate::governance_view;
 use crate::inquiry_view;
 use crate::ledger_view;
 use crate::marketplace_view;
-use crate::paired::{self, PairedMobiles};
-use crate::pairing::{self, PairError, PairRequest, PairResponse, PendingPair};
+use crate::paired::PairedMobiles;
+use crate::pairing::{
+    self, PairError, PairFinish, PairFinished, PairOffer, PairStart, PendingPair, PendingStage,
+};
 use crate::reputation_view;
 use crate::rpc_envelope::{self, ChannelError, RequestEnvelope, ResponseEnvelope};
 use crate::transaction_view;
@@ -214,14 +216,23 @@ pub enum Command {
         /// How many were newly appended (not already held).
         reply: oneshot::Sender<usize>,
     },
-    /// A mobile's pairing request, from the mobile HTTP surface. The
-    /// core verifies it, records it as pending for the operator to confirm, and
-    /// replies with the station's signed response.
-    PairRequest {
-        /// The request as it arrived on the wire.
-        request: PairRequest,
-        /// The station's signed response, or why it was rejected.
-        reply: oneshot::Sender<Result<PairResponse, PairError>>,
+    /// A device's pairing start (its commitment), from the mobile HTTP
+    /// surface. The core verifies it, opens a session awaiting the reveal, and
+    /// replies with the station's signed offer.
+    PairStart {
+        /// The start as it arrived on the wire.
+        request: PairStart,
+        /// The station's signed offer, or why the start was refused.
+        reply: oneshot::Sender<Result<PairOffer, PairError>>,
+    },
+    /// A device's pairing finish (its reveal), from the mobile HTTP surface.
+    /// The core checks it against the session and, if it holds, leaves the
+    /// session awaiting the operator's code.
+    PairFinish {
+        /// The finish as it arrived on the wire.
+        request: PairFinish,
+        /// Acknowledgement, or why the finish was refused.
+        reply: oneshot::Sender<Result<PairFinished, PairError>>,
     },
     /// A paired mobile's authenticated request, from the mobile HTTP
     /// surface. The bytes are the sealed envelope; the reply is the sealed
@@ -571,13 +582,23 @@ impl CoreHandle {
         rx.await.unwrap_or(0)
     }
 
-    /// Submits a mobile's pairing request; returns the station's signed response
-    /// or the rejection reason. [`PairError::Unavailable`] means the core is gone.
-    pub async fn pair_request(&self, request: PairRequest) -> Result<PairResponse, PairError> {
+    /// Submits a device's pairing start; returns the station's signed offer or
+    /// the refusal. [`PairError::Unavailable`] means the core is gone.
+    pub async fn pair_start(&self, request: PairStart) -> Result<PairOffer, PairError> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::PairStart { request, reply }).is_err() {
+            return Err(PairError::Unavailable);
+        }
+        rx.await.unwrap_or(Err(PairError::Unavailable))
+    }
+
+    /// Submits a device's pairing finish; returns the acknowledgement or the
+    /// refusal. [`PairError::Unavailable`] means the core is gone.
+    pub async fn pair_finish(&self, request: PairFinish) -> Result<PairFinished, PairError> {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
-            .send(Command::PairRequest { request, reply })
+            .send(Command::PairFinish { request, reply })
             .is_err()
         {
             return Err(PairError::Unavailable);
@@ -660,9 +681,10 @@ pub struct Core {
     /// Mobiles that have completed pairing — the authorization list for the
     /// mobile HTTP surface. Persisted across restarts.
     paired: PairedMobiles,
-    /// Pairing requests accepted but not yet confirmed by the operator, keyed by
-    /// mobile address. In-memory only: an unconfirmed request has no standing to
-    /// survive a restart, and each entry expires after [`pairing::PENDING_TTL_SECS`].
+    /// Pairing sessions in progress (awaiting the device's reveal or the
+    /// operator's code), keyed by mobile address. In-memory only: an
+    /// unconfirmed pairing has no standing to survive a restart, and each
+    /// session expires [`pairing::PENDING_TTL_SECS`] after entering its stage.
     pending: BTreeMap<String, PendingPair>,
     /// Publishes the log tail after every append so a parked `/subscribe`
     /// long-poll wakes and re-polls for events.
@@ -1010,8 +1032,11 @@ impl Core {
             Command::AppendEntries { entries, reply } => {
                 let _ = reply.send(self.do_append_entries(entries));
             }
-            Command::PairRequest { request, reply } => {
-                let _ = reply.send(self.do_pair_request(request));
+            Command::PairStart { request, reply } => {
+                let _ = reply.send(self.do_pair_start(request));
+            }
+            Command::PairFinish { request, reply } => {
+                let _ = reply.send(self.do_pair_finish(request));
             }
             Command::RpcRequest { sealed, reply } => {
                 let _ = reply.send(self.do_rpc_request(sealed));
@@ -5798,14 +5823,20 @@ impl Core {
 
     // --- pairing ---------------------------------------------------
 
-    /// Verifies a mobile's pairing request, records it as pending for the
-    /// operator to confirm, and returns the station's signed response.
+    /// A device's pairing start: verifies its signature and clock, opens (or
+    /// re-answers) its session, and returns the station's signed offer.
     ///
-    /// Accepting a request does **not** pair the mobile: it proves the mobile
-    /// holds its key and lets both sides display the same confirmation code. The
-    /// mobile is added to [`paired`](Self::paired) only when the operator runs
-    /// `station pair-mobile` after comparing that code in person.
-    fn do_pair_request(&mut self, request: PairRequest) -> Result<PairResponse, PairError> {
+    /// Starting does **not** pair the device. The offer fixes the station's
+    /// nonce against the device's commitment before the device reveals; the
+    /// device is added to [`paired`](Self::paired) only when the operator types
+    /// the code it shows (`station pair-mobile <address> --code <code>`).
+    ///
+    /// A start for an address that already has a session: the same commitment
+    /// is a retry (the stored offer is re-sent) while the reveal is awaited and
+    /// a replay once it has happened; a different commitment replaces the
+    /// session only if its `requested_at` is later, so a captured older start
+    /// cannot evict a newer session.
+    fn do_pair_start(&mut self, request: PairStart) -> Result<PairOffer, PairError> {
         let verified = request.verify()?;
 
         let now = self.clock.now();
@@ -5815,30 +5846,103 @@ impl Core {
             return Err(PairError::StaleTimestamp);
         }
 
-        let station = self.station_keypair();
-        let station_pubkey = station.public_key();
-        let sas = paired::confirmation_code(&station_pubkey, &verified.mobile_pubkey);
-
-        // Drop anything that has aged out before recording this one, so a stream
-        // of abandoned attempts cannot grow the map without bound.
+        // Drop anything that has aged out before looking, so an expired
+        // session neither answers nor blocks a new start.
         self.prune_pending(now);
         let address = verified.mobile_address.to_string();
+        if let Some(current) = self.pending.get(&address) {
+            if current.commitment == verified.commitment {
+                return match &current.stage {
+                    PendingStage::AwaitingReveal { offer, .. } => Ok(offer.clone()),
+                    PendingStage::AwaitingOperator { .. } => Err(PairError::Replay),
+                };
+            }
+            if verified.requested_at <= current.requested_at {
+                return Err(PairError::Replay);
+            }
+        }
+
+        let station = self.station_keypair();
+        let station_pk = station.public_key();
+        let station_nonce = rrn_identity::pairing::fresh_nonce();
+        let msg = rrn_identity::pairing::offer_signed_bytes(
+            &station_pk.to_bytes(),
+            &verified.mobile_pk.to_bytes(),
+            &verified.commitment,
+            &station_nonce,
+        );
+        let offer = PairOffer {
+            station_address: self.wallet.address.to_string(),
+            station_nonce: hex(&station_nonce),
+            signature: hex(&station.sign(&msg).to_bytes()),
+        };
         self.pending.insert(
             address.clone(),
             PendingPair {
                 mobile_address: address,
-                sas,
+                commitment: verified.commitment,
+                requested_at: verified.requested_at,
                 received_at: now,
+                stage: PendingStage::AwaitingReveal {
+                    mobile_pk: verified.mobile_pk,
+                    station_nonce,
+                    offer: offer.clone(),
+                },
             },
         );
+        Ok(offer)
+    }
 
-        // Sign a response bound to this request's token, proving the station's
-        // identity and preventing a captured response from being reused.
-        let msg = pairing::response_signed_bytes(&station_pubkey, &verified.token);
-        let signature = station.sign(&msg);
-        Ok(PairResponse {
-            station_address: self.wallet.address.to_string(),
-            signature: hex(&signature.to_bytes()),
+    /// A device's pairing finish: checks, in order, that it names this
+    /// station, that a session is awaiting its reveal, that its signature
+    /// covers this station's key, the session's commitment and station nonce,
+    /// and the revealed nonce, and that the nonce opens the commitment. Then
+    /// the session waits for the operator's code. A refused finish leaves the
+    /// session as it was.
+    fn do_pair_finish(&mut self, request: PairFinish) -> Result<PairFinished, PairError> {
+        let finish = request.parse()?;
+        let station_pk = self.station_keypair().public_key();
+        if finish.station_address.as_ref().map(|a| *a.public_key()) != Some(station_pk) {
+            return Err(PairError::WrongStation);
+        }
+
+        let now = self.clock.now();
+        self.prune_pending(now);
+        let address = finish.mobile_address.to_string();
+        let session = self.pending.get_mut(&address).ok_or(PairError::NoSession)?;
+        let PendingStage::AwaitingReveal {
+            mobile_pk,
+            station_nonce,
+            ..
+        } = &session.stage
+        else {
+            return Err(PairError::NoSession);
+        };
+        pairing::verify_finish(
+            &station_pk,
+            mobile_pk,
+            &session.commitment,
+            station_nonce,
+            &finish,
+        )?;
+        if !rrn_identity::pairing::opens(
+            &session.commitment,
+            &mobile_pk.to_bytes(),
+            &finish.mobile_nonce,
+        ) {
+            return Err(PairError::CommitmentMismatch);
+        }
+
+        let code = rrn_identity::pairing::code(
+            &station_pk.to_bytes(),
+            &mobile_pk.to_bytes(),
+            &finish.mobile_nonce,
+            station_nonce,
+        );
+        session.stage = PendingStage::AwaitingOperator { code };
+        session.received_at = now;
+        Ok(PairFinished {
+            status: pairing::AWAITING_OPERATOR.to_string(),
         })
     }
 
@@ -7000,48 +7104,69 @@ impl Core {
         ok(&serde_json::json!({ "contracts": rows }))
     }
 
-    /// Removes pending requests older than [`pairing::PENDING_TTL_SECS`].
+    /// Removes sessions that have spent more than [`pairing::PENDING_TTL_SECS`]
+    /// in their current stage.
     fn prune_pending(&mut self, now: i64) {
         self.pending
-            .retain(|_, p| now - p.received_at <= pairing::PENDING_TTL_SECS);
+            .retain(|_, p| now.saturating_sub(p.received_at) <= pairing::PENDING_TTL_SECS);
     }
 
-    /// `pair_list_pending` — the accepted-but-unconfirmed requests, each with the
-    /// confirmation code the operator reads aloud to compare with the mobile.
+    /// `pair_list_pending` — the sessions awaiting the operator, each with the
+    /// confirmation code the operator compares with the device's. A session
+    /// still awaiting the device's reveal has no code yet and is not listed.
     fn m_pair_list_pending(&mut self) -> Result<serde_json::Value, rpc::RpcError> {
         let now = self.clock.now();
         self.prune_pending(now);
         let pending: Vec<_> = self
             .pending
             .values()
-            .map(|p| {
-                serde_json::json!({
+            .filter_map(|p| match &p.stage {
+                PendingStage::AwaitingOperator { code } => Some(serde_json::json!({
                     "address": p.mobile_address,
-                    "sas": p.sas,
-                    "age_secs": now - p.received_at,
-                })
+                    "code": code,
+                    "age_secs": now.saturating_sub(p.received_at),
+                })),
+                PendingStage::AwaitingReveal { .. } => None,
             })
             .collect();
         ok(&serde_json::json!({ "pending": pending }))
     }
 
-    /// `pair_confirm` — the operator has compared the code in person and vouches
-    /// for the pair. Moves the mobile from pending to the persisted paired list.
+    /// `pair_confirm` — the operator has compared the code in person, and types
+    /// the code the device shows. The station checks it against its own: a
+    /// match moves the device from pending to the persisted paired list; a
+    /// mismatch is refused and leaves the session in place.
     fn m_pair_confirm(&mut self, req: &rpc::Request) -> Result<serde_json::Value, rpc::RpcError> {
         #[derive(serde::Deserialize)]
         struct Params {
             address: String,
+            code: String,
         }
         let params: Params = parse_params(req)?;
 
         let now = self.clock.now();
         self.prune_pending(now);
-        let pending = self.pending.get(&params.address).cloned().ok_or_else(|| {
-            invalid_params(format!(
-                "no pending pairing request from {} (it may have expired)",
+        let (pending, code) = self
+            .pending
+            .get(&params.address)
+            .and_then(|p| match &p.stage {
+                PendingStage::AwaitingOperator { code } => Some((p.clone(), code.clone())),
+                PendingStage::AwaitingReveal { .. } => None,
+            })
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no pending pairing request from {} (it may have expired)",
+                    params.address
+                ))
+            })?;
+        if rrn_identity::human_code::normalize(&params.code)
+            != rrn_identity::human_code::normalize(&code)
+        {
+            return Err(invalid_params(format!(
+                "the code does not match the pending request from {}; compare again",
                 params.address
-            ))
-        })?;
+            )));
+        }
 
         // Pairing is the enrollment ceremony (ADR-0038 §1): the operator has
         // compared the code in person. The writer enrolls the member *before*
@@ -8310,7 +8435,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Decodes lowercase/uppercase hex, or `None` if it is not an even-length run of
 /// ASCII hex digit pairs.
 ///
-/// Reached with caller-supplied strings (pre-authentication from `/pair`), so it
+/// Reached with caller-supplied strings (pre-authentication from the pairing routes), so it
 /// must never panic: it walks the *bytes* in pairs rather than slicing the `&str`
 /// (a byte-range slice panics when a multi-byte character straddles it), and a
 /// non-ASCII byte, whitespace, or a `+`/`-` sign fails the whole decode.
@@ -14640,20 +14765,40 @@ mod tests {
 
     /// Runs the pairing handshake for `member` and the operator's confirmation.
     fn pair(core: &mut Core, member: &Keypair) {
-        let token = [7u8; 32];
+        use rrn_identity::pairing as layout;
         let now = core.clock.now();
-        let msg = pairing::request_signed_bytes(&member.public_key(), &token, now);
-        core.do_pair_request(PairRequest {
+        let mpk = member.public_key().to_bytes();
+        let nonce = [7u8; 32];
+        let commitment = layout::commitment(&mpk, &nonce);
+        let start = layout::start_signed_bytes(&mpk, &commitment, now);
+        let offer = core
+            .do_pair_start(PairStart {
+                v: pairing::PAIRING_VERSION,
+                mobile_address: addr_of(member).to_string(),
+                commitment: hex(&commitment),
+                requested_at: now,
+                signature: hex(&member.sign(&start).to_bytes()),
+            })
+            .unwrap();
+        let spk = core.station_pubkey();
+        let station_nonce = offer
+            .verify(&spk, &member.public_key(), &commitment)
+            .unwrap();
+        let finish =
+            layout::finish_signed_bytes(&spk.to_bytes(), &mpk, &commitment, &station_nonce, &nonce);
+        core.do_pair_finish(PairFinish {
+            v: pairing::PAIRING_VERSION,
             mobile_address: addr_of(member).to_string(),
-            token: hex(&token),
-            requested_at: now,
-            signature: hex(&member.sign(&msg).to_bytes()),
+            station_address: Address::from_public_key(spk).to_string(),
+            mobile_nonce: hex(&nonce),
+            signature: hex(&member.sign(&finish).to_bytes()),
         })
         .unwrap();
+        let code = layout::code(&spk.to_bytes(), &mpk, &nonce, &station_nonce);
         call(
             core,
             "pair_confirm",
-            serde_json::json!({ "address": addr_of(member).to_string() }),
+            serde_json::json!({ "address": addr_of(member).to_string(), "code": code }),
         );
     }
 

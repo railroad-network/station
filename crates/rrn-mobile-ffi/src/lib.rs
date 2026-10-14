@@ -48,6 +48,12 @@ pub use cert::{
     proposal_sign_with_certificate, CertError, CertificateInfo, OfflineSpendVerdict,
 };
 
+mod pairing;
+pub use pairing::{
+    pairing_code, pairing_commitment, pairing_finish_signed_bytes, pairing_nonce,
+    pairing_offer_signed_bytes, pairing_start_signed_bytes,
+};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
