@@ -207,6 +207,102 @@ fingerprint makes a mismatch *detectable*, not impossible. Co-acknowledgement or
 an announced delay (RRN-A-001 recommendation #3) remains a future hardening that
 needs its own ADR.
 
+## Clarification (2026-10-14) — the ceremony fingerprint commits to the whole request and is 80 bits
+
+*Proposed 2026-10-14 — awaiting maintainer ratification. In force, once
+ratified, with the change that implements it.*
+
+This supersedes the fingerprint paragraph ("Holder confirmation is procedural…")
+of the 2026-09-17 Clarification, which stays above as the record of what shipped
+first. Nothing else in that Clarification changes, and the wire formats
+(`rrnrecover-req:`, `rrnrecover-resp:`) are unchanged.
+
+The internal security review of October 2026 found the fingerprint too weak for
+the job it had taken on. **RRN-A-029:** it was ten hex characters (40 bits) of a
+hash over the ephemeral key alone. Once a request is relayed rather than scanned
+in person — which both the CLI ("or paste this line") and the app ("in person or
+on a call") invite — the fingerprint is the only thing a holder checks. The
+genuine request is visible before an attacker chooses a key, so finding an
+ephemeral key whose 40-bit code collides with the genuine one is a search of
+about 10^12 key derivations, reachable with rented compute inside the hours a
+ceremony stays open. Every holder shown the substituted request then sees the
+code the owner reads aloud and seals their share to the attacker. **RRN-A-030**
+(ADR-0024's Clarification of the same date) found that the encrypted profile's
+unlock console printed a second algorithm that no holder's screen could ever
+match.
+
+**One construction, for every ceremony.** The ceremony fingerprint is
+
+```
+code = human_code::render(
+         blake3("rrn.ceremony.fingerprint.v2" ‖ request_bytes),
+         16, 4)
+```
+
+- `request_bytes` is the canonical dCBOR encoding of the recovery request,
+  `RecoveryRequest::to_bytes` — the map `{rk, addr}` of the ephemeral recovery
+  key and the target address. Hashing the canonical request commits to every
+  field it carries, including any added later, without a hand-written byte
+  layout. The holder decodes the request (which enforces canonical form) and
+  re-encodes it, so the requester's input and every holder's input are the same
+  bytes.
+- The tag is ASCII with no terminator, and the `.v2` suffix keeps the new code
+  disjoint from the old one.
+- `human_code::render` is the Crockford base32 renderer that pairing already
+  uses (ADR-0008's 2026-10-14 Clarification; `docs/spec/pairing.md`): the first
+  80 bits of the digest, read big-endian, five bits per character, in four groups
+  of four — `XXXX-XXXX-XXXX-XXXX`. Taking whole leading bits has no modulo bias.
+  Comparison normalizes case, hyphens, whitespace, and the Crockford aliases
+  (`O`→`0`, `I`/`L`→`1`).
+
+It is computed in exactly one place, `rrn_identity::recovery::ceremony::fingerprint`,
+and every requester and holder reaches that function: `rrn wallet recover`, the
+phone's `RecoverySession` and its holder screen (through the mobile FFI; the app
+never re-implements it), `station recovery restore`, and the encrypted profile's
+unlock and VMK-refresh console (ADR-0024's Clarification). The pinned procedure
+and vectors are in `docs/spec/vmk-boot-ceremony.md`.
+
+**What it binds, and the bound.** The code now binds the target address as well
+as the ephemeral key: the same ephemeral key aimed at a different identity gives
+a different code. An attacker who sees the genuine request must find a fresh
+ephemeral key whose request hashes to the same 80 leading bits — a second-preimage
+search of about 2^80 — which no ceremony window makes reachable.
+
+**Why length, and not a commitment round.** Pairing defeats the same search with
+commit-then-reveal (ADR-0008's 2026-10-14 Clarification), but a recovery
+ceremony is one-way: the request goes out as a QR or a pasted line to holders
+who may be offline, and nothing comes back to the requester before a share is
+sealed. A commitment has no round to run in. Length is the control that fits.
+
+**The normative procedure.** A holder responds only after confirming that the
+code on their screen equals the code on the requester's screen, all sixteen
+characters. Either:
+
+- **in person** — the holder scans the request from the requester's own
+  screen and compares the codes side by side; or
+- **relayed** — the request arrives by message, and the holder reads all four
+  groups back to the requester over a voice channel the holder already trusts to
+  reach that person (a number they already had, a voice they know). A code that
+  arrives in the same message as the request proves nothing, because whoever can
+  substitute the request can substitute the code beside it.
+
+Two holders comparing codes can also detect a split ceremony, as before. With
+the 40-bit search gone, relayed ceremonies stay permitted under the read-back
+condition rather than being restricted to in-person scanning.
+
+**What it still is not.** The fingerprint proves that the holder and the
+requester are looking at the same request. It does not prove that the requester
+is the identity's owner: a recovery request remains exactly as trustworthy as
+the person presenting it. Co-acknowledgement or an announced delay (RRN-A-001
+recommendation #3) remains open for its own ADR.
+
+**Transition.** The fingerprint is display only — it is not signed, stored, or
+sent — so the change touches no record, but it does change the cross-platform
+fixture `recovery_fingerprint.json`. A holder whose app still shows the old
+ten-character code sees a code that never matches a new requester's. That
+failure is the safe one: the holder declines, and must update the app before
+responding.
+
 ## Alternatives Considered
 
 - **Encrypt the archive under the passphrase only.** Simplest, and rejected as

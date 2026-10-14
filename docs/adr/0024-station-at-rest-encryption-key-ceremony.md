@@ -384,6 +384,49 @@ converge to contribute shards. Rough MTTR: where holders are co-located
 - **Running-seizure is explicitly unsolved.** The honest boundary is stated;
   physical custody and rapid re-bootstrap are the answer, not this ADR.
 
+## Clarification (2026-10-14) — the console fingerprint is the ceremony fingerprint
+
+*Proposed 2026-10-14 — awaiting maintainer ratification. In force, once
+ratified, with the change that implements it.*
+
+Decision step 1 of the boot ceremony has `station unlock` show "a short
+**ceremony fingerprint** on the physical console", and step 2 makes the holder's
+out-of-band confirmation of it the ceremony's only authenticator, because the
+request is unsigned. The ADR did not say which fingerprint. As built, the
+console printed its own algorithm — RFC 4648 base32 over the recovery key and the
+volume key's public key, two groups of five — while the request it publishes is
+an ordinary `rrnrecover-req:` recovery request, and every holder's device shows
+the ADR-0016 ceremony fingerprint of the request it scans. The internal security
+review of October 2026 (**RRN-A-030**) found that the two can never be equal. A
+legitimate unlock always mismatched, so holders who follow the rule could not
+unlock the station, and holders who learned to ignore the mismatch would respond
+to a seizer's forged request for the same volume — the attack the fingerprint
+exists to stop.
+
+**The console fingerprint is the ADR-0016 ceremony fingerprint** (ADR-0016's
+2026-10-14 Clarification): computed by
+`rrn_identity::recovery::ceremony::fingerprint` over the request the console
+publishes, whose target is the VMK's address. `station unlock` and
+`station vmk refresh` print exactly the code each holder's device shows for the
+request it scanned, sixteen characters in four groups. **A separate console
+algorithm is not permitted**: the holder's device can show only the ceremony
+fingerprint, so any other code the console prints is one no holder can confirm.
+
+Consequences for the rest of this ADR, all narrowing and none changing the
+decision:
+
+- Step 2's out-of-band confirmation follows ADR-0016's normative procedure: in
+  person at the console (the primary path), or relayed with all four groups read
+  back over a voice channel the holder already trusts. The pre-unlock LAN
+  endpoint of step 2 is still not built, and this Clarification does not add it.
+- Because the code commits to the target address, a forged request aimed at the
+  genuine VMK must find a fresh ephemeral key whose request collides on 80 bits;
+  "Ceremony-request authentication" under the sharp edges stands, with the
+  fingerprint now strong enough to carry it. The residual — holders actually
+  checking the code, and junk responses as denial of service — is unchanged.
+- The algorithm and test vectors are pinned once, for every ceremony, in
+  `docs/spec/vmk-boot-ceremony.md`.
+
 ## Alternatives Considered
 
 - **SQLCipher (transparent full-DB page encryption).** The reflexive choice, and
