@@ -53,6 +53,7 @@ use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_crypto::serialize::from_canonical_bytes;
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
+use rrn_ledger::engine::CLOCK_SKEW_TOLERANCE_SECS;
 use rrn_ledger::escrow::{
     CertId, EquivocationBasis, EquivocationId, EquivocationVerdictRecord, VerdictDecision,
 };
@@ -67,7 +68,7 @@ use crate::panel::{resolve_panel, tally, DisputeOutcome, Panel};
 use crate::sortition::{
     draw_sequence, eligible_pool_excluding, vouchees_of_until, vouchers_of_until,
 };
-use crate::{DisputeParams, Error, Result};
+use crate::{admission_instant, DisputeParams, Error, Result};
 
 /// Domain-separation tag mixed into an equivocation case's sortition seed, kept
 /// distinct from the transaction-dispute tag so the two case kinds can never draw
@@ -731,8 +732,9 @@ pub fn resolve_equivocation(
 ///
 /// Errors — without writing — on a bad signature or signer/juror mismatch
 /// ([`Error::BadEquivocationBallot`]); no case for the named record
-/// ([`Error::NoEquivocationCase`]); a ballot in an unknown round, cast outside that
-/// round's window, or from a juror who does not hold a live seat then
+/// ([`Error::NoEquivocationCase`]); a ballot in an unknown round, admitted outside
+/// that round's window, from a juror who does not hold a live seat then, or whose
+/// `cast_at` is dated into the future beyond the clock-skew tolerance
 /// ([`Error::NotSeated`]); or a second ballot from the same juror in that round
 /// ([`Error::AlreadyVoted`]).
 pub fn append_equivocation_ballot(
@@ -745,17 +747,24 @@ pub fn append_equivocation_ballot(
     station: &PublicKey,
 ) -> Result<()> {
     ballot.verify().map_err(|_| Error::BadEquivocationBallot)?;
-    let (equivocation_id, juror, round) = (
+    let (equivocation_id, juror, round, cast_at) = (
         ballot.payload.equivocation_id,
         ballot.payload.juror,
         ballot.payload.round,
+        ballot.payload.cast_at,
     );
     if &ballot.signer != juror.public_key() {
         return Err(Error::BadEquivocationBallot);
     }
 
     let case = case_for_record(db, &equivocation_id, station)?.ok_or(Error::NoEquivocationCase)?;
-    let rounds = rounds(db, founders, &case, params, anchor, now, station)?;
+    let admitted_at = admission_instant(db, now)?;
+    // The asserted `cast_at` is testimony, bounded only against future-dating
+    // (ADR-0022 §3).
+    if cast_at > admitted_at.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+        return Err(Error::NotSeated);
+    }
+    let rounds = rounds(db, founders, &case, params, anchor, admitted_at, station)?;
     let round_anchor = rounds
         .iter()
         .find(|r| r.index == round)
@@ -766,12 +775,12 @@ pub fn append_equivocation_ballot(
         return Err(Error::AlreadyVoted);
     }
 
-    // Seat the juror as of the ballot's **admission** instant (`now`), never its
-    // asserted `cast_at` (ADR-0022): the ballot is being admitted now, so the juror
-    // must occupy a seat still awaiting a ruling as of now. A juror whose response
-    // window already closed has had their seat redrawn, so this fails — a late
-    // ballot cannot be backdated in. `cast_at` is retained on the record as
-    // testimony only and enters no arithmetic.
+    // Seat the juror as of the ballot's **admission** instant (`admitted_at`), never
+    // its asserted `cast_at` (ADR-0022): the juror must occupy a seat still awaiting
+    // a ruling as of the admission. A juror whose response window already closed has
+    // had their seat redrawn, so this fails — a late ballot cannot be backdated in.
+    // `cast_at` is retained on the record as testimony; beyond the future-dating
+    // bound above it enters no arithmetic.
     let panel = round_panel(
         db,
         founders,
@@ -779,7 +788,7 @@ pub fn append_equivocation_ballot(
         round_anchor,
         params,
         anchor,
-        now,
+        admitted_at,
         station,
     )?;
     match panel.seat_of(&juror) {
@@ -820,16 +829,19 @@ pub fn append_equivocation_reseat(
     }
 
     let case = case_for_record(db, &equivocation_id, station)?.ok_or(Error::NoEquivocationCase)?;
+    // Judged at the instant the log will stamp this request with (ADR-0022 §6), so
+    // the gate and replay agree even after a backwards clock step.
+    let admitted_at = admission_instant(db, now)?;
 
     // The case must currently be lapsed, and this request must open the very next
     // round. A terminal (confirmed/overturned) or still-pending case is not
     // re-seatable, and a round that does not follow the current one is refused.
-    if decide_equivocation(db, founders, &case, params, anchor, now, station)?
+    if decide_equivocation(db, founders, &case, params, anchor, admitted_at, station)?
         != EquivResolution::Lapsed
     {
         return Err(Error::NotReseatable);
     }
-    let rounds = rounds(db, founders, &case, params, anchor, now, station)?;
+    let rounds = rounds(db, founders, &case, params, anchor, admitted_at, station)?;
     let cur = rounds.last().expect("round 0 is always present");
     if round != cur.index + 1 {
         return Err(Error::NotReseatable);
@@ -840,7 +852,15 @@ pub fn append_equivocation_reseat(
     // (ADR-0022 §5). Never `u64::MAX`: standing manufactured concurrently must not
     // qualify a requester the replayed bound would reject.
     let will_be_seq = AppendLog::new(db).tail()?.map_or(1, |t| t.seq + 1);
-    if !reseat_eligible(db, founders, &case, &requester, now, will_be_seq, station)? {
+    if !reseat_eligible(
+        db,
+        founders,
+        &case,
+        &requester,
+        admitted_at,
+        will_be_seq,
+        station,
+    )? {
         return Err(Error::NotReseatable);
     }
 

@@ -1,8 +1,8 @@
 //! Seating the drawn jury, redrawing around jurors who go silent, and tallying.
 //!
 //! The panel is *derived*, deterministically, from three inputs: the sortition
-//! order (who was drawn, in what sequence), the verdicts on the log, and the
-//! clock. [`resolve_panel`] replays the seating forward from the dispute's open
+//! order (who was drawn, in what sequence), the verdicts on the log with their
+//! admission times (ADR-0022 §5), and the clock. [`resolve_panel`] replays the seating forward from the dispute's open
 //! time — the first [`panel_size`](crate::DisputeParams::panel_size) candidates
 //! take their seats, and any who pass their response deadline without a valid
 //! verdict are redrawn around, their seat handed to the next candidate in the
@@ -23,7 +23,7 @@ pub struct SeatedJuror {
     /// When they took the seat: the dispute's open time for the initial panel, or
     /// the moment the juror they replaced timed out.
     pub seated_at: i64,
-    /// Their verdict, if they cast one within their window: `Some(true)` upholds,
+    /// Their verdict, if one was admitted within their window: `Some(true)` upholds,
     /// `Some(false)` rejects, `None` means still awaiting (or past deadline).
     pub verdict: Option<bool>,
 }
@@ -54,11 +54,13 @@ pub enum DisputeOutcome {
     Rejected,
 }
 
-/// Derives the seated jury as of `now` from the sortition `sequence`, the cast
-/// `verdicts`, and the timing.
+/// Derives the seated jury as of `now` from the sortition `sequence`, the
+/// `verdicts` keyed by juror as `(uphold, admitted_at)`, and the timing.
 ///
-/// A candidate takes a seat at a known instant; their verdict counts only if cast
-/// within `[seated_at, seated_at + juror_response_seconds]`. A seat whose occupant
+/// A candidate takes a seat at a known instant; their verdict counts only if
+/// **admitted** within `[seated_at, seated_at + juror_response_seconds]`. The times
+/// in `verdicts` are admission times, never a juror-signed timestamp (ADR-0022 §5),
+/// so a juror cannot date a verdict back inside a seat that has already lapsed. A seat whose occupant
 /// lets that window close without a valid verdict is handed to the next unused
 /// candidate, seated at the missed deadline — cascading deterministically until
 /// the pool is exhausted or no more deadlines have passed as of `now`. Iterating
@@ -105,10 +107,13 @@ pub fn resolve_panel(
             }
             let (juror, seated_at) = (occ.juror, occ.seated_at);
 
-            // Count a verdict only if cast inside this occupant's window and not in
-            // the future relative to `now`.
-            if let Some((uphold, cast_at)) = verdicts.get(&juror) {
-                if *cast_at >= seated_at && *cast_at <= seated_at + rw && *cast_at <= now {
+            // Count a verdict only if admitted inside this occupant's window and not
+            // after `now`.
+            if let Some((uphold, admitted_at)) = verdicts.get(&juror) {
+                if *admitted_at >= seated_at
+                    && *admitted_at <= seated_at + rw
+                    && *admitted_at <= now
+                {
                     seats[s].as_mut().expect("seat occupied").verdict = Some(*uphold);
                     changed = true;
                     continue;
@@ -143,8 +148,9 @@ pub fn resolve_panel(
     }
 }
 
-/// The instant a terminal majority was reached: the cast time of the
-/// majority-th concurring verdict, ordered earliest-first. `None` if the panel has
+/// The instant a terminal majority was reached: the admission time of the
+/// majority-th concurring verdict, ordered earliest-first — never a juror-signed
+/// timestamp, so jurors cannot date a ruling back to shorten its appeal window. `None` if the panel has
 /// not reached a majority. This is when a jury ruling becomes appealable and when
 /// its appeal window starts (ADR-0014 §5).
 pub fn ruling_reached_at(
@@ -160,7 +166,7 @@ pub fn ruling_reached_at(
         .seats
         .iter()
         .filter(|s| s.verdict == Some(want))
-        .filter_map(|s| verdicts.get(&s.juror).map(|(_, cast_at)| *cast_at))
+        .filter_map(|s| verdicts.get(&s.juror).map(|(_, admitted_at)| *admitted_at))
         .collect();
     times.sort_unstable();
     // A terminal tally guarantees at least `majority` concurring verdicts.

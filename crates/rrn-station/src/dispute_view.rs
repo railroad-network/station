@@ -217,7 +217,7 @@ pub fn dispute_view(
         station,
     )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
-    let cast = verdicts(db, tx_id)?;
+    let cast = verdicts(db, tx_id, info.opened_seq)?;
     let panel = resolve_panel(&sequence, &cast, info.opened_at, params, now);
     let panel = panel
         .seats
@@ -245,7 +245,7 @@ pub fn dispute_view(
                     .min(info.opened_at.saturating_add(params.window_seconds));
                 let electorate =
                     escalation_electorate(db, founders, &info, admitted_at, esc_seq, station)?;
-                let ballots = escalation_ballots(db, tx_id)?;
+                let ballots = escalation_ballots(db, tx_id, esc_seq)?;
                 let t = count_escalation(&ballots, &electorate, params, admitted_at, closes_at);
                 Ok(EscalationView {
                     reason: match esc.reason {
@@ -311,7 +311,7 @@ fn summarize(
         station,
     )?;
     let sequence = draw_sequence(&pool, sortition_seed(tx_id, anchor));
-    let cast = verdicts(db, tx_id)?;
+    let cast = verdicts(db, tx_id, info.opened_seq)?;
     let panel = resolve_panel(&sequence, &cast, info.opened_at, params, now);
 
     let uphold = panel

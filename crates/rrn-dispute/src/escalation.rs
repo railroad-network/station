@@ -72,8 +72,9 @@ pub struct EscalationRecord {
     pub initiator: Address,
     /// Why the escalation is warranted.
     pub reason: EscalationReason,
-    /// Unix seconds when the escalation was opened — the instant the electorate is
-    /// snapshotted at, and the start of the escalation sub-window.
+    /// Unix seconds when the initiator says they opened the escalation — testimony
+    /// only (ADR-0022 §3). The electorate snapshot and the escalation sub-window run
+    /// from the record's admission time and position (see [`escalation_of`]).
     pub opened_at: i64,
 }
 
@@ -91,7 +92,10 @@ pub struct EscalationBallot {
     /// identical semantics to a [`JurorVerdict`](crate::verdict::JurorVerdict), so a
     /// terminal escalation maps onto the same ledger primitive.
     pub uphold: bool,
-    /// Unix seconds when the ballot was cast.
+    /// Unix seconds when the voter says they cast the ballot — testimony only
+    /// (ADR-0022 §3). The ballot is windowed and tallied by its admission time; this
+    /// value is refused only when dated into the future beyond the clock-skew
+    /// tolerance.
     pub cast_at: i64,
 }
 
@@ -203,18 +207,25 @@ pub fn escalation_of(
     Ok(None)
 }
 
-/// Every ballot cast on `tx_id`'s escalation, keyed by voter, as `(uphold, cast_at)`.
+/// Every ballot cast on `tx_id`'s escalation, keyed by voter, as
+/// `(uphold, admitted_at)`.
 ///
-/// Keeps the **first** ballot each voter cast (a ballot is final). Whether a ballot
-/// *counts* is decided by [`count_escalation`], which credits only established,
-/// non-party voters inside the sub-window.
+/// The time is the ballot's **admission** time (its log entry's `created_at`), never
+/// the voter-signed [`cast_at`](EscalationBallot::cast_at) (ADR-0022 §1, §5), so a
+/// late voter cannot date a ballot back inside a closed window. Scans the log after
+/// `after_seq` (pass the escalation's admission `seq` from [`escalation_of`]; a
+/// ballot cannot precede the escalation it votes in), keeps only ballots whose
+/// signer is the voter they name, and keeps the **first** admitted per voter (a
+/// ballot is final). Whether a ballot *counts* is decided by [`count_escalation`],
+/// which credits only established, non-party voters inside the sub-window.
 pub fn escalation_ballots(
     db: &Database,
     tx_id: &TransactionId,
+    after_seq: u64,
 ) -> Result<HashMap<Address, (bool, i64)>> {
     let log = AppendLog::new(db);
     let mut out: HashMap<Address, (bool, i64)> = HashMap::new();
-    for entry in log.iter_from(1) {
+    for entry in log.iter_from(after_seq.saturating_add(1)) {
         let entry = entry?;
         let Ok(ballot) = from_canonical_bytes::<EscalationBallot>(&entry.payload.bytes) else {
             continue;
@@ -222,8 +233,12 @@ pub fn escalation_ballots(
         if ballot.proposal_id != *tx_id {
             continue;
         }
+        // The signer must be the named voter (defends a hostile log copy).
+        if Address::from_public_key(entry.payload.signer) != ballot.voter {
+            continue;
+        }
         out.entry(ballot.voter)
-            .or_insert((ballot.uphold, ballot.cast_at));
+            .or_insert((ballot.uphold, entry.created_at));
     }
     Ok(out)
 }
@@ -272,19 +287,24 @@ pub struct EscalationTally {
 
 /// Counts an escalation's ballots against its electorate and the quorum/approval
 /// bars, in integer arithmetic (`count * 100` vs `pct * base`) so replicas cannot
-/// disagree over rounding. Only ballots from an eligible voter cast within
-/// `[opened_at, close]` are credited.
+/// disagree over rounding. `ballots` is the map [`escalation_ballots`] returns, whose
+/// times are admission times; only ballots from an eligible voter admitted within
+/// `[admitted_at, close]` — `admitted_at` being the escalation's own admission
+/// time — are credited.
 pub fn count_escalation(
     ballots: &HashMap<Address, (bool, i64)>,
     electorate: &HashSet<Address>,
     params: &DisputeParams,
-    opened_at: i64,
+    admitted_at: i64,
     close: i64,
 ) -> EscalationTally {
     let mut uphold = 0u32;
     let mut reject = 0u32;
-    for (voter, (up, cast_at)) in ballots {
-        if !electorate.contains(voter) || *cast_at < opened_at || *cast_at > close {
+    for (voter, (up, ballot_admitted_at)) in ballots {
+        if !electorate.contains(voter)
+            || *ballot_admitted_at < admitted_at
+            || *ballot_admitted_at > close
+        {
             continue;
         }
         if *up {

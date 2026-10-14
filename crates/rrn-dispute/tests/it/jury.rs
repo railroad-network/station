@@ -9,6 +9,7 @@ use rrn_crypto::keypair::{Keypair, SecretKey};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::dispute::{DisputeRecord, SignedDispute};
+use rrn_ledger::engine::CLOCK_SKEW_TOLERANCE_SECS;
 use rrn_ledger::settlement::BalanceView;
 use rrn_ledger::state::{CancelReason, LedgerSnapshot, TransactionState};
 use rrn_ledger::transaction::{TransactionConfirmation, TransactionId, TransactionProposal};
@@ -22,8 +23,8 @@ use rrn_reputation::testutil::{
 };
 
 use rrn_dispute::escalation::{
-    escalation_electorate, escalation_of, EscalationBallot, EscalationReason, EscalationRecord,
-    SignedEscalation, SignedEscalationBallot,
+    escalation_ballots, escalation_electorate, escalation_of, EscalationBallot, EscalationReason,
+    EscalationRecord, SignedEscalation, SignedEscalationBallot,
 };
 use rrn_dispute::panel::resolve_panel;
 use rrn_dispute::resolution::{
@@ -477,7 +478,8 @@ fn a_silent_juror_is_redrawn_around() {
     .unwrap();
 
     // After the deadline, the panel redraws seq[1]/seq[2] to seq[3]/seq[4].
-    let existing = verdicts(&db, &tx).unwrap();
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    let existing = verdicts(&db, &tx, info.opened_seq).unwrap();
     let panel = resolve_panel(&seq, &existing, T, &p, T + 15);
     assert!(
         panel.seat_of(&seq[0]).is_some(),
@@ -975,12 +977,13 @@ fn escalation_ballot_gate_refuses_ineligible_double_and_out_of_window() {
     );
     assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
 
-    // A ballot before the escalation opened is out of window.
+    // A ballot dated into the future beyond the clock-skew tolerance is refused;
+    // its signed `cast_at` is testimony, bounded only from above (ADR-0022 §3).
     let err = append_escalation_ballot(
         &db,
         &[],
         &p,
-        signed_ballot(&tx, &lone, true, T + 1),
+        signed_ballot(&tx, &lone, true, T + 10 + CLOCK_SKEW_TOLERANCE_SECS + 1),
         T + 10,
         &test_station().public_key(),
     );
@@ -1076,7 +1079,8 @@ fn find_disputed_lists_the_frozen_transaction() {
 
     // No verdicts cast yet.
     let empty: HashMap<Address, (bool, i64)> = HashMap::new();
-    assert_eq!(verdicts(&db, &tx).unwrap(), empty);
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    assert_eq!(verdicts(&db, &tx, info.opened_seq).unwrap(), empty);
 }
 
 // --- Bootstrap grace (ADR-0015) ---------------------------------------------
@@ -1577,4 +1581,352 @@ fn a_tail_anchored_dispute_bounds_to_the_whole_log() {
         draw_sequence(&whole, sortition_seed(&tx, ANCHOR)),
     );
     assert_eq!(bounded.len(), 5, "the five jurors; both parties recused");
+}
+
+// --- Admission-clock anchoring of verdicts and ballots (ADR-0022 §1, §3, §5) -----
+
+/// Params for the late-juror tests: a 10-second juror deadline inside a long
+/// overall window, no appeal delay.
+fn late_juror_params() -> DisputeParams {
+    DisputeParams {
+        window_seconds: 1000,
+        juror_response_seconds: 10,
+        panel_size: 3,
+        appeal_window_seconds: 0,
+        escalation_window_seconds: 500,
+        escalation_quorum_pct: 30,
+        escalation_approval_pct: 50,
+    }
+}
+
+/// Seats a panel and lets two jurors lapse: `seq[0]` upholds at T+5, `seq[1]` and
+/// `seq[2]` stay silent past their T+10 deadline, and their replacements `seq[3]`
+/// and `seq[4]` reject at T+12 and T+13 — a 2–1 rejection. Returns the members, the
+/// sortition order, and the disputed transaction.
+fn lapsed_seat_setup(
+    db: &Database,
+    p: &DisputeParams,
+) -> (Vec<Keypair>, Vec<Address>, TransactionId) {
+    let members = establish_members(db, &test_station(), 6, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(db, &alice, &bob, 300, T);
+    let seq = sequence(db, &tx, p);
+    for (who, uphold, at) in [(0, true, T + 5), (3, false, T + 12), (4, false, T + 13)] {
+        append_verdict(
+            db,
+            &[],
+            p,
+            ANCHOR,
+            signed_verdict(&tx, kp_for(&members, &seq[who]), uphold, at),
+            at,
+            &test_station().public_key(),
+        )
+        .unwrap();
+    }
+    (members, seq, tx)
+}
+
+#[test]
+fn a_late_juror_cannot_backdate_a_verdict_into_their_lapsed_seat() {
+    let db = fresh_db();
+    let p = late_juror_params();
+    let (members, seq, tx) = lapsed_seat_setup(&db, &p);
+
+    // seq[1] let their seat lapse at T+10 and was redrawn around. At T+15 they sign
+    // an uphold dated T+8 — inside their old window. The gate judges the admission
+    // (T+15), by which time they hold no seat.
+    let err = append_verdict(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 8),
+        T + 15,
+        &test_station().public_key(),
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::NotSeated)));
+
+    // The replacements' 2–1 rejection stands.
+    let station = test_station();
+    assert_eq!(
+        resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 16).unwrap(),
+        Resolution::Rejected
+    );
+}
+
+#[test]
+fn a_raw_appended_backdated_verdict_is_inert_on_replay() {
+    let db = fresh_db();
+    let p = late_juror_params();
+    let (members, seq, tx) = lapsed_seat_setup(&db, &p);
+
+    // The same backdated verdict, put on the log directly (bypassing the gate, as a
+    // hostile or buggy writer could). Replay reads its admission time, T+15.
+    AppendLog::new(&db)
+        .append(
+            signed_verdict(&tx, kp_for(&members, &seq[1]), true, T + 8),
+            T + 15,
+        )
+        .unwrap();
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    let cast = verdicts(&db, &tx, info.opened_seq).unwrap();
+    assert_eq!(cast.get(&seq[1]), Some(&(true, T + 15)));
+
+    let station = test_station();
+    assert_eq!(
+        resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 16).unwrap(),
+        Resolution::Rejected
+    );
+}
+
+#[test]
+fn jurors_cannot_backdate_a_ruling_to_erase_the_appeal_window() {
+    let db = fresh_db();
+    let members = establish_members(&db, &test_station(), 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let p = esc_params();
+    let seq = sequence(&db, &tx, &p);
+    let station = test_station();
+
+    // Two jurors uphold, both dating their verdicts T+1, both admitted at T+400.
+    for who in [0, 1] {
+        append_verdict(
+            &db,
+            &[],
+            &p,
+            ANCHOR,
+            signed_verdict(&tx, kp_for(&members, &seq[who]), true, T + 1),
+            T + 400,
+            &test_station().public_key(),
+        )
+        .unwrap();
+    }
+
+    // The ruling formed at its admission (T+400), so its appeal window runs to
+    // T+1400 — not to T+1001, as the signed dates would have it.
+    assert_eq!(
+        resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 1050).unwrap(),
+        Resolution::AwaitingAppeal
+    );
+    // The losing party can still appeal.
+    open_escalation(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::Appeal, T + 1100),
+        T + 1100,
+        &test_station().public_key(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_late_voter_cannot_backdate_an_escalation_ballot() {
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    // Main window closes at T+100; the escalation opens at T+50.
+    let p = DisputeParams {
+        window_seconds: 100,
+        escalation_window_seconds: 5000,
+        ..esc_params()
+    };
+    open_escalation(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 50),
+        T + 50,
+        &test_station().public_key(),
+    )
+    .unwrap();
+
+    // At T+150, past the clamped close, the lone voter dates a ballot T+90.
+    let err = append_escalation_ballot(
+        &db,
+        &[],
+        &p,
+        signed_ballot(&tx, &lone, true, T + 90),
+        T + 150,
+        &test_station().public_key(),
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::NotEligible)));
+
+    // A raw-appended copy is not counted either: it was admitted at T+150.
+    AppendLog::new(&db)
+        .append(signed_ballot(&tx, &lone, true, T + 90), T + 150)
+        .unwrap();
+    let (_, _, esc_seq) = escalation_of(&db, &tx).unwrap().unwrap();
+    assert_eq!(
+        escalation_ballots(&db, &tx, esc_seq)
+            .unwrap()
+            .get(&addr(&lone)),
+        Some(&(true, T + 150))
+    );
+    let station = test_station();
+    assert_eq!(
+        resolve(&db, &[], &station, &tx, &p, ANCHOR, T + 200).unwrap(),
+        Resolution::EscalationLapsed
+    );
+}
+
+#[test]
+fn a_future_dated_verdict_is_refused_and_an_old_one_is_admitted() {
+    let db = fresh_db();
+    let members = establish_members(&db, &test_station(), 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let p = params();
+    let seq = sequence(&db, &tx, &p);
+    let now = T + 10;
+
+    // Dated beyond the clock-skew tolerance: refused.
+    let err = append_verdict(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_verdict(
+            &tx,
+            kp_for(&members, &seq[0]),
+            true,
+            now + CLOCK_SKEW_TOLERANCE_SECS + 1,
+        ),
+        now,
+        &test_station().public_key(),
+    );
+    assert!(matches!(err, Err(rrn_dispute::Error::NotSeated)));
+
+    // Dated a day ago — before the dispute even opened — from a juror still seated:
+    // admitted, because only the admission is windowed.
+    append_verdict(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[0]), true, now - 86_400),
+        now,
+        &test_station().public_key(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_verdict_entry_before_the_dispute_does_not_count() {
+    let db = fresh_db();
+    let members = establish_members(&db, &test_station(), 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    // The transaction id `append_disputed` will produce, known ahead of the dispute.
+    let tx = TransactionProposal::new(addr(&alice), addr(&bob), 300, None, 0, 1, i64::MAX / 2).id;
+
+    // Every member's uphold lands on the log before the dispute exists.
+    for m in &members {
+        AppendLog::new(&db)
+            .append(signed_verdict(&tx, m, true, T), T)
+            .unwrap();
+    }
+    assert_eq!(append_disputed(&db, &alice, &bob, 300, T), tx);
+
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    assert_eq!(verdicts(&db, &tx, 0).unwrap().len(), members.len());
+    assert!(verdicts(&db, &tx, info.opened_seq).unwrap().is_empty());
+
+    // So a seated juror's verdict is their first, not a duplicate.
+    let p = params();
+    let seq = sequence(&db, &tx, &p);
+    append_verdict(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, kp_for(&members, &seq[0]), true, T + 5),
+        T + 5,
+        &test_station().public_key(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_verdict_signed_by_someone_other_than_the_named_juror_is_ignored() {
+    let db = fresh_db();
+    let members = establish_members(&db, &test_station(), 5, T);
+    let (alice, bob) = (Keypair::generate(), Keypair::generate());
+    let tx = append_disputed(&db, &alice, &bob, 300, T);
+    let p = params();
+    let seq = sequence(&db, &tx, &p);
+    let (juror, forger) = (kp_for(&members, &seq[0]), kp_for(&members, &seq[1]));
+
+    // A verdict naming `seq[0]` but signed by `seq[1]`, put on the log directly.
+    let forged = SignedVerdict::sign(
+        JurorVerdict {
+            proposal_id: tx,
+            juror: addr(juror),
+            uphold: true,
+            cast_at: T + 5,
+        },
+        forger,
+    );
+    AppendLog::new(&db).append(forged, T + 5).unwrap();
+
+    let info = disputed_info(&db, &tx, &test_station().public_key()).unwrap();
+    assert!(verdicts(&db, &tx, info.opened_seq).unwrap().is_empty());
+    // The named juror's own verdict is their first, not a duplicate.
+    append_verdict(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_verdict(&tx, juror, false, T + 6),
+        T + 6,
+        &test_station().public_key(),
+    )
+    .unwrap();
+    assert_eq!(
+        verdicts(&db, &tx, info.opened_seq).unwrap().get(&seq[0]),
+        Some(&(false, T + 6))
+    );
+}
+
+#[test]
+fn an_escalation_ballot_signed_by_someone_other_than_the_named_voter_is_ignored() {
+    let db = fresh_db();
+    let (alice, _bob, lone, tx) = cannot_seat_setup(&db);
+    let p = esc_params();
+    open_escalation(
+        &db,
+        &[],
+        &p,
+        ANCHOR,
+        signed_escalation(&tx, &alice, EscalationReason::CannotSeat, T + 5),
+        T + 5,
+        &test_station().public_key(),
+    )
+    .unwrap();
+
+    // A ballot naming `lone`, signed by a stranger, put on the log directly.
+    let forged = SignedEscalationBallot::sign(
+        EscalationBallot {
+            proposal_id: tx,
+            voter: addr(&lone),
+            uphold: true,
+            cast_at: T + 10,
+        },
+        &Keypair::generate(),
+    );
+    AppendLog::new(&db).append(forged, T + 10).unwrap();
+
+    let (_, _, esc_seq) = escalation_of(&db, &tx).unwrap().unwrap();
+    assert!(escalation_ballots(&db, &tx, esc_seq).unwrap().is_empty());
+    // `lone` can still cast their own ballot.
+    append_escalation_ballot(
+        &db,
+        &[],
+        &p,
+        signed_ballot(&tx, &lone, false, T + 11),
+        T + 11,
+        &test_station().public_key(),
+    )
+    .unwrap();
 }

@@ -33,6 +33,18 @@
 //! cannot seat a panel, or a party contests its ruling, [`escalation`] puts the
 //! question to the whole established-member electorate on a bounded sub-window that
 //! also fails open.
+//!
+//! # Time is the admission clock
+//!
+//! Every window, seat, tally, and ruling time on these paths reads the **admission
+//! time** of the record it concerns — the log entry's `created_at`, stamped by the
+//! station when it appends the record (ADR-0022 §1, §5). A juror's or voter's signed
+//! `cast_at` and a party's signed `opened_at` are testimony: kept on the record and
+//! never fed into window arithmetic. A `cast_at` is refused only when dated into the
+//! future beyond the clock-skew tolerance (ADR-0022 §3); an escalation's `opened_at`
+//! is refused when later than the station's clock. The write gates and replay
+//! read the same value, so a record a gate admits counts identically on replay, and
+//! a late juror cannot date a verdict back inside a seat that has already lapsed.
 
 pub mod equivocation;
 pub mod escalation;
@@ -42,6 +54,9 @@ pub mod sortition;
 pub mod verdict;
 
 pub use rrn_ledger::dispute::DEFAULT_DISPUTE_WINDOW_SECONDS;
+
+use rrn_storage::db::Database;
+use rrn_storage::log::AppendLog;
 
 /// The number of jurors on a panel: three, so a single bad or bought juror is
 /// outvoted and a clean 2–1 still terminates (ADR-0014 §3).
@@ -151,8 +166,9 @@ pub enum Error {
     /// names.
     #[error("verdict signature is invalid or does not match the named juror")]
     BadVerdict,
-    /// The juror is not seated on the panel as of the verdict's timestamp — never
-    /// drawn, already replaced as a no-show, or past their response deadline.
+    /// The juror is not seated on the panel as of the verdict's admission — never
+    /// drawn, already replaced as a no-show, or past their response deadline — or
+    /// the verdict is dated into the future beyond the clock-skew tolerance.
     #[error("juror does not hold a live seat on the panel")]
     NotSeated,
     /// The juror has already cast a verdict on this dispute; a verdict is final.
@@ -175,7 +191,9 @@ pub enum Error {
     #[error("this dispute has already been escalated")]
     AlreadyEscalated,
     /// The voter is not an established, non-party member of the escalation
-    /// electorate as of the escalation's open time.
+    /// electorate as of the escalation's admission, the ballot's admission falls
+    /// outside the escalation window, or the ballot is dated into the future beyond
+    /// the clock-skew tolerance.
     #[error("voter is not eligible to vote in this escalation")]
     NotEligible,
     /// There is no open escalation on this dispute to vote in.
@@ -203,3 +221,14 @@ pub enum Error {
 
 /// Convenience alias for dispute results.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The admission time a record appended at `now` will be stamped with: `now`,
+/// clamped up to the log tail's `created_at` — exactly the monotone clamp
+/// [`AppendLog::append`] applies (ADR-0022 §6). Every write gate in this crate judges
+/// windows and seats at this value, so a gate and a later replay of the admitted
+/// record read the same instant even after the station's clock steps backwards.
+pub(crate) fn admission_instant(db: &Database, now: i64) -> Result<i64> {
+    Ok(AppendLog::new(db)
+        .tail()?
+        .map_or(now, |t| now.max(t.created_at)))
+}
