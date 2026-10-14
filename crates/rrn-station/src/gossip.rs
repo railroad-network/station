@@ -16,8 +16,15 @@
 //! request and response lines are capped ([`crate::rpc_client`]), the server
 //! caps concurrent connections and idle reads, and one `log_range` reads at
 //! most one bounded page of the log.
+//!
+//! Who may read the chain (ADR-0020 Clarification 2026-10-14): the replica
+//! method set is served only to loopback and to the addresses in
+//! `[network] replicas` ([`PeerGate`]); every other source is refused with
+//! [`rpc::PEER_NOT_ALLOWED`] and served nothing. The gate is per method, so
+//! federation methods can carry their own authentication later (ADR-0029 §6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +57,60 @@ pub const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// itself stays bounded by that, and a pull in flight is abandoned the moment
 /// shutdown is signalled.
 pub const PEER_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Most distinct refused source addresses remembered so each is warned about
+/// once; sources beyond this are logged at `debug` only.
+const REFUSED_SOURCES_REMEMBERED: usize = 256;
+
+/// Whether `source` may be served the replica method set: loopback
+/// (`127.0.0.0/8`, `::1`, or an IPv4-mapped form) or exactly one of the
+/// configured `replicas`. IPv4-mapped IPv6 addresses compare as their IPv4
+/// form on both sides, so a dual-stack listener cannot be used to dodge the list.
+pub fn peer_allowed(source: IpAddr, replicas: &[IpAddr]) -> bool {
+    let source = source.to_canonical();
+    source.is_loopback() || replicas.iter().any(|r| r.to_canonical() == source)
+}
+
+/// The peer port's replica allowlist, plus the refused-source memory that
+/// keeps its log quiet (one `warn` per source per process).
+#[derive(Debug, Default)]
+pub struct PeerGate {
+    replicas: Vec<IpAddr>,
+    refused: Mutex<HashSet<IpAddr>>,
+}
+
+impl PeerGate {
+    /// A gate serving loopback and `replicas` (`[network] replicas`).
+    pub fn new(replicas: Vec<IpAddr>) -> Self {
+        Self {
+            replicas,
+            refused: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Whether `source` may be served; logs a refusal.
+    fn admit(&self, source: IpAddr, method: &str) -> bool {
+        if peer_allowed(source, &self.replicas) {
+            return true;
+        }
+        let source = source.to_canonical();
+        let first = {
+            let mut refused = self.refused.lock().expect("refused-sources mutex");
+            refused.len() < REFUSED_SOURCES_REMEMBERED && refused.insert(source)
+        };
+        if first {
+            tracing::warn!(
+                %source,
+                method,
+                "refusing a peer-port read from an address that is not a configured \
+                 replica; add it to [network] replicas if it is yours"
+            );
+        } else {
+            tracing::debug!(%source, method, "refused peer-port read");
+        }
+        false
+    }
+}
 
 /// The health of one peer, as last observed by the gossip loop. Derived, in-memory
 /// only (never logged/persisted state) — the `status` connectivity block reads it.
@@ -207,11 +268,13 @@ pub(crate) struct LogRangeResult {
 // --- server side: handle inbound peer connections ---------------------------
 
 /// Serves the peer protocol on `listener` until `shutdown` resolves, dispatching
-/// each request to `core`. At most [`MAX_PEER_CONNECTIONS`] connections are
-/// served at once; one accepted beyond that is dropped immediately.
+/// each request to `core` behind `gate`. At most [`MAX_PEER_CONNECTIONS`]
+/// connections are served at once; one accepted beyond that is dropped
+/// immediately.
 pub async fn serve_peers(
     listener: TcpListener,
     core: CoreHandle,
+    gate: Arc<PeerGate>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let slots = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
@@ -226,8 +289,9 @@ pub async fn serve_peers(
                             continue;
                         };
                         let core = core.clone();
+                        let gate = gate.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_peer_conn(stream, core).await {
+                            if let Err(e) = handle_peer_conn(stream, addr.ip(), core, &gate).await {
                                 tracing::debug!(error = %e, "peer connection ended");
                             }
                             drop(permit);
@@ -249,8 +313,13 @@ pub async fn serve_peers(
 /// within [`PEER_IDLE_TIMEOUT`]. An oversize line is answered with one
 /// `INVALID_REQUEST` and the connection closed (the stream cannot be
 /// resynchronized mid-line); an idle connection is closed without a reply, and
-/// one that stops reading a reply is closed after the same timeout.
-async fn handle_peer_conn(stream: TcpStream, core: CoreHandle) -> anyhow::Result<()> {
+/// one that stops reading a reply is closed after [`PEER_PAGE_TIMEOUT`].
+async fn handle_peer_conn(
+    stream: TcpStream,
+    source: IpAddr,
+    core: CoreHandle,
+    gate: &PeerGate,
+) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = Vec::new();
@@ -290,7 +359,7 @@ async fn handle_peer_conn(stream: TcpStream, core: CoreHandle) -> anyhow::Result
         }
 
         let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(req) => dispatch_peer(&req, &core).await,
+            Ok(req) => dispatch_peer(&req, source, &core, gate).await,
             Err(e) => Response::err("", rpc::INVALID_REQUEST, format!("bad request: {e}")),
         };
         write_line(&mut write_half, &response).await?;
@@ -298,26 +367,43 @@ async fn handle_peer_conn(stream: TcpStream, core: CoreHandle) -> anyhow::Result
 }
 
 /// Writes `response` as one JSON line and flushes it, within
-/// [`PEER_IDLE_TIMEOUT`]: a peer that stops reading cannot hold a connection
-/// slot forever.
+/// [`PEER_PAGE_TIMEOUT`] — the same budget a puller gives a page to arrive, so a
+/// full page still reaches a replica on a slow link, while a peer that stops
+/// reading cannot hold a connection slot forever.
 async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     response: &Response,
 ) -> anyhow::Result<()> {
     let mut out = serde_json::to_string(response)?;
     out.push('\n');
-    tokio::time::timeout(PEER_IDLE_TIMEOUT, async {
+    tokio::time::timeout(PEER_PAGE_TIMEOUT, async {
         w.write_all(out.as_bytes()).await?;
         w.flush().await
     })
     .await
-    .map_err(|_| anyhow::anyhow!("peer stopped reading; closing after {PEER_IDLE_TIMEOUT:?}"))??;
+    .map_err(|_| anyhow::anyhow!("peer stopped reading; closing after {PEER_PAGE_TIMEOUT:?}"))??;
     Ok(())
 }
 
-/// Maps one peer request to a core query and builds the response.
-async fn dispatch_peer(req: &Request, core: &CoreHandle) -> Response {
-    match req.method.as_str() {
+/// Maps one peer request to a core query and builds the response. The replica
+/// method set is refused, before any core query, to a `source` the `gate`
+/// does not admit.
+async fn dispatch_peer(
+    req: &Request,
+    source: IpAddr,
+    core: &CoreHandle,
+    gate: &PeerGate,
+) -> Response {
+    let method = req.method.as_str();
+    if matches!(method, "peer_handshake" | "log_tail" | "log_range") && !gate.admit(source, method)
+    {
+        return Response::err(
+            req.id.clone(),
+            rpc::PEER_NOT_ALLOWED,
+            rpc::PEER_NOT_ALLOWED_MESSAGE,
+        );
+    }
+    match method {
         "peer_handshake" => {
             // We log the peer's claimed address but don't act on it in Phase 0.
             let _params: Result<HandshakeParams, _> = serde_json::from_value(req.params.clone());
@@ -386,6 +472,8 @@ pub async fn gossip_loop(
     // Per-peer pull cursor: the peer's next seq to fetch. In memory only — a
     // restart re-pulls once from 1, and `append_raw` dedups what we hold.
     let mut cursors: HashMap<String, u64> = HashMap::new();
+    // Peers that refused us as a replica, so the refusal is warned once.
+    let mut refused_by: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -410,6 +498,21 @@ pub async fn gossip_loop(
                     let ok = outcome.is_ok();
                     if let Err(e) = &outcome {
                         tracing::debug!(peer = %peer, error = %e, "gossip round failed");
+                    }
+                    // A refusal is a configuration problem on the writer, not an
+                    // outage: say so once per peer, where this operator will look.
+                    let refused = outcome
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| e.downcast_ref::<PeerRefused>().is_some());
+                    if refused && refused_by.insert(peer.clone()) {
+                        tracing::warn!(
+                            peer = %peer,
+                            "the peer refused this station as a replica — add this \
+                             station's address to the writer's [network] replicas"
+                        );
+                    } else if ok {
+                        refused_by.remove(peer);
                     }
                     match connectivity.record(peer, ok, clock.now()) {
                         Some(true) => tracing::info!(peer = %peer, "peer reachable"),
@@ -541,11 +644,23 @@ async fn peer_call_within<T: for<'de> Deserialize<'de>>(
     .await
     .map_err(|_| anyhow::anyhow!("peer {peer} timed out after {exchange:?}"))??;
     if let Some(err) = response.error {
+        if err.code == rpc::PEER_NOT_ALLOWED {
+            return Err(PeerRefused.into());
+        }
         anyhow::bail!("peer error: {} (code {})", err.message, err.code);
     }
     let value = response.result.unwrap_or(serde_json::Value::Null);
     Ok(serde_json::from_value(value)?)
 }
+
+/// The peer answered [`rpc::PEER_NOT_ALLOWED`]: it does not list this station
+/// as a replica.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "peer refused this station: not a configured replica (code {})",
+    rpc::PEER_NOT_ALLOWED
+)]
+struct PeerRefused;
 
 /// Resolves once `shutdown` reads `true` (never, if its sender is gone).
 async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
@@ -601,6 +716,102 @@ mod tests {
         // Last success is the most recent reachable round (t=103), not the flip.
         assert_eq!(h.last_success_at, Some(103));
         assert_eq!(h.last_attempt_at, Some(104));
+    }
+
+    #[test]
+    fn peer_allowed_loopback_and_listed_only() {
+        let ip = |a: &str| a.parse::<IpAddr>().unwrap();
+        let replicas = vec![ip("192.168.1.20")];
+        // Loopback in every form, with or without a list.
+        for a in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"] {
+            assert!(peer_allowed(ip(a), &replicas), "{a}");
+            assert!(peer_allowed(ip(a), &[]), "{a}");
+        }
+        // A listed address, also as IPv4-mapped IPv6 (a dual-stack listener).
+        assert!(peer_allowed(ip("192.168.1.20"), &replicas));
+        assert!(peer_allowed(ip("::ffff:192.168.1.20"), &replicas));
+        // A list entry written in mapped form matches the plain address too.
+        assert!(peer_allowed(
+            ip("192.168.1.20"),
+            &[ip("::ffff:192.168.1.20")]
+        ));
+        // Everything else is refused.
+        for a in [
+            "192.168.1.21",
+            "10.0.0.1",
+            "0.0.0.0",
+            "::",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!peer_allowed(ip(a), &replicas), "{a}");
+        }
+        assert!(!peer_allowed(ip("192.168.1.20"), &[]));
+    }
+
+    /// A real core (writer, one vouch on its log) behind a handle.
+    fn spawn_core() -> CoreHandle {
+        use rrn_crypto::keypair::Keypair;
+        use rrn_identity::address::Address;
+        use rrn_storage::db::Database;
+        use rrn_storage::log::AppendLog;
+        let db = Database::open_in_memory().unwrap();
+        rrn_storage::migrations::run(&db).unwrap();
+        let kp = Keypair::generate();
+        let subject = Address::from_public_key(Keypair::generate().public_key());
+        AppendLog::new(&db)
+            .append(
+                rrn_identity::vouch::create_vouch(&kp, &subject, "c", "hi", 0),
+                1_000,
+            )
+            .unwrap();
+        crate::core::Core::new(
+            db,
+            rrn_identity::wallet::WalletContents::create_new(),
+            rrn_ledger::settlement::SettlementConfig::default(),
+            rrn_ledger::credit::CreditConfig::default(),
+            Clock::manual(1_000),
+            crate::paired::PairedMobiles::default(),
+            rrn_marketplace::search::SearchIndex::in_memory(),
+        )
+        .spawn()
+    }
+
+    #[tokio::test]
+    async fn unlisted_source_gets_peer_not_allowed() {
+        let core = spawn_core();
+        let gate = PeerGate::new(vec!["192.168.1.20".parse().unwrap()]);
+        let requests = [
+            ("peer_handshake", serde_json::json!({ "our_address": "x" })),
+            ("log_tail", serde_json::Value::Null),
+            (
+                "log_range",
+                serde_json::json!({ "from_seq": 1, "to_seq": 10, "limit": 10 }),
+            ),
+        ];
+        let outsider: IpAddr = "192.168.1.99".parse().unwrap();
+        let replica: IpAddr = "::ffff:192.168.1.20".parse().unwrap();
+        for (method, params) in requests {
+            let req = Request {
+                id: format!("id-{method}"),
+                method: method.into(),
+                params,
+            };
+            // Refused: the typed code, the constant message, no result.
+            let refused = dispatch_peer(&req, outsider, &core, &gate).await;
+            assert!(refused.result.is_none(), "{method} served a result");
+            let err = refused.error.expect("a refusal");
+            assert_eq!(err.code, rpc::PEER_NOT_ALLOWED, "{method}");
+            assert_eq!(err.message, rpc::PEER_NOT_ALLOWED_MESSAGE, "{method}");
+            assert_eq!(refused.id, req.id);
+            // The listed replica (here arriving IPv4-mapped) is served.
+            let served = dispatch_peer(&req, replica, &core, &gate).await;
+            assert!(served.error.is_none(), "{method}: {:?}", served.error);
+            assert!(served.result.is_some(), "{method}");
+        }
+        // The outsider was remembered once, for one warning.
+        assert_eq!(gate.refused.lock().unwrap().len(), 1);
+        core.shutdown();
     }
 
     #[test]

@@ -426,6 +426,12 @@ pub struct NetworkConfig {
     /// this field existed is a writer — today's behavior.
     #[serde(default)]
     pub role: StationRole,
+    /// Source addresses of the read-replicas this station serves its chain to
+    /// over the peer port, beside loopback, which is always served (ADR-0020
+    /// Clarification 2026-10-14). Exact addresses, no ranges; empty (the
+    /// default) serves loopback only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replicas: Vec<std::net::IpAddr>,
 }
 
 /// `[network] role` — the station's place in the single-writer chain
@@ -937,6 +943,7 @@ impl StationConfig {
             network: NetworkConfig {
                 listen: format!("127.0.0.1:{}", random_port()),
                 role: StationRole::Writer,
+                replicas: Vec::new(),
             },
             mobile: MobileConfig::default(),
             settlement: SettlementSection::default(),
@@ -1017,6 +1024,41 @@ mod tests {
         assert_eq!(cfg.mobile.listen, "0.0.0.0:7500");
         assert!(cfg.mobile.advertise);
         assert_eq!(cfg.mobile.name, None);
+    }
+
+    #[test]
+    fn network_replicas_parse() {
+        let config = StationConfig::parse(
+            r#"
+                [network]
+                listen = "192.168.1.10:7400"
+                replicas = ["192.168.1.20", "::ffff:192.168.1.21", "fe80::1"]
+            "#,
+            &p(),
+        )
+        .unwrap();
+        let want: Vec<std::net::IpAddr> = ["192.168.1.20", "::ffff:192.168.1.21", "fe80::1"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(config.network.replicas, want);
+
+        // Absent means none (loopback only).
+        let none = StationConfig::parse("[network]\nlisten = \"127.0.0.1:7400\"\n", &p()).unwrap();
+        assert!(none.network.replicas.is_empty());
+
+        // Anything but an exact IP address is a config error.
+        for bad in [
+            r#"["not-an-ip"]"#,
+            r#"["192.168.1.0/24"]"#,
+            r#"["192.168.1.20:7401"]"#,
+        ] {
+            let text = format!("[network]\nlisten = \"127.0.0.1:7400\"\nreplicas = {bad}\n");
+            assert!(
+                StationConfig::parse(&text, &p()).is_err(),
+                "{bad} must not parse"
+            );
+        }
     }
 
     #[test]

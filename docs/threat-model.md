@@ -1913,20 +1913,24 @@ core, a panic restarts the station (see the denial-of-service entry below).
   copies the whole chain with `log_range` — the vouch graph, payment memos,
   dispute statements, inquiry threads — without being a replica the operator
   runs.
-- *Mitigation:* the default `listen` is loopback, so out of the box only the
-  host itself can read the chain; the runbook tells an operator who binds a LAN
-  address to firewall the port to the replica's address. **Proposed, pending
-  maintainer ratification** (ADR-0020 Clarification, 2026-10-14): the replica
-  method set is served only to loopback and to the addresses listed in
-  `[network] replicas`; every other source gets a typed refusal and is served
-  nothing.
-- *Residual risk:* until that Clarification is ratified and implemented,
-  **anyone who reaches a non-loopback peer port is served the whole chain**. Once
-  it is, a source address is network position, not cryptographic identity — an
-  attacker who takes over a listed address on the LAN is served the chain — and
-  the TCP stream is plaintext either way, so a replica off the LAN should connect
-  through a VPN or SSH tunnel. Cryptographic replica authentication waits for the
-  Phase 3 hello (ADR-0029 §6).
+- *Mitigation:* the replica method set (`peer_handshake`, `log_tail`,
+  `log_range`) is served only to loopback (`127.0.0.0/8`, `::1`, and their
+  IPv4-mapped forms) and to the exact addresses listed in `[network] replicas`
+  (ADR-0020 Clarification, 2026-10-14); an IPv4 address and its IPv4-mapped
+  IPv6 form count as the same address, on both sides. Every other source gets
+  `PEER_NOT_ALLOWED` (`-32011`) with a constant message and is served nothing;
+  the refusal is logged once per source (`gossip::PeerGate`, covered by
+  `gossip::unlisted_source_gets_peer_not_allowed`). The default `listen` is
+  loopback; a station bound beyond loopback with no replicas listed warns at
+  startup, and `station peers list` prints the allowlist. Federation partners
+  are never listed as replicas and never receive `log_range` (ADR-0029).
+- *Residual risk:* a source address is network position, not cryptographic
+  identity — an attacker who takes over a listed address on the LAN (or spoofs
+  it on a path that allows that) is served the chain — and the TCP stream is
+  plaintext, so a replica off the LAN should connect through a VPN or SSH
+  tunnel. Loopback is always served, so any process on the station's own host
+  can read the chain (the same host trust as the at-rest database). Cryptographic
+  replica authentication waits for the Phase 3 hello (ADR-0029 §6).
 
 #### Denial of service — malformed input, peer flooding, the single writer
 
@@ -1951,8 +1955,8 @@ core, a panic restarts the station (see the denial-of-service entry below).
   (the runbook runs `station` under `systemd` with `Restart=on-failure`). Every
   line-JSON surface caps its line (peer requests 4 KiB, local socket ≈ 8.25 MiB,
   peer responses ≈ 34 MiB) and closes the connection on overflow; the peer port
-  also caps concurrent connections at 8, and closes a connection that sends no
-  request, or stops reading its reply, for 10 s; one `log_range`
+  also caps concurrent connections at 8, closes a connection that sends no
+  request for 10 s, and gives a reply 60 s to drain; one `log_range`
   call reads at most 256 entries / 1 MiB in one bounded SQL page, and a replica
   pulls in pages from a cursor (RRN-A-025, covered by `peer_port`). A peer that
   errors only fails *that* gossip round.

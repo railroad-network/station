@@ -4,7 +4,8 @@
 //! - `init` — bootstrap a data directory (wallet + database + config).
 //! - `run` (default) — open the data directory and run the daemon until
 //!   Ctrl-C / SIGTERM.
-//! - `peers list` — print the configured peer list and exit.
+//! - `peers list` — print the role, who the chain is served to, and the
+//!   configured peer list, and exit.
 //!
 //! The passphrase is read without echo (via `rpassword`), or from the
 //! `RRN_PASSPHRASE` environment variable when set — the latter is how CI and the
@@ -196,7 +197,8 @@ enum RecoveryCmd {
 
 #[derive(Subcommand)]
 enum PeersCmd {
-    /// Print the configured peers.
+    /// Print the role, the replicas the chain is served to, and the configured
+    /// peers.
     List,
 }
 
@@ -476,12 +478,18 @@ fn cmd_run(data_dir: &std::path::Path) -> Result<()> {
     })
 }
 
-/// `station peers list` — print this station's role and its configured peers
+/// `station peers list` — print this station's role, who its peer port serves
+/// the chain to (loopback plus `[network] replicas`), and its configured peers
 /// (read-only). A writer never pulls, so it reports no peers; only a replica
 /// copies the writer's chain from the listed peers (ADR-0020 §7).
 fn cmd_peers_list(data_dir: &std::path::Path) -> Result<()> {
     let config = StationConfig::load_or_create(&data_dir.join(CONFIG_FILE))?;
     eprintln!("role: {}", config.network.role.as_str());
+    // Who this station's peer port serves the chain to (ADR-0020 Clarification
+    // 2026-10-14): loopback always, plus `[network] replicas`.
+    let mut readers = vec!["loopback".to_string()];
+    readers.extend(config.network.replicas.iter().map(|ip| ip.to_string()));
+    eprintln!("serves the chain to: {}", readers.join(", "));
     if config.peers.list.is_empty() {
         eprintln!("(no peers configured)");
     } else {

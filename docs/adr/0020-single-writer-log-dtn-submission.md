@@ -259,8 +259,8 @@ its wire cost.
 
 ## Clarification (2026-10-14) — who may read the chain over the peer port
 
-> **Draft — proposed for maintainer ratification.** Nothing that depends on this
-> rule is implemented until it is ratified.
+*Ratified by the maintainer on 2026-10-14 (option A below); in force with the
+change that implements the allowlist.*
 
 Decision §7 and the 2026-09-14 Clarification say a writer "still *serves* the
 peer port, so replicas can copy the chain from it," but not who counts as a
