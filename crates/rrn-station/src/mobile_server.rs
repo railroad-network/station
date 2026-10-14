@@ -25,7 +25,6 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use rrn_protocol::bundle::MAX_BUNDLE_BYTES;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -33,12 +32,14 @@ use crate::core::{CoreHandle, SubscribeOutcome};
 use crate::pairing::{PairError, PairFinish, PairFinished, PairOffer, PairStart};
 use crate::rpc_envelope::ChannelError;
 
-/// Request-body ceiling for the sealed channel. A `bundle_submit`
-/// carries a DTN bundle up to [`MAX_BUNDLE_BYTES`] hex-encoded (≈ 2×) inside a
-/// signed, sealed envelope, so the axum default (2 MiB) would 413 a legitimate
-/// full bundle before the seal is ever opened. Sized to that worst case plus
-/// headroom for the envelope/seal framing; every other request is far smaller.
-const MOBILE_BODY_LIMIT: usize = MAX_BUNDLE_BYTES * 2 + 256 * 1024;
+/// Request-body ceiling for the sealed channel. A `bundle_submit` carries a
+/// DTN bundle up to
+/// [`MAX_BUNDLE_BYTES`](rrn_protocol::bundle::MAX_BUNDLE_BYTES) hex-encoded
+/// (≈ 2×) inside a signed, sealed envelope, so the axum default (2 MiB) would
+/// 413 a legitimate full bundle before the seal is ever opened. Sized to that
+/// worst case plus headroom for the envelope/seal framing — the same worst case
+/// as the operator socket's request line; every other request is far smaller.
+const MOBILE_BODY_LIMIT: usize = crate::rpc_client::LOCAL_REQUEST_LINE_LIMIT;
 
 /// Router state: the core handle plus how long a `/subscribe` is held open.
 #[derive(Clone)]

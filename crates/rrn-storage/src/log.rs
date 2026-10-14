@@ -364,6 +364,54 @@ impl<'a> AppendLog<'a> {
         self.collect_from(from_seq).into_iter()
     }
 
+    /// The entries with `from_seq <= seq <= to_seq`, ascending, at most `limit`
+    /// of them — one bounded SQL page (`LIMIT` in the query), unlike
+    /// [`iter_from`](Self::iter_from), which loads everything to the tail.
+    pub fn range(&self, from_seq: u64, to_seq: u64, limit: u32) -> Result<Vec<LogEntry>> {
+        self.range_within(from_seq, to_seq, limit, usize::MAX)
+    }
+
+    /// [`range`](Self::range), additionally stopping before the entry that would
+    /// take the sum of signed payload bytes (`payload.bytes.len()`) past
+    /// `max_payload_bytes`. The first entry is always included, so a single
+    /// entry larger than the budget is still returned alone. Rows are stepped
+    /// one at a time, so at most one row past the budget is ever read.
+    pub fn range_within(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+        limit: u32,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<LogEntry>> {
+        // Seqs are SQLite integers (`i64`): a lower bound past `i64::MAX`
+        // matches nothing, an upper bound past it matches to the tail.
+        let Ok(from) = i64::try_from(from_seq) else {
+            return Ok(Vec::new());
+        };
+        let to = i64::try_from(to_seq).unwrap_or(i64::MAX);
+        if from > to || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, prev_hash, content_hash, payload, created_at \
+             FROM log_entries WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![from, to, i64::from(limit)], row_to_raw)?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let entry = decode_entry(row?)?;
+            let len = entry.payload.bytes.len();
+            if !out.is_empty() && bytes.saturating_add(len) > max_payload_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(len);
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
     /// Re-reads the whole log and checks every link: each entry's stored
     /// `content_hash` must equal the Blake3 of its payload bytes, and its
     /// `prev_hash` must equal the previous entry's `content_hash` (zero for the
@@ -593,6 +641,41 @@ mod tests {
         assert!(log.get(2).unwrap().unwrap().payload.verify().is_ok());
         assert_eq!(log.tail().unwrap().unwrap().seq, 3);
         assert_eq!(log.iter_from(2).count(), 2);
+    }
+
+    #[test]
+    fn range_is_bounded_in_sql() {
+        let db = fresh_log_db();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&db);
+        for n in 1..=10 {
+            append_note(&mut log, &kp, n);
+        }
+        // An inverted range is empty.
+        assert!(log.range(5, 3, 10).unwrap().is_empty());
+        // `limit` caps the page.
+        let seqs: Vec<u64> = log.range(1, 10, 4).unwrap().iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        // The upper bound caps it too; out-of-range bounds clamp, never wrap.
+        let seqs: Vec<u64> = log
+            .range(8, u64::MAX, 100)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![8, 9, 10]);
+        assert!(log.range(u64::MAX, u64::MAX, 100).unwrap().is_empty());
+        assert!(log.range(1, 10, 0).unwrap().is_empty());
+        // A payload-byte budget stops the page early but always serves one.
+        let one = log.get(1).unwrap().unwrap().payload.bytes.len();
+        let seqs: Vec<u64> = log
+            .range_within(1, 10, 10, one * 2)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(log.range_within(3, 10, 10, 0).unwrap().len(), 1);
     }
 
     #[test]

@@ -152,7 +152,8 @@ telling you to remove the peers or set `role = "replica"`). You do not need
 Two practical notes:
 
 - **Firewall:** if the machine runs one, allow inbound TCP **7500** from your
-  LAN. Port 7400 should stay unreachable from other machines.
+  LAN. Port 7400 should stay unreachable from other machines — except from
+  your configured replicas (below).
 - **`advertise = true`** is what makes the station appear automatically in
   the app's "Join your community" list. Leave it on unless your network
   blocks mDNS/Bonjour — in that case members type the station's IP and port
@@ -163,8 +164,20 @@ read-only *replica*: a warm second copy of the writer's chain, useful for a live
 off-site backup or an audit workstation. A replica pulls the writer's log and
 re-derives from it, but **admits nothing** — every attempt to write to it (a
 payment, a vouch, a courier bundle) is refused with a "this station is a
-read-replica" message, so it can never accidentally fork the community. Point it
-at the writer and set the role:
+read-replica" message, so it can never accidentally fork the community. On the
+**writer**, bind the station-to-station port to the LAN address the replica will
+dial (the loopback default only serves the same machine) **and** list the
+replica's IP address under `replicas` — the writer serves its chain only to
+loopback and the addresses listed there, and refuses everyone else:
+
+```toml
+[network]
+listen = "192.168.1.10:7400"   # the writer's LAN address
+role = "writer"
+replicas = ["192.168.1.20"]    # each replica's IP address (exact, no port, no ranges)
+```
+
+Then point the replica at the writer and set its role:
 
 ```toml
 [peers]
@@ -175,7 +188,20 @@ listen = "127.0.0.1:7401"
 role = "replica"
 ```
 
-`station peers list` prints the role and peers of whichever station you run it
+A replica receives **every record on the log** — who vouched for whom, payment
+memos, dispute statements, marketplace inquiry threads. The writer recognizes a
+replica only by its IP address, so keep the firewall on port 7400 as well: allow
+the replica's address only. The connection is not encrypted: for a replica off
+your LAN, connect the two machines through a VPN or an SSH tunnel rather than
+opening the port to the internet. For an SSH tunnel, keep the writer's `listen`
+at the loopback default and tunnel to `127.0.0.1:7400` on the writer — the
+replica then arrives from loopback and needs no `replicas` entry. Over a VPN,
+list the replica's VPN address. Upgrade the writer and its replicas
+together — a replica and a writer on different versions cannot copy the chain,
+and the writer shows as unreachable in the replica's `rrn status`.
+
+`station peers list` prints the role, the addresses the chain is served to, and
+the peers of whichever station you run it
 against, and `rrn status` shows the role at the top. A replica is **not** a
 failover standby — if the writer is lost, you recover it from the encrypted
 backup (§4.1), not by promoting a replica; writer succession is a later-phase

@@ -257,6 +257,52 @@ not the receiver, a self-payment, inconsistent timestamps) stay on the transient
 (`rrn wallet abandon`), and a second, final catch-all slug was judged not worth
 its wire cost.
 
+## Clarification (2026-10-14) — who may read the chain over the peer port
+
+*Ratified by the maintainer on 2026-10-14 (option A below); in force with the
+change that implements the allowlist.*
+
+Decision §7 and the 2026-09-14 Clarification say a writer "still *serves* the
+peer port, so replicas can copy the chain from it," but not who counts as a
+replica. In code, anyone who could reach `[network] listen` was served the
+replica method set (`peer_handshake`, `log_tail`, `log_range`) and could copy
+the whole chain: the vouch graph, payment memos, dispute statements, inquiry
+threads. The handshake's claimed address was parsed and ignored. The internal
+security review (RRN-A-025, closing the August review's RRN-A-003) named this a
+disclosure. This narrows §7 and does not change the decision.
+
+**The replica method set is served only to loopback and to the operator's
+configured replica addresses.** A station serves `peer_handshake`, `log_tail`,
+and `log_range` to a connection whose source address is loopback (`127.0.0.0/8`,
+`::1`, or an IPv4-mapped form of either) or exactly one of the addresses listed
+in `[network] replicas` (default empty: loopback only). Every other source gets
+a typed refusal on each of the three methods and is served nothing. The rule
+applies to every station role: a replica's own peer port serves its copy under
+the same allowlist.
+
+- **Identity is network position, until Phase 3.** A replica is recognized by
+  its source address, not by a key. A signed challenge under the replica's
+  station key would need a new signed kind, a fixture, and a second round trip
+  on a one-shot protocol — the federation hello machinery of ADR-0029 §6 built
+  early. When Phase 3 lands that hello, extending it to replicas is a later
+  decision; until then the residual is stated in the threat model: whoever takes
+  over a listed address on the network is served the chain, and the stream is
+  plaintext, so a replica off the LAN should connect through a VPN or SSH
+  tunnel.
+- **The gate is per method, for the replica set only.** ADR-0029 §6's federation
+  methods (`fed_hello`, `fed_bundle`, `fed_receipt`, `fed_profile`) arrive on
+  the same port with their own writer-signed hello authentication, so the
+  allowlist does not gate the port as a whole.
+- **Federation partners never receive `log_range`.** A treaty partner is not a
+  replica and is never listed as one: consistent with ADR-0029's maintainer
+  decision (2026-09-23) — federation-scoped records only, never full partner
+  logs.
+
+Not chosen: keeping the port open and documenting the disclosure only (the
+chain carries member-to-member content that a community has not agreed to
+publish), and the signed challenge-response above (Phase 3 machinery, for a
+residual that network position plus a tunnel already bounds at pilot scale).
+
 ## Alternatives Considered
 
 - **Per-node chains (a small set of co-equal station-class writers), merged

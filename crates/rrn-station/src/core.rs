@@ -104,6 +104,7 @@ use crate::pairing::{
     self, PairError, PairFinish, PairFinished, PairOffer, PairStart, PendingPair, PendingStage,
 };
 use crate::reputation_view;
+use crate::rpc_client::{MAX_LOG_RANGE_ENTRIES, MAX_LOG_RANGE_PAGE_BYTES};
 use crate::rpc_envelope::{self, ChannelError, ReplyBinding, RequestEnvelope, ResponseEnvelope};
 use crate::transaction_view;
 use crate::vouch_view;
@@ -200,21 +201,26 @@ pub enum Command {
         /// Tail seq (0 if empty).
         reply: oneshot::Sender<u64>,
     },
-    /// The log entries with `from_seq <= seq <= to_seq`, as wire entries.
+    /// One bounded page of the log entries with `from_seq <= seq <= to_seq`, as
+    /// wire entries, plus the seq to resume from.
     LogRange {
         /// Inclusive lower bound.
         from_seq: u64,
         /// Inclusive upper bound.
         to_seq: u64,
-        /// The matching entries.
-        reply: oneshot::Sender<Vec<WireEntry>>,
+        /// The caller's page size; clamped to `1..=MAX_LOG_RANGE_ENTRIES`.
+        limit: u32,
+        /// The page and the seq after its last entry (`from_seq` when empty);
+        /// `None` on a read error.
+        reply: oneshot::Sender<Option<(Vec<WireEntry>, u64)>>,
     },
-    /// Append replicated entries from a peer; reply with how many were new.
+    /// Append replicated entries from a peer; reply with how many were new, or
+    /// `None` when a storage error stopped the page part-way.
     AppendEntries {
         /// Entries received from a peer, in the peer's log order.
         entries: Vec<WireEntry>,
         /// How many were newly appended (not already held).
-        reply: oneshot::Sender<usize>,
+        reply: oneshot::Sender<Option<usize>>,
     },
     /// A device's pairing start (its commitment), from the mobile HTTP
     /// surface. The core verifies it, opens a session awaiting the reveal, and
@@ -550,34 +556,44 @@ impl CoreHandle {
         rx.await.unwrap_or(0)
     }
 
-    /// Fetches the wire entries in `[from_seq, to_seq]`.
-    pub async fn log_range(&self, from_seq: u64, to_seq: u64) -> Vec<WireEntry> {
+    /// Fetches one bounded page of the wire entries in `[from_seq, to_seq]`
+    /// and the seq to resume from (see [`MAX_LOG_RANGE_ENTRIES`] and
+    /// [`MAX_LOG_RANGE_PAGE_BYTES`]); `None` on a read error or a stopped core.
+    pub async fn log_range(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+        limit: u32,
+    ) -> Option<(Vec<WireEntry>, u64)> {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
             .send(Command::LogRange {
                 from_seq,
                 to_seq,
+                limit,
                 reply,
             })
             .is_err()
         {
-            return Vec::new();
+            return None;
         }
-        rx.await.unwrap_or_default()
+        rx.await.ok().flatten()
     }
 
-    /// Appends replicated entries; returns the count newly appended.
-    pub async fn append_entries(&self, entries: Vec<WireEntry>) -> usize {
+    /// Appends replicated entries; returns the count newly appended, or `None`
+    /// when the page was not fully applied (a storage error, or the core is
+    /// gone) — the caller must not advance past it.
+    pub async fn append_entries(&self, entries: Vec<WireEntry>) -> Option<usize> {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
             .send(Command::AppendEntries { entries, reply })
             .is_err()
         {
-            return 0;
+            return None;
         }
-        rx.await.unwrap_or(0)
+        rx.await.unwrap_or(None)
     }
 
     /// Submits a device's pairing start; returns the station's signed offer or
@@ -1025,9 +1041,10 @@ impl Core {
             Command::LogRange {
                 from_seq,
                 to_seq,
+                limit,
                 reply,
             } => {
-                let _ = reply.send(self.do_log_range(from_seq, to_seq));
+                let _ = reply.send(self.do_log_range(from_seq, to_seq, limit));
             }
             Command::AppendEntries { entries, reply } => {
                 let _ = reply.send(self.do_append_entries(entries));
@@ -3148,23 +3165,40 @@ impl Core {
             .unwrap_or(0)
     }
 
-    fn do_log_range(&self, from_seq: u64, to_seq: u64) -> Vec<WireEntry> {
-        let log = AppendLog::new(&self.db);
-        let mut out = Vec::new();
-        for entry in log.iter_from(from_seq) {
-            match entry {
-                Ok(e) if e.seq <= to_seq => out.push(WireEntry::from_stored(&e.payload)),
-                Ok(_) => break, // past the upper bound (iter is ascending)
-                Err(e) => {
-                    tracing::warn!(error = %e, "log_range read error");
-                    break;
-                }
+    /// One page of the log for the peer port: at most `limit` (clamped to
+    /// `1..=MAX_LOG_RANGE_ENTRIES`) entries and about `MAX_LOG_RANGE_PAGE_BYTES`
+    /// of payload, read in one bounded SQL query, plus the seq after the last
+    /// entry served (`from_seq` when the page is empty). A read error is logged
+    /// and answered `None`, so the puller's round fails visibly instead of
+    /// reading an empty page as "nothing more".
+    fn do_log_range(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+        limit: u32,
+    ) -> Option<(Vec<WireEntry>, u64)> {
+        let limit = limit.clamp(1, MAX_LOG_RANGE_ENTRIES);
+        let page = match AppendLog::new(&self.db).range_within(
+            from_seq,
+            to_seq,
+            limit,
+            MAX_LOG_RANGE_PAGE_BYTES,
+        ) {
+            Ok(page) => page,
+            Err(e) => {
+                tracing::warn!(error = %e, "log_range read error");
+                return None;
             }
-        }
-        out
+        };
+        let next_from_seq = page.last().map_or(from_seq, |e| e.seq.saturating_add(1));
+        let entries = page
+            .iter()
+            .map(|e| WireEntry::from_stored(&e.payload))
+            .collect();
+        Some((entries, next_from_seq))
     }
 
-    fn do_append_entries(&mut self, entries: Vec<WireEntry>) -> usize {
+    fn do_append_entries(&mut self, entries: Vec<WireEntry>) -> Option<usize> {
         // Only a replica applies pulled entries (ADR-0020 §7): this is the
         // read-replica gossip path. A writer never pulls — the daemon does not
         // even spawn the gossip client for a writer — so reaching this on a
@@ -3179,9 +3213,10 @@ impl Core {
                      (ADR-0020 §1/§7)"
                 );
             }
-            return 0;
+            return Some(0);
         }
         let mut appended = 0;
+        let mut complete = true;
         // Listings a replicated entry claims to be about, so the browse index
         // can be brought back in step below. Collected rather than reindexed
         // inline because each reindex replays the log, and a gossip round can
@@ -3211,17 +3246,25 @@ impl Core {
                     }
                 }
                 Ok(None) => {} // already held — dedup
+                Err(rrn_storage::Error::InvalidSignature) => {
+                    // A peer's entry that fails signature verification is
+                    // skipped for good — never trust a peer's bytes.
+                    tracing::warn!("rejecting peer log entry: invalid signature");
+                }
                 Err(e) => {
-                    // A peer's entry that fails signature verification (or any
-                    // other error) is skipped — never trust a peer's bytes.
-                    tracing::warn!(error = %e, "rejecting peer log entry");
+                    // A storage failure is not the entry's fault: stop here and
+                    // report the page incomplete, so the puller re-reads it
+                    // rather than stepping past entries it never applied.
+                    tracing::warn!(error = %e, "failed to apply peer log entry");
+                    complete = false;
+                    break;
                 }
             }
         }
         for listing_id in &touched {
             self.reindex_listing(listing_id);
         }
-        appended
+        complete.then_some(appended)
     }
 
     // --- governance ----------------------------------------------
@@ -8553,11 +8596,11 @@ mod tests {
         // One good, one tampered: only the good one is appended, and the bad one
         // does not abort the batch or crash.
         let appended = core.do_append_entries(vec![good.clone(), bad]);
-        assert_eq!(appended, 1);
+        assert_eq!(appended, Some(1));
         assert_eq!(core.tail_seq(), 1);
 
         // Replaying the same good entry is deduped (idempotent).
-        assert_eq!(core.do_append_entries(vec![good]), 0);
+        assert_eq!(core.do_append_entries(vec![good]), Some(0));
         assert_eq!(core.tail_seq(), 1);
     }
 
@@ -8572,9 +8615,68 @@ mod tests {
         let good = wire_vouch(false);
         assert_eq!(
             core.do_append_entries(vec![good.clone(), wire_vouch(false)]),
-            0
+            Some(0)
         );
         assert_eq!(core.tail_seq(), 0);
+    }
+
+    #[test]
+    fn log_range_is_one_bounded_page() {
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
+        let entries: Vec<WireEntry> = (0..600).map(|_| wire_vouch(false)).collect();
+        assert_eq!(core.do_append_entries(entries), Some(600));
+
+        // An oversized `limit` is clamped to one page.
+        let (page, next) = core.do_log_range(1, u64::MAX, 10_000).unwrap();
+        assert_eq!(page.len(), MAX_LOG_RANGE_ENTRIES as usize);
+        assert_eq!(page.len(), 256);
+        assert_eq!(next, 257);
+        // A page that runs into the tail is partial.
+        let (page, next) = core.do_log_range(599, 1_000, 256).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(next, 601);
+        // Past the tail: empty, and the cursor stays put.
+        let (page, next) = core.do_log_range(700, 800, 10).unwrap();
+        assert!(page.is_empty());
+        assert_eq!(next, 700);
+        // A zero `limit` still serves one entry.
+        let (page, next) = core.do_log_range(5, 10, 0).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, 6);
+        // The page is the log in order: entry `seq` is the stored entry `seq`.
+        let (page, _) = core.do_log_range(300, 300, 1).unwrap();
+        let stored = AppendLog::new(&core.db).get(300).unwrap().unwrap();
+        assert_eq!(page[0].bytes, stored.payload.bytes);
+    }
+
+    #[test]
+    fn log_range_respects_the_byte_budget() {
+        let core = test_core();
+        let kp = Keypair::generate();
+        let mut log = AppendLog::new(&core.db);
+        let blob = |len: usize| -> SignedPayload<dcbor::CBOR> {
+            SignedPayload::sign(dcbor::ByteString::from(vec![7u8; len]).into(), &kp)
+        };
+        for _ in 0..5 {
+            log.append(blob(300 * 1024), 1_000).unwrap();
+        }
+        log.append(blob(2 * 1024 * 1024), 1_000).unwrap();
+
+        // Three 300 KiB entries fit the 1 MiB budget; a fourth would not.
+        let (page, next) = core.do_log_range(1, u64::MAX, 256).unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(next, 4);
+        let served: usize = page.iter().map(|e| e.bytes.len()).sum();
+        assert!(served <= MAX_LOG_RANGE_PAGE_BYTES);
+        // The remaining two, then the 2 MiB entry stops the page.
+        let (page, next) = core.do_log_range(4, u64::MAX, 256).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(next, 6);
+        // An entry larger than the whole budget is still served, alone.
+        let (page, next) = core.do_log_range(6, u64::MAX, 256).unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(page[0].bytes.len() > MAX_LOG_RANGE_PAGE_BYTES);
+        assert_eq!(next, 7);
     }
 
     #[test]
@@ -12048,7 +12150,7 @@ mod tests {
             signature: signed.signature.to_bytes().to_vec(),
             bytes: to_canonical_bytes(listing.clone()),
         };
-        assert_eq!(core.do_append_entries(vec![entry]), 1);
+        assert_eq!(core.do_append_entries(vec![entry]), Some(1));
 
         let env = envelope(&provider, "marketplace_search", serde_json::json!({}));
         let result = core.route_channel_method(&env).unwrap();
@@ -12066,7 +12168,7 @@ mod tests {
             signature: signed.signature.to_bytes().to_vec(),
             bytes: to_canonical_bytes(forged),
         };
-        assert_eq!(core.do_append_entries(vec![entry]), 1);
+        assert_eq!(core.do_append_entries(vec![entry]), Some(1));
 
         let result = core.route_channel_method(&env).unwrap();
         let listings = result["listings"].as_array().unwrap();

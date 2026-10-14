@@ -20,6 +20,7 @@ mod ipc;
 mod offline_lifecycle;
 mod outage_72h;
 mod pairing;
+mod peer_port;
 mod reticulum_spike;
 mod rpc_channel;
 mod sms_carrier;

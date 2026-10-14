@@ -29,6 +29,14 @@ pub const INTERNAL_ERROR: i32 = -32603;
 /// In JSON-RPC's application-defined server-error range (`-32000..=-32099`),
 /// distinct from the standard codes above so a client can single it out.
 pub const READ_REPLICA: i32 = -32010;
+/// The peer port serves its replica methods (`peer_handshake`, `log_tail`,
+/// `log_range`) only to loopback and the configured `[network] replicas`
+/// (ADR-0020 Clarification 2026-10-14); any other source gets this code with
+/// [`PEER_NOT_ALLOWED_MESSAGE`] and is served nothing.
+pub const PEER_NOT_ALLOWED: i32 = -32011;
+/// The constant message sent with [`PEER_NOT_ALLOWED`]; it names no address,
+/// method detail, or log state.
+pub const PEER_NOT_ALLOWED_MESSAGE: &str = "this address is not a configured replica";
 
 /// A request line: an opaque `id` echoed back in the response, a `method` name,
 /// and free-form `params` interpreted per method.

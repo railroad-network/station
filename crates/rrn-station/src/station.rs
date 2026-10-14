@@ -342,14 +342,36 @@ impl Station {
 
         // Peer TCP listener. Both roles *serve* the peer port so a replica can
         // pull the chain from a writer (ADR-0020 §7) — it is a read-only surface
-        // (handshake / log_tail / log_range).
+        // (handshake / log_tail / log_range), gated to loopback and
+        // `[network] replicas`.
         let tcp = TcpListener::bind(&config.network.listen)
             .await
             .with_context(|| format!("bind peer listener on {}", config.network.listen))?;
         tracing::info!(listen = %config.network.listen, "Listening for peers");
+        // The chain is served only to loopback and the configured replicas
+        // (ADR-0020 Clarification 2026-10-14). A non-loopback bind with no
+        // replicas listed is almost certainly a missing setting.
+        let replicas = config.network.replicas.clone();
+        let bound_loopback = tcp
+            .local_addr()
+            .map(|a| a.ip().to_canonical().is_loopback())
+            .unwrap_or(true);
+        if !bound_loopback && replicas.is_empty() {
+            tracing::warn!(
+                listen = %config.network.listen,
+                "the peer port is bound beyond loopback but [network] replicas is empty — \
+                 it serves the chain to loopback only; list each replica's address there"
+            );
+        } else if !replicas.is_empty() {
+            tracing::info!(
+                ?replicas,
+                "serving the chain to loopback and these replicas"
+            );
+        }
         tasks.push(tokio::spawn(gossip::serve_peers(
             tcp,
             core.clone(),
+            Arc::new(gossip::PeerGate::new(replicas)),
             shutdown_rx.clone(),
         )));
 
