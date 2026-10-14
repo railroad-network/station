@@ -341,8 +341,10 @@ impl TryFrom<CBOR> for ListingClosed {
 ///
 /// When a listing-linked transaction settles, the provider is long gone — the
 /// settlement window closes 48h after the payment, with no party present — so,
-/// exactly as with expiry, only the station can witness the sale (ADR-0005). One
-/// settled payment consumes one unit; the model carries no quantity. `tx_id` is
+/// exactly as with expiry, only the station can witness the sale (ADR-0005). It
+/// attests only a payment the provider agreed to sell for
+/// ([`purchases_entitled`](crate::inquiry::purchases_entitled)), and one attested
+/// sale consumes one unit; the model carries no quantity. `tx_id` is
 /// the settled transaction, both for traceability and as the idempotency key:
 /// [`state_of`] counts *distinct* transactions, so a replayed or gossiped
 /// duplicate takes no second unit.

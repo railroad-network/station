@@ -837,6 +837,40 @@ pub fn all_inquiry_records(
     scan(log, Scope::All, station, admits)
 }
 
+/// How many purchases of `listing` the provider agreed to sell `buyer` at
+/// exactly `amount_centi` — the ceiling on units a payment from `buyer` to
+/// `payee` at that amount may consume (ADR-0010 "Linking transactions to
+/// listings"; the station attests the sale under its ADR-0005 authority, so it
+/// attests only what the provider consented to).
+///
+/// Zero unless the payment is a purchase from the provider: a positive amount
+/// (a payment request debits its receiver and is never a purchase), paid *to*
+/// the listing's provider, by someone other than the provider. Otherwise, the
+/// number of inquiries on this listing opened by `buyer` and closed
+/// `Agreed` at exactly `amount_centi`. The caller subtracts the units such
+/// agreements have already consumed.
+pub fn purchases_entitled(
+    inquiries: &BTreeMap<InquiryId, InquiryRecords>,
+    listing: &Listing,
+    buyer: &Address,
+    payee: &Address,
+    amount_centi: i64,
+) -> usize {
+    if amount_centi <= 0 || *payee != listing.provider || *buyer == listing.provider {
+        return 0;
+    }
+    inquiries
+        .values()
+        .filter(|r| r.opened.listing_id == listing.id && r.buyer() == *buyer)
+        .filter(|r| {
+            matches!(
+                r.closed.as_ref().map(|c| c.outcome),
+                Some(InquiryOutcome::Agreed { final_price_centi }) if final_price_centi == amount_centi
+            )
+        })
+        .count()
+}
+
 /// Where one inquiry stands at `now`, or `None` if this log has no qualifying
 /// open for it.
 pub fn compute_inquiry_state(
@@ -2260,5 +2294,102 @@ mod tests {
             Some(opened.inquiry_id)
         );
         assert_eq!(touched_inquiry(b"not cbor at all"), None);
+    }
+
+    // --- purchase entitlement ---------------------------------------------
+
+    /// An inquiry record on `listing` by `buyer`, closed with `outcome` (or left
+    /// open when `None`). `note` keeps two otherwise-identical opens distinct.
+    fn inquiry_on(
+        listing: &Listing,
+        buyer: &Address,
+        note: &str,
+        outcome: Option<InquiryOutcome>,
+    ) -> (InquiryId, InquiryRecords) {
+        let opened = InquiryOpened::new(listing.id, *buyer, note.into(), None, OPENED_AT).unwrap();
+        let id = opened.inquiry_id;
+        let mut records = InquiryRecords::new(opened, listing.clone());
+        records.closed = outcome.map(|outcome| InquiryClosed {
+            inquiry_id: id,
+            outcome,
+            closed_at: OPENED_AT,
+        });
+        (id, records)
+    }
+
+    #[test]
+    fn purchases_entitled_requires_provider_payee_positive_amount_and_agreement() {
+        let provider = Keypair::generate();
+        let listing = listing_of(&provider, true);
+        let other_listing = listing_of(&Keypair::generate(), true);
+        let p = listing.provider;
+        let buyer = Address::from_public_key(Keypair::generate().public_key());
+        let stranger = Address::from_public_key(Keypair::generate().public_key());
+        let agreed = |price| {
+            Some(InquiryOutcome::Agreed {
+                final_price_centi: price,
+            })
+        };
+
+        let one_agreed: BTreeMap<_, _> = [inquiry_on(&listing, &buyer, "a", agreed(400))].into();
+        assert_eq!(
+            purchases_entitled(&one_agreed, &listing, &buyer, &p, 400),
+            1
+        );
+        // (a) a non-positive amount is a payment request, never a purchase.
+        assert_eq!(purchases_entitled(&one_agreed, &listing, &buyer, &p, 0), 0);
+        assert_eq!(
+            purchases_entitled(&one_agreed, &listing, &buyer, &p, -400),
+            0
+        );
+        // (b) paid to someone other than the provider.
+        assert_eq!(
+            purchases_entitled(&one_agreed, &listing, &buyer, &stranger, 400),
+            0
+        );
+        // (c) the provider paying out cannot buy from themselves.
+        let own: BTreeMap<_, _> = [inquiry_on(&listing, &p, "a", agreed(400))].into();
+        assert_eq!(purchases_entitled(&own, &listing, &p, &p, 400), 0);
+        // Another price, another listing, another buyer: nothing agreed.
+        assert_eq!(
+            purchases_entitled(&one_agreed, &listing, &buyer, &p, 399),
+            0
+        );
+        assert_eq!(
+            purchases_entitled(
+                &one_agreed,
+                &other_listing,
+                &buyer,
+                &other_listing.provider,
+                400
+            ),
+            0
+        );
+        assert_eq!(
+            purchases_entitled(&one_agreed, &listing, &stranger, &p, 400),
+            0
+        );
+
+        // An open inquiry and a buyer-declined one are not agreements.
+        let unagreed: BTreeMap<_, _> = [
+            inquiry_on(&listing, &buyer, "open", None),
+            inquiry_on(
+                &listing,
+                &buyer,
+                "declined",
+                Some(InquiryOutcome::DeclinedByBuyer),
+            ),
+        ]
+        .into();
+        assert_eq!(purchases_entitled(&unagreed, &listing, &buyer, &p, 400), 0);
+
+        // Two agreements at the price entitle two units; a third party's does not count.
+        let two: BTreeMap<_, _> = [
+            inquiry_on(&listing, &buyer, "first", agreed(400)),
+            inquiry_on(&listing, &buyer, "second", agreed(400)),
+            inquiry_on(&listing, &stranger, "theirs", agreed(400)),
+        ]
+        .into();
+        assert_eq!(purchases_entitled(&two, &listing, &buyer, &p, 400), 2);
     }
 }
