@@ -15,19 +15,19 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 
-use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
+use rrn_crypto::keypair::{Keypair, PublicKey};
 use rrn_identity::address::Address;
 use rrn_identity::attestation::Attestation;
-use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
+use rrn_identity::sealed::{self, TRANSPORT_CONTEXT};
 use rrn_identity::vouch::{VouchBody, VouchKind};
 use rrn_ledger::transaction::{
     SignedConfirmation, SignedProposal, TransactionConfirmation, TransactionProposal,
 };
-use rrn_station::channel_client::ChannelClient;
+use rrn_station::channel_client::{ChannelClient, ChannelClientError, SentRequest};
 use rrn_station::core::hex;
 use rrn_station::rpc_envelope::{
-    frame_signed_record, frame_signed_request, request_payload_bytes, RequestEnvelope,
-    ResponseEnvelope, ENVELOPE_VERSION,
+    frame_signed_record, frame_signed_request, request_hash, request_payload_bytes,
+    RequestEnvelope, ResponseEnvelope, ENVELOPE_V2,
 };
 use rrn_station::station::{Station, StationParams};
 use rrn_station::Clock;
@@ -37,11 +37,21 @@ use rrn_crypto::serialize::to_canonical_bytes;
 const PASSPHRASE: &str = "rpc-channel-test";
 const MOBILE_PORT: u16 = 7530;
 const PEER_PORT: u16 = 7531;
+/// Ports for the re-pair replay test's own station.
+const REPAIR_MOBILE_PORT: u16 = 7532;
+const REPAIR_PEER_PORT: u16 = 7533;
+/// Ports for the subscribe-binding test's own station.
+const SUBSCRIBE_MOBILE_PORT: u16 = 7534;
+const SUBSCRIBE_PEER_PORT: u16 = 7535;
 
 fn write_config(dir: &Path) {
+    write_config_on(dir, MOBILE_PORT, PEER_PORT);
+}
+
+fn write_config_on(dir: &Path, mobile_port: u16, peer_port: u16) {
     let text = format!(
-        "[peers]\nlist = []\n\n[network]\nlisten = \"127.0.0.1:{PEER_PORT}\"\n\n\
-         [mobile]\nadvertise = false\nlisten = \"127.0.0.1:{MOBILE_PORT}\"\nsubscribe_hold_secs = 2\n\n\
+        "[peers]\nlist = []\n\n[network]\nlisten = \"127.0.0.1:{peer_port}\"\n\n\
+         [mobile]\nadvertise = false\nlisten = \"127.0.0.1:{mobile_port}\"\nsubscribe_hold_secs = 2\n\n\
          [timers]\nsweep_interval_secs = 60\ngossip_interval_secs = 60\n"
     );
     std::fs::write(dir.join("config.toml"), text).unwrap();
@@ -58,7 +68,12 @@ fn now_secs() -> i64 {
 /// `Connection: close` lets us read the (binary) response to EOF without chunk
 /// parsing.
 async fn http_post(path: &str, content_type: &str, body: &[u8]) -> (u16, Vec<u8>) {
-    let addr = format!("127.0.0.1:{MOBILE_PORT}");
+    http_post_on(MOBILE_PORT, path, content_type, body).await
+}
+
+/// [`http_post`] to the mobile listener on `port`.
+async fn http_post_on(port: u16, path: &str, content_type: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let addr = format!("127.0.0.1:{port}");
     let mut stream = TcpStream::connect(&addr).await.unwrap();
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\n\
@@ -115,7 +130,12 @@ async fn socket_rpc(socket: &Path, method: &str, params: serde_json::Value) -> s
 /// here proves it produces bytes the station's real pairing routes accept and
 /// that its pin/signature checks pass against a real station offer.
 async fn pair_mobile(socket: &Path, station_pk: &PublicKey, mobile: &Keypair) {
-    let client = ChannelClient::new(format!("127.0.0.1:{MOBILE_PORT}"), *station_pk);
+    pair_mobile_on(MOBILE_PORT, socket, station_pk, mobile).await;
+}
+
+/// [`pair_mobile`] against the mobile listener on `port`.
+async fn pair_mobile_on(port: u16, socket: &Path, station_pk: &PublicKey, mobile: &Keypair) {
+    let client = ChannelClient::new(format!("127.0.0.1:{port}"), *station_pk);
     let outcome = client
         .pair(mobile, now_secs())
         .await
@@ -134,7 +154,21 @@ async fn pair_mobile(socket: &Path, station_pk: &PublicKey, mobile: &Keypair) {
     assert_eq!(confirmed["result"]["address"], addr);
 }
 
-/// Builds a sealed, signed request the way the mobile does.
+/// A sealed request as POSTed, and what its reply must answer. Derefs to the
+/// sealed bytes so it can be POSTed directly.
+struct SealedReq {
+    bytes: Vec<u8>,
+    sent: SentRequest,
+}
+
+impl std::ops::Deref for SealedReq {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Builds a sealed, signed version-2 request the way the mobile does.
 fn sealed_request(
     mobile: &Keypair,
     station_pk: &PublicKey,
@@ -143,8 +177,9 @@ fn sealed_request(
     params: &str,
     nonce: u64,
     timestamp: i64,
-) -> Vec<u8> {
+) -> SealedReq {
     let envelope = RequestEnvelope {
+        v: ENVELOPE_V2,
         method: method.into(),
         params: params.into(),
         signer: mobile.public_key(),
@@ -155,25 +190,29 @@ fn sealed_request(
     let payload = request_payload_bytes(&envelope);
     let signature = mobile.sign(&payload);
     let frame = frame_signed_request(&payload, &signature);
-    sealed::seal(station_pk, &frame, TRANSPORT_CONTEXT)
-        .unwrap()
-        .to_bytes()
+    SealedReq {
+        bytes: sealed::seal(station_pk, &frame, TRANSPORT_CONTEXT)
+            .unwrap()
+            .to_bytes(),
+        sent: SentRequest {
+            nonce,
+            request_hash: request_hash(&payload),
+        },
+    }
 }
 
-/// Opens and verifies a sealed reply, returning the decoded response envelope.
-fn open_reply(mobile: &Keypair, station_pk: &PublicKey, sealed_reply: &[u8]) -> ResponseEnvelope {
-    let sb = SealedBox::from_bytes(sealed_reply).unwrap();
-    let frame = sealed::open(&sb, mobile.secret_key(), TRANSPORT_CONTEXT).unwrap();
-    // Frame is payload_len(4 BE) ‖ payload ‖ signature(64).
-    let len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
-    let payload = &frame[4..4 + len];
-    let sig: [u8; 64] = frame[4 + len..].try_into().unwrap();
-    station_pk
-        .verify(payload, &Signature::from_bytes(sig).unwrap())
-        .expect("station reply signature verifies");
-    // The response is JSON (the mobile carries no dCBOR decoder); the request was
-    // canonical dCBOR. See rpc_envelope for why they differ.
-    serde_json::from_slice(payload).unwrap()
+/// Opens and verifies a sealed reply as the answer to `sent`, through the
+/// client's own check (station signature under the reply tag, version, nonce,
+/// recipient, request hash), returning the decoded response envelope.
+fn open_reply(
+    mobile: &Keypair,
+    station_pk: &PublicKey,
+    sealed_reply: &[u8],
+    sent: &SentRequest,
+) -> ResponseEnvelope {
+    ChannelClient::new("", *station_pk)
+        .verify_reply(mobile, sealed_reply, sent)
+        .expect("the reply answers this request")
 }
 
 /// Builds the `submit_proposal` params: a sender-signed proposal, framed as a
@@ -322,7 +361,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     let result: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
     assert_eq!(result["address"], station.address().to_string());
 
@@ -393,12 +432,11 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "authenticated, but the method is gated");
-    let reply = open_reply(&mobile, &station_pk, &body);
+    // A method-error reply is bound to its request like a result is.
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
+    assert_eq!(reply.v, ENVELOPE_V2);
     assert!(reply.result.is_none());
     assert_eq!(reply.error.unwrap().code, -32601, "method not found");
-
-    // The reply really used the current envelope version.
-    assert_eq!(ENVELOPE_VERSION, 1);
 
     // --- write path: the mobile submits its own signed proposal ---
     // A receiver mobile, also paired so it can later confirm over the channel.
@@ -421,7 +459,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     let ledger_nonce = serde_json::from_str::<serde_json::Value>(reply.result.as_deref().unwrap())
         .unwrap()["nonce"]
         .as_u64()
@@ -442,7 +480,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "proposal submitted");
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(reply.error.is_none(), "propose error: {:?}", reply.error);
     let proposed: serde_json::Value =
         serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
@@ -462,7 +500,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     let view: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
     let row = &view["transactions"][0];
     assert_eq!(row["id"], tx_id);
@@ -484,7 +522,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "confirmation submitted");
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     assert!(reply.error.is_none(), "confirm error: {:?}", reply.error);
 
     // The receiver's view now shows it: in, positive, confirmed.
@@ -500,7 +538,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     let view: serde_json::Value = serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
     let row = &view["transactions"][0];
     assert_eq!(row["direction"], "in");
@@ -521,7 +559,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "authenticated");
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(
         reply.error.is_some(),
         "a relayed foreign proposal is refused"
@@ -543,7 +581,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "subscribe with pending events returns at once");
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(
         has_kind(&reply, "confirmation_received"),
         "sender told of confirm"
@@ -566,7 +604,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     assert!(
         has_kind(&reply, "proposal_received"),
         "receiver told of proposal"
@@ -583,6 +621,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         11,
         now_secs(),
     );
+    let parked_sent = parked_req.sent;
     let parked = tokio::spawn(async move {
         http_post("/subscribe", "application/octet-stream", &parked_req).await
     });
@@ -601,7 +640,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         now,
     );
     let (_, body) = http_post("/rpc", "application/octet-stream", &req).await;
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     let r_nonce = serde_json::from_str::<serde_json::Value>(reply.result.as_deref().unwrap())
         .unwrap()["nonce"]
         .as_u64()
@@ -625,7 +664,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
         .expect("parked subscribe returns")
         .unwrap();
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &parked_sent);
     assert!(
         has_kind(&reply, "proposal_received"),
         "parked subscribe woke on the new proposal"
@@ -645,7 +684,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(events_of(&reply).is_empty(), "heartbeat carries no events");
     assert!(
         cursor_of(&reply) >= sender_cursor2,
@@ -665,7 +704,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "vouch submitted");
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(reply.error.is_none(), "vouch error: {:?}", reply.error);
     let vouched: serde_json::Value =
         serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
@@ -686,7 +725,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200, "authenticated");
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(reply.error.is_some(), "a relayed foreign vouch is refused");
 
     // --- the vouch reaches its subject over /subscribe -------------
@@ -704,7 +743,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     assert!(has_kind(&reply, "vouch_received"), "subject told of vouch");
     let vouch_event = events_of(&reply)
         .into_iter()
@@ -730,7 +769,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/subscribe", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(
         !has_kind(&reply, "vouch_received"),
         "voucher not told of own vouch"
@@ -751,7 +790,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(
         reply.error.is_none(),
         "vouch_counts error: {:?}",
@@ -772,7 +811,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     assert!(
         reply.error.is_none(),
         "vouch_counts error: {:?}",
@@ -796,7 +835,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(
         reply.error.is_none(),
         "list_vouches error: {:?}",
@@ -830,7 +869,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&receiver, &station_pk, &body);
+    let reply = open_reply(&receiver, &station_pk, &body, &req.sent);
     assert!(
         reply.error.is_none(),
         "list_vouches error: {:?}",
@@ -863,7 +902,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(reply.error.is_none(), "reputation error: {:?}", reply.error);
     let standing: serde_json::Value =
         serde_json::from_str(reply.result.as_deref().unwrap()).unwrap();
@@ -903,7 +942,7 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(
         reply.error.is_none(),
         "reputation_band error: {:?}",
@@ -933,8 +972,155 @@ async fn authenticated_channel_happy_path_and_rejections() {
     );
     let (status, body) = http_post("/rpc", "application/octet-stream", &req).await;
     assert_eq!(status, 200);
-    let reply = open_reply(&mobile, &station_pk, &body);
+    let reply = open_reply(&mobile, &station_pk, &body, &req.sent);
     assert!(reply.error.is_some(), "malformed address rejected");
+
+    station.shutdown().await;
+}
+
+/// The station's public key, read back from its address.
+fn station_key(station: &Station) -> PublicKey {
+    *station
+        .address()
+        .to_string()
+        .parse::<Address>()
+        .unwrap()
+        .public_key()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_below_the_mark_after_re_pairing_is_a_replay() {
+    let port = REPAIR_MOBILE_PORT;
+    let dir = tempfile::tempdir().unwrap();
+    Station::init(dir.path(), PASSPHRASE).unwrap();
+    write_config_on(dir.path(), port, REPAIR_PEER_PORT);
+    let station = open_station(dir.path()).await;
+    let socket = station.socket_path().to_path_buf();
+    let station_pk = station_key(&station);
+    let mobile = Keypair::generate();
+    let addr = Address::from_public_key(mobile.public_key()).to_string();
+
+    let whoami = |nonce: u64| {
+        sealed_request(
+            &mobile,
+            &station_pk,
+            &station_pk,
+            "whoami",
+            "null",
+            nonce,
+            now_secs(),
+        )
+    };
+
+    pair_mobile_on(port, &socket, &station_pk, &mobile).await;
+    let (status, _) = http_post_on(port, "/rpc", "application/octet-stream", &whoami(5)).await;
+    assert_eq!(status, 200);
+
+    // The operator unpairs the device, and it pairs again (the full handshake,
+    // confirmed by code).
+    let unpaired = socket_rpc(&socket, "unpair", serde_json::json!({ "address": addr })).await;
+    assert!(unpaired.get("error").is_none(), "{unpaired}");
+    let (status, _) = http_post_on(port, "/rpc", "application/octet-stream", &whoami(6)).await;
+    assert_eq!(status, 401, "unpaired in between");
+    pair_mobile_on(port, &socket, &station_pk, &mobile).await;
+
+    // A nonce below the mark set under the earlier pairing is still a replay.
+    let (status, body) = http_post_on(port, "/rpc", "application/octet-stream", &whoami(3)).await;
+    assert_eq!(status, 401);
+    assert_eq!(String::from_utf8_lossy(&body), "stale or replayed nonce");
+    // Above the mark, the re-paired device is served.
+    let req = whoami(7);
+    let (status, body) = http_post_on(port, "/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    open_reply(&mobile, &station_pk, &body, &req.sent);
+
+    station.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_replies_carry_the_binding() {
+    let port = SUBSCRIBE_MOBILE_PORT;
+    let dir = tempfile::tempdir().unwrap();
+    Station::init(dir.path(), PASSPHRASE).unwrap();
+    write_config_on(dir.path(), port, SUBSCRIBE_PEER_PORT);
+    let station = open_station(dir.path()).await;
+    let socket = station.socket_path().to_path_buf();
+    let station_pk = station_key(&station);
+    let voucher = Keypair::generate();
+    let subject = Keypair::generate();
+    pair_mobile_on(port, &socket, &station_pk, &voucher).await;
+    pair_mobile_on(port, &socket, &station_pk, &subject).await;
+    let subject_addr = Address::from_public_key(subject.public_key());
+    let client = ChannelClient::new("", station_pk);
+
+    // Give the subject an event to be told about: a vouch for it.
+    let req = sealed_request(
+        &voucher,
+        &station_pk,
+        &station_pk,
+        "submit_vouch",
+        &vouch_params(&voucher, &subject_addr, now_secs()),
+        1,
+        now_secs(),
+    );
+    let (status, body) = http_post_on(port, "/rpc", "application/octet-stream", &req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&voucher, &station_pk, &body, &req.sent);
+    assert!(reply.error.is_none(), "{reply:?}");
+
+    // (a) An immediate reply: events were already pending.
+    let ready_req = sealed_request(
+        &subject,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        "{\"last_seen_event_id\":0}",
+        1,
+        now_secs(),
+    );
+    let (status, ready) =
+        http_post_on(port, "/subscribe", "application/octet-stream", &ready_req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&subject, &station_pk, &ready, &ready_req.sent);
+    assert!(!events_of(&reply).is_empty(), "the vouch is pending");
+    let cursor = cursor_of(&reply);
+
+    // (b) A heartbeat: nothing new, so the long-poll answers empty after the hold.
+    let beat_req = sealed_request(
+        &subject,
+        &station_pk,
+        &station_pk,
+        "subscribe",
+        &format!("{{\"last_seen_event_id\":{cursor}}}"),
+        2,
+        now_secs(),
+    );
+    let (status, beat) =
+        http_post_on(port, "/subscribe", "application/octet-stream", &beat_req).await;
+    assert_eq!(status, 200);
+    let reply = open_reply(&subject, &station_pk, &beat, &beat_req.sent);
+    assert!(events_of(&reply).is_empty(), "a heartbeat");
+
+    // Each verifies only for its own request: the heartbeat does not answer the
+    // first subscribe even if its nonce were matched, nor the first the second.
+    let beat_as_ready = SentRequest {
+        nonce: beat_req.sent.nonce,
+        request_hash: ready_req.sent.request_hash,
+    };
+    assert!(matches!(
+        client.verify_reply(&subject, &beat, &beat_as_ready),
+        Err(ChannelClientError::RequestMismatch)
+    ));
+    let ready_as_beat = SentRequest {
+        nonce: ready_req.sent.nonce,
+        request_hash: beat_req.sent.request_hash,
+    };
+    assert!(matches!(
+        client.verify_reply(&subject, &ready, &ready_as_beat),
+        Err(ChannelClientError::RequestMismatch)
+    ));
+    // And neither is an answer to anything the voucher asked, even re-sealed.
+    assert!(client.verify_reply(&voucher, &ready, &req.sent).is_err());
 
     station.shutdown().await;
 }

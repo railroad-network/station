@@ -820,9 +820,13 @@ impl Wallet {
     }
 
     /// Persists the *next* transport nonce before it is used, so a crash never
-    /// reuses one (ADR-0028 §3.1). Returns the nonce to send.
-    fn next_transport_nonce(&self) -> Result<u64> {
-        let next = self.meta_u64(K_TRANSPORT_NONCE)?.saturating_add(1);
+    /// reuses one (ADR-0028 §3.1). Returns the nonce to send:
+    /// `max(last + 1, now_millis)`. The time floor keeps a wallet that lost its
+    /// counter (restored from an export, or a copied wallet directory) above
+    /// the high-water mark the station kept for this member, with no extra
+    /// round trip (ADR-0008, Clarification 2026-10-14, Part B).
+    fn next_transport_nonce(&self, now_millis: u64) -> Result<u64> {
+        let next = transport_nonce_after(self.meta_u64(K_TRANSPORT_NONCE)?, now_millis);
         self.set_meta(K_TRANSPORT_NONCE, &next.to_string())?;
         Ok(next)
     }
@@ -1540,7 +1544,7 @@ impl Wallet {
         let client = self.client()?;
         // Call the raw client here (not the anyhow-mapping helper) so the typed
         // READ_REPLICA method error can be recognized and re-couriered.
-        let nonce = self.next_transport_nonce()?;
+        let nonce = self.next_transport_nonce(now_millis())?;
         let result = client
             .call(
                 &keypair,
@@ -1726,7 +1730,7 @@ impl Wallet {
         method: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let nonce = self.next_transport_nonce()?;
+        let nonce = self.next_transport_nonce(now_millis())?;
         client
             .call(keypair, method, params, nonce, now())
             .await
@@ -2078,6 +2082,21 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The transport nonce that follows `last` at `now_millis`: one past it, or the
+/// clock in milliseconds when that is higher.
+fn transport_nonce_after(last: u64, now_millis: u64) -> u64 {
+    last.saturating_add(1).max(now_millis)
+}
+
+/// The current Unix time in milliseconds — the floor of the next transport
+/// nonce. Read only at the CLI edge.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Reads the wallet passphrase: `RRN_WALLET_PASSPHRASE` (never `RRN_PASSPHRASE`)
 /// else a hidden prompt. Never taken on argv, never logged.
 fn read_passphrase(confirm: bool) -> Result<String> {
@@ -2239,6 +2258,23 @@ fn resolve_expiry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_nonce_is_floored_at_the_clock() {
+        // A fresh or restored counter jumps to the clock, above any mark a
+        // previous pairing of this member could have left on the station.
+        assert_eq!(
+            transport_nonce_after(0, 1_760_400_000_000),
+            1_760_400_000_000
+        );
+        // Within one millisecond, or with a clock behind, it still increases.
+        assert_eq!(
+            transport_nonce_after(1_760_400_000_000, 1_760_400_000_000),
+            1_760_400_000_001
+        );
+        assert_eq!(transport_nonce_after(9_000, 5), 9_001);
+        assert_eq!(transport_nonce_after(u64::MAX, 5), u64::MAX);
+    }
 
     #[test]
     fn expiry_carrier_defaults() {

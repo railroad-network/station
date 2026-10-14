@@ -167,9 +167,8 @@ async fn subscribe(
         Ok(SubscribeOutcome::Ready(sealed)) => Ok(sealed),
         Ok(SubscribeOutcome::Waiting {
             member,
-            member_pk,
             last_seen,
-            nonce,
+            binding,
         }) => {
             let mut tail = core.log_tail_watch();
             let hold = tokio::time::sleep(state.subscribe_hold);
@@ -180,7 +179,7 @@ async fn subscribe(
                         // Timeout: return a sealed empty heartbeat advancing the
                         // cursor. `None` here would only be a seal failure.
                         return match core
-                            .poll_events(member, member_pk, last_seen, nonce, true)
+                            .poll_events(member, last_seen, binding, true)
                             .await
                         {
                             Some(sealed) => Ok(sealed),
@@ -199,7 +198,7 @@ async fn subscribe(
                             ));
                         }
                         if let Some(sealed) = core
-                            .poll_events(member, member_pk, last_seen, nonce, false)
+                            .poll_events(member, last_seen, binding, false)
                             .await
                         {
                             return Ok(sealed);

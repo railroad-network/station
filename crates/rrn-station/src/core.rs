@@ -104,7 +104,7 @@ use crate::pairing::{
     self, PairError, PairFinish, PairFinished, PairOffer, PairStart, PendingPair, PendingStage,
 };
 use crate::reputation_view;
-use crate::rpc_envelope::{self, ChannelError, RequestEnvelope, ResponseEnvelope};
+use crate::rpc_envelope::{self, ChannelError, ReplyBinding, RequestEnvelope, ResponseEnvelope};
 use crate::transaction_view;
 use crate::vouch_view;
 use crate::{history, rpc};
@@ -256,12 +256,11 @@ pub enum Command {
     CollectEvents {
         /// The subscriber's address.
         member: Address,
-        /// The subscriber's public key (to seal the reply to).
-        member_pk: PublicKey,
         /// The cursor the subscriber is polling from.
         last_seen: u64,
-        /// The subscribe request's nonce, echoed in the sealed reply.
-        nonce: u64,
+        /// What the reply must answer: the subscribe request's version, nonce,
+        /// member key (the reply is sealed to it), and request hash.
+        binding: ReplyBinding,
         /// Return a sealed empty batch even with no events (the timeout path).
         force: bool,
         /// The sealed response, or `None` when there is still nothing.
@@ -328,12 +327,11 @@ pub enum SubscribeOutcome {
     Waiting {
         /// The subscriber's address.
         member: Address,
-        /// The subscriber's public key (to seal the reply to).
-        member_pk: PublicKey,
         /// The cursor to poll from.
         last_seen: u64,
-        /// The request nonce to echo in the eventual reply.
-        nonce: u64,
+        /// What the eventual reply (events or a heartbeat) must answer — built
+        /// when the subscribe request was authenticated.
+        binding: ReplyBinding,
     },
 }
 
@@ -634,9 +632,8 @@ impl CoreHandle {
     pub async fn poll_events(
         &self,
         member: Address,
-        member_pk: PublicKey,
         last_seen: u64,
-        nonce: u64,
+        binding: ReplyBinding,
         force: bool,
     ) -> Option<Vec<u8>> {
         let (reply, rx) = oneshot::channel();
@@ -644,9 +641,8 @@ impl CoreHandle {
             .tx
             .send(Command::CollectEvents {
                 member,
-                member_pk,
                 last_seen,
-                nonce,
+                binding,
                 force,
                 reply,
             })
@@ -686,6 +682,9 @@ pub struct Core {
     /// unconfirmed pairing has no standing to survive a restart, and each
     /// session expires [`pairing::PENDING_TTL_SECS`] after entering its stage.
     pending: BTreeMap<String, PendingPair>,
+    /// Signers already warned (once per process) for sending an unbound v1
+    /// channel envelope, so the deprecation log names each legacy client once.
+    legacy_v1_warned: std::collections::HashSet<String>,
     /// Publishes the log tail after every append so a parked `/subscribe`
     /// long-poll wakes and re-polls for events.
     tail_tx: watch::Sender<u64>,
@@ -760,6 +759,7 @@ impl Core {
             clock,
             paired,
             pending: BTreeMap::new(),
+            legacy_v1_warned: std::collections::HashSet::new(),
             tail_tx,
             listings,
             dtn_receipt_retention_secs: DEFAULT_RECEIPT_RETENTION_SECS,
@@ -1046,14 +1046,12 @@ impl Core {
             }
             Command::CollectEvents {
                 member,
-                member_pk,
                 last_seen,
-                nonce,
+                binding,
                 force,
                 reply,
             } => {
-                let _ =
-                    reply.send(self.do_collect_events(member, member_pk, last_seen, nonce, force));
+                let _ = reply.send(self.do_collect_events(member, last_seen, &binding, force));
             }
             Command::Shutdown => {
                 tracing::info!("core shutting down");
@@ -5962,32 +5960,48 @@ impl Core {
         // dispatch through the mobile-permitted method surface and seal the reply
         // back to the mobile. A method-level failure still gets a sealed error
         // response; only auth failures return no sealed body (a 4xx at the edge).
-        let envelope = self.authenticate_envelope(&sealed_bytes)?;
-        let mobile_pubkey = envelope.signer;
-        let response = self.dispatch_channel_call(&envelope);
+        let (envelope, binding) = self.authenticate_envelope(&sealed_bytes)?;
+        let response = self.dispatch_channel_call(&envelope, &binding);
+        self.seal_reply(&binding, &response)
+            .ok_or(ChannelError::Sealed)
+    }
+
+    /// Signs `response` as the station and seals it to the member the binding
+    /// names — the one sealing path every channel reply (`/rpc` result or error,
+    /// `/subscribe` events or heartbeat) goes through. `None` only if sealing
+    /// fails.
+    fn seal_reply(&self, binding: &ReplyBinding, response: &ResponseEnvelope) -> Option<Vec<u8>> {
         let station = self.station_keypair();
-        let reply_frame = rpc_envelope::frame_signed_response(&response, &station);
-        let sealed_reply = sealed::seal(&mobile_pubkey, &reply_frame, TRANSPORT_CONTEXT)
-            .map_err(|_| ChannelError::Sealed)?;
-        Ok(sealed_reply.to_bytes())
+        let reply_frame = rpc_envelope::frame_signed_response(response, &station);
+        match sealed::seal(&binding.recipient, &reply_frame, TRANSPORT_CONTEXT) {
+            Ok(s) => Some(s.to_bytes()),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to seal channel reply");
+                None
+            }
+        }
     }
 
     /// Opens, verifies, and authorizes a sealed request envelope — the auth
     /// preamble shared by `/rpc` and `/subscribe`. On success the
     /// request's transport nonce is consumed and persisted, so a replay is
-    /// rejected even if the caller never dispatches. Auth failures return a
-    /// [`ChannelError`] the edge turns into a 4xx.
+    /// rejected even if the caller never dispatches, and the [`ReplyBinding`]
+    /// every reply to this request is built from is returned with the
+    /// envelope. Auth failures return a [`ChannelError`] the edge turns into a
+    /// 4xx.
     fn authenticate_envelope(
         &mut self,
         sealed_bytes: &[u8],
-    ) -> Result<RequestEnvelope, ChannelError> {
+    ) -> Result<(RequestEnvelope, ReplyBinding), ChannelError> {
         // 1. Open the seal with the station's secret key.
         let sealed = SealedBox::from_bytes(sealed_bytes).map_err(|_| ChannelError::Sealed)?;
         let frame = sealed::open(&sealed, &self.wallet.secret_key, TRANSPORT_CONTEXT)
             .map_err(|_| ChannelError::Sealed)?;
 
         // 2. Parse the frame and verify the signature over the exact payload.
-        let envelope = rpc_envelope::parse_signed_request(&frame)?;
+        let request = rpc_envelope::parse_signed_request(&frame)?;
+        let binding = ReplyBinding::for_request(&request);
+        let envelope = request.envelope;
 
         // 3. Stateful authorization.
         let station = self.station_keypair();
@@ -6014,34 +6028,34 @@ impl Core {
             tracing::error!(error = %e, "failed to persist mobile request nonce");
             return Err(ChannelError::Unavailable);
         }
-        Ok(envelope)
+        if envelope.v == rpc_envelope::ENVELOPE_V1 && self.legacy_v1_warned.insert(signer.clone()) {
+            tracing::warn!(signer = %signer, "legacy unbound channel envelope (v1)");
+        }
+        Ok((envelope, binding))
     }
 
     /// Authenticates a `/subscribe` request and either returns pending events
     /// (sealed, ready) or the context to long-poll on. The 30s wait
     /// itself lives in the async edge, not here — the core must not block.
     fn do_subscribe(&mut self, sealed_bytes: Vec<u8>) -> Result<SubscribeOutcome, ChannelError> {
-        let envelope = self.authenticate_envelope(&sealed_bytes)?;
+        let (envelope, binding) = self.authenticate_envelope(&sealed_bytes)?;
         if envelope.method != "subscribe" {
             return Err(ChannelError::Malformed);
         }
         let last_seen = parse_subscribe_cursor(&envelope.params);
         let member = Address::from_public_key(envelope.signer);
-        let member_pk = envelope.signer;
-        let nonce = envelope.nonce;
         let tail = self.tail_seq();
         let events =
             events::events_since(&self.db, &member, last_seen, tail, &self.station_pubkey());
         if events.is_empty() {
             Ok(SubscribeOutcome::Waiting {
                 member,
-                member_pk,
                 last_seen,
-                nonce,
+                binding,
             })
         } else {
             let sealed = self
-                .seal_subscribe_reply(&member_pk, nonce, tail, events)
+                .seal_subscribe_reply(&binding, tail, events)
                 .ok_or(ChannelError::Sealed)?;
             Ok(SubscribeOutcome::Ready(sealed))
         }
@@ -6054,9 +6068,8 @@ impl Core {
     fn do_collect_events(
         &self,
         member: Address,
-        member_pk: PublicKey,
         last_seen: u64,
-        nonce: u64,
+        binding: &ReplyBinding,
         force: bool,
     ) -> Option<Vec<u8>> {
         let tail = self.tail_seq();
@@ -6065,40 +6078,34 @@ impl Core {
         if events.is_empty() && !force {
             return None;
         }
-        self.seal_subscribe_reply(&member_pk, nonce, tail, events)
+        self.seal_subscribe_reply(binding, tail, events)
     }
 
     /// Builds the subscribe response (`{last_seen_event_id, events}` as the
-    /// `ResponseEnvelope.result` JSON), signs it as the station, and seals it to
-    /// the member — mirroring the `/rpc` reply path.
+    /// `ResponseEnvelope.result` JSON) answering `binding`, then signs and seals
+    /// it through the same path as an `/rpc` reply.
     fn seal_subscribe_reply(
         &self,
-        member_pk: &PublicKey,
-        nonce: u64,
+        binding: &ReplyBinding,
         tail: u64,
         events: Vec<Event>,
     ) -> Option<Vec<u8>> {
         let result =
             serde_json::json!({ "last_seen_event_id": tail, "events": events }).to_string();
-        let response = ResponseEnvelope::ok(nonce, result);
-        let station = self.station_keypair();
-        let reply_frame = rpc_envelope::frame_signed_response(&response, &station);
-        match sealed::seal(member_pk, &reply_frame, TRANSPORT_CONTEXT) {
-            Ok(s) => Some(s.to_bytes()),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to seal subscribe reply");
-                None
-            }
-        }
+        self.seal_reply(binding, &ResponseEnvelope::ok(binding, result))
     }
 
     /// Routes an authenticated envelope to the mobile-permitted method surface
     /// and wraps the outcome as a response envelope (a method-level failure
     /// becomes a sealed error, not a transport rejection).
-    fn dispatch_channel_call(&mut self, envelope: &RequestEnvelope) -> ResponseEnvelope {
+    fn dispatch_channel_call(
+        &mut self,
+        envelope: &RequestEnvelope,
+        binding: &ReplyBinding,
+    ) -> ResponseEnvelope {
         match self.route_channel_method(envelope) {
-            Ok(result) => ResponseEnvelope::ok(envelope.nonce, result.to_string()),
-            Err((code, message)) => ResponseEnvelope::err(envelope.nonce, code, message),
+            Ok(result) => ResponseEnvelope::ok(binding, result.to_string()),
+            Err((code, message)) => ResponseEnvelope::err(binding, code, message),
         }
     }
 
@@ -8998,6 +9005,7 @@ mod tests {
     /// so the envelope's other fields do not matter to them.
     fn envelope(signer: &Keypair, method: &str, params: serde_json::Value) -> RequestEnvelope {
         RequestEnvelope {
+            v: rpc_envelope::ENVELOPE_V2,
             method: method.into(),
             params: params.to_string(),
             signer: signer.public_key(),
@@ -9640,6 +9648,7 @@ mod tests {
             );
             let params = serde_json::json!({ "signed_vouch": hex(&frame) });
             let env = RequestEnvelope {
+                v: rpc_envelope::ENVELOPE_V2,
                 method: "submit_vouch".into(),
                 params: params.to_string(),
                 signer: voucher.public_key(),

@@ -8,6 +8,7 @@
 mod at_rest_dmcrypt;
 mod audit_regressions;
 mod backup_recover;
+mod cross_platform_channel;
 mod cross_platform_contract;
 mod cross_platform_inquiry;
 mod cross_platform_listing;
