@@ -3452,18 +3452,33 @@ pipeline enforces.
   carries is still subject to the ledger's own content-addressing and per-sender
   gap-free nonce (see [Replay across crates](#replay-across-crates)). The nonce
   high-water mark is persisted **before** dispatch, so a replay cannot slip in
-  even if the method then fails. *Residual risk:* replay within the ±5-minute
+  even if the method then fails. The station never lowers a member's nonce
+  high-water mark, across re-pairing or unpairing, and clients send
+  `max(last + 1, unix milliseconds)`, so a restored device resumes above it
+  (ADR-0008, Clarification 2026-10-14, Part B; before it, a re-pair reset the
+  mark to 0 and reopened every recorded request — RRN-A-024, RRN-A-039).
+  *Residual risk:* replay within the ±5-minute
   window is bounded by its width; a request whose transport nonce was burned but
   never reached the ledger is simply refused on retry (the mobile skips to the
-  next nonce).
+  next nonce). A phone app that predates the time-floored nonce and resets its
+  counter when it re-pairs is refused as a replay until it counts past the mark
+  the station kept.
 - **Station impersonation.** *Threat:* a rogue host poses as the member's paired
   station. *Mitigation (shipped):* the request is sealed to the
   paired station's public key, so only the real station can open it; the
   `recipient` key is **bound inside the mobile's signature**, so a station cannot
   peel a signed request out of its envelope and re-seal it to a third party; and
   the station signs its reply, which the mobile verifies against the paired key.
+  Since envelope v2 the station's signed reply carries the requesting member's
+  key and a hash of the exact request bytes, under a domain tag, so a reply
+  recorded for one request (another member's, or the same member's before a
+  re-pair or restore) never verifies as the answer to another (RRN-A-024;
+  `/subscribe` events and heartbeats included).
   *Residual risk:* see TOFU below — the bind is only as trustworthy as the moment
-  pairing was made.
+  pairing was made. v1 (unbound) replies are still issued to clients that send v1
+  requests, until the updated app ships; only those clients are exposed. A v2
+  client cannot be downgraded: the request's version is inside the member's
+  signature, and a v2 client accepts only a tag-signed v2 reply.
 - **Signer impersonation / unpaired access.** *Threat:* a device that is not the
   member — an unpaired key, or one paired mobile trying to act as another —
   submits requests. *Mitigation (shipped):* the station authorizes on the

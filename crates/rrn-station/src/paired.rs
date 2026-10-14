@@ -31,9 +31,13 @@ pub struct PairedMobile {
     pub paired_at: i64,
     /// The highest request nonce seen from this mobile on the authenticated
     /// channel. Monotonic per mobile: a request must carry a strictly
-    /// greater nonce or it is rejected as a replay. Starts at 0 (so the first
-    /// request is nonce 1) and resets on a fresh pairing. `#[serde(default)]` so
-    /// a `paired_mobiles.json` written before this field parses as 0.
+    /// greater nonce or it is rejected as a replay. Starts at 0 for an address
+    /// never seen before, and **never decreases** — not on a re-pair, and not
+    /// on an unpair followed by a new pairing (the mark is kept in the retired
+    /// list meanwhile), so a request recorded under an earlier pairing can never
+    /// be replayed (ADR-0008, Clarification 2026-10-14, Part B).
+    /// `#[serde(default)]` so a `paired_mobiles.json` written before this field
+    /// parses as 0.
     #[serde(default)]
     pub last_nonce: u64,
 }
@@ -45,6 +49,10 @@ pub struct PairedMobile {
 #[derive(Debug, Default)]
 pub struct PairedMobiles {
     mobiles: BTreeMap<String, PairedMobile>,
+    /// The nonce high-water marks of unpaired mobiles, by address, restored by
+    /// [`add`](Self::add) if the address pairs again. Grows only by an operator
+    /// unpair, so it is left uncapped.
+    retired: BTreeMap<String, u64>,
     /// Where [`save`](Self::save) writes. Not serialized — it *is* the location.
     path: PathBuf,
 }
@@ -54,6 +62,18 @@ pub struct PairedMobiles {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Stored {
     mobiles: Vec<PairedMobile>,
+    /// `#[serde(default)]` so a file written before nonce retention parses.
+    #[serde(default)]
+    retired_nonces: Vec<RetiredNonce>,
+}
+
+/// The nonce high-water mark of a mobile that has been unpaired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RetiredNonce {
+    /// The unpaired mobile's bech32 address.
+    address: String,
+    /// Its highest accepted request nonce when it was unpaired.
+    last_nonce: u64,
 }
 
 impl PairedMobiles {
@@ -64,6 +84,7 @@ impl PairedMobiles {
         if !path.exists() {
             return Ok(Self {
                 mobiles: BTreeMap::new(),
+                retired: BTreeMap::new(),
                 path,
             });
         }
@@ -76,7 +97,16 @@ impl PairedMobiles {
             .into_iter()
             .map(|m| (m.address.clone(), m))
             .collect();
-        Ok(Self { mobiles, path })
+        let retired = stored
+            .retired_nonces
+            .into_iter()
+            .map(|r| (r.address, r.last_nonce))
+            .collect();
+        Ok(Self {
+            mobiles,
+            retired,
+            path,
+        })
     }
 
     /// Writes the list back to disk, atomically (temp file + rename) so a crash
@@ -85,6 +115,14 @@ impl PairedMobiles {
     pub fn save(&self) -> anyhow::Result<()> {
         let stored = Stored {
             mobiles: self.mobiles.values().cloned().collect(),
+            retired_nonces: self
+                .retired
+                .iter()
+                .map(|(address, &last_nonce)| RetiredNonce {
+                    address: address.clone(),
+                    last_nonce,
+                })
+                .collect(),
         };
         let json = serde_json::to_string_pretty(&stored)?;
         let tmp = self.path.with_extension("json.tmp");
@@ -95,16 +133,22 @@ impl PairedMobiles {
     }
 
     /// Records a mobile as paired at `now` (Unix seconds), replacing any prior
-    /// entry for the same address. Does **not** persist — call [`save`](Self::save).
+    /// entry for the same address. The nonce high-water mark carries over — the
+    /// higher of the current entry's and a retired one's — and is never reset,
+    /// so a re-pair, a re-confirm, or an unpair followed by a new pairing cannot
+    /// reopen nonces the station already accepted. Clients send
+    /// `max(last + 1, unix milliseconds)`, so a device that lost its counter
+    /// still lands above the mark. Does **not** persist — call
+    /// [`save`](Self::save).
     pub fn add(&mut self, address: String, now: i64) {
+        let current = self.mobiles.get(&address).map_or(0, |m| m.last_nonce);
+        let retired = self.retired.remove(&address).unwrap_or(0);
         self.mobiles.insert(
             address.clone(),
             PairedMobile {
                 address,
                 paired_at: now,
-                // A fresh pairing resets the nonce window; the mobile likewise
-                // restarts its request counter after (re)pairing.
-                last_nonce: 0,
+                last_nonce: current.max(retired),
             },
         );
     }
@@ -125,10 +169,18 @@ impl PairedMobiles {
         }
     }
 
-    /// Removes a mobile by address. Returns whether it was present. Does not
-    /// persist — call [`save`](Self::save).
+    /// Removes a mobile by address, keeping its nonce high-water mark in the
+    /// retired list for a later [`add`](Self::add). Returns whether it was
+    /// present. Does not persist — call [`save`](Self::save).
     pub fn remove(&mut self, address: &str) -> bool {
-        self.mobiles.remove(address).is_some()
+        match self.mobiles.remove(address) {
+            Some(m) => {
+                let mark = self.retired.entry(m.address).or_insert(0);
+                *mark = (*mark).max(m.last_nonce);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether `address` is currently paired — the authorization check the
@@ -225,13 +277,58 @@ mod tests {
     }
 
     #[test]
-    fn repairing_resets_the_nonce_window() {
+    fn repairing_keeps_the_nonce_window() {
         let dir = tmp_dir();
         let mut paired = PairedMobiles::load(dir.path()).unwrap();
         paired.add("rrn1alice".to_string(), 1_000);
         assert!(paired.accept_nonce("rrn1alice", 9));
-        // Re-pairing the same address starts the window over.
+        // Re-pairing (or re-confirming) the same address keeps the mark: a
+        // request recorded under the earlier pairing stays a replay.
         paired.add("rrn1alice".to_string(), 2_000);
-        assert!(paired.accept_nonce("rrn1alice", 1));
+        assert_eq!(paired.list()[0].paired_at, 2_000);
+        assert!(!paired.accept_nonce("rrn1alice", 1));
+        assert!(!paired.accept_nonce("rrn1alice", 9));
+        assert!(paired.accept_nonce("rrn1alice", 10));
+    }
+
+    #[test]
+    fn unpair_then_pair_keeps_the_retired_mark() {
+        let dir = tmp_dir();
+        let mut paired = PairedMobiles::load(dir.path()).unwrap();
+        paired.add("rrn1alice".to_string(), 1_000);
+        assert!(paired.accept_nonce("rrn1alice", 9));
+        assert!(paired.remove("rrn1alice"));
+        assert!(!paired.contains("rrn1alice"));
+        // The retired mark survives a restart while unpaired.
+        paired.save().unwrap();
+        let mut paired = PairedMobiles::load(dir.path()).unwrap();
+        paired.add("rrn1alice".to_string(), 2_000);
+        assert_eq!(paired.list()[0].last_nonce, 9);
+        assert!(!paired.accept_nonce("rrn1alice", 9));
+        assert!(paired.accept_nonce("rrn1alice", 10));
+        // Consumed back into the live entry: a second unpair retires the new mark.
+        assert!(paired.remove("rrn1alice"));
+        paired.add("rrn1alice".to_string(), 3_000);
+        assert_eq!(paired.list()[0].last_nonce, 10);
+        // Other addresses start from zero.
+        paired.add("rrn1bob".to_string(), 3_000);
+        assert!(paired.accept_nonce("rrn1bob", 1));
+    }
+
+    #[test]
+    fn old_file_without_retired_nonces_parses() {
+        let dir = tmp_dir();
+        std::fs::write(
+            dir.path().join(FILE),
+            r#"{"mobiles":[{"address":"rrn1alice","paired_at":1000,"last_nonce":4}]}"#,
+        )
+        .unwrap();
+        let mut paired = PairedMobiles::load(dir.path()).unwrap();
+        assert!(paired.contains("rrn1alice"));
+        assert!(!paired.accept_nonce("rrn1alice", 4));
+        assert!(paired.remove("rrn1alice"));
+        paired.save().unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("retired_nonces"), "{text}");
     }
 }
