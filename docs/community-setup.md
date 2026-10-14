@@ -279,11 +279,22 @@ step that proves to the phone it's talking to the real station, and to the
 station that this phone is welcome — the code comparison below is the actual
 security boundary, so do it face to face, reading the code aloud.
 
+> **Note (2026-10-14): phone pairing is unavailable until the app is
+> updated.** The station now speaks only the new pairing handshake (a
+> 10-character code, `XXXXX-XXXXX`); the old one, with an 8-character code,
+> was retired because its code could be forged (security review finding
+> RRN-A-023). The current phone app still speaks the old one, so a phone
+> pairing attempt fails with "pairing protocol v1 is retired; update the app",
+> and no updated app has shipped yet. Phones paired before the station update
+> keep working. Until the app ships, a new member pairs with the
+> command-line wallet (§2.4, `rrn wallet pair`), which already speaks the new
+> handshake. The steps below describe the phone once it does.
+
 **On the phone:** after creating the wallet, the member taps **Join your
 community** (or later: Settings → Station pairing). The station appears in
 the list by name — or they tap *Add by address* and type the station's IP and
-port 7500. They unlock their wallet; the phone then shows an **8-character
-code**.
+port 7500. They unlock their wallet; the phone then shows a **10-character
+code** (`XXXXX-XXXXX`), new for every pairing attempt.
 
 **On the station:**
 
@@ -291,15 +302,20 @@ code**.
 station pair-mobile
 ```
 
-lists the pending requests, each with the same style of 8-character code and
-the phone's `rrn1…` address.
+lists the pending requests, each with its 10-character code and the phone's
+`rrn1…` address.
 
 **Together:** compare the code on the phone's screen with the one the station
-printed. If — and only if — they match:
+printed. If — and only if — they match, type the code **as the phone shows it**
+(case and hyphen don't matter):
 
 ```sh
-station pair-mobile <the-phone's-rrn1-address>
+station pair-mobile <the-phone's-rrn1-address> --code <the-code-on-the-phone>
 ```
+
+The station checks the code you typed against its own and refuses a mismatch,
+so a request planted by someone else under another address cannot be confirmed
+by mistake.
 
 and the member confirms on their phone. Done: the phone now syncs with the
 station, receives push updates, and can transact.
@@ -349,11 +365,12 @@ phone — so read the station's `rrn1…` address to them, don't email it.
 # on the member's laptop (set a passphrase once; it is never taken on the command line):
 export RRN_WALLET_PASSPHRASE='something the member chooses'
 rrn wallet init  --station rrn1<your-station-address>   # prints their new rrn1… address
-rrn wallet pair  --url 192.168.4.1:7500                 # shows an 8-char SAS
+rrn wallet pair  --url 192.168.4.1:7500                 # shows a 10-char code
 ```
 
-**Confirm the pair as in §2.3:** compare the SAS the wallet prints with what
-`station pair-mobile` lists, then `station pair-mobile <their-rrn1-address>`.
+**Confirm the pair as in §2.3:** compare the code the wallet prints with what
+`station pair-mobile` lists, then
+`station pair-mobile <their-rrn1-address> --code <the-code-the-wallet-printed>`.
 As with a phone, confirming the pair enrolls them.
 The member then runs `rrn wallet sync` to pull their nonce, balance, and any
 receipts. To pay offline they `rrn wallet pay …` and `rrn wallet export qr
@@ -1217,7 +1234,7 @@ station run                       # serve (prompts passphrase, or RRN_PASSPHRASE
 
 # phones
 station pair-mobile               # list pending pair requests + codes
-station pair-mobile <rrn1-addr>   # confirm one, after comparing codes in person
+station pair-mobile <rrn1-addr> --code <code>   # confirm one, typing the phone's code
 station list-mobiles              # who is paired
 station unpair <rrn1-addr>        # revoke a phone (the member stays enrolled)
 

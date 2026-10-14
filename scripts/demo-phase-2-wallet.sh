@@ -116,10 +116,14 @@ MEMBER_ADDR="$(wallet init --station "$OP_ADDR")"
 echo "Member wallet: $MEMBER_ADDR"
 
 say "The member pairs with the station over the sealed channel"
-wallet pair --url "127.0.0.1:${MOBILE_PORT}"
+PAIR_OUT="$(wallet pair --url "127.0.0.1:${MOBILE_PORT}")"
+echo "$PAIR_OUT"
+PAIR_CODE="$(printf '%s\n' "$PAIR_OUT" | sed -n 's/^code: //p')"
+[ -n "$PAIR_CODE" ] || { echo "wallet pair printed no code" >&2; exit 1; }
 
-say "The operator confirms the pairing in person (compares the SAS), then the member syncs"
-"$STATION" pair-mobile "$MEMBER_ADDR" --data-dir "$OP_DIR"
+say "The operator compares the code in person, types the one the member reads out, then the member syncs"
+"$STATION" pair-mobile --data-dir "$OP_DIR"
+"$STATION" pair-mobile "$MEMBER_ADDR" --code "$PAIR_CODE" --data-dir "$OP_DIR"
 wallet sync
 
 # --- 3. the operator pays the member; the member confirms OFFLINE -----------

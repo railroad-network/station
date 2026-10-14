@@ -39,16 +39,27 @@ const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 use rrn_crypto::keypair::{Keypair, PublicKey, Signature};
 use rrn_identity::address::Address;
+use rrn_identity::pairing as layout;
 use rrn_identity::sealed::{self, SealedBox, TRANSPORT_CONTEXT};
 
 use crate::core::hex;
-use crate::pairing::{request_signed_bytes, PairRequest, PairResponse};
+use crate::pairing::{PairFinish, PairFinished, PairOffer, PairStart, PAIRING_VERSION};
 use crate::rpc_envelope::{
     frame_signed_request, request_payload_bytes, RequestEnvelope, ResponseEnvelope,
 };
 
 /// How long a single request waits for the station's response before giving up.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A completed pairing handshake, awaiting the operator: the station that
+/// answered (always the pinned one) and the code to read to its operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairOutcome {
+    /// The station's bech32 address.
+    pub station_address: String,
+    /// The confirmation code (`XXXXX-XXXXX`) the operator types to confirm.
+    pub code: String,
+}
 
 /// Why a sealed-channel call failed. The transport/crypto variants are the
 /// client's own; [`ChannelClientError::Method`] carries a station-returned
@@ -133,60 +144,102 @@ impl ChannelClient {
         }
     }
 
-    /// Performs the `POST /pair` handshake for `member` and returns the station's
-    /// [`PairResponse`].
+    /// Runs both rounds of the pairing handshake for `member` and returns the
+    /// station's address and the confirmation code to show the operator.
     ///
-    /// Verifies, in the order ADR-0028 §3.3 requires: first that the returned
-    /// `station_address` equals the pinned station (a [`ChannelClientError::StationMismatch`]
-    /// otherwise, naming both), then that the response signature verifies against
-    /// the pinned key over this request's token. The token is a fresh 32-byte
-    /// nonce so a captured reply cannot be replayed against a later request.
+    /// Commits to a fresh nonce (`POST /pair/start`), then checks the offer in
+    /// the order ADR-0028 §3.3 requires: first that the returned
+    /// `station_address` equals the pinned station (a
+    /// [`ChannelClientError::StationMismatch`] otherwise, naming both), then
+    /// that the offer's signature verifies against the pinned key over this
+    /// member's key and commitment. Only then does it reveal its nonce in a
+    /// finish signed over the pinned station's key (`POST /pair/finish`). The
+    /// station never sends the code; both sides compute it.
     pub async fn pair(
         &self,
         member: &Keypair,
         now: i64,
-    ) -> Result<PairResponse, ChannelClientError> {
-        let token = random_token();
-        let msg = request_signed_bytes(&member.public_key(), &token, now);
-        let request = PairRequest {
-            mobile_address: Address::from_public_key(member.public_key()).to_string(),
-            token: hex(&token),
+    ) -> Result<PairOutcome, ChannelClientError> {
+        let member_pk = member.public_key();
+        let member_address = Address::from_public_key(member_pk).to_string();
+        let mobile_nonce = layout::fresh_nonce();
+        let commitment = layout::commitment(&member_pk.to_bytes(), &mobile_nonce);
+
+        let start_msg = layout::start_signed_bytes(&member_pk.to_bytes(), &commitment, now);
+        let start = PairStart {
+            v: PAIRING_VERSION,
+            mobile_address: member_address.clone(),
+            commitment: hex(&commitment),
             requested_at: now,
-            signature: hex(&member.sign(&msg).to_bytes()),
+            signature: hex(&member.sign(&start_msg).to_bytes()),
         };
-        let body = serde_json::to_vec(&request).expect("PairRequest serializes");
-        let (status, resp) = self.http_post("/pair", "application/json", &body).await?;
-        if status != 200 {
-            return Err(ChannelClientError::Http {
-                status,
-                message: String::from_utf8_lossy(&resp).into_owned(),
-            });
-        }
-        let response: PairResponse =
-            serde_json::from_slice(&resp).map_err(|_| ChannelClientError::Malformed)?;
+        let body = serde_json::to_vec(&start).expect("PairStart serializes");
+        let offer: PairOffer = self.pair_post("/pair/start", &body).await?;
 
         // The station names itself: it must be the one this wallet pinned. This
         // is checked before the signature so a wrong station gives the precise
         // "not the station you enrolled with" error rather than a generic
         // verification failure (ADR-0028 §3.3).
         let pinned = Address::from_public_key(self.station).to_string();
-        if response.station_address != pinned {
+        if offer.station_address != pinned {
             return Err(ChannelClientError::StationMismatch {
                 pinned,
-                got: response.station_address,
+                got: offer.station_address,
             });
         }
-        // Then prove the pin holds the key behind that address and bound this
-        // token, so a man-in-the-middle echoing the address cannot pass.
-        let response_msg = crate::pairing::response_signed_bytes(&self.station, &token);
-        let sig_bytes = crate::core::unhex(&response.signature)
-            .and_then(|b| <[u8; 64]>::try_from(b).ok())
-            .ok_or(ChannelClientError::Malformed)?;
-        let signature = Signature::from_bytes(sig_bytes).map_err(|_| ChannelClientError::Verify)?;
-        self.station
-            .verify(&response_msg, &signature)
-            .map_err(|_| ChannelClientError::Verify)?;
-        Ok(response)
+        // Then prove the pin holds the key behind that address and fixed its
+        // nonce against this commitment, so a man-in-the-middle echoing the
+        // address cannot pass.
+        let station_nonce = offer
+            .verify(&self.station, &member_pk, &commitment)
+            .map_err(|e| match e {
+                crate::pairing::PairError::SignatureMismatch => ChannelClientError::Verify,
+                _ => ChannelClientError::Malformed,
+            })?;
+
+        let finish_msg = layout::finish_signed_bytes(
+            &self.station.to_bytes(),
+            &member_pk.to_bytes(),
+            &commitment,
+            &station_nonce,
+            &mobile_nonce,
+        );
+        let finish = PairFinish {
+            v: PAIRING_VERSION,
+            mobile_address: member_address,
+            station_address: pinned.clone(),
+            mobile_nonce: hex(&mobile_nonce),
+            signature: hex(&member.sign(&finish_msg).to_bytes()),
+        };
+        let body = serde_json::to_vec(&finish).expect("PairFinish serializes");
+        let _: PairFinished = self.pair_post("/pair/finish", &body).await?;
+
+        Ok(PairOutcome {
+            station_address: pinned,
+            code: layout::code(
+                &self.station.to_bytes(),
+                &member_pk.to_bytes(),
+                &mobile_nonce,
+                &station_nonce,
+            ),
+        })
+    }
+
+    /// POSTs one pairing round and parses a `200` JSON answer; any other
+    /// status is an [`ChannelClientError::Http`] carrying the station's reason.
+    async fn pair_post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &[u8],
+    ) -> Result<T, ChannelClientError> {
+        let (status, resp) = self.http_post(path, "application/json", body).await?;
+        if status != 200 {
+            return Err(ChannelClientError::Http {
+                status,
+                message: String::from_utf8_lossy(&resp).into_owned(),
+            });
+        }
+        serde_json::from_slice(&resp).map_err(|_| ChannelClientError::Malformed)
     }
 
     /// Makes one authenticated `method` call with `params`, using `transport_nonce`
@@ -345,12 +398,4 @@ impl ChannelClient {
             .ok_or(ChannelClientError::Malformed)?;
         Ok((status, resp_body))
     }
-}
-
-/// A fresh 32-byte pairing nonce. Derived from an ephemeral keypair's public key
-/// bytes so the channel client needs no direct `rand` dependency (the CSPRNG is
-/// `rrn-crypto`'s `Keypair::generate`); the token is a uniqueness/unpredictability
-/// nonce, not key material.
-fn random_token() -> [u8; 32] {
-    Keypair::generate().public_key().to_bytes()
 }

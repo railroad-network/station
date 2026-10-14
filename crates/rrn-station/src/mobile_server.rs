@@ -7,8 +7,11 @@
 //! ourselves — see ADR-0008. Every handler forwards to the single-threaded
 //! [`Core`](crate::core), so there is no shared-state race here either.
 //!
-//! Routes: `POST /pair`, `POST /rpc` — the authenticated request channel
-//! and `POST /subscribe`, the long-poll for push-style updates.
+//! Routes: `POST /pair/start` and `POST /pair/finish` — the two rounds of the
+//! commit-then-reveal pairing handshake (`docs/spec/pairing.md`); `POST /pair`,
+//! the retired version-1 handshake, which answers `410 Gone`; `POST /rpc` — the
+//! authenticated request channel; and `POST /subscribe`, the long-poll for
+//! push-style updates.
 //! The subscribe handler is the one place a request is *held open*: it
 //! authenticates through the core, then either returns pending events immediately
 //! or parks on the core's log-tail signal (up to `subscribe_hold`) and returns
@@ -27,7 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::core::{CoreHandle, SubscribeOutcome};
-use crate::pairing::{PairError, PairRequest, PairResponse};
+use crate::pairing::{PairError, PairFinish, PairFinished, PairOffer, PairStart};
 use crate::rpc_envelope::ChannelError;
 
 /// Request-body ceiling for the sealed channel. A `bundle_submit`
@@ -47,10 +50,12 @@ struct AppState {
 /// Builds the router over a core handle and the subscribe hold duration.
 fn app(core: CoreHandle, subscribe_hold: Duration) -> Router {
     Router::new()
-        .route("/pair", post(pair))
+        .route("/pair", post(pair_retired))
+        .route("/pair/start", post(pair_start))
+        .route("/pair/finish", post(pair_finish))
         // `/rpc` carries `bundle_submit`, whose sealed body can approach
         // `MOBILE_BODY_LIMIT`; `/subscribe` shares the ceiling for symmetry.
-        // `/pair` keeps the small default (its body is a fixed-size handshake).
+        // The pairing routes keep the small default (fixed-size handshakes).
         .route(
             "/rpc",
             post(rpc).route_layer(DefaultBodyLimit::max(MOBILE_BODY_LIMIT)),
@@ -85,22 +90,49 @@ pub async fn serve(
     }
 }
 
-/// `POST /pair` — a mobile's one-time pairing request.
-///
-/// A rejected request maps to `400 Bad Request` with a short reason (the mobile
-/// shows it to the user); a core that is shutting down maps to `503`.
-async fn pair(
+/// `POST /pair` — the retired version-1 handshake. Always `410 Gone`, with no
+/// compatibility window: if it still worked, an attacker would use it.
+async fn pair_retired() -> (StatusCode, String) {
+    pair_refusal(PairError::Retired)
+}
+
+/// `POST /pair/start` — a device's commitment; answers with the station's
+/// signed offer.
+async fn pair_start(
     State(state): State<AppState>,
-    Json(request): Json<PairRequest>,
-) -> Result<Json<PairResponse>, (StatusCode, String)> {
-    match state.core.pair_request(request).await {
-        Ok(response) => Ok(Json(response)),
-        Err(PairError::Unavailable) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            PairError::Unavailable.as_str().to_string(),
-        )),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e.as_str().to_string())),
-    }
+    Json(request): Json<PairStart>,
+) -> Result<Json<PairOffer>, (StatusCode, String)> {
+    state
+        .core
+        .pair_start(request)
+        .await
+        .map(Json)
+        .map_err(pair_refusal)
+}
+
+/// `POST /pair/finish` — a device's reveal; answers `awaiting-operator`.
+async fn pair_finish(
+    State(state): State<AppState>,
+    Json(request): Json<PairFinish>,
+) -> Result<Json<PairFinished>, (StatusCode, String)> {
+    state
+        .core
+        .pair_finish(request)
+        .await
+        .map(Json)
+        .map_err(pair_refusal)
+}
+
+/// A refused pairing request: a short reason the device shows to the user,
+/// with `410` for the retired route, `503` when the core is shutting down, and
+/// `400` otherwise.
+fn pair_refusal(e: PairError) -> (StatusCode, String) {
+    let status = match e {
+        PairError::Retired => StatusCode::GONE,
+        PairError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (status, e.as_str().to_string())
 }
 
 /// `POST /rpc` — a paired mobile's authenticated request.

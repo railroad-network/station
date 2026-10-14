@@ -93,17 +93,18 @@ accepted; each form's section states which it uses.
 
 ---
 
-## 3. Pairing — no QR (network + SAS)
+## 3. Pairing — no QR (network + confirmation code)
 
-Mobile↔station pairing does **not** use a QR code. It is a network handshake: the
-mobile POSTs a signed pairing request to the station over the LAN, the operator
-confirms on the station CLI, and both sides compare an 8-hex Short Authentication
-String (SAS) derived from both static public keys (ADR-0008). A headless
-Pi cannot scan a QR, and one QR cannot carry both parties' keys — hence the
-network+SAS design instead.
+Mobile↔station pairing does **not** use a QR code. It is a two-round
+commit-then-reveal network handshake over the LAN (`POST /pair/start`,
+`POST /pair/finish`); both sides show a 10-character confirmation code derived
+from both static public keys and a fresh nonce from each side, and the operator
+confirms on the station CLI by typing the device's code (ADR-0008, Clarification
+2026-10-14). A headless Pi cannot scan a QR, and one QR cannot carry both
+parties' keys — hence the network-and-code design instead.
 
-See `docs/adr/0008-mobile-station-transport.md` and the station `pairing.rs` /
-`paired.rs` wire contract.
+The full contract — routes, JSON, byte layouts, code rendering, errors — is
+[`pairing.md`](pairing.md).
 
 ---
 

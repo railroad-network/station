@@ -113,6 +113,36 @@ namespace rrn_mobile_ffi {
     // the amount fits the allowance left (cap − Σ history). Returns a verdict;
     // never throws.
     OfflineSpendVerdict offline_spend_verify(bytes cert_envelope, bytes proposal_envelope, sequence<bytes> presented_history, string receiver_address, bytes station_pubkey, i64 now);
+
+    // ---- Pairing (ADR-0008, docs/spec/pairing.md) ------------------------
+    // The commit-then-reveal handshake's byte layouts and confirmation code,
+    // built in Rust so the phone matches the station byte-for-byte. Keys,
+    // nonces, and the commitment are 32 bytes; any other length is
+    // `WrongLength`. Sign with `Keypair.sign`; verify the offer with
+    // `PublicKey.verify` over `pairing_offer_signed_bytes`.
+
+    // A fresh 32-byte nonce from the OS CSPRNG (the device's pairing nonce).
+    bytes pairing_nonce();
+
+    // The device's commitment to its nonce, sent in the start.
+    [Throws=CryptoError]
+    bytes pairing_commitment(bytes mobile_pk, bytes mobile_nonce);
+
+    // The bytes the device signs for POST /pair/start.
+    [Throws=CryptoError]
+    bytes pairing_start_signed_bytes(bytes mobile_pk, bytes commitment, i64 requested_at);
+
+    // The bytes the station's offer signature covers.
+    [Throws=CryptoError]
+    bytes pairing_offer_signed_bytes(bytes station_pk, bytes mobile_pk, bytes commitment, bytes station_nonce);
+
+    // The bytes the device signs for POST /pair/finish (station-bound).
+    [Throws=CryptoError]
+    bytes pairing_finish_signed_bytes(bytes station_pk, bytes mobile_pk, bytes commitment, bytes station_nonce, bytes mobile_nonce);
+
+    // The confirmation code the device shows (`XXXXX-XXXXX`).
+    [Throws=CryptoError]
+    string pairing_code(bytes station_pk, bytes mobile_pk, bytes mobile_nonce, bytes station_nonce);
 };
 
 // Flat error surface for canonical_bytes. Mirrors the tagged-value failure modes

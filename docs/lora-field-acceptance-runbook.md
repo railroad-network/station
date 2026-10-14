@@ -197,20 +197,22 @@ If the socket never appears, `tail "$B/station.log"` — a passphrase prompt mea
 human **`$WRITER_ADDR`** and this machine's **LAN IP** — the sender needs both to provision
 the member wallet.
 
-### R3. Confirm the member (after the sender relays the member address + SAS)
+### R3. Confirm the member (after the sender relays the member address + code)
 
 📥 **RELAY IN:** wait for the human to bring you the **member's `rrn1…` address** and the
-**pairing SAS** the sender printed. ⏱ The pending pairing **expires 5 minutes** after the
-sender ran `wallet pair` — if the relay is slower than that, ask the human to have Machine A
-re-run `wallet pair` and relay a fresh SAS.
+**pairing code** (`XXXXX-XXXXX`) the sender printed. ⏱ The pending pairing **expires 5
+minutes** after the sender ran `wallet pair` — if the relay is slower than that, ask the human
+to have Machine A re-run `wallet pair` and relay the fresh code (every run gives a new one).
 
 ```sh
 source "$HOME/rrn-field.env"; export B="$HOME/rrn-writer"
 MEMBER_ADDR="<the member address the human relayed>"
-# 1. List the pending request and READ its SAS code:
-"$STATION" pair-mobile --data-dir "$B"          # prints:  <sas>   <addr>   (<age>s ago)
-# 🔴 STOP — compare that <sas> to the SAS the human relayed from Machine A. Only if they MATCH:
-"$STATION" pair-mobile "$MEMBER_ADDR" --data-dir "$B"    # confirms the pairing
+MEMBER_CODE="<the code the human relayed>"
+# 1. List the pending request and READ its code:
+"$STATION" pair-mobile --data-dir "$B"          # prints:  <code>   <addr>   (<age>s ago)
+# 🔴 STOP — compare that <code> to the code the human relayed from Machine A. Only if they
+# MATCH, confirm with the relayed code (the station refuses a code that does not match):
+"$STATION" pair-mobile "$MEMBER_ADDR" --code "$MEMBER_CODE" --data-dir "$B"
 # 2. Vouch for the member (needed for standing; the debt floor lets a zero-balance member pay):
 "$RRN" --socket "$B/station.sock" vouch "$MEMBER_ADDR" --statement "field-test member"
 ```
@@ -312,13 +314,13 @@ WRITER_ADDR="<relayed from Machine B>"
 # 1. create the wallet, pinned to the writer's address:
 MEMBER_ADDR="$("$RRN" wallet --home "$MEMBER" init --station "$WRITER_ADDR")"
 echo "MEMBER_ADDR=$MEMBER_ADDR"
-# 2. pair over the sealed channel to B's mobile listener (prints a line beginning "SAS:"):
+# 2. pair over the sealed channel to B's mobile listener (prints a line beginning "code:"):
 "$RRN" wallet --home "$MEMBER" pair --url "<B-LAN-IP>:7412"
 ```
 
-📤 **RELAY OUT:** give the human the **`$MEMBER_ADDR`** and the **SAS** so Machine B can
+📤 **RELAY OUT:** give the human the **`$MEMBER_ADDR`** and the **code** so Machine B can
 compare and confirm the pairing. ⏱ Machine B must confirm within **5 minutes** — if it
-lapses, re-run `wallet pair` and relay the new SAS. 📥 Then wait for "member confirmed."
+lapses, re-run `wallet pair` and relay the new code. 📥 Then wait for "member confirmed."
 
 ```sh
 source "$HOME/rrn-field.env"; export MEMBER="$HOME/rrn-member"

@@ -15,6 +15,10 @@
 //! - [`recovery`] — Shamir-based social recovery: split the wallet's secret key
 //!   into shards, seal each to a holder, and reconstruct from a threshold. Own
 //!   Shamir implementation over GF(256) per ADR-0004.
+//! - [`pairing`] — the byte layouts and confirmation code of the
+//!   commit-then-reveal device pairing handshake (ADR-0008).
+//! - [`human_code`] — Crockford-base32 codes that two people read aloud and
+//!   compare.
 //!
 //! # Where it sits in the stack
 //!
@@ -29,6 +33,8 @@
 pub mod address;
 pub mod attestation;
 pub mod envelope;
+pub mod human_code;
+pub mod pairing;
 pub mod recovery;
 pub mod sealed;
 pub mod vouch;

@@ -6,4 +6,5 @@
 //! `cargo test -p rrn-mobile-ffi --test it <name>`.
 mod cross_platform_canonical;
 mod cross_platform_dtn_certs;
+mod pairing_v2;
 mod recovery_ceremony;

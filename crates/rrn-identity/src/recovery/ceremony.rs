@@ -55,7 +55,7 @@ pub const FINGERPRINT_TAG: &[u8] = b"rrn.recovery.fingerprint";
 ///
 /// It binds the request's ephemeral key, so a forged parallel ceremony (a
 /// different ephemeral key) yields a different code. Requester and holders
-/// compare it out-of-band — the same ritual as the pairing SAS — to confirm they
+/// compare it out-of-band — the same ritual as the pairing code — to confirm they
 /// are taking part in the *same* recovery before any share is contributed. It is
 /// not a secret and not an authenticator on its own; it only lets humans detect
 /// a mismatch.
