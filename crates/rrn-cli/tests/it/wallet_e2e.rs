@@ -660,7 +660,19 @@ async fn transient_refusal_of_a_confirmation_stays_pending_and_retries() {
 
     let paid = wjson(&home_a, &["pay", &b, "1.00"]).await;
     let tx_id = paid["tx_id"].as_str().unwrap().to_string();
-    wjson(&home_b, &["confirm", &tx_id]).await;
+    // B confirms from A's carried bundle: the station has not seen it yet.
+    let carried = dir.path().join("carried");
+    wjson(
+        &home_a,
+        &["export", "bundle", "--out", carried.to_str().unwrap()],
+    )
+    .await;
+    let bundle = carried.join("payload.bundle");
+    wjson(
+        &home_b,
+        &["confirm", &tx_id, "--from", bundle.to_str().unwrap()],
+    )
+    .await;
 
     let first_b = {
         let home_b = home_b.clone();
@@ -746,7 +758,19 @@ async fn a_confirmation_whose_payment_never_arrives_can_be_abandoned() {
 
     let paid = wjson(&home_a, &["pay", &b, "1.00"]).await;
     let tx_id = paid["tx_id"].as_str().unwrap().to_string();
-    wjson(&home_b, &["confirm", &tx_id]).await;
+    // B confirms from A's carried QR sheet; A never delivers the payment.
+    let carried = dir.path().join("carried");
+    wjson(
+        &home_a,
+        &["export", "qr", "--out", carried.to_str().unwrap()],
+    )
+    .await;
+    let sheet = carried.join("bundle.txt");
+    wjson(
+        &home_b,
+        &["confirm", &tx_id, "--from", sheet.to_str().unwrap()],
+    )
+    .await;
     wjson(&home_b, &["submit"]).await;
     assert_eq!(
         pending_rows(&home_b, &b),
@@ -775,6 +799,182 @@ async fn a_confirmation_whose_payment_never_arrives_can_be_abandoned() {
     assert_eq!(wjson(&home_b, &["status"]).await["refused_for_now"], 0);
     let stderr = wfail(&home_b, Some(PASS), &["submit"]).await;
     assert!(stderr.contains("nothing pending"), "got: {stderr}");
+    h.shutdown().await;
+}
+
+// --- confirm signs only a verified, displayed proposal ---------------------
+
+/// Submits a proposal hand-signed by the member whose wallet lives in `home`
+/// over the sealed channel — as a hostile or buggy client could — and returns
+/// its transaction id.
+async fn submit_hand_signed(h: &Harness, home: &Path, receiver: &str, amount_centi: i64) -> String {
+    let contents = WalletContents::load_from_file(&home.join("member.rrnwallet"), PASS).unwrap();
+    let kp = Keypair::from_secret(contents.secret_key.clone());
+    let now = now_secs();
+    let p = TransactionProposal::new(
+        Address::from_public_key(kp.public_key()),
+        receiver.parse().unwrap(),
+        amount_centi,
+        None,
+        0,
+        now,
+        now + 86_400,
+    );
+    let tx_id = hex(&p.id.to_bytes());
+    let signed = SignedProposal::sign(p, &kp);
+    let frame = rrn_station::rpc_envelope::frame_signed_record(
+        &rrn_crypto::serialize::to_canonical_bytes(signed.payload.clone()),
+        &signed.signer,
+        &signed.signature,
+    );
+    let client = rrn_station::channel_client::ChannelClient::new(
+        h.url.clone(),
+        *h.station_addr.parse::<Address>().unwrap().public_key(),
+    );
+    let nonce = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64)
+        + 1_000;
+    client
+        .call(
+            &kp,
+            "submit_proposal",
+            &serde_json::json!({ "signed_proposal": hex(&frame) }),
+            nonce,
+            now,
+        )
+        .await
+        .expect("the station admits the hand-signed proposal");
+    tx_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_shows_payment_request_and_requires_accept_debit() {
+    // B sends A a −5.00 proposal: a payment *request*, which debits whoever
+    // confirms it (ADR-0018). "Confirm this id, I paid you" must not get A to
+    // sign a debit unseen.
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_b, b) = init_wallet(dir.path(), "b", &h.station_addr).await;
+    pair_and_confirm(&h, &home_a, &a).await;
+    pair_and_confirm(&h, &home_b, &b).await;
+    wjson(&home_a, &["sync"]).await;
+    let tx_id = submit_hand_signed(&h, &home_b, &a, -500).await;
+
+    let stderr = wfail(&home_a, Some(PASS), &["confirm", &tx_id]).await;
+    assert!(stderr.contains("you would PAY 5.00"), "got: {stderr}");
+    assert!(stderr.contains("--accept-debit"), "got: {stderr}");
+    assert_eq!(pending_rows(&home_a, &a), 0, "nothing was signed");
+
+    let confirmed = wjson(&home_a, &["confirm", &tx_id, "--accept-debit"]).await;
+    assert_eq!(confirmed["direction"], "you-pay");
+    assert_eq!(confirmed["proposal_amount_centi"], -500);
+    assert_eq!(confirmed["counterparty"], b.as_str());
+    assert_eq!(pending_rows(&home_a, &a), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_refuses_a_proposal_not_addressed_to_you() {
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_c, c) = init_wallet(dir.path(), "c", &h.station_addr).await;
+    pair_and_confirm(&h, &home_a, &a).await;
+    pair_and_confirm(&h, &home_c, &c).await;
+    wjson(&home_a, &["sync"]).await;
+    wjson(&home_c, &["sync"]).await;
+    // A pays the station; C is shown the id and told to confirm it.
+    let paid = wjson(&home_a, &["pay", &h.station_addr, "1.00"]).await;
+    let tx_id = paid["tx_id"].as_str().unwrap().to_string();
+    wjson(&home_a, &["submit"]).await;
+
+    let stderr = wfail(&home_c, Some(PASS), &["confirm", &tx_id]).await;
+    assert!(stderr.contains("not addressed to you"), "got: {stderr}");
+    assert_eq!(pending_rows(&home_c, &c), 0);
+
+    // An id the station does not serve is refused, not signed blind.
+    let stderr = wfail(&home_c, Some(PASS), &["confirm", &"ab".repeat(32)]).await;
+    assert!(stderr.contains("no servable record"), "got: {stderr}");
+    assert_eq!(pending_rows(&home_c, &c), 0);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_from_carried_bundle_offline() {
+    // B pays A offline and prints the QR sheet; A — never paired — confirms
+    // straight from the sheet.
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_b, b) = init_wallet(dir.path(), "b", &h.station_addr).await;
+    let paid = wjson(&home_b, &["pay", &a, "2.50", "--memo", "eggs"]).await;
+    let tx_id = paid["tx_id"].as_str().unwrap().to_string();
+    let out = dir.path().join("sheet");
+    wjson(&home_b, &["export", "qr", "--out", out.to_str().unwrap()]).await;
+    let sheet = out.join("bundle.txt");
+    let sheet = sheet.to_str().unwrap();
+
+    // A bundle needs the id; a wrong id is not in it.
+    let stderr = wfail(&home_a, Some(PASS), &["confirm", "--from", sheet]).await;
+    assert!(stderr.contains("give the transaction id"), "got: {stderr}");
+    let stderr = wfail(
+        &home_a,
+        Some(PASS),
+        &["confirm", &"cd".repeat(32), "--from", sheet],
+    )
+    .await;
+    assert!(stderr.contains("has no record"), "got: {stderr}");
+
+    let confirmed = wjson(&home_a, &["confirm", &tx_id, "--from", sheet]).await;
+    assert_eq!(confirmed["tx_id"], tx_id.as_str());
+    assert_eq!(confirmed["direction"], "you-receive");
+    assert_eq!(confirmed["proposal_amount_centi"], 250);
+    assert_eq!(confirmed["counterparty"], b.as_str());
+    assert_eq!(pending_rows(&home_a, &a), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_from_voucher_runs_the_receiver_ritual() {
+    // B holds a certificate and pays C offline with a voucher. A, handed the
+    // voucher, is refused by the receiver's check; C confirms from it.
+    let h = Harness::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (home_a, a) = init_wallet(dir.path(), "a", &h.station_addr).await;
+    let (home_b, b) = init_wallet(dir.path(), "b", &h.station_addr).await;
+    let (home_c, c) = init_wallet(dir.path(), "c", &h.station_addr).await;
+    pair_and_confirm(&h, &home_b, &b).await;
+    wjson(&home_b, &["sync"]).await;
+    let issued = wjson(&home_b, &["cert", "request", "5"]).await;
+    let cert_id = issued["cert_id"].as_str().unwrap().to_string();
+    let voucher = dir.path().join("voucher.txt");
+    let paid = wjson(
+        &home_b,
+        &[
+            "pay",
+            &c,
+            "2.00",
+            "--cert",
+            &cert_id,
+            "--voucher-out",
+            voucher.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let tx_id = paid["tx_id"].as_str().unwrap().to_string();
+    let voucher = voucher.to_str().unwrap();
+
+    let stderr = wfail(&home_a, Some(PASS), &["confirm", "--from", voucher]).await;
+    assert!(stderr.contains("wrong-receiver"), "got: {stderr}");
+    assert_eq!(pending_rows(&home_a, &a), 0);
+
+    let confirmed = wjson(&home_c, &["confirm", "--from", voucher]).await;
+    assert_eq!(confirmed["tx_id"], tx_id.as_str());
+    assert_eq!(confirmed["direction"], "you-receive");
+    assert_eq!(pending_rows(&home_c, &c), 1);
     h.shutdown().await;
 }
 

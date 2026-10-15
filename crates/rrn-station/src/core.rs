@@ -4673,6 +4673,68 @@ impl Core {
         }))
     }
 
+    /// `signed_record` (paired member / sealed channel): the exact signed bytes
+    /// the log holds for a record id — `{"kind", "body_hex", "signer_hex",
+    /// "signature_hex", "seq"}`, where `body_hex` is the canonical body its
+    /// author signed (so `Hash::of(body)` is the id) and the signer and
+    /// signature are the log row's, verbatim. Nothing is re-encoded.
+    ///
+    /// A client about to sign over a content id it did not build — a
+    /// confirmation, verdict or escalation ballot over a transaction id, a vote
+    /// or co-sign over a governance proposal id — fetches the record here and
+    /// checks it, so what it shows is what the id names.
+    ///
+    /// Serves only `rrn.tx.proposal` and `rrn.gov.proposal`; an unknown id and
+    /// a record of another kind get the same answer, so the read is no oracle
+    /// for which other ids exist. Any paired member may read it — the audience
+    /// of the `transactions`, `dispute` and `governance_proposal` reads. No
+    /// write, no cache row. A read: served on a replica, which holds the pulled
+    /// log.
+    fn channel_signed_record(
+        &mut self,
+        envelope: &RequestEnvelope,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        const SERVED_KINDS: [&str; 2] = [rrn_ledger::transaction::PROPOSAL_KIND, KIND_GOV_PROPOSAL];
+        let not_servable = || {
+            (
+                rpc::INVALID_PARAMS,
+                "no servable record with that id".into(),
+            )
+        };
+        let bytes = hex_param(&envelope.params, "id")?;
+        let id: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| (rpc::INVALID_PARAMS, "id is not a 32-byte hash".into()))?;
+        let log = AppendLog::new(&self.db);
+        let seq = match log
+            .admission_of(&Hash::from_bytes(id))
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+        {
+            Some((seq, _)) => seq,
+            None => return Err(not_servable()),
+        };
+        let entry = log
+            .get(seq)
+            .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?
+            .ok_or_else(not_servable)?;
+        let kind = match rrn_crypto::serialize::decode_kinded(&entry.payload.bytes) {
+            Ok(k) => k.kind,
+            Err(_) => None,
+        };
+        let kind = match kind {
+            Some(k) if SERVED_KINDS.contains(&k.as_str()) => k,
+            _ => return Err(not_servable()),
+        };
+        Ok(serde_json::json!({
+            "kind": kind,
+            "body_hex": hex(&entry.payload.bytes),
+            "signer_hex": hex(&entry.payload.signer.to_bytes()),
+            "signature_hex": hex(&entry.payload.signature.to_bytes()),
+            "seq": entry.seq,
+        }))
+    }
+
     /// `cert_request` (paired member / sealed channel): a member submits their
     /// own signed headroom-certificate request and gets back the station-signed
     /// certificate (ADR-0021 §1, ADR-0028 §4).
@@ -6229,6 +6291,10 @@ impl Core {
             // paper-first wallet resumes without forking. A read; served on a
             // replica.
             "outbox_head" => self.channel_outbox_head(envelope),
+            // The canonical signed bytes of a transaction or governance
+            // proposal, by content id, so a member signing over that id checks
+            // the bytes hash to it first. A read; served on a replica.
+            "signed_record" => self.channel_signed_record(envelope),
             // Live headroom-certificate issuance (ADR-0021 §1, ADR-0028 §4): a
             // member submits their own signed request and gets the station-signed
             // certificate back. Issuance is a live round-trip (refused over DTN),
@@ -7981,6 +8047,7 @@ fn channel_method_is_replica_safe(method: &str) -> bool {
             | "dispute"
             | "receipts_fetch"
             | "outbox_head"
+            | "signed_record"
     )
 }
 
@@ -9550,6 +9617,135 @@ mod tests {
         let env = envelope(&member, "cert_request", serde_json::json!({}));
         let (code, _) = core.route_channel_method(&env).unwrap_err();
         assert_eq!(code, rpc::READ_REPLICA);
+    }
+
+    // --- signed_record: the bytes a member signs over ---------------------
+
+    /// Appends a member-signed transaction proposal and a governance proposal
+    /// straight onto the log, returning their content ids.
+    fn seed_signed_records(core: &Core, member: &Keypair) -> (Hash, Hash) {
+        let mut log = AppendLog::new(&core.db);
+        let receiver = Keypair::generate();
+        let tx = member_proposal(member, &receiver, -500, 0, NOW, NOW + 86_400);
+        let tx_id = tx.payload.id.0;
+        log.append(tx, NOW).unwrap();
+        let gov = Proposal::new(
+            Address::from_public_key(member.public_key()),
+            "Tool library hours".into(),
+            "Open the tool library on Saturdays.".into(),
+            ProposalKind::Statute,
+            NOW,
+        )
+        .unwrap();
+        let gov_id = gov.proposal_id.0;
+        log.append(SignedPayload::sign(gov, member), NOW).unwrap();
+        (tx_id, gov_id)
+    }
+
+    #[test]
+    fn signed_record_returns_bytes_that_hash_to_the_id() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        let (tx_id, gov_id) = seed_signed_records(&core, &member);
+        for (id, kind) in [(tx_id, "rrn.tx.proposal"), (gov_id, "rrn.gov.proposal")] {
+            let env = envelope(
+                &member,
+                "signed_record",
+                serde_json::json!({ "id": hex(&id.to_bytes()) }),
+            );
+            let r = core.route_channel_method(&env).unwrap();
+            assert_eq!(r["kind"], kind);
+            let body = unhex(r["body_hex"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                Hash::of(&body),
+                id,
+                "the body is the content-addressed bytes"
+            );
+            let signer = PublicKey::from_bytes(
+                unhex(r["signer_hex"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+            let sig = rrn_crypto::keypair::Signature::from_bytes(
+                unhex(r["signature_hex"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(signer, member.public_key());
+            assert!(signer.verify(&body, &sig).is_ok());
+            assert!(r["seq"].as_u64().unwrap() >= 1);
+        }
+        // The transaction proposal opens with the ledger helper a wallet uses.
+        let env = envelope(
+            &member,
+            "signed_record",
+            serde_json::json!({ "id": hex(&tx_id.to_bytes()) }),
+        );
+        let r = core.route_channel_method(&env).unwrap();
+        let body = unhex(r["body_hex"].as_str().unwrap()).unwrap();
+        let entry = AppendLog::new(&core.db)
+            .get(r["seq"].as_u64().unwrap())
+            .unwrap()
+            .unwrap();
+        let opened = rrn_ledger::transaction::open_signed_proposal(
+            &entry.payload.signer,
+            &entry.payload.signature,
+            &body,
+            &TransactionId(tx_id),
+        )
+        .unwrap();
+        assert_eq!(opened.payload.amount_centi, -500);
+    }
+
+    #[test]
+    fn signed_record_refuses_other_kinds_and_unknown_ids_alike() {
+        let mut core = test_core();
+        let member = Keypair::generate();
+        let receiver = Keypair::generate();
+        // A confirmation on the log: a real id, of a kind this read does not serve.
+        let p = member_proposal(&receiver, &member, 100, 0, NOW, NOW + 86_400);
+        let c = member_confirmation(&member, &p, NOW);
+        let c_id = c.payload_hash();
+        AppendLog::new(&core.db).append(c, NOW).unwrap();
+
+        let ask = |core: &mut Core, id: &str| {
+            let env = envelope(&member, "signed_record", serde_json::json!({ "id": id }));
+            core.route_channel_method(&env).unwrap_err()
+        };
+        let other_kind = ask(&mut core, &hex(&c_id.to_bytes()));
+        let unknown = ask(&mut core, &hex(&[0x42u8; 32]));
+        assert_eq!(
+            other_kind, unknown,
+            "the two refusals are indistinguishable"
+        );
+        assert_eq!(
+            unknown,
+            (
+                rpc::INVALID_PARAMS,
+                "no servable record with that id".to_string()
+            )
+        );
+        // Nothing was written by the reads.
+        assert_eq!(AppendLog::new(&core.db).tail().unwrap().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn replica_serves_signed_record() {
+        let mut core = test_core().with_role(crate::config::StationRole::Replica);
+        let member = Keypair::generate();
+        let (tx_id, _) = seed_signed_records(&core, &member);
+        let env = envelope(
+            &member,
+            "signed_record",
+            serde_json::json!({ "id": hex(&tx_id.to_bytes()) }),
+        );
+        let r = core.route_channel_method(&env).unwrap();
+        assert_eq!(r["kind"], "rrn.tx.proposal");
+        assert!(channel_method_is_replica_safe("signed_record"));
     }
 
     // --- DTN bundle ingest (ADR-0020) -------------------------------

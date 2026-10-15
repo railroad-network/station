@@ -48,6 +48,9 @@ pub use cert::{
     proposal_sign_with_certificate, CertError, CertificateInfo, OfflineSpendVerdict,
 };
 
+mod record;
+pub use record::{signed_record_open, RecordError, VerifiedRecord};
+
 mod pairing;
 pub use pairing::{
     pairing_code, pairing_commitment, pairing_finish_signed_bytes, pairing_nonce,

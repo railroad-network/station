@@ -409,6 +409,10 @@ spend over the debt floor) stays pending and is retried on the next submit;
 `rrn wallet show --pending` says why. If one can never succeed — say the member
 confirmed a payment whose sender lost their laptop before sending it —
 `rrn wallet abandon <hash>` stops carrying it.
+`rrn wallet confirm` shows who pays whom before it signs; a payment *request* —
+you pay — needs `--accept-debit`. It signs only a proposal it has checked: by id
+against the station's copy when online, or straight from the payer's carried
+voucher or exported bundle with `--from <file>` when not.
 That is not a revocation: a copy already carried can still be admitted. When you
 upgrade the station, have laptop members upgrade `rrn wallet` too: a station can
 answer with a refusal reason an older wallet does not know (such as `tx-closed`),
@@ -872,7 +876,9 @@ phone is on the right Wi‑Fi is what's worth investigating.
 
 When a member cannot reach the station by any means — no Wi‑Fi, no mesh, no
 radio — a payment can still travel on **paper**. The member confirms (or spends)
-offline, which produces QR codes; those get printed or photographed, physically
+offline, which produces QR codes — a confirmation is checked first against the
+payer's carried voucher or exported bundle (`rrn wallet confirm --from`), since
+the station's copy is out of reach; those get printed or photographed, physically
 carried to the station, scanned back to text, and ingested. The station's
 delivery receipt makes the return trip the same way. Today the member side of
 this is the **command-line wallet** (`rrn wallet pay` / `confirm` then
@@ -894,8 +900,10 @@ rrn paper ingest --in scanned.txt --out carryback/
 #   → prints each carried record's outcome (admitted / known / refused) and
 #     writes the station's delivery receipts to carryback/ for the return trip.
 
-# Inspect a sheet without ingesting (works with the daemon stopped):
-rrn paper show --in scanned.txt
+# Inspect a sheet without ingesting (works with the daemon stopped). Pass your
+# station's address: a certificate or receipt is reported verified only when the
+# station signed it — without --station, show says the signer was not checked:
+rrn paper show --station rrn1… --in scanned.txt
 
 # Export pending receipts for a member to carry home:
 rrn paper export-receipts --author rrn1… --out receipts/
@@ -1047,7 +1055,11 @@ rrn paper cert --cert-id <hex> --out cards/   # print it as a wallet card (Part 
 What a receiver checks offline, before handing over goods: the certificate is
 station-signed, it belongs to the payer, the payment fits the remaining cap, and
 it has not expired (the `rrnspend:` voucher the payer's wallet writes with
-`--voucher-out` carries what is needed; `rrn paper show` verifies it). The
+`--voucher-out` carries what is needed). Check it with `rrn paper show --in
+voucher.txt --station <the station's rrn1…> --receiver <your rrn1…>`, or confirm
+straight from it with `rrn wallet confirm --from voucher.txt`; without both
+addresses `paper show` only checks that the signatures are self-consistent and
+says `verified: false`. The
 receiver also sees the payer's earlier spends against that certificate — but
 only the ones the payer *presents*. A
 payer can hide earlier spends; the cap still bounds what the community can lose

@@ -220,8 +220,13 @@ Rust reference: `rrn_protocol::paper` (`encode_certificate`, `decode_certificate
 ## 7. Spend voucher — prefix `rrnspend:`
 
 The offline point-of-sale form: one code the **payer** renders, the receiver
-scans and verifies entirely offline (ADR-0021 §3, via the mobile FFI's
-`offline_spend_verify` or the paper CLI):
+scans and verifies entirely offline (ADR-0021 §3). The verifier is the shared
+`rrn_ledger::offline_spend::verify_offline_spend`, which the mobile FFI's
+`offline_spend_verify`, `rrn paper show --station … --receiver …` and
+`rrn wallet confirm --from` all call. Its verdicts are named by slug in CLI
+output (`ok`, `wrong-receiver`, `overspent`, …); the CLI adds
+`malformed-certificate` and `malformed-proposal` for a voucher whose envelopes do
+not decode, mirroring the FFI's two decode-level verdicts:
 
 ```
 rrnspend:<base64url of a SpendVoucher CBOR container>

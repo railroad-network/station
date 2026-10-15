@@ -5,10 +5,11 @@
 #
 # One `station` daemon (the operator) and one **laptop member** who holds their
 # own key and runs `rrn wallet` — no smartphone. The member pairs and syncs over
-# the sealed channel, confirms a payment while offline, prints it to QR sheets, a
-# courier carries them to the station (a file copy), the station ingests them and
-# hands back a delivery receipt the member applies, and finally the member pays
-# some of it back online. Both balances settle.
+# the sealed channel, checks a payment against the station's copy and confirms
+# it, prints the confirmation to QR sheets, a courier carries them to the station
+# (a file copy), the station ingests them and hands back a delivery receipt the
+# member applies, and finally the member pays some of it back online. Both
+# balances settle.
 #
 # This is the human acceptance path for the CLI member wallet. macOS + Linux
 # only; it does the release build for you.
@@ -126,14 +127,14 @@ say "The operator compares the code in person, types the one the member reads ou
 "$STATION" pair-mobile "$MEMBER_ADDR" --code "$PAIR_CODE" --data-dir "$OP_DIR"
 wallet sync
 
-# --- 3. the operator pays the member; the member confirms OFFLINE -----------
+# --- 3. the operator pays the member; the member confirms, carried on paper --
 
 say "Operator vouches for the member and proposes a 3 Common payment"
 "$RRN" --socket "$OP_SOCK" vouch "$MEMBER_ADDR" --statement "known good" >/dev/null
 TX_ID="$("$RRN" --socket "$OP_SOCK" pay "$MEMBER_ADDR" 3.00 --memo "lunch")"
 echo "Proposed transaction: $TX_ID"
 
-say "The member confirms OFFLINE on the laptop (no station in reach)"
+say "The member checks the proposal against the station's copy and confirms; the confirmation still travels on paper"
 wallet confirm "$TX_ID"
 
 say "The member prints the confirmation to QR sheets"
@@ -146,7 +147,7 @@ say "A courier carries the paper to the station (a file copy stands in)"
 cp "$PRINTED/bundle.txt" "$CARRIED/bundle.txt"
 
 say "The courier inspects the sheet before handing it over (needs no station)"
-"$RRN" paper show --in "$CARRIED/bundle.txt"
+"$RRN" paper show --station "$OP_ADDR" --in "$CARRIED/bundle.txt"
 
 say "The station scans and ingests the carried confirmation"
 "$RRN" --socket "$OP_SOCK" paper ingest --in "$CARRIED/bundle.txt" --out "$BACK"
@@ -182,5 +183,5 @@ printf 'Operator = %s\nMember   = %s\n' \
 
 echo
 echo "CLI member-wallet demo complete: a member with no phone held their own key,"
-echo "confirmed a payment offline, carried it on paper, applied the receipt, and"
+echo "checked and confirmed a payment, carried it on paper, applied the receipt, and"
 echo "paid some back online — operator -2.00, member +2.00 Commons."

@@ -114,6 +114,16 @@ namespace rrn_mobile_ffi {
     // never throws.
     OfflineSpendVerdict offline_spend_verify(bytes cert_envelope, bytes proposal_envelope, sequence<bytes> presented_history, string receiver_address, bytes station_pubkey, i64 now);
 
+    // ---- Served records (the station's `signed_record` read) ---------------
+    // Opens a record the station served by content id, before the phone signs
+    // over that id: checks that `kind` is served, that `body` hashes to
+    // `expected_id`, that it is a canonical record of that kind, that
+    // `signature` verifies over `body`, and that `signer` is the record's sender
+    // (transaction proposal) or author (governance proposal). Render from the
+    // returned fields, never from the station's JSON.
+    [Throws=RecordError]
+    VerifiedRecord signed_record_open(string kind, bytes body, bytes signer, bytes signature, bytes expected_id);
+
     // ---- Pairing (ADR-0008, docs/spec/pairing.md) ------------------------
     // The commit-then-reveal handshake's byte layouts and confirmation code,
     // built in Rust so the phone matches the station byte-for-byte. Keys,
@@ -494,4 +504,29 @@ interface OfflineSpendVerdict {
     ProposalInadmissible();
     Overspent(i64 available_centi, i64 attempted_centi);
     MalformedHistory();
+};
+
+// ---------------------------------------------------------------------------
+// Served records. See src/record.rs.
+
+// Why signed_record_open refused a served record, in check order.
+[Error]
+enum RecordError {
+    "UnknownKind",
+    "IdMismatch",
+    "Malformed",
+    "BadSignature",
+    "SignerNotSender",
+    "SignerNotAuthor",
+};
+
+// A verified record's display fields. Addresses are `rrn1…`, ids/hashes are
+// 64-char hex, amounts are signed centicommons (a negative TransactionProposal
+// amount is a payment request: confirming it debits the receiver). A governance
+// proposal's voting window is not part of the signed record; read it from the
+// `governance_proposal` view.
+[Enum]
+interface VerifiedRecord {
+    TransactionProposal(string id, string sender, string receiver, i64 amount_centi, string? memo, string? listing_id, string? cert_id, u8 effective_tier, u64 nonce, i64 proposed_at, i64 expires_at);
+    GovernanceProposal(string id, string author, string title, string body, string kind, string? scope, i64? emergency_expires_at, i64 created_at);
 };

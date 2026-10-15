@@ -131,7 +131,7 @@ say "A courier carries the paper to the station (a file copy stands in)"
 cp "$WORKDIR/payload.txt" "$CARRIED/payload.txt"
 
 say "The courier inspects the sheet before handing it over (works with no station)"
-"$RRN" paper show --in "$CARRIED/payload.txt"
+"$RRN" paper show --station "$OP_ADDR" --in "$CARRIED/payload.txt"
 
 say "The station scans and ingests the carried confirmation"
 "$RRN" --socket "$OP_SOCK" paper ingest --in "$CARRIED/payload.txt" --out "$BACK"
@@ -154,7 +154,7 @@ say "Operator prints the member's credential card (the bare address QR)"
 
 say "Operator reserves and prints a headroom-certificate wallet card"
 "$RRN" --socket "$OP_SOCK" paper cert --request 5 --out "$CARDS"
-"$RRN" paper show --in "$CARDS/certificate.txt"
+"$RRN" paper show --station "$OP_ADDR" --in "$CARDS/certificate.txt"
 
 # --- 6. settle and report ---------------------------------------------------
 

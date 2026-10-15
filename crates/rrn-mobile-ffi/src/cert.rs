@@ -13,7 +13,6 @@
 //! signing secret never leaves Rust ([`Keypair`](crate::Keypair) handles only,
 //! ADR-0006).
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rrn_crypto::hash::Hash;
@@ -22,7 +21,7 @@ use rrn_crypto::serialize::{from_canonical_bytes, to_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::escrow::{CertId, CertificateRequest, HeadroomCertificate};
-use rrn_ledger::transaction::{TransactionId, TransactionProposal};
+use rrn_ledger::transaction::TransactionProposal;
 
 use crate::envelope::{self, DecodedEnvelope};
 use crate::Keypair;
@@ -247,6 +246,11 @@ pub enum OfflineSpendVerdict {
 /// certificate; and that the amount fits the allowance left (`cap − Σ history`).
 /// On success it returns the spend amount and the allowance remaining after it.
 ///
+/// The checks are `rrn_ledger::offline_spend::verify_offline_spend` — the one
+/// verifier `rrn paper show` and `rrn wallet confirm` also call; this function
+/// decodes the envelopes and maps the verdict 1:1, adding only the two
+/// decode-level variants.
+///
 /// # The clock is testimony (ADR-0022)
 ///
 /// Offline, the receiver's own device clock is the best `now` available; there is
@@ -278,103 +282,79 @@ pub fn offline_spend_verify(
     station_pubkey: Vec<u8>,
     now: i64,
 ) -> OfflineSpendVerdict {
-    use OfflineSpendVerdict::*;
+    use rrn_ledger::offline_spend::{self, OfflineSpendVerdict as V};
 
     // The station key that must have signed the certificate. A malformed key
     // cannot establish the station identity, so the certificate cannot be
     // trusted — treat it as an unverifiable signature.
     let Some(station) = parse_pubkey(&station_pubkey) else {
-        return BadCertificateSignature;
+        return OfflineSpendVerdict::BadCertificateSignature;
     };
-
-    let Some(cert_signed) = decode_certificate(&cert_envelope) else {
-        return MalformedCertificate;
+    let Some(cert) = decode_certificate(&cert_envelope) else {
+        return OfflineSpendVerdict::MalformedCertificate;
     };
-    if cert_signed.signer != station || cert_signed.verify().is_err() {
-        return BadCertificateSignature;
-    }
-    let cert = &cert_signed.payload;
-
+    // A malformed proposal is reported only after the certificate's signature
+    // check, the order the verifier runs its own steps in.
     let Some(proposal) = decode_proposal(&proposal_envelope) else {
-        return MalformedProposal;
+        return if offline_spend::certificate_signed_by(&cert, &station) {
+            OfflineSpendVerdict::MalformedProposal
+        } else {
+            OfflineSpendVerdict::BadCertificateSignature
+        };
     };
-    // The proposal must be signed by its own sender — otherwise anyone could
-    // author a debit against the certificate holder.
-    if &proposal.signer != proposal.payload.sender.public_key() || proposal.verify().is_err() {
-        return BadProposalSignature;
-    }
-    let p = &proposal.payload;
+    // An undecodable history item is `None`: the shared verifier reports it as
+    // malformed history at the history step, after every earlier check.
+    let history: Vec<_> = presented_history
+        .iter()
+        .map(|item| decode_proposal(item))
+        .collect();
 
-    if cert.member != p.sender {
-        return CertMemberMismatch;
-    }
-    if p.cert_id != Some(cert.cert_id) {
-        return CertNotReferenced;
-    }
-    // The spend must be addressed to *this* receiver: a proposal naming someone
-    // else can only be confirmed by that someone else (the station requires
-    // confirmer == receiver), so accepting it delivers goods against nothing. A
-    // malformed self-address cannot be matched, so it is treated as a mismatch.
-    match receiver_address.parse::<Address>() {
-        Ok(receiver) if receiver == p.receiver => {}
-        _ => return WrongReceiver,
-    }
-    if p.amount_centi <= 0 {
-        return NotADebit;
-    }
-    // Mirror the station's payload-only proposal refusals, which it judges
-    // *before* the certificate carve-out (see `Engine::submit_proposal`): an
-    // inverted or elapsed window, an over-long memo, or a tier above what the
-    // phase serves would all be refused regardless of the cap, so an `Ok` here
-    // would mislead the receiver into delivering against a spend the station
-    // declines. All are checkable with only the payload and the receiver's clock.
-    if p.proposed_at > p.expires_at
-        || !p.memo_within_bounds()
-        || !rrn_ledger::tier::is_phase1_serviceable(p.effective_tier())
-    {
-        return ProposalInadmissible;
-    }
-    if now > p.expires_at {
-        return ProposalExpired;
-    }
-    // Unexpired at the receiver's clock (ADR-0021 §3 "unexpired at signing").
-    if now > cert.expires_at {
-        return CertExpired;
-    }
-
-    // Sum the presented history's distinct spends against this certificate. The
-    // current proposal's id is pre-seeded, so a copy of it in the history is not
-    // double-counted against itself.
-    let mut seen: BTreeSet<TransactionId> = BTreeSet::new();
-    seen.insert(p.id);
-    let mut spent: i64 = 0;
-    for item in &presented_history {
-        let Some(h) = decode_proposal(item) else {
-            return MalformedHistory;
-        };
-        if &h.signer != h.payload.sender.public_key() || h.verify().is_err() {
-            return MalformedHistory;
+    let verdict = match receiver_address.parse::<Address>() {
+        Ok(receiver) => offline_spend::verify_offline_spend(
+            &cert, &proposal, &history, &receiver, &station, now,
+        ),
+        // A malformed self-address cannot be matched, so it is a wrong receiver —
+        // reported at the receiver step: run the verifier as if the address
+        // matched, keep any verdict from the steps before it, and otherwise
+        // report the mismatch.
+        Err(_) => {
+            let receiver = proposal.payload.receiver;
+            match offline_spend::verify_offline_spend(
+                &cert, &proposal, &history, &receiver, &station, now,
+            ) {
+                v @ (V::BadCertificateSignature
+                | V::BadProposalSignature
+                | V::CertMemberMismatch
+                | V::CertNotReferenced) => v,
+                _ => V::WrongReceiver,
+            }
         }
-        let hp = &h.payload;
-        if hp.sender != cert.member || hp.cert_id != Some(cert.cert_id) || hp.amount_centi <= 0 {
-            return MalformedHistory;
-        }
-        // A repeated presentation of the same spend is not new consumption.
-        if seen.insert(hp.id) {
-            spent = spent.saturating_add(hp.amount_centi);
-        }
-    }
-
-    let available = cert.cap_centi.saturating_sub(spent);
-    if p.amount_centi > available {
-        return Overspent {
-            available_centi: available,
-            attempted_centi: p.amount_centi,
-        };
-    }
-    Ok {
-        amount_centi: p.amount_centi,
-        remaining_centi: available.saturating_sub(p.amount_centi),
+    };
+    match verdict {
+        V::Ok {
+            amount_centi,
+            remaining_centi,
+        } => OfflineSpendVerdict::Ok {
+            amount_centi,
+            remaining_centi,
+        },
+        V::BadCertificateSignature => OfflineSpendVerdict::BadCertificateSignature,
+        V::BadProposalSignature => OfflineSpendVerdict::BadProposalSignature,
+        V::CertMemberMismatch => OfflineSpendVerdict::CertMemberMismatch,
+        V::CertNotReferenced => OfflineSpendVerdict::CertNotReferenced,
+        V::WrongReceiver => OfflineSpendVerdict::WrongReceiver,
+        V::NotADebit => OfflineSpendVerdict::NotADebit,
+        V::CertExpired => OfflineSpendVerdict::CertExpired,
+        V::ProposalExpired => OfflineSpendVerdict::ProposalExpired,
+        V::ProposalInadmissible => OfflineSpendVerdict::ProposalInadmissible,
+        V::Overspent {
+            available_centi,
+            attempted_centi,
+        } => OfflineSpendVerdict::Overspent {
+            available_centi,
+            attempted_centi,
+        },
+        V::MalformedHistory => OfflineSpendVerdict::MalformedHistory,
     }
 }
 

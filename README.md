@@ -185,7 +185,7 @@ itself, and is safe to re-run.
 | --- | --- |
 | `scripts/demo-phase-0.sh` | A writer station and a read replica converge on the same log and balances after a vouch, a payment, and settlement. |
 | `scripts/demo-phase-2-paper.sh` | A member confirms a payment with no network at all; the confirmation travels to the station as printed QR sheets and the receipt travels back the same way. |
-| `scripts/demo-phase-2-wallet.sh` | A laptop member with `rrn wallet`: pair, sync, confirm offline, export to paper, courier, ingest, apply receipts, pay back online. |
+| `scripts/demo-phase-2-wallet.sh` | A laptop member with `rrn wallet`: pair, sync, confirm a payment checked against the station's copy, export to paper, courier, ingest, apply receipts, pay back online. |
 | `scripts/demo-phase-2-outage.sh` | The 72-hour outage simulation, narrated step by step. |
 | `scripts/drill-seizure-recovery.sh` | The seizure-recovery drill: restore onto fresh storage (any platform) and prove the encrypted container leaks nothing (Linux). |
 | `scripts/field-test-lora.sh` | The scripted radio field-acceptance run for two stations with RNode radios (`--dry-run` in CI). |

@@ -145,3 +145,222 @@ fn read_payloads_dedups_rescan_and_reports_bad_lines() {
         "no phantom incomplete group from the re-scan"
     );
 }
+
+// --- `show` pins station-signed artifacts to `--station` -------------------
+
+use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::Keypair;
+use rrn_crypto::serialize::to_canonical_bytes;
+use rrn_ledger::escrow::{CertId, RequestId};
+use rrn_protocol::receipt::{DeliveryReceipt, Outcome};
+
+fn addr_of(kp: &Keypair) -> Address {
+    Address::from_public_key(kp.public_key())
+}
+
+fn pinned(station: Option<&Keypair>, receiver: Option<&Keypair>) -> ShowPins {
+    ShowPins {
+        station: station.map(addr_of),
+        receiver: receiver.map(addr_of),
+    }
+}
+
+/// A certificate for `member` signed by `signer`, as envelope bytes.
+fn cert_bytes(signer: &Keypair, member: &Keypair, cap: i64, expires_at: i64) -> Vec<u8> {
+    let cert = HeadroomCertificate::new(
+        addr_of(member),
+        cap,
+        RequestId(Hash::of(b"req")),
+        100,
+        expires_at,
+    );
+    escrow::encode_certificate_envelope(&SignedPayload::sign(cert, signer))
+}
+
+/// A `{signer, sig, body}` proposal envelope.
+fn proposal_bytes(signed: &SignedProposal) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("signer", CBOR::to_byte_string(signed.signer.to_bytes()));
+    m.insert("sig", CBOR::to_byte_string(signed.signature.to_bytes()));
+    m.insert(
+        "body",
+        CBOR::to_byte_string(to_canonical_bytes(signed.payload.clone())),
+    );
+    CBOR::from(m).to_cbor_data()
+}
+
+fn spend(
+    member: &Keypair,
+    receiver: &Keypair,
+    cert: CertId,
+    amount: i64,
+    nonce: u64,
+) -> SignedProposal {
+    let p = TransactionProposal::new(
+        addr_of(member),
+        addr_of(receiver),
+        amount,
+        None,
+        nonce,
+        1_000,
+        9_000,
+    )
+    .with_certificate(cert);
+    SignedPayload::sign(p, member)
+}
+
+#[test]
+fn certificate_signed_by_throwaway_key_is_not_verified() {
+    let station = Keypair::generate();
+    let throwaway = Keypair::generate();
+    let member = Keypair::generate();
+    let bytes = cert_bytes(&throwaway, &member, 1_000, 5_000);
+
+    // No pin: the signature is self-consistent but the signer is unknown.
+    let insp = inspect_certificate(&bytes, &ShowPins::default(), 1_000);
+    assert_eq!(insp.json["verified"], false);
+    assert_eq!(insp.json["signer_checked"], false);
+    assert_eq!(insp.json["signature_valid"], true);
+    assert_eq!(insp.json["signer"], addr_of(&throwaway).to_string());
+    assert!(insp.text.contains("UNKNOWN key"), "{}", insp.text);
+    assert!(!insp.text.contains("station signature ok"), "{}", insp.text);
+
+    // Pinned to the real station: the other key is named.
+    let insp = inspect_certificate(&bytes, &pinned(Some(&station), None), 1_000);
+    assert_eq!(insp.json["verified"], false);
+    assert_eq!(insp.json["signer_checked"], true);
+    assert!(insp.text.contains("SIGNED BY ANOTHER KEY"), "{}", insp.text);
+
+    // The real station's certificate verifies when pinned, until it expires.
+    let real = cert_bytes(&station, &member, 1_000, 5_000);
+    let insp = inspect_certificate(&real, &pinned(Some(&station), None), 1_000);
+    assert_eq!(insp.json["verified"], true);
+    assert!(
+        insp.text.contains("station signature ok (pinned"),
+        "{}",
+        insp.text
+    );
+    let insp = inspect_certificate(&real, &pinned(Some(&station), None), 6_000);
+    assert_eq!(insp.json["verified"], false);
+    assert_eq!(insp.json["expired"], true);
+}
+
+#[test]
+fn self_named_receipt_is_not_verified_against_the_pin() {
+    let station = Keypair::generate();
+    let forger = Keypair::generate();
+    // A receipt that names its own signer — self-consistent, and not the station.
+    let receipt = |signer: &Keypair, names: &Keypair| {
+        let r = DeliveryReceipt {
+            station: addr_of(names),
+            outcomes: vec![Outcome {
+                record_hash: Hash::of(b"record"),
+                disposition: Disposition::Admitted { seq: 7 },
+            }],
+            received_at: 1_000,
+        };
+        receipt::encode_signed(&SignedPayload::sign(r, signer))
+    };
+    let forged = receipt(&forger, &forger);
+
+    let insp = inspect_receipt(&forged, &ShowPins::default());
+    assert_eq!(insp.json["verified"], false);
+    assert_eq!(insp.json["signer_checked"], false);
+    assert!(insp.text.contains("UNKNOWN key"), "{}", insp.text);
+
+    let insp = inspect_receipt(&forged, &pinned(Some(&station), None));
+    assert_eq!(insp.json["verified"], false);
+    assert!(insp.text.contains("SIGNED BY ANOTHER KEY"), "{}", insp.text);
+
+    // Signed by the station but naming another: not verified either.
+    let misnamed = receipt(&station, &forger);
+    let insp = inspect_receipt(&misnamed, &pinned(Some(&station), None));
+    assert_eq!(insp.json["verified"], false);
+    assert!(insp.text.contains("NAMES ANOTHER STATION"), "{}", insp.text);
+    assert!(!insp.text.contains("signature ok"), "{}", insp.text);
+
+    let genuine = receipt(&station, &station);
+    let insp = inspect_receipt(&genuine, &pinned(Some(&station), None));
+    assert_eq!(insp.json["verified"], true);
+    assert!(
+        insp.text.contains("station signature ok (pinned"),
+        "{}",
+        insp.text
+    );
+}
+
+#[test]
+fn voucher_verdicts_come_from_the_shared_verifier() {
+    let station = Keypair::generate();
+    let member = Keypair::generate();
+    let receiver = Keypair::generate();
+    let cert = cert_bytes(&station, &member, 1_000, 5_000);
+    let cert_id = escrow::decode_certificate_envelope(&cert)
+        .unwrap()
+        .payload
+        .cert_id;
+    let voucher = |proposal: Vec<u8>, history: Vec<Vec<u8>>| {
+        SpendVoucher {
+            proposal,
+            cert: cert.clone(),
+            history,
+        }
+        .encode()
+    };
+    let both = pinned(Some(&station), Some(&receiver));
+
+    // ok, with what would remain.
+    let v = voucher(
+        proposal_bytes(&spend(&member, &receiver, cert_id, 200, 1)),
+        vec![proposal_bytes(&spend(&member, &receiver, cert_id, 300, 0))],
+    );
+    let insp = inspect_spend_voucher(&v, &both, 1_000);
+    assert_eq!(insp.json["verdict"], "ok");
+    assert_eq!(insp.json["verified"], true);
+    assert_eq!(insp.json["remaining_centi"], 500);
+
+    // wrong-receiver: the voucher pays someone else.
+    let stranger = Keypair::generate();
+    let v = voucher(
+        proposal_bytes(&spend(&member, &stranger, cert_id, 200, 1)),
+        vec![],
+    );
+    let insp = inspect_spend_voucher(&v, &both, 1_000);
+    assert_eq!(insp.json["verdict"], "wrong-receiver");
+    assert_eq!(insp.json["verified"], false);
+
+    // overspent against the presented history.
+    let v = voucher(
+        proposal_bytes(&spend(&member, &receiver, cert_id, 300, 1)),
+        vec![proposal_bytes(&spend(&member, &receiver, cert_id, 800, 0))],
+    );
+    let insp = inspect_spend_voucher(&v, &both, 1_000);
+    assert_eq!(insp.json["verdict"], "overspent");
+    assert_eq!(insp.json["verified"], false);
+
+    // bad-proposal-signature: signed by someone other than the sender.
+    let mut forged = spend(&member, &receiver, cert_id, 200, 1);
+    let impostor = Keypair::generate();
+    forged.signer = impostor.public_key();
+    forged.signature = impostor.sign(&to_canonical_bytes(forged.payload.clone()));
+    let v = voucher(proposal_bytes(&forged), vec![]);
+    let insp = inspect_spend_voucher(&v, &both, 1_000);
+    assert_eq!(insp.json["verdict"], "bad-proposal-signature");
+    assert_eq!(insp.json["verified"], false);
+
+    // A missing pin: no verdict, never verified — even for a good voucher.
+    let good = voucher(
+        proposal_bytes(&spend(&member, &receiver, cert_id, 200, 1)),
+        vec![],
+    );
+    for pins in [
+        ShowPins::default(),
+        pinned(Some(&station), None),
+        pinned(None, Some(&receiver)),
+    ] {
+        let insp = inspect_spend_voucher(&good, &pins, 1_000);
+        assert!(insp.json["verdict"].is_null());
+        assert_eq!(insp.json["verified"], false);
+        assert!(insp.text.contains("verdict: not checked"), "{}", insp.text);
+    }
+}
