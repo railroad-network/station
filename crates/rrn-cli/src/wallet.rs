@@ -197,10 +197,12 @@ pub enum WalletCmd {
         #[arg(long)]
         voucher_out: Option<PathBuf>,
     },
-    /// Confirm a proposed payment addressed to you. The wallet signs only a
-    /// proposal it has checked: fetched from the station by id (online), or read
-    /// from a carried `rrnspend:` voucher or exported bundle (`--from`). It shows
-    /// who pays whom first; a payment *request* — you pay — needs `--accept-debit`.
+    /// Confirm a proposed payment addressed to you.
+    ///
+    /// The wallet signs only a proposal it has checked: fetched from the station
+    /// by id (online), or read from a carried `rrnspend:` voucher or exported
+    /// bundle (`--from`). It shows who pays whom first; a payment *request* — you
+    /// pay — needs `--accept-debit`.
     Confirm {
         /// The hex transaction id (required with a bundle; optional with a
         /// voucher, where it must match the voucher's proposal).
@@ -276,12 +278,13 @@ pub enum WalletCmd {
         #[command(subcommand)]
         cmd: WalletReceiptsCmd,
     },
-    /// Stop carrying a pending record that can never succeed — e.g. a
-    /// confirmation of a payment whose sender never delivers it — so it no
-    /// longer holds up the outbox. Not a revocation: a copy already carried can still be
-    /// admitted. A record the station never received leaves its chain position
-    /// empty there for good, which `sync` reports. A proposal cannot be
-    /// abandoned. Local only: no passphrase, no station.
+    /// Stop carrying a pending record that can never succeed.
+    ///
+    /// For example, a confirmation of a payment whose sender never delivers it,
+    /// so it no longer holds up the outbox. Not a revocation: a copy already
+    /// carried can still be admitted. A record the station never received leaves
+    /// its chain position empty there for good, which `sync` reports. A proposal
+    /// cannot be abandoned. Local only: no passphrase, no station.
     Abandon {
         /// The record hash (hex), or a unique prefix of at least 8 hex
         /// characters, as `rrn wallet show` prints it.
