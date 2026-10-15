@@ -25,7 +25,7 @@ workspace of crates that produce the `station` daemon and the `rrn`
 command-line client. The Android app lives in the sibling repo
 [`mobile`](https://github.com/railroad-network/mobile). The human-facing
 documentation, written for members, organizers, and operators rather than for
-the code, is at **<https://railroad-network.github.io>**; this repo holds the
+the code, is at **<https://railroadnetwork.org>**; this repo holds the
 engineering record (design overview, decision records, wire specs, threat
 model, audits) that the site explains.
 
@@ -205,14 +205,14 @@ rrn history                     # the local append-only log, decoded
 ```
 
 The full `--help` of every command is on the docs site under
-[Reference](https://railroad-network.github.io/reference/).
+[Reference](https://railroadnetwork.org/reference/).
 
 ## Running a real community
 
 The docs site has the plain-language guides for
-[members](https://railroad-network.github.io/members/),
-[organizers](https://railroad-network.github.io/organizers/), and
-[operators](https://railroad-network.github.io/operators/). The complete
+[members](https://railroadnetwork.org/members/),
+[organizers](https://railroadnetwork.org/organizers/), and
+[operators](https://railroadnetwork.org/operators/). The complete
 operator runbooks live here and are the site's source:
 
 - [`docs/community-setup.md`](docs/community-setup.md): stand up a station,

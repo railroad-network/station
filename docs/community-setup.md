@@ -1252,7 +1252,7 @@ answer the phone; does the merchant trust an offline payment. Write down what
 surprised you and fix the people-side before the storm.
 
 The organizer-facing version of this guide is
-[Running an outage drill](https://railroad-network.github.io/organizers/outage-drill.html)
+[Running an outage drill](https://railroadnetwork.org/organizers/outage-drill.html)
 on the docs site.
 
 ---
