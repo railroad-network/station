@@ -87,5 +87,5 @@ scheme (ADR-0017 renumbered: Phase 2 is now single-community resilience).
 
 See also [`docs/threat-model.md`](../threat-model.md) for the project's living
 threat model, which references decisions recorded here, and the docs site's
-[ADR index](https://railroad-network.github.io/reference/adrs.html), generated
+[ADR index](https://railroadnetwork.org/reference/adrs.html), generated
 from this directory.

@@ -17,4 +17,4 @@ changed in ADR-0017 (Phase 2 is single-community resilience, Phase 3 is
 federation); the overview uses the new numbering.
 
 For the plain-language version of all of this, written for members,
-organizers, and operators, see <https://railroad-network.github.io>.
+organizers, and operators, see <https://railroadnetwork.org>.

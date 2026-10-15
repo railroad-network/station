@@ -13,7 +13,7 @@ What is genuinely useful right now, in order:
 
 1. **Run a pilot.** Twenty people, one station, play stakes, ninety days, and
    honest notes about what confused people. The guides at
-   <https://railroad-network.github.io> are the runbook. Open an issue with
+   <https://railroadnetwork.org> are the runbook. Open an issue with
    what you learned.
 2. **Report bugs and confusing behaviour**: open an issue with the commit, the
    command or screen, and what you expected.

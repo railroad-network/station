@@ -52,7 +52,7 @@ red-team checklist (`docs/security/phase-2-redteam.md`); the independent profess
 audit is still pending. **Do not use with real value.**
 
 **The docs site.** The human-facing documentation is an mdBook in the sibling repo
-`../railroad-network.github.io`, live at https://railroad-network.github.io, split by
+`../railroad-network.github.io`, live at https://railroadnetwork.org, split by
 audience (members / organizers / operators / reference). Its `rrn`/`station` command
 pages and ADR index are generated from this checkout by `scripts/gen-reference.sh` there;
 re-run it after a CLI help-string or ADR change. When the site and an ADR disagree, the
