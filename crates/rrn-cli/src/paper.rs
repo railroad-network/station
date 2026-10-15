@@ -39,7 +39,8 @@ use rrn_crypto::serialize::{checked_from_data, from_canonical_bytes};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use rrn_ledger::escrow::{self, HeadroomCertificate};
-use rrn_ledger::transaction::TransactionProposal;
+use rrn_ledger::offline_spend::{verify_offline_spend, OfflineSpendVerdict};
+use rrn_ledger::transaction::{SignedProposal, TransactionProposal};
 use rrn_protocol::bundle::Bundle;
 use rrn_protocol::outbox;
 use rrn_protocol::paper::{
@@ -64,10 +65,23 @@ pub enum PaperCmd {
     /// Classify and pretty-print any paper payload(s) without ingesting them —
     /// the courier's inspection path. Verifies every signature it can and reports
     /// missing chunks for incomplete multi-part groups. Needs no station.
+    ///
+    /// A station-signed artifact (certificate, receipt, a voucher's certificate)
+    /// is reported verified only when its signer is the station given with
+    /// `--station`; without it, the output says the signer was not checked. A
+    /// spend voucher gets the receiver's full offline verdict only with both
+    /// `--station` and `--receiver`.
     Show {
         /// Files of QR-text lines (one payload string per line). Repeatable.
         #[arg(long = "in", required = true)]
         input: Vec<PathBuf>,
+        /// The station's `rrn1…` address: station-signed artifacts are checked
+        /// against it.
+        #[arg(long)]
+        station: Option<String>,
+        /// Your own `rrn1…` address, as the receiver of a spend voucher.
+        #[arg(long)]
+        receiver: Option<String>,
     },
     /// Reassemble scanned QR text, submit carried bundles to the station, and
     /// print each record's outcome. Re-ingesting the same input is idempotent.
@@ -139,7 +153,11 @@ pub enum PaperCmd {
 /// the station; `show`, `credential`, and `render` are purely local.
 pub async fn cmd_paper(client: &UnixClient, fmt: Format, cmd: PaperCmd) -> Result<()> {
     match cmd {
-        PaperCmd::Show { input } => cmd_show(fmt, &input),
+        PaperCmd::Show {
+            input,
+            station,
+            receiver,
+        } => cmd_show(fmt, &input, station.as_deref(), receiver.as_deref()),
         PaperCmd::Ingest { input, out } => cmd_ingest(client, fmt, &input, out.as_deref()).await,
         PaperCmd::ExportReceipts {
             out,
@@ -367,16 +385,29 @@ struct Inspection {
     summary: String,
 }
 
-/// Inspects a completed payload, verifying every signature it can offline. The
-/// signer *identity* is not cross-checked to a known station here (that needs the
-/// daemon); a self-consistent signature proves the bytes were not tampered with
-/// after signing (ADR-0002).
-fn inspect(p: &Payload) -> Inspection {
+/// The addresses `show` checks against: the station that must have signed a
+/// certificate or receipt, and the receiver a spend voucher must name.
+#[derive(Default)]
+struct ShowPins {
+    station: Option<Address>,
+    receiver: Option<Address>,
+}
+
+/// Inspects a completed payload, verifying every signature it can offline.
+///
+/// A self-consistent signature only proves the bytes were not altered after
+/// signing (ADR-0002); anyone can sign a well-formed certificate or receipt with
+/// a throwaway key. So a station-signed artifact is `verified` only when its
+/// signer is the pinned station (`pins.station`), and the output says when no
+/// pin was given. A spend voucher's verdict is the shared receiver check
+/// ([`rrn_ledger::offline_spend::verify_offline_spend`]) and needs both pins.
+/// `now` is this computer's clock — testimony, as on a phone (ADR-0022).
+fn inspect(p: &Payload, pins: &ShowPins, now: i64) -> Inspection {
     match (p.kind, &p.bytes) {
         (PayloadKind::Bundle, Some(b)) => inspect_bundle(b),
-        (PayloadKind::Receipt, Some(b)) => inspect_receipt(b),
-        (PayloadKind::Certificate, Some(b)) => inspect_certificate(b),
-        (PayloadKind::SpendVoucher, Some(b)) => inspect_spend_voucher(b),
+        (PayloadKind::Receipt, Some(b)) => inspect_receipt(b, pins),
+        (PayloadKind::Certificate, Some(b)) => inspect_certificate(b, pins, now),
+        (PayloadKind::SpendVoucher, Some(b)) => inspect_spend_voucher(b, pins, now),
         (PayloadKind::Address, Some(b)) => inspect_address(b),
         (PayloadKind::RecoveryShard, _) => Inspection {
             json: json!({ "kind": "recovery-shard" }),
@@ -452,6 +483,11 @@ fn inspect_bundle(bytes: &[u8]) -> Inspection {
             "verified": ok,
         }));
     }
+    lines.push(
+        "  entry signatures are checked against each entry's own author; whether the \
+         author is a member is decided by the station"
+            .to_string(),
+    );
     let summary = format!(
         "bundle · {} record(s) [{}]",
         bundle.entries.len(),
@@ -469,24 +505,56 @@ fn inspect_bundle(bytes: &[u8]) -> Inspection {
     }
 }
 
-fn inspect_receipt(bytes: &[u8]) -> Inspection {
+/// How a station-signed artifact's signer checked out against the pin, as one
+/// line of `show` text. Only a valid signature by the pinned station reads "ok".
+fn signer_line(signature_valid: bool, signer: &Address, pin: Option<&Address>) -> String {
+    if !signature_valid {
+        return "SIGNATURE INVALID".to_string();
+    }
+    match pin {
+        Some(pin) if pin == signer => format!("station signature ok (pinned {})", short_addr(pin)),
+        Some(pin) => format!(
+            "SIGNED BY ANOTHER KEY {} — not the station {}",
+            short_addr(signer),
+            short_addr(pin)
+        ),
+        None => format!(
+            "signature valid, by an UNKNOWN key {} — not checked against a station \
+             (pass --station rrn1…)",
+            short_addr(signer)
+        ),
+    }
+}
+
+fn inspect_receipt(bytes: &[u8], pins: &ShowPins) -> Inspection {
     let signed = match receipt::decode_signed(bytes) {
         Ok(s) => s,
         Err(e) => return undecodable("receipt", &e.to_string()),
     };
-    let sig_ok = signed.verify().is_ok();
-    let station_matches = Address::from_public_key(signed.signer) == signed.payload.station;
+    let signature_valid = signed.verify().is_ok();
+    let signer = Address::from_public_key(signed.signer);
     let r = &signed.payload;
+    let pin = pins.station.as_ref();
+    // A receipt must be signed by the pinned station *and* name it — a receipt
+    // that names the key that signed it proves nothing about which station.
+    let verified = signature_valid && pin == Some(&signer) && pin == Some(&r.station);
+    // Signed by the pinned station but naming another: not verified, and the
+    // line must not read "ok".
+    let misnamed = signature_valid && pin == Some(&signer) && pin != Some(&r.station);
+    let signer_text = if misnamed {
+        format!(
+            "signed by the pinned station but NAMES ANOTHER STATION {} — not verified",
+            short_addr(&r.station)
+        )
+    } else {
+        signer_line(signature_valid, &signer, pin)
+    };
     let mut lines = vec![format!(
         "receipt from {}: {} outcome(s), received @ {} — {}",
         short_addr(&r.station),
         r.outcomes.len(),
         r.received_at,
-        if sig_ok && station_matches {
-            "station signature ok"
-        } else {
-            "STATION SIGNATURE INVALID"
-        },
+        signer_text,
     )];
     let mut outcomes = Vec::new();
     for o in &r.outcomes {
@@ -508,7 +576,10 @@ fn inspect_receipt(bytes: &[u8]) -> Inspection {
             "station": r.station.to_string(),
             "received_at": r.received_at,
             "outcomes": outcomes,
-            "verified": sig_ok && station_matches,
+            "signer": signer.to_string(),
+            "signature_valid": signature_valid,
+            "signer_checked": pin.is_some(),
+            "verified": verified,
         }),
         text: lines.join("\n"),
         summary: format!(
@@ -519,22 +590,29 @@ fn inspect_receipt(bytes: &[u8]) -> Inspection {
     }
 }
 
-fn inspect_certificate(bytes: &[u8]) -> Inspection {
+fn inspect_certificate(bytes: &[u8], pins: &ShowPins, now: i64) -> Inspection {
     let signed = match escrow::decode_certificate_envelope(bytes) {
         Some(s) => s,
         None => return undecodable("certificate", "not a certificate envelope"),
     };
-    let ok = signed.verify().is_ok();
+    let signature_valid = signed.verify().is_ok();
+    let signer = Address::from_public_key(signed.signer);
+    let pin = pins.station.as_ref();
     let c = &signed.payload;
-    let text = format!(
-        "certificate {}\n  member {}\n  cap {}\n  issued {}  expires {}\n  station signature {}",
+    let expired = now > c.expires_at;
+    let verified = signature_valid && pin == Some(&signer) && !expired;
+    let mut text = format!(
+        "certificate {}\n  member {}\n  cap {}\n  issued {}  expires {}\n  {}",
         short_hash(&hex(&c.cert_id.0.to_bytes())),
         c.member,
         rrn_station::history::fmt_commons(c.cap_centi),
         c.issued_at,
         c.expires_at,
-        if ok { "ok" } else { "INVALID" },
+        signer_line(signature_valid, &signer, pin),
     );
+    if expired {
+        text.push_str("\n  EXPIRED by this computer's clock");
+    }
     Inspection {
         json: json!({
             "kind": "certificate",
@@ -543,7 +621,11 @@ fn inspect_certificate(bytes: &[u8]) -> Inspection {
             "cap_centi": c.cap_centi,
             "issued_at": c.issued_at,
             "expires_at": c.expires_at,
-            "verified": ok,
+            "expired": expired,
+            "signer": signer.to_string(),
+            "signature_valid": signature_valid,
+            "signer_checked": pin.is_some(),
+            "verified": verified,
         }),
         text,
         summary: format!(
@@ -554,29 +636,36 @@ fn inspect_certificate(bytes: &[u8]) -> Inspection {
     }
 }
 
-fn inspect_spend_voucher(bytes: &[u8]) -> Inspection {
+/// Decodes a `{signer, sig, body}` envelope as a signed transaction proposal,
+/// without verifying it (the verifier does).
+fn decode_proposal_envelope(bytes: &[u8]) -> Option<SignedProposal> {
+    let (signer, signature, body) = decode_envelope(bytes)?;
+    let payload = from_canonical_bytes::<TransactionProposal>(&body).ok()?;
+    Some(SignedPayload {
+        payload,
+        signer,
+        signature,
+    })
+}
+
+fn inspect_spend_voucher(bytes: &[u8], pins: &ShowPins, now: i64) -> Inspection {
     let v = match SpendVoucher::decode(bytes) {
         Ok(v) => v,
         Err(e) => return undecodable("spend-voucher", &e.to_string()),
     };
-    let mut lines = vec!["spend voucher (structural + signature check only —".to_string()];
-    lines
-        .push("  the full offline-spend verdict is the mobile `offline_spend_verify`)".to_string());
+    let mut lines = vec!["spend voucher".to_string()];
+    let proposal = decode_proposal_envelope(&v.proposal);
+    let cert = escrow::decode_certificate_envelope(&v.cert);
+    let mut summary = "spend voucher".to_string();
 
     let mut proposal_ok = None;
     let mut cert_ok = None;
+    let mut cert_signer = None;
     let mut sender_binds = None;
-    let mut summary = "spend voucher".to_string();
-
-    // Proposal envelope → TransactionProposal.
-    if let Some((signer, sig, body)) = decode_envelope(&v.proposal) {
-        if let Ok(p) = from_canonical_bytes::<TransactionProposal>(&body) {
-            let signed = SignedPayload {
-                payload: p.clone(),
-                signer,
-                signature: sig,
-            };
-            let ok = signed.verify().is_ok();
+    match &proposal {
+        Some(signed) => {
+            let p = &signed.payload;
+            let ok = signed.verify().is_ok() && &signed.signer == p.sender.public_key();
             proposal_ok = Some(ok);
             lines.push(format!(
                 "  proposal: {} → {} amount {} cert {} — {}",
@@ -588,7 +677,7 @@ fn inspect_spend_voucher(bytes: &[u8]) -> Inspection {
                     .map(|c| short_hash(&hex(&c.0.to_bytes())))
                     .unwrap_or_else(|| "(none)".to_string()),
                 if ok {
-                    "signature ok"
+                    "signed by its sender"
                 } else {
                     "SIGNATURE INVALID"
                 },
@@ -599,45 +688,97 @@ fn inspect_spend_voucher(bytes: &[u8]) -> Inspection {
                 short_addr(&p.receiver),
                 rrn_station::history::fmt_commons(p.amount_centi)
             );
-            // Cert envelope → HeadroomCertificate.
-            if let Some(cert) = escrow::decode_certificate_envelope(&v.cert) {
-                let cok = cert.verify().is_ok();
-                cert_ok = Some(cok);
-                sender_binds = Some(cert.payload.member == p.sender);
-                lines.push(format!(
-                    "  certificate: cap {} for {} — {}; sender binds: {}",
-                    rrn_station::history::fmt_commons(cert.payload.cap_centi),
-                    short_addr(&cert.payload.member),
-                    if cok {
-                        "signature ok"
-                    } else {
-                        "SIGNATURE INVALID"
-                    },
-                    if sender_binds == Some(true) {
-                        "yes"
-                    } else {
-                        "NO"
-                    },
-                ));
-            } else {
-                lines.push("  certificate: undecodable".to_string());
-            }
-        } else {
-            lines.push("  proposal: undecodable".to_string());
         }
-    } else {
-        lines.push("  proposal: undecodable envelope".to_string());
+        None => lines.push("  proposal: undecodable".to_string()),
+    }
+    match &cert {
+        Some(c) => {
+            let signature_valid = c.verify().is_ok();
+            let signer = Address::from_public_key(c.signer);
+            // As for a standalone certificate: signed by the pin and unexpired.
+            cert_ok = Some(
+                signature_valid
+                    && pins.station.as_ref() == Some(&signer)
+                    && now <= c.payload.expires_at,
+            );
+            sender_binds = proposal
+                .as_ref()
+                .map(|p| c.payload.member == p.payload.sender);
+            lines.push(format!(
+                "  certificate: cap {} for {} — {}",
+                rrn_station::history::fmt_commons(c.payload.cap_centi),
+                short_addr(&c.payload.member),
+                signer_line(signature_valid, &signer, pins.station.as_ref()),
+            ));
+            cert_signer = Some((signer, signature_valid));
+        }
+        None => lines.push("  certificate: undecodable".to_string()),
     }
     lines.push(format!("  history: {} prior entr(y/ies)", v.history.len()));
 
-    Inspection {
-        json: json!({
-            "kind": "spend-voucher",
-            "proposal_verified": proposal_ok,
-            "certificate_verified": cert_ok,
-            "sender_binds_certificate": sender_binds,
-            "history_len": v.history.len(),
+    // The receiver's full verdict — the same check a phone runs — needs both
+    // the station that must have signed the certificate and the receiver the
+    // spend must name.
+    let mut remaining = None;
+    let verdict: Option<&'static str> = match (&pins.station, &pins.receiver) {
+        (Some(station), Some(receiver)) => Some(match (&cert, &proposal) {
+            (None, _) => "malformed-certificate",
+            (Some(c), None) => {
+                if rrn_ledger::offline_spend::certificate_signed_by(c, station.public_key()) {
+                    "malformed-proposal"
+                } else {
+                    "bad-certificate-signature"
+                }
+            }
+            (Some(c), Some(p)) => {
+                let history: Vec<_> = v
+                    .history
+                    .iter()
+                    .map(|h| decode_proposal_envelope(h))
+                    .collect();
+                let verdict =
+                    verify_offline_spend(c, p, &history, receiver, station.public_key(), now);
+                if let OfflineSpendVerdict::Ok {
+                    remaining_centi, ..
+                } = verdict
+                {
+                    remaining = Some(remaining_centi);
+                }
+                verdict.slug()
+            }
         }),
+        _ => None,
+    };
+    match (verdict, remaining) {
+        (Some(slug), Some(rem)) => lines.push(format!(
+            "  verdict: {slug} — {} would remain on the certificate",
+            rrn_station::history::fmt_commons(rem)
+        )),
+        (Some(slug), None) => lines.push(format!("  verdict: {slug} — DO NOT ACCEPT")),
+        (None, _) => lines.push(
+            "  verdict: not checked — pass --station rrn1… and --receiver rrn1… (your own \
+             address) for the receiver's offline check"
+                .to_string(),
+        ),
+    }
+
+    let mut json = json!({
+        "kind": "spend-voucher",
+        "proposal_verified": proposal_ok,
+        "certificate_verified": cert_ok,
+        "sender_binds_certificate": sender_binds,
+        "history_len": v.history.len(),
+        "signer": cert_signer.as_ref().map(|(a, _)| a.to_string()),
+        "signature_valid": cert_signer.as_ref().map(|(_, ok)| *ok),
+        "signer_checked": pins.station.is_some(),
+        "verdict": verdict,
+        "verified": verdict == Some("ok"),
+    });
+    if let Some(rem) = remaining {
+        json["remaining_centi"] = json!(rem);
+    }
+    Inspection {
+        json,
         text: lines.join("\n"),
         summary,
     }
@@ -748,7 +889,28 @@ fn short_hash(s: &str) -> String {
 // Commands
 // ===========================================================================
 
-fn cmd_show(fmt: Format, files: &[PathBuf]) -> Result<()> {
+fn cmd_show(
+    fmt: Format,
+    files: &[PathBuf],
+    station: Option<&str>,
+    receiver: Option<&str>,
+) -> Result<()> {
+    let parse_pin = |flag: &str, s: Option<&str>| -> Result<Option<Address>> {
+        s.map(|s| {
+            s.parse::<Address>()
+                .map_err(|_| anyhow!("--{flag} is not a valid rrn1… address"))
+        })
+        .transpose()
+    };
+    let pins = ShowPins {
+        station: parse_pin("station", station)?,
+        receiver: parse_pin("receiver", receiver)?,
+    };
+    // One clock reading for every expiry check in this run.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let payloads = read_payloads(files)?;
     if payloads.is_empty() {
         bail!("no QR payloads found in the given file(s)");
@@ -756,7 +918,7 @@ fn cmd_show(fmt: Format, files: &[PathBuf]) -> Result<()> {
     let mut json = Vec::new();
     let mut text = String::new();
     for p in &payloads {
-        let insp = inspect(p);
+        let insp = inspect(p, &pins, now);
         if !p.missing.is_empty() {
             text.push_str(&format!(
                 "[{}] {} — INCOMPLETE, missing chunk(s) {:?} of {}\n",
@@ -1136,6 +1298,13 @@ fn render_lines(dir: &Path, lines: &[String]) -> Result<usize> {
     Ok(count)
 }
 
+/// Captions use only an inspection's `summary`, which depends on neither the
+/// pins nor the clock.
+const CAPTION_PINS: ShowPins = ShowPins {
+    station: None,
+    receiver: None,
+};
+
 /// Per-payload one-line summaries keyed by id8, for sheet captions. Best effort:
 /// undecodable or incomplete groups just get their kind label.
 fn caption_summaries(lines: &[String]) -> std::collections::HashMap<String, String> {
@@ -1162,7 +1331,7 @@ fn caption_summaries(lines: &[String]) -> std::collections::HashMap<String, Stri
                             count: 0,
                             note: None,
                         };
-                        map.insert(id8.clone(), inspect(&p).summary);
+                        map.insert(id8.clone(), inspect(&p, &CAPTION_PINS, 0).summary);
                     } else {
                         map.entry(id8)
                             .or_insert_with(|| "multi-part payload".to_string());
@@ -1172,7 +1341,7 @@ fn caption_summaries(lines: &[String]) -> std::collections::HashMap<String, Stri
             other => {
                 let p = single_payload(line, other);
                 let id8 = p.id8.clone();
-                let s = inspect(&p).summary;
+                let s = inspect(&p, &CAPTION_PINS, 0).summary;
                 map.insert(id8, s);
             }
         }

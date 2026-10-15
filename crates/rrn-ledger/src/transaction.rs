@@ -33,6 +33,7 @@
 
 use dcbor::prelude::*;
 use rrn_crypto::hash::Hash;
+use rrn_crypto::keypair::{PublicKey, Signature};
 use rrn_crypto::signed::SignedPayload;
 use rrn_identity::address::Address;
 use serde::{Deserialize, Serialize};
@@ -384,6 +385,65 @@ impl TryFrom<CBOR> for TransactionProposal {
 /// A [`TransactionProposal`] signed by its sender.
 pub type SignedProposal = SignedPayload<TransactionProposal>;
 
+/// Why [`open_signed_proposal`] refused a carried proposal. Variants are listed
+/// in the order the checks run.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenProposalError {
+    /// The bytes do not hash to the transaction id the caller expected.
+    #[error("the record does not hash to the expected transaction id")]
+    IdMismatch,
+    /// The bytes are not a canonical `rrn.tx.proposal`.
+    #[error("the record is not a canonical transaction proposal")]
+    Malformed,
+    /// The signature does not verify over the bytes.
+    #[error("the proposal's signature does not verify")]
+    BadSignature,
+    /// The signer is not the proposal's sender.
+    #[error("the proposal is not signed by its sender")]
+    SignerNotSender,
+}
+
+/// Opens a proposal carried as its three verbatim parts — the canonical `body`
+/// its sender signed, the `signer` and the `sig` — checking, in order, that the
+/// body hashes to `expected` (a [`TransactionId`] is the hash of exactly these
+/// bytes), that it is a canonical `rrn.tx.proposal`, that the signature verifies
+/// over the body, and that the signer is the sender.
+///
+/// This is what a client does before signing anything over a transaction id it
+/// did not build itself — a confirmation, a verdict, an escalation ballot — so
+/// the record it shows is the record the id names.
+pub fn open_signed_proposal(
+    signer: &PublicKey,
+    sig: &Signature,
+    body: &[u8],
+    expected: &TransactionId,
+) -> Result<SignedProposal, OpenProposalError> {
+    if Hash::of(body) != expected.0 {
+        return Err(OpenProposalError::IdMismatch);
+    }
+    let payload: TransactionProposal =
+        match rrn_crypto::serialize::from_canonical_bytes_if_kind(body, PROPOSAL_KIND) {
+            Ok(Some(p)) => p,
+            _ => return Err(OpenProposalError::Malformed),
+        };
+    // A field the decoder drops (an invalid tier opt-up) re-encodes differently;
+    // such bytes are not a proposal any sender could have produced.
+    if payload.id != *expected {
+        return Err(OpenProposalError::Malformed);
+    }
+    if signer.verify(body, sig).is_err() {
+        return Err(OpenProposalError::BadSignature);
+    }
+    if signer != payload.sender.public_key() {
+        return Err(OpenProposalError::SignerNotSender);
+    }
+    Ok(SignedPayload {
+        payload,
+        signer: *signer,
+        signature: *sig,
+    })
+}
+
 /// The receiver's signed acceptance of a [`TransactionProposal`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TransactionConfirmation {
@@ -660,5 +720,103 @@ mod tests {
         };
         let confirmation_bytes = to_canonical_bytes(confirmation);
         assert!(from_canonical_bytes::<TransactionProposal>(&confirmation_bytes).is_err());
+    }
+
+    // --- open_signed_proposal ----------------------------------------------
+
+    /// A sender-signed proposal as its verbatim parts: (signer, sig, body, id).
+    fn carried(
+        sender: &Keypair,
+        receiver: Address,
+        amount: i64,
+    ) -> (PublicKey, Signature, Vec<u8>, TransactionId) {
+        let p = TransactionProposal::new(
+            Address::from_public_key(sender.public_key()),
+            receiver,
+            amount,
+            None,
+            0,
+            1_700_000_000,
+            1_700_086_400,
+        );
+        let id = p.id;
+        let signed = SignedProposal::sign(p, sender);
+        (
+            signed.signer,
+            signed.signature,
+            to_canonical_bytes(signed.payload),
+            id,
+        )
+    }
+
+    #[test]
+    fn open_signed_proposal_ok() {
+        let sender = Keypair::generate();
+        let (signer, sig, body, id) = carried(&sender, addr(), -500);
+        let opened = open_signed_proposal(&signer, &sig, &body, &id).expect("opens");
+        assert_eq!(opened.payload.id, id);
+        assert_eq!(opened.payload.amount_centi, -500);
+        assert!(opened.verify().is_ok());
+    }
+
+    #[test]
+    fn open_signed_proposal_id_mismatch() {
+        let sender = Keypair::generate();
+        let (signer, sig, body, _) = carried(&sender, addr(), 100);
+        let other = TransactionId(Hash::of(b"another record"));
+        assert_eq!(
+            open_signed_proposal(&signer, &sig, &body, &other).unwrap_err(),
+            OpenProposalError::IdMismatch
+        );
+    }
+
+    #[test]
+    fn open_signed_proposal_malformed() {
+        // A confirmation's bytes hash to their own id but are not a proposal.
+        let kp = Keypair::generate();
+        let confirmation = TransactionConfirmation {
+            proposal_id: sample_proposal().id,
+            confirmer: Address::from_public_key(kp.public_key()),
+            confirmed_at: 1,
+        };
+        let signed = SignedConfirmation::sign(confirmation, &kp);
+        let body = to_canonical_bytes(signed.payload);
+        let id = TransactionId(Hash::of(&body));
+        assert_eq!(
+            open_signed_proposal(&signed.signer, &signed.signature, &body, &id).unwrap_err(),
+            OpenProposalError::Malformed
+        );
+        // Not CBOR at all.
+        let junk = b"not cbor".to_vec();
+        let id = TransactionId(Hash::of(&junk));
+        assert_eq!(
+            open_signed_proposal(&signed.signer, &signed.signature, &junk, &id).unwrap_err(),
+            OpenProposalError::Malformed
+        );
+    }
+
+    #[test]
+    fn open_signed_proposal_bad_signature() {
+        let sender = Keypair::generate();
+        let (signer, _, body, id) = carried(&sender, addr(), 100);
+        let wrong = sender.sign(b"something else");
+        assert_eq!(
+            open_signed_proposal(&signer, &wrong, &body, &id).unwrap_err(),
+            OpenProposalError::BadSignature
+        );
+    }
+
+    #[test]
+    fn open_signed_proposal_signer_not_sender() {
+        // A valid signature over the proposal bytes, by someone other than its
+        // sender.
+        let sender = Keypair::generate();
+        let (_, _, body, id) = carried(&sender, addr(), 100);
+        let impostor = Keypair::generate();
+        let sig = impostor.sign(&body);
+        assert_eq!(
+            open_signed_proposal(&impostor.public_key(), &sig, &body, &id).unwrap_err(),
+            OpenProposalError::SignerNotSender
+        );
     }
 }

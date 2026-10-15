@@ -150,6 +150,7 @@ async fn paper_export_ingest_receipts_roundtrip() {
     // Everything that touches the binary runs off the reactor.
     let socket2 = socket.clone();
     let b_str = b_addr.to_string();
+    let station_str = who.address.clone();
     let work = work.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let socket = socket2.as_path();
@@ -217,13 +218,28 @@ async fn paper_export_ingest_receipts_roundtrip() {
         let receipts_txt = exp.join("receipts.txt");
         assert!(receipts_txt.exists());
 
-        // show the carried-back receipt: it verifies as the station's signature.
+        // show the carried-back receipt: it verifies as the station's signature
+        // only against the pinned station; unpinned, the signer is not checked.
         let shown = rrn_json(
             socket,
             &["paper", "show", "--in", receipts_txt.to_str().unwrap()],
         );
         assert_eq!(shown["payloads"][0]["kind"], "receipt");
+        assert_eq!(shown["payloads"][0]["verified"], false);
+        assert_eq!(shown["payloads"][0]["signer_checked"], false);
+        let shown = rrn_json(
+            socket,
+            &[
+                "paper",
+                "show",
+                "--station",
+                &station_str,
+                "--in",
+                receipts_txt.to_str().unwrap(),
+            ],
+        );
         assert_eq!(shown["payloads"][0]["verified"], true);
+        assert_eq!(shown["payloads"][0]["signer"], station_str);
 
         // A certificate wallet card round-trips: request → export → show verifies.
         let cards = work.join("cards");
@@ -242,10 +258,23 @@ async fn paper_export_ingest_receipts_roundtrip() {
         assert!(cert_txt.exists() && cards.join("certificate.pdf").exists());
         let shown = rrn_json(
             socket,
-            &["paper", "show", "--in", cert_txt.to_str().unwrap()],
+            &[
+                "paper",
+                "show",
+                "--station",
+                &station_str,
+                "--in",
+                cert_txt.to_str().unwrap(),
+            ],
         );
         assert_eq!(shown["payloads"][0]["kind"], "certificate");
-        assert_eq!(shown["payloads"][0]["verified"], true);
+        assert_eq!(shown["payloads"][0]["signer"], station_str);
+        assert_eq!(shown["payloads"][0]["signature_valid"], true);
+        // This station runs on a manual clock near the epoch, so by this
+        // computer's clock the certificate has long expired — and `show` says
+        // so rather than calling it verified.
+        assert_eq!(shown["payloads"][0]["expired"], true);
+        assert_eq!(shown["payloads"][0]["verified"], false);
 
         // A member credential card is the bare address QR.
         rrn_text(
@@ -281,7 +310,6 @@ async fn paper_export_ingest_receipts_roundtrip() {
     // The operator wallet loads (sanity that the fixtures path and wallet file are
     // where the offline flow expects them, for the demo script).
     let _ = WalletContents::load_from_file(&dir.path().join(WALLET_FILE), PASSPHRASE).unwrap();
-    let _ = who;
 
     station.shutdown().await;
 }

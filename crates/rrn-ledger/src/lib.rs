@@ -30,6 +30,8 @@
 //!   outstanding certificate's remaining cap counts against its member's
 //!   committed position exactly like a pending debit, so a cert-backed spend can
 //!   later be admitted under partition without a fresh floor check.
+//! - [`offline_spend`] — the receiver's offline verdict on a cert-backed spend
+//!   (ADR-0021 §3), the one verifier the mobile FFI and the CLI share.
 //! - [`enrollment`] — who may go into debt (ADR-0038): the station-signed
 //!   enrollment record the writer appends at an in-person ceremony. Only an
 //!   enrolled identity runs the configured debt floor; any other key is held at
@@ -70,6 +72,7 @@ pub mod dispute;
 pub mod engine;
 pub mod enrollment;
 pub mod escrow;
+pub mod offline_spend;
 pub mod settlement;
 pub mod state;
 pub mod tier;

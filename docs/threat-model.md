@@ -1759,6 +1759,16 @@ cursors); the wallet's trust anchor (the pinned station address).
   read (test: `station_dir_refused`). `--home`/`RRN_WALLET_HOME` still let a member
   point the wallet at an attacker-seeded chain; the pin and the re-anchor rule
   bound the damage to that member's own accountability, not the community's log.
+- *Tampering / spoofing — confirming a proposal the member was not shown.*
+  `rrn wallet confirm` signs only a proposal it has verified: fetched by id over
+  the channel's `signed_record` read, or read from a carried voucher (which must
+  also pass the receiver's offline check against the pin) or bundle. It checks
+  id → decode → signature → sender → receiver → expiry before it unlocks to
+  sign, prints who pays whom, and refuses a payment request — which debits the
+  confirmer, ADR-0018 — without `--accept-debit` (test:
+  `confirm_shows_payment_request_and_requires_accept_debit`). Online, the wallet
+  unlocks before the fetch, because the channel request is itself signed by the
+  member key; nothing is signed over the id until the checks pass.
 - *The new station surface.* The wallet adds one member-signed channel write,
   `cert_request` (signer-bound like `submit_vouch`, calling the existing engine
   door), and one read, `outbox_head` (a read, served on a replica). Neither is a
@@ -3611,6 +3621,26 @@ pipeline enforces.
   read-scoped background token** minted at pairing, which would let the phone
   fetch events without carrying a transacting key; that is a future cross-repo
   change, out of scope for Phase 1.
+- **Signing over an id the client did not build.** *Threat:* a confirmation,
+  juror verdict, escalation ballot, vote or co-sign names its subject only by
+  content id. A client that signs over an id on the strength of a
+  station-rendered row (or a counterparty's "confirm this id, I paid you") can
+  be steered into signing something else — a payment *request* that debits the
+  confirmer (ADR-0018), or a proposal it was never shown. *Mitigation:* the
+  `signed_record` channel read returns the log row's verbatim bytes for an id —
+  the canonical body its author signed, the signer and the signature — so a
+  client checks that the body hashes to the id it is about to sign over,
+  decodes as the expected kind, and is signed by its own author before showing
+  or signing anything (`rrn_ledger::transaction::open_signed_proposal`; the FFI's
+  `signed_record_open` for the phone). `rrn wallet confirm` signs only a
+  proposal it opened this way (or from a carried voucher or bundle), names who
+  pays whom, refuses one not addressed to the member, and requires
+  `--accept-debit` for a payment request. The read serves two kinds
+  (`rrn.tx.proposal`, `rrn.gov.proposal`), answers an unknown id and an unserved
+  kind identically, writes nothing, and is replica-safe. *Residual:* any paired
+  member may read any served record — the same audience as today's
+  `transactions`/`dispute`/`governance_proposal` reads; per-caller scoping is
+  separate work. The phone app does not yet consume the read.
 
 ### DTN bundle ingest (station, ADR-0020)
 
@@ -3866,11 +3896,16 @@ core against malformed scanned input; the invariant that the CLI remains a
   the radio path — paper adds no bypass. `show` verifies every signature it can
   offline (`outbox::validate` per bundle entry; `SignedPayload::verify` for
   receipts and certificates) before printing a word, and flags any entry whose
-  signature does not hold. *Residual:* `show` cannot cross-check a *signer's
-  identity* to a known member with no station in reach — a self-consistent
-  signature proves the bytes are as the author signed them, not who the author is;
-  the authoritative check is the station's admission. This is stated in the
-  command output.
+  signature does not hold. A station-signed artifact (certificate, receipt, a
+  voucher's certificate) is reported `verified` only when its signer is the
+  station given with `--station`, and a receipt must also name that station; a
+  spend voucher's verdict is the shared receiver check
+  (`rrn_ledger::offline_spend::verify_offline_spend`, the one the FFI's
+  `offline_spend_verify` calls), run only with both `--station` and `--receiver`.
+  *Residual:* `show` checks a station-signed artifact against the station key
+  only when given `--station`; without it the output says the signer was not
+  checked and reports `verified: false`. Bundle entries are checked against their
+  own authors; membership is the station's decision.
 - *Spoofing / DoS — malformed or oversized scanned text.* Scanned lines are
   untrusted input. Reassembly and decode run entirely through `rrn-protocol`'s
   bounded codecs — the `MAX_CHUNKS`/`CHUNK_PAYLOAD_BYTES`/`MAX_QR_TEXT_CHARS`
@@ -3914,11 +3949,12 @@ dependency enters the audit surface**. Their input is the operator's own
 already-encoded QR strings — a rendering fault damages a printout, never a signed
 payload.
 
-*Known limitation:* `show` on a spend voucher (`rrnspend:`) is a structural and
-signature check only; the full offline-spend admissibility verdict lives in the
-mobile `offline_spend_verify` (`rrn-mobile-ffi`) and is not duplicated in the CLI.
-Lifting it into `rrn-ledger` so the CLI can render the full verdict is tracked as
-backlog.
+*Known limitation:* the offline-spend verdict `show` renders on a spend voucher
+(`rrnspend:`) is `rrn_ledger::offline_spend::verify_offline_spend`, the same
+function the FFI's `offline_spend_verify` calls, and `show` runs it only with
+both `--station` and `--receiver`; without them it prints the structural and
+signature lines, `"verdict": null` and `verified: false`. Like the phone's
+check, it sees only the history the payer presents (ADR-0021 §3).
 
 ### Reticulum transport sidecar (station, ADR-0013 / ADR-0026)
 
@@ -4734,7 +4770,7 @@ entry citing its ADR or the section that owns it.
 - **Some Phase 2 deliverables stop at a software seam.** The SMS *modem
   gateway* is not built (only the codec, registry, relay, and a mock gateway);
   the RNode/LoRa field round-trip is bench-verified but the human field sign-off
-  is pending; `rrn paper show` on a spend voucher is a structural check only. The
+  is pending. The
   member-side outbox export the round-trip needed now exists (`rrn wallet export`,
   ADR-0028), so a full propose → confirm → settle payment over radio is provable
   in software; only the human LoRa field sign-off remains. See

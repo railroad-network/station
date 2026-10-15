@@ -197,10 +197,23 @@ pub enum WalletCmd {
         #[arg(long)]
         voucher_out: Option<PathBuf>,
     },
-    /// Confirm a proposed payment addressed to you.
+    /// Confirm a proposed payment addressed to you. The wallet signs only a
+    /// proposal it has checked: fetched from the station by id (online), or read
+    /// from a carried `rrnspend:` voucher or exported bundle (`--from`). It shows
+    /// who pays whom first; a payment *request* — you pay — needs `--accept-debit`.
     Confirm {
-        /// The hex transaction id.
-        tx_id: String,
+        /// The hex transaction id (required with a bundle; optional with a
+        /// voucher, where it must match the voucher's proposal).
+        #[arg(required_unless_present = "from")]
+        tx_id: Option<String>,
+        /// Read the proposal from a carried voucher (`rrnspend:` / `rrnp:` lines)
+        /// or bundle (`rrnp:` lines or a raw `payload.bundle`) instead of the
+        /// station.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Sign even though the proposal debits you (a payment request).
+        #[arg(long)]
+        accept_debit: bool,
     },
     /// Cast a governance ballot.
     Vote {
@@ -376,7 +389,15 @@ pub async fn cmd_wallet(
             carrier,
             voucher_out.as_deref(),
         ),
-        WalletCmd::Confirm { tx_id } => wallet.cmd_confirm(fmt, &tx_id),
+        WalletCmd::Confirm {
+            tx_id,
+            from,
+            accept_debit,
+        } => {
+            wallet
+                .cmd_confirm(fmt, tx_id.as_deref(), from.as_deref(), accept_debit)
+                .await
+        }
         WalletCmd::Vote {
             proposal_id,
             choice,
@@ -1258,11 +1279,76 @@ impl Wallet {
         )
     }
 
-    fn cmd_confirm(&self, fmt: Format, tx_id: &str) -> Result<()> {
-        self.require_signable()?;
-        let keypair = self.unlock()?;
-        let id = TransactionId(Hash::from_bytes(parse_hash(tx_id)?));
+    /// Confirms a proposal only after checking it: the bytes hash to the id,
+    /// are a proposal signed by its sender, name this wallet as receiver, and
+    /// are unexpired — and, for a payment request (a negative amount, which
+    /// debits the confirmer, ADR-0018), only with `accept_debit`. Nothing is
+    /// signed before every check passes.
+    async fn cmd_confirm(
+        &self,
+        fmt: Format,
+        tx_id: Option<&str>,
+        from: Option<&Path>,
+        accept_debit: bool,
+    ) -> Result<()> {
         let now = now();
+        let own = self.address()?;
+        let expected = tx_id
+            .map(|t| parse_hash(t).map(|h| TransactionId(Hash::from_bytes(h))))
+            .transpose()?;
+        // Online, the channel request itself is signed by the member key, so the
+        // wallet unlocks before the fetch; the confirmation is still signed only
+        // after the checks below.
+        let mut online_key = None;
+        let proposal = match from {
+            Some(path) => self.read_carried_proposal(path, expected.as_ref(), &own, now)?,
+            None => {
+                let id = expected.ok_or_else(|| {
+                    anyhow!("give a transaction id, or --from a carried voucher or bundle")
+                })?;
+                // No paired URL: the station's copy is out of reach, so point at
+                // the carried path rather than ask for a passphrase first.
+                let client = self.client().map_err(|_| {
+                    anyhow!(
+                        "the station is not reachable (no paired URL); confirm from the \
+                         payer's carried voucher or bundle with `rrn wallet confirm \
+                         <tx_id> --from <file>`"
+                    )
+                })?;
+                let keypair = self.unlock()?;
+                let served = self
+                    .call(
+                        &client,
+                        &keypair,
+                        "signed_record",
+                        &json!({ "id": hex(&id.to_bytes()) }),
+                    )
+                    .await?;
+                online_key = Some(keypair);
+                open_served_proposal(&served, &id)?
+            }
+        };
+        let p = &proposal.payload;
+        if p.receiver != own {
+            bail!("this proposal is not addressed to you");
+        }
+        if now > p.expires_at {
+            bail!("this proposal has expired");
+        }
+        let summary = confirm_summary(p);
+        if p.amount_centi < 0 && !accept_debit {
+            bail!(
+                "{summary}\nThis is a payment request — confirming it debits YOU. \
+                 Re-run with --accept-debit to sign it."
+            );
+        }
+        self.require_signable()?;
+        eprintln!("{summary}");
+        let keypair = match online_key {
+            Some(k) => k,
+            None => self.unlock()?,
+        };
+        let id = p.id;
         let confirmation = TransactionConfirmation {
             proposal_id: id,
             confirmer: Address::from_public_key(keypair.public_key()),
@@ -1270,9 +1356,157 @@ impl Wallet {
         };
         let signed = SignedConfirmation::sign(confirmation, &keypair);
         self.append_record(&keypair, &signed, now)?;
-        crate::emit(fmt, &json!({ "tx_id": tx_id, "state": "pending" }), || {
-            Ok(format!("confirmed {tx_id} (pending)"))
-        })
+        let tx_id = hex(&id.to_bytes());
+        let direction = match p.amount_centi.signum() {
+            -1 => "you-pay",
+            1 => "you-receive",
+            _ => "none",
+        };
+        crate::emit(
+            fmt,
+            &json!({
+                "tx_id": tx_id,
+                "state": "pending",
+                "direction": direction,
+                "proposal_amount_centi": p.amount_centi,
+                "counterparty": p.sender.to_string(),
+            }),
+            || Ok(format!("confirmed {tx_id} (pending)")),
+        )
+    }
+
+    /// Reads the proposal to confirm from a carried file: a spend voucher
+    /// (`rrnspend:` or `rrnp:` voucher chunks), which must also pass the
+    /// receiver's offline check against the pinned station and this wallet; or
+    /// a bundle (`rrnp:` bundle chunks, or a raw `payload.bundle`), whose entry
+    /// for `expected` is opened from its verbatim record bytes.
+    fn read_carried_proposal(
+        &self,
+        path: &Path,
+        expected: Option<&TransactionId>,
+        own: &Address,
+        now: i64,
+    ) -> Result<SignedProposal> {
+        let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let mut vouchers: Vec<Vec<u8>> = Vec::new();
+        let mut bundles: Vec<Vec<u8>> = Vec::new();
+        if Bundle::decode(&raw).is_ok() {
+            bundles.push(raw);
+        } else {
+            let text = String::from_utf8_lossy(&raw);
+            let mut reass = PaperReassembler::new();
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                match classify(line) {
+                    PaperPayloadKind::Multipart => match reass.accept(line) {
+                        Ok(Some((PaperKind::Bundle, bytes))) => bundles.push(bytes),
+                        Ok(Some((PaperKind::SpendVoucher, bytes))) => vouchers.push(bytes),
+                        _ => {}
+                    },
+                    PaperPayloadKind::SpendVoucher => {
+                        let v = paper::decode_spend_voucher(line)
+                            .map_err(|e| anyhow!("bad rrnspend: line: {e}"))?;
+                        vouchers.push(v.encode());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !vouchers.is_empty() {
+            return self.open_voucher(&vouchers, expected, own, now);
+        }
+        let id = expected.ok_or_else(|| {
+            anyhow!("give the transaction id to confirm from a bundle: rrn wallet confirm <tx_id> --from …")
+        })?;
+        for bytes in &bundles {
+            let bundle = Bundle::decode(bytes).map_err(|e| anyhow!("bad bundle: {e}"))?;
+            for env in &bundle.entries {
+                let Ok(entry) = env.to_signed() else {
+                    continue;
+                };
+                let e = &entry.payload;
+                if e.record_hash() == id.0 {
+                    return rrn_ledger::transaction::open_signed_proposal(
+                        &e.record_signer,
+                        &e.record_sig,
+                        &e.record_bytes,
+                        id,
+                    )
+                    .map_err(|err| anyhow!("the carried proposal does not check out: {err}"));
+                }
+            }
+        }
+        if bundles.is_empty() {
+            bail!("no voucher or bundle found in {}", path.display());
+        }
+        bail!("the carried bundle has no record {}", hex(&id.to_bytes()))
+    }
+
+    /// Picks the voucher for `expected` (or the only one), opens its proposal,
+    /// and runs the receiver's offline check (ADR-0021 §3) against the pinned
+    /// station and this wallet's address.
+    fn open_voucher(
+        &self,
+        vouchers: &[Vec<u8>],
+        expected: Option<&TransactionId>,
+        own: &Address,
+        now: i64,
+    ) -> Result<SignedProposal> {
+        let mut opened = Vec::new();
+        for bytes in vouchers {
+            let v = SpendVoucher::decode(bytes).map_err(|e| anyhow!("bad voucher: {e}"))?;
+            let (signer, sig, body) = decode_envelope(&v.proposal)
+                .ok_or_else(|| anyhow!("the voucher's proposal is undecodable"))?;
+            let id = TransactionId(Hash::of(&body));
+            opened.push((v, signer, sig, body, id));
+        }
+        let pick = match expected {
+            Some(want) => opened.into_iter().find(|o| o.4 == *want).ok_or_else(|| {
+                anyhow!(
+                    "the voucher's proposal is not {} — confirm the id the voucher carries",
+                    hex(&want.to_bytes())
+                )
+            })?,
+            None if opened.len() == 1 => opened.remove(0),
+            None => bail!("the file carries several vouchers; give the transaction id"),
+        };
+        let (v, signer, sig, body, id) = pick;
+        let proposal = rrn_ledger::transaction::open_signed_proposal(&signer, &sig, &body, &id)
+            .map_err(|err| anyhow!("the voucher's proposal does not check out: {err}"))?;
+        let cert = escrow::decode_certificate_envelope(&v.cert).ok_or_else(|| {
+            anyhow!("refused (malformed-certificate): the voucher's certificate is undecodable")
+        })?;
+        let history: Vec<Option<SignedProposal>> = v
+            .history
+            .iter()
+            .map(|h| {
+                let (signer, signature, body) = decode_envelope(h)?;
+                let payload =
+                    rrn_crypto::serialize::from_canonical_bytes::<TransactionProposal>(&body)
+                        .ok()?;
+                Some(SignedPayload {
+                    payload,
+                    signer,
+                    signature,
+                })
+            })
+            .collect();
+        let pin = self.pin_address()?;
+        let verdict = rrn_ledger::offline_spend::verify_offline_spend(
+            &cert,
+            &proposal,
+            &history,
+            own,
+            pin.public_key(),
+            now,
+        );
+        if verdict.slug() != "ok" {
+            bail!(
+                "refused ({}): this voucher does not pass the receiver's offline check",
+                verdict.slug()
+            );
+        }
+        Ok(proposal)
     }
 
     fn cmd_vote(&self, fmt: Format, proposal_id: &str, choice: VoteChoice) -> Result<()> {
@@ -2206,6 +2440,52 @@ fn decode_envelope(
         rrn_crypto::keypair::Signature::from_bytes(sig).ok()?,
         body,
     ))
+}
+
+/// Opens the `signed_record` reply for transaction `id`: it must be a
+/// transaction proposal whose verbatim bytes hash to `id`, signed by its sender.
+fn open_served_proposal(served: &serde_json::Value, id: &TransactionId) -> Result<SignedProposal> {
+    if served.get("kind").and_then(|k| k.as_str()) != Some("rrn.tx.proposal") {
+        bail!("{} is not a transaction proposal", hex(&id.to_bytes()));
+    }
+    let field = |name: &str| -> Result<Vec<u8>> {
+        served
+            .get(name)
+            .and_then(|v| v.as_str())
+            .and_then(rrn_station::core::unhex)
+            .ok_or_else(|| anyhow!("station reply has no {name}"))
+    };
+    let body = field("body_hex")?;
+    let signer = <[u8; 32]>::try_from(field("signer_hex")?.as_slice())
+        .ok()
+        .and_then(|b| rrn_crypto::keypair::PublicKey::from_bytes(b).ok())
+        .ok_or_else(|| anyhow!("station reply has a malformed signer"))?;
+    let sig = <[u8; 64]>::try_from(field("signature_hex")?.as_slice())
+        .ok()
+        .and_then(|b| rrn_crypto::keypair::Signature::from_bytes(b).ok())
+        .ok_or_else(|| anyhow!("station reply has a malformed signature"))?;
+    rrn_ledger::transaction::open_signed_proposal(&signer, &sig, &body, id)
+        .map_err(|err| anyhow!("the station's copy of this proposal does not check out: {err}"))
+}
+
+/// What confirming `p` does, from the confirmer's side: who pays whom, then
+/// the memo, tier and expiry.
+fn confirm_summary(p: &TransactionProposal) -> String {
+    let head = match p.amount_centi.signum() {
+        -1 => format!(
+            "PAYMENT REQUEST: you would PAY {} to {}",
+            fmt_commons(p.amount_centi.saturating_abs()),
+            p.sender
+        ),
+        1 => format!("{} pays you {}", p.sender, fmt_commons(p.amount_centi)),
+        _ => format!("{}: no money moves (0.00)", p.sender),
+    };
+    format!(
+        "{head}\n  memo: {}\n  tier: {}\n  expires: {}",
+        p.memo.as_deref().unwrap_or("(none)"),
+        p.effective_tier(),
+        p.expires_at
+    )
 }
 
 /// Parses a 32-byte hex hash (transaction/proposal/cert/evidence id).
